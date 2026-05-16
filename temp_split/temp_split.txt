@@ -1,1 +1,0 @@
-This is where the 9 split images are temporarily stored when finding the 4 point edge detection and image realignment
