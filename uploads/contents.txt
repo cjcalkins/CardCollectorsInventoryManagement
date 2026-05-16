@@ -1,0 +1,1 @@
+This is both the temporary direcotries location, denoted by temp_X and the inventory images uploaded and stored.
