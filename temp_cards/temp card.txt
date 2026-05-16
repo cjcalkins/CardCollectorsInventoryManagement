@@ -1,1 +1,0 @@
-This is where the temporary 4 port realignment images are stored before import in to the database.
