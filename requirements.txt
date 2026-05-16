@@ -1,0 +1,16 @@
+# Python 3.10.9
+# Third-party dependencies for app_33.py (Flask OCR Inventory Scanner)
+# Install with: pip install -r requirements.txt
+#
+# NOTE: pytesseract wraps the system Tesseract OCR binary, which must be
+# installed separately (e.g. `sudo apt install tesseract-ocr` on Debian/Ubuntu
+# or `brew install tesseract` on macOS). It is NOT a pip package.
+
+Flask>=2.3,<3.1
+Flask-SQLAlchemy>=3.0,<3.2
+Werkzeug>=2.3,<3.1
+SQLAlchemy>=2.0,<2.1
+opencv-python>=4.8,<4.11
+pytesseract>=0.3.10,<0.4
+numpy>=1.24,<2.1
+Pillow>=9.5,<11.0
