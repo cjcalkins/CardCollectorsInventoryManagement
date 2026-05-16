@@ -1,0 +1,1 @@
+This is where the uploaded image and split is temporarily stored during image splitting and edge detection.
