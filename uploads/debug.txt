@@ -1,1 +1,0 @@
-This is where debug images will be stored if you enabled debug images
