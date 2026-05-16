@@ -1,0 +1,869 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Inventory - Card Collector Inventory Manager</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+
+    <style>
+        body {
+            background-color: #f8f9fa;
+        }
+
+        .thumbnail {
+            max-height: 80px;
+            max-width: 80px;
+            object-fit: cover;
+            border-radius: 8px;
+            border: 1px solid #dee2e6;
+            background: #fff;
+        }
+
+        .table-card {
+            border: none;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+            border-radius: 14px;
+        }
+
+        .nav-tabs-minimal {
+            display: flex;
+            gap: 10px;
+            margin-left: auto;
+        }
+
+        .nav-tab {
+            padding: 8px 14px;
+            text-decoration: none;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.08);
+            color: rgba(255, 255, 255, 0.85);
+            font-weight: 600;
+            transition: 0.2s ease;
+        }
+
+        .nav-tab:hover {
+            background: rgba(255, 255, 255, 0.18);
+            color: #fff;
+        }
+
+        .nav-tab.active {
+            background: #fff;
+            color: #212529;
+        }
+
+        .pagination .page-link {
+            border-radius: 6px !important;
+            margin: 0 2px;
+        }
+
+        @media (max-width: 768px) {
+            .nav-tabs-minimal {
+                margin-left: 0;
+                margin-top: 12px;
+                width: 100%;
+            }
+
+            .nav-tab {
+                flex: 1;
+                text-align: center;
+            }
+        }
+
+        /* ── Column controls ── */
+        .col-toggle-bar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px 12px;
+            align-items: center;
+        }
+        .col-toggle-bar .form-check {
+            margin: 0;
+            white-space: nowrap;
+        }
+
+        /* ── Sortable headers ── */
+        #inventoryTable thead th.sortable {
+            cursor: pointer;
+            user-select: none;
+            white-space: nowrap;
+        }
+        #inventoryTable thead th.sortable .sort-icon {
+            display: inline-block;
+            margin-left: 4px;
+            opacity: 0.45;
+            font-style: normal;
+            font-size: 0.75em;
+            vertical-align: middle;
+        }
+        #inventoryTable thead th.sortable.sort-asc  .sort-icon,
+        #inventoryTable thead th.sortable.sort-desc .sort-icon {
+            opacity: 1;
+        }
+
+        /* ── Resizable column handles ── */
+        #inventoryTable thead th {
+            position: relative;
+            overflow: visible;
+        }
+        #inventoryTable thead th .col-resize-handle {
+            position: absolute;
+            top: 0;
+            right: 0;
+            width: 6px;
+            height: 100%;
+            cursor: col-resize;
+            z-index: 10;
+            /* Prevent the handle from triggering the sort click */
+            user-select: none;
+        }
+        #inventoryTable thead th .col-resize-handle:hover,
+        #inventoryTable thead th .col-resize-handle.resizing {
+            background: rgba(255,255,255,0.35);
+        }
+        /* Keep table layout fixed so explicit widths are respected */
+        #inventoryTable {
+            table-layout: fixed;
+        }
+    </style>
+</head>
+<body class="bg-light">
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+        <div class="container d-flex flex-wrap align-items-center">
+            <a class="navbar-brand" href="{{ url_for('index') }}">
+                <i class="fas fa-barcode me-2"></i>Card Collector Inventory Manager
+            </a>
+
+            <div class="nav-tabs-minimal">
+                <a href="{{ url_for('import_page') }}" class="nav-tab">Import</a>
+                <a href="{{ url_for('index') }}"        class="nav-tab">Scan</a>
+                <a href="{{ url_for('inventory') }}"    class="nav-tab active">Inventory</a>
+                <a href="{{ url_for('albums_list') }}"  class="nav-tab">Album</a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container py-5">
+        <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-3">
+            <h2 class="mb-0">
+                <i class="fas fa-boxes-stacked me-2"></i>Inventory Records
+            </h2>
+
+            <div class="d-flex gap-2">
+                <a href="{{ url_for('duplicates') }}" class="btn btn-outline-warning">
+                    <i class="fas fa-clone me-1"></i>Find Duplicates
+                </a>
+                <button class="btn btn-success" id="addCustomFieldBtn" type="button">
+                    <i class="fas fa-plus me-1"></i>Add Field to Game
+                </button>
+                <button class="btn btn-danger" id="deleteSelectedBtn" type="button">
+                    <i class="fas fa-trash me-1"></i>Delete Selected
+                </button>
+            </div>
+        </div>
+
+        <!-- Filter Bar -->
+        <div class="card table-card mb-3">
+            <div class="card-body py-3">
+                <div class="row g-2 align-items-end">
+                    <div class="col-12 col-md-4">
+                        <label class="form-label small fw-semibold mb-1">Search</label>
+                        <div class="input-group">
+                            <span class="input-group-text"><i class="fas fa-search"></i></span>
+                            <input type="text" id="filterSearch" class="form-control"
+                                   placeholder="Search all fields… (press Enter)"
+                                   value="{{ search }}">
+                        </div>
+                    </div>
+                    <div class="col-6 col-md-2">
+                        <label class="form-label small fw-semibold mb-1">Game</label>
+                        <select id="filterGame" class="form-select">
+                            <option value="">All Games</option>
+                        </select>
+                    </div>
+                    <div class="col-6 col-md-2">
+                        <label class="form-label small fw-semibold mb-1">Album</label>
+                        <select id="filterAlbum" class="form-select">
+                            <option value="">All Albums</option>
+                        </select>
+                    </div>
+                    <div class="col-6 col-md-2">
+                        <label class="form-label small fw-semibold mb-1">Template</label>
+                        <select id="filterTemplate" class="form-select">
+                            <option value="">All Templates</option>
+                        </select>
+                    </div>
+                    <div class="col-6 col-md-2 d-flex gap-2 align-items-end">
+                        <button class="btn btn-outline-secondary w-100" id="clearFiltersBtn" type="button">
+                            <i class="fas fa-times me-1"></i>Clear
+                        </button>
+                    </div>
+                </div>
+                <div class="mt-2 text-muted small">
+                    Showing {{ pagination.first }}–{{ pagination.last }} of {{ pagination.total }} record{{ 's' if pagination.total != 1 else '' }}
+                    {% if search or f_game or f_album or f_template %}
+                        <span class="ms-2 text-primary fw-semibold">(filtered)</span>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+
+        <!-- Column Visibility Controls -->
+        <div class="card table-card mb-3" id="colControlsCard">
+            <div class="card-body py-2 px-3">
+                <div class="d-flex align-items-center gap-3 flex-wrap">
+                    <span class="text-muted small fw-semibold" style="white-space:nowrap;">
+                        <i class="fas fa-columns me-1"></i>Columns:
+                    </span>
+                    <div class="col-toggle-bar" id="colToggleBar">
+                        <!-- populated by JS -->
+                    </div>
+                    <button class="btn btn-outline-secondary btn-sm ms-auto" id="resetColsBtn" type="button">
+                        <i class="fas fa-undo me-1"></i>Reset
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <div class="card table-card">
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle mb-0" id="inventoryTable">
+                        <thead class="table-dark">
+                            <tr>
+                                <th style="width: 40px;" data-col="select">
+                                    <input type="checkbox" id="selectAll">
+                                </th>
+                                <th data-col="date" class="sortable" data-sort-type="date">Date <span class="sort-icon">⇅</span></th>
+                                <th data-col="image">Image</th>
+                                <th data-col="game" class="sortable" data-sort-type="text">Game <span class="sort-icon">⇅</span></th>
+                                <th data-col="album" class="sortable" data-sort-type="text">Album <span class="sort-icon">⇅</span></th>
+                                <th data-col="page" class="sortable" data-sort-type="num">Page <span class="sort-icon">⇅</span></th>
+                                <th data-col="slot" class="sortable" data-sort-type="num">Slot <span class="sort-icon">⇅</span></th>
+                                <th data-col="template" class="sortable" data-sort-type="text">Template <span class="sort-icon">⇅</span></th>
+                                {% for field in entry_fields %}
+                                <th data-col="entry_{{ field | e }}" data-entry-field="{{ field | e }}" class="sortable" data-sort-type="text">{{ field | replace('_', ' ') | title }} <span class="sort-icon">⇅</span></th>
+                                {% endfor %}
+                                <th data-col="actions">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for record in records %}
+                            <tr data-game="{{ record.extracted_data.get('game', '') }}">
+                                <td>
+                                    <input type="checkbox" class="record-checkbox" value="{{ record.id }}">
+                                </td>
+                                <td>{{ record.scan_date.strftime('%Y-%m-%d %H:%M') }}</td>
+                                <td>
+                                    {% if record.image_path %}
+                                    <img
+                                        src="{{ url_for('uploaded_file', filename=record.image_path.replace('\\', '/')) }}"
+                                        class="thumbnail"
+                                        alt="Record image"
+                                    >
+                                    {% else %}
+                                    <span class="text-muted small">No image</span>
+                                    {% endif %}
+                                </td>
+                                <td>{{ record.extracted_data.get('game', '') }}</td>
+                                <td>{{ record.extracted_data.get('album', '') }}</td>
+                                <td>{{ record.extracted_data.get('page', '') }}</td>
+                                <td>{{ record.extracted_data.get('slot', '') }}</td>
+                                <td>
+                                    <span class="badge bg-secondary">{{ record.template_used }}</span>
+                                </td>
+                                {% for field in entry_fields %}
+                                <td data-entry-field="{{ field | e }}">{{ record.extracted_data.get(field, '') | e }}</td>
+                                {% endfor %}
+                                <td>
+                                    <a href="{{ url_for('inventory_detail', record_id=record.id) }}" class="btn btn-sm btn-primary">
+                                        <i class="fas fa-pen me-1"></i>Open
+                                    </a>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+
+                {% if not records %}
+                <div class="text-center text-muted py-4">
+                    No inventory records found.
+                </div>
+                {% endif %}
+
+                <!-- Pagination Controls -->
+                {% if pagination.pages > 1 %}
+                <div class="d-flex justify-content-between align-items-center mt-4 flex-wrap gap-2">
+                    <div class="text-muted small">
+                        Page {{ pagination.page }} of {{ pagination.pages }}
+                    </div>
+                    <nav aria-label="Inventory pagination">
+                        <ul class="pagination pagination-sm mb-0">
+                            <li class="page-item {% if not pagination.has_prev %}disabled{% endif %}">
+                                <a class="page-link" href="{{ build_inventory_url(pagination.prev_num) }}">‹ Prev</a>
+                            </li>
+                            {% for p in pagination.iter_pages(left_edge=1, right_edge=1, left_current=2, right_current=2) %}
+                                {% if p %}
+                                    <li class="page-item {% if p == pagination.page %}active{% endif %}">
+                                        <a class="page-link" href="{{ build_inventory_url(p) }}">{{ p }}</a>
+                                    </li>
+                                {% else %}
+                                    <li class="page-item disabled"><span class="page-link">…</span></li>
+                                {% endif %}
+                            {% endfor %}
+                            <li class="page-item {% if not pagination.has_next %}disabled{% endif %}">
+                                <a class="page-link" href="{{ build_inventory_url(pagination.next_num) }}">Next ›</a>
+                            </li>
+                        </ul>
+                    </nav>
+                    <div class="d-flex align-items-center gap-2">
+                        <label class="text-muted small mb-0">Per page:</label>
+                        <select id="perPageSelect" class="form-select form-select-sm" style="width: auto;">
+                            <option value="25"  {% if per_page == 25  %}selected{% endif %}>25</option>
+                            <option value="50"  {% if per_page == 50  %}selected{% endif %}>50</option>
+                            <option value="100" {% if per_page == 100 %}selected{% endif %}>100</option>
+                            <option value="200" {% if per_page == 200 %}selected{% endif %}>200</option>
+                        </select>
+                    </div>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+
+    <!-- Add Custom Field to Game Modal -->
+    <div class="modal fade" id="customFieldModal" tabindex="-1" aria-labelledby="customFieldModalLabel" aria-hidden="true">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="customFieldModalLabel">Add Custom Field to All Entries of a Game</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label for="gameSelect" class="form-label">Game</label>
+                        <select id="gameSelect" class="form-select">
+                            <option value="">Loading games…</option>
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label for="customKey" class="form-label">New Field Name (Key)</label>
+                        <input type="text" id="customKey" class="form-control" placeholder="e.g. condition, edition, notes">
+                    </div>
+                    <div class="mb-3">
+                        <label for="customValue" class="form-label">Value</label>
+                        <input type="text" id="customValue" class="form-control" placeholder="e.g. Near Mint, 1st Edition, Special">
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" id="applyCustomFieldBtn" class="btn btn-primary">Apply to All Matching Records</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // ====================== ACTIVE FILTER STATE (injected from server) ======================
+        const activeFilters = {
+            search:   {{ search     | tojson }},
+            game:     {{ f_game     | tojson }},
+            album:    {{ f_album    | tojson }},
+            template: {{ f_template | tojson }},
+            per_page: {{ per_page   | tojson }},
+        };
+
+        // ====================== LOAD DROPDOWN OPTIONS FROM SERVER ======================
+        async function loadFilterOptions() {
+            try {
+                const res  = await fetch('/inventory/filter_options');
+                const data = await res.json();
+
+                const mapping = [
+                    ['filterGame',     data.games,     activeFilters.game],
+                    ['filterAlbum',    data.albums,    activeFilters.album],
+                    ['filterTemplate', data.templates, activeFilters.template],
+                ];
+
+                mapping.forEach(([id, values, active]) => {
+                    const sel = document.getElementById(id);
+                    values.forEach(val => {
+                        const opt = document.createElement('option');
+                        opt.value = opt.textContent = val;
+                        if (val === active) opt.selected = true;
+                        sel.appendChild(opt);
+                    });
+                });
+            } catch (err) {
+                console.error('Failed to load filter options:', err);
+            }
+        }
+
+        // ====================== SUBMIT FILTERS (navigate to filtered URL) ======================
+        function submitFilters() {
+            const params = new URLSearchParams({
+                search:   document.getElementById('filterSearch').value.trim(),
+                game:     document.getElementById('filterGame').value,
+                album:    document.getElementById('filterAlbum').value,
+                template: document.getElementById('filterTemplate').value,
+                per_page: activeFilters.per_page,
+                page:     '1',
+            });
+            // Strip blank params for cleaner URLs
+            for (const [k, v] of [...params.entries()]) {
+                if (!v) params.delete(k);
+            }
+            window.location.href = '/inventory?' + params.toString();
+        }
+
+        // Search submits on Enter to avoid a server round-trip per keystroke
+        document.getElementById('filterSearch').addEventListener('keydown', function (e) {
+            if (e.key === 'Enter') submitFilters();
+        });
+
+        document.getElementById('filterGame').addEventListener('change',     submitFilters);
+        document.getElementById('filterAlbum').addEventListener('change',    submitFilters);
+        document.getElementById('filterTemplate').addEventListener('change', submitFilters);
+
+        document.getElementById('clearFiltersBtn').addEventListener('click', function () {
+            window.location.href = '/inventory';
+        });
+
+        // Per-page selector — preserves current filters, resets to page 1
+        const perPageSelect = document.getElementById('perPageSelect');
+        if (perPageSelect) {
+            perPageSelect.addEventListener('change', function () {
+                const params = new URLSearchParams({
+                    search:   activeFilters.search,
+                    game:     activeFilters.game,
+                    album:    activeFilters.album,
+                    template: activeFilters.template,
+                    per_page: this.value,
+                    page:     '1',
+                });
+                for (const [k, v] of [...params.entries()]) {
+                    if (!v) params.delete(k);
+                }
+                window.location.href = '/inventory?' + params.toString();
+            });
+        }
+
+        // ====================== SELECT ALL (current page only) ======================
+        document.getElementById('selectAll')?.addEventListener('change', function () {
+            document.querySelectorAll('.record-checkbox').forEach(cb => {
+                cb.checked = this.checked;
+            });
+        });
+
+        // ====================== DELETE SELECTED ======================
+        document.getElementById('deleteSelectedBtn')?.addEventListener('click', async function () {
+            const selected = Array.from(document.querySelectorAll('.record-checkbox:checked'))
+                .map(cb => parseInt(cb.value, 10));
+
+            if (!selected.length) {
+                alert('Please select at least one record.');
+                return;
+            }
+
+            const confirmed = confirm(`Delete ${selected.length} selected record(s)? This cannot be undone.`);
+            if (!confirmed) return;
+
+            const response = await fetch('/delete_scans', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ record_ids: selected })
+            });
+
+            const data = await response.json();
+
+            if (data.status === 'success') {
+                location.reload();
+            } else {
+                alert(data.message || 'Delete failed.');
+            }
+        });
+
+        // ====================== ADD CUSTOM FIELD MODAL ======================
+        const customFieldModal = new bootstrap.Modal(document.getElementById('customFieldModal'));
+        const gameSelect       = document.getElementById('gameSelect');
+        const customKeyInput   = document.getElementById('customKey');
+        const customValueInput = document.getElementById('customValue');
+
+        // Uses filter_options so it shows ALL games, not just the current page
+        async function populateGameSelect() {
+            try {
+                const res  = await fetch('/inventory/filter_options');
+                const data = await res.json();
+                gameSelect.innerHTML = '<option value="">Select a Game...</option>';
+                data.games.forEach(game => {
+                    const opt = document.createElement('option');
+                    opt.value = opt.textContent = game;
+                    gameSelect.appendChild(opt);
+                });
+            } catch (err) {
+                gameSelect.innerHTML = '<option value="">Failed to load games</option>';
+            }
+        }
+
+        document.getElementById('addCustomFieldBtn')?.addEventListener('click', function () {
+            populateGameSelect();
+            customKeyInput.value  = '';
+            customValueInput.value = '';
+            customFieldModal.show();
+        });
+
+        document.getElementById('applyCustomFieldBtn')?.addEventListener('click', async function () {
+            const selectedGame = gameSelect.value;
+            const key   = customKeyInput.value.trim();
+            const value = customValueInput.value.trim();
+
+            if (!selectedGame) { alert('Please select a Game.'); return; }
+            if (!key || !value) { alert('Please fill in both Field Name and Value.'); return; }
+
+            const confirmed = confirm(`Add "${key}: ${value}" to ALL records with Game "${selectedGame}"?`);
+            if (!confirmed) return;
+
+            try {
+                const response = await fetch('/add_custom_field', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    // Sends game name so the server finds all matching records itself —
+                    // avoids the old bug where only the current page's IDs were collected.
+                    body: JSON.stringify({ game: selectedGame, key, value })
+                });
+
+                const data = await response.json();
+
+                if (data.status === 'success') {
+                    alert(`✅ ${data.message}`);
+                    customFieldModal.hide();
+                    location.reload();
+                } else {
+                    alert(data.message || 'Update failed.');
+                }
+            } catch (error) {
+                console.error(error);
+                alert('An error occurred.');
+            }
+        });
+
+        // ====================== COLUMN VISIBILITY & SORTING ======================
+
+        // Storage key bumped to v3 to drop old hidden-col state
+        // that referenced the removed matched_product column.
+        const COL_STORAGE_KEY  = 'inventory_hidden_cols_v3';
+        const COL_WIDTHS_KEY   = 'inventory_col_widths_v1';
+
+        // Entry fields discovered server-side and injected as JSON.
+        // Each item is a raw field key string (e.g. "name", "atk", "stars").
+        const ENTRY_FIELDS = {{ entry_fields | tojson }};
+
+        // Static columns that can be toggled (key matches data-col on <th>)
+        const STATIC_TOGGLEABLE_COLS = [
+            { key: 'date',            label: 'Date' },
+            { key: 'image',           label: 'Image' },
+            { key: 'game',            label: 'Game' },
+            { key: 'album',           label: 'Album' },
+            { key: 'page',            label: 'Page' },
+            { key: 'slot',            label: 'Slot' },
+            { key: 'template',        label: 'Template' },
+        ];
+
+        // OCR metadata suffixes that must never appear as column chooser options.
+        const OCR_HIDDEN_SUFFIXES = ['__ocr_conf', '__ocr_variant'];
+        function isOcrMetaField(fieldKey) {
+            return OCR_HIDDEN_SUFFIXES.some(sfx => fieldKey.endsWith(sfx));
+        }
+
+        // Build the full toggleable-columns list, appending one entry per
+        // dynamic field.  Label converts underscores to spaces and title-cases.
+        // OCR conf/variant fields are filtered from the chooser.
+        function toLabel(fieldKey) {
+            return fieldKey.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+        }
+        // Only non-OCR-meta fields appear in the column chooser
+        const DYNAMIC_TOGGLEABLE_COLS = ENTRY_FIELDS
+            .filter(f => !isOcrMetaField(f))
+            .map(f => ({
+                key:      'entry_' + f,
+                label:    toLabel(f),
+                isDynamic: true,
+                fieldKey: f,
+            }));
+        // All dynamic cols (including OCR meta) for visibility-application logic;
+        // OCR meta ones are force-hidden regardless of the hiddenSet.
+        const ALL_DYNAMIC_COLS = ENTRY_FIELDS.map(f => ({
+            key:      'entry_' + f,
+            fieldKey: f,
+        }));
+        const TOGGLEABLE_COLS = [...STATIC_TOGGLEABLE_COLS, ...DYNAMIC_TOGGLEABLE_COLS];
+
+        // Static column key → 0-based cell index.
+        // Dynamic columns are NOT in this map; they are looked up by data-entry-field
+        // attribute on the <td> elements instead of by numeric index.
+        const STATIC_COL_INDEX = {
+            select: 0, date: 1, image: 2, game: 3,
+            album: 4, page: 5, slot: 6, template: 7,
+            // actions column is always last; excluded from toggles
+        };
+
+        function loadHiddenCols() {
+            try {
+                return new Set(JSON.parse(localStorage.getItem(COL_STORAGE_KEY) || '[]'));
+            } catch { return new Set(); }
+        }
+
+        function saveHiddenCols(hiddenSet) {
+            localStorage.setItem(COL_STORAGE_KEY, JSON.stringify([...hiddenSet]));
+        }
+
+        function applyColVisibility(hiddenSet) {
+            const table = document.getElementById('inventoryTable');
+            if (!table) return;
+            const allRows = table.querySelectorAll('tr');
+
+            // Apply visibility for static columns (by cell index)
+            for (const [key, idx] of Object.entries(STATIC_COL_INDEX)) {
+                const hide = hiddenSet.has(key);
+                allRows.forEach(row => {
+                    const cell = row.cells[idx];
+                    if (cell) cell.style.display = hide ? 'none' : '';
+                });
+            }
+
+            // Apply visibility for ALL dynamic entry columns (by data-col / data-entry-field).
+            // OCR meta fields (e.g. name__ocr_conf) are always force-hidden.
+            ALL_DYNAMIC_COLS.forEach(({ key, fieldKey }) => {
+                const hide = hiddenSet.has(key) || isOcrMetaField(fieldKey);
+                // Hide/show header <th>
+                const th = table.querySelector(`thead th[data-col="${CSS.escape(key)}"]`);
+                if (th) th.style.display = hide ? 'none' : '';
+                // Hide/show body <td>
+                table.querySelectorAll(`tbody td[data-entry-field="${CSS.escape(fieldKey)}"]`).forEach(td => {
+                    td.style.display = hide ? 'none' : '';
+                });
+            });
+        }
+
+        function buildColToggles(hiddenSet) {
+            const bar = document.getElementById('colToggleBar');
+            if (!bar) return;
+            bar.innerHTML = '';
+
+            // TOGGLEABLE_COLS already excludes OCR meta fields
+            TOGGLEABLE_COLS.forEach(({ key, label }) => {
+                const id = `colToggle_${key}`;
+                const wrap = document.createElement('div');
+                wrap.className = 'form-check form-check-inline';
+
+                const cb = document.createElement('input');
+                cb.type = 'checkbox';
+                cb.className = 'form-check-input';
+                cb.id = id;
+                cb.checked = !hiddenSet.has(key);
+                cb.dataset.col = key;
+
+                cb.addEventListener('change', function () {
+                    const hidden = loadHiddenCols();
+                    if (this.checked) hidden.delete(this.dataset.col);
+                    else              hidden.add(this.dataset.col);
+                    saveHiddenCols(hidden);
+                    applyColVisibility(hidden);
+                });
+
+                const lbl = document.createElement('label');
+                lbl.className = 'form-check-label small';
+                lbl.htmlFor = id;
+                lbl.textContent = label;
+
+                wrap.appendChild(cb);
+                wrap.appendChild(lbl);
+                bar.appendChild(wrap);
+            });
+        }
+
+        // Reset clears both hidden-cols state AND saved column widths
+        document.getElementById('resetColsBtn')?.addEventListener('click', function () {
+            localStorage.removeItem(COL_STORAGE_KEY);
+            localStorage.removeItem(COL_WIDTHS_KEY);
+            const hidden = new Set();
+            applyColVisibility(hidden);
+            buildColToggles(hidden);
+            clearAllColWidths();
+        });
+
+        // ── Sorting ─────────────────────────────────────────────────────────────
+        let sortState = { col: null, dir: 'asc' };
+
+        function getCellValue(row, colKey) {
+            // Dynamic entry columns: look up <td data-entry-field="fieldKey">
+            if (colKey.startsWith('entry_')) {
+                const fieldKey = colKey.slice('entry_'.length);
+                const td = row.querySelector(`td[data-entry-field="${CSS.escape(fieldKey)}"]`);
+                return td ? td.textContent.trim() : '';
+            }
+            // Static columns: look up by numeric cell index
+            const idx = STATIC_COL_INDEX[colKey];
+            if (idx === undefined) return '';
+            const cell = row.cells[idx];
+            if (!cell) return '';
+            return cell.textContent.trim();
+        }
+
+        function sortTable(colKey, sortType) {
+            const tbody = document.querySelector('#inventoryTable tbody');
+            if (!tbody) return;
+
+            const rows = Array.from(tbody.querySelectorAll('tr'));
+
+            // Toggle direction if same column clicked again
+            if (sortState.col === colKey) {
+                sortState.dir = sortState.dir === 'asc' ? 'desc' : 'asc';
+            } else {
+                sortState.col = colKey;
+                sortState.dir = 'asc';
+            }
+
+            const dir = sortState.dir === 'asc' ? 1 : -1;
+
+            rows.sort((a, b) => {
+                const va = getCellValue(a, colKey);
+                const vb = getCellValue(b, colKey);
+
+                if (sortType === 'num') {
+                    const na = parseFloat(va) || 0;
+                    const nb = parseFloat(vb) || 0;
+                    return (na - nb) * dir;
+                }
+                if (sortType === 'date') {
+                    const da = new Date(va);
+                    const db = new Date(vb);
+                    return (da - db) * dir;
+                }
+                // text
+                return va.localeCompare(vb, undefined, { sensitivity: 'base' }) * dir;
+            });
+
+            rows.forEach(r => tbody.appendChild(r));
+
+            // Update header indicators
+            document.querySelectorAll('#inventoryTable thead th.sortable').forEach(th => {
+                th.classList.remove('sort-asc', 'sort-desc');
+                if (th.dataset.col === colKey) {
+                    th.classList.add(sortState.dir === 'asc' ? 'sort-asc' : 'sort-desc');
+                    const icon = th.querySelector('.sort-icon');
+                    if (icon) icon.textContent = sortState.dir === 'asc' ? '↑' : '↓';
+                } else {
+                    const icon = th.querySelector('.sort-icon');
+                    if (icon) icon.textContent = '⇅';
+                }
+            });
+        }
+
+        // Attach sort click handlers to ALL sortable headers.
+        // The handler checks that the click did not originate on the resize handle.
+        document.querySelectorAll('#inventoryTable thead th.sortable').forEach(th => {
+            th.addEventListener('click', function (e) {
+                if (e.target.classList.contains('col-resize-handle')) return;
+                sortTable(this.dataset.col, this.dataset.sortType);
+            });
+        });
+
+        // ── Column resize ───────────────────────────────────────────────────────
+        function loadColWidths() {
+            try {
+                return JSON.parse(localStorage.getItem(COL_WIDTHS_KEY) || '{}');
+            } catch { return {}; }
+        }
+
+        function saveColWidths(widths) {
+            localStorage.setItem(COL_WIDTHS_KEY, JSON.stringify(widths));
+        }
+
+        function applyColWidth(th, px) {
+            th.style.width    = px + 'px';
+            th.style.minWidth = px + 'px';
+        }
+
+        function clearAllColWidths() {
+            document.querySelectorAll('#inventoryTable thead th').forEach(th => {
+                th.style.width    = '';
+                th.style.minWidth = '';
+            });
+        }
+
+        function restoreColWidths() {
+            const widths = loadColWidths();
+            document.querySelectorAll('#inventoryTable thead th[data-col]').forEach(th => {
+                const key = th.dataset.col;
+                if (widths[key]) applyColWidth(th, widths[key]);
+            });
+        }
+
+        function attachResizeHandles() {
+            document.querySelectorAll('#inventoryTable thead th').forEach(th => {
+                // Skip the checkbox (select) column — it has a fixed width
+                if (th.dataset.col === 'select') return;
+                // Avoid double-attaching on re-runs
+                if (th.querySelector('.col-resize-handle')) return;
+
+                const handle = document.createElement('span');
+                handle.className = 'col-resize-handle';
+                handle.setAttribute('aria-hidden', 'true');
+                th.appendChild(handle);
+
+                let startX, startW;
+
+                handle.addEventListener('mousedown', function (e) {
+                    e.preventDefault();  // prevent text selection during drag
+                    e.stopPropagation(); // prevent sort click
+                    handle.classList.add('resizing');
+                    startX = e.clientX;
+                    startW = th.offsetWidth;
+
+                    function onMouseMove(ev) {
+                        const newW = Math.max(40, startW + ev.clientX - startX);
+                        applyColWidth(th, newW);
+                    }
+
+                    function onMouseUp() {
+                        handle.classList.remove('resizing');
+                        document.removeEventListener('mousemove', onMouseMove);
+                        document.removeEventListener('mouseup',   onMouseUp);
+                        // Persist width keyed by data-col
+                        const key = th.dataset.col;
+                        if (key) {
+                            const widths = loadColWidths();
+                            widths[key] = th.offsetWidth;
+                            saveColWidths(widths);
+                        }
+                    }
+
+                    document.addEventListener('mousemove', onMouseMove);
+                    document.addEventListener('mouseup',   onMouseUp);
+                });
+
+                // Prevent handle click from bubbling to the sort handler
+                handle.addEventListener('click', function (e) {
+                    e.stopPropagation();
+                });
+            });
+        }
+
+        // ── Init column visibility + resize ─────────────────────────────────────
+        (function initCols() {
+            const hidden = loadHiddenCols();
+            buildColToggles(hidden);
+            applyColVisibility(hidden);
+            attachResizeHandles();
+            restoreColWidths();
+        })();
+
+        // ====================== INIT ======================
+        loadFilterOptions();
+    </script>
+</body>
+</html>

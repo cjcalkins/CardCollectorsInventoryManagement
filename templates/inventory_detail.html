@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Inventory Item - Card Collector Inventory Manager</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+
+    <style>
+        body { background-color: #f8f9fa; }
+
+        .nav-tabs-minimal { display: flex; gap: 10px; margin-left: auto; }
+        .nav-tab {
+            padding: 8px 14px; text-decoration: none; border-radius: 8px;
+            background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.85);
+            font-weight: 600; transition: 0.2s ease;
+        }
+        .nav-tab:hover { background: rgba(255,255,255,0.18); color: #fff; }
+        .nav-tab.active { background: #fff; color: #212529; }
+
+        .detail-card {
+            box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+            border: none; border-radius: 14px;
+        }
+
+        .record-image {
+            max-width: 100%; max-height: 420px; border-radius: 12px;
+            border: 1px solid #dee2e6; cursor: zoom-in;
+            transition: all 0.25s ease; object-fit: contain;
+            margin: 0 auto; display: block; background: #fff;
+        }
+        .record-image.expanded { max-height: none; width: auto; height: auto; cursor: zoom-out; }
+
+        /* TCGPlayer linked state */
+        .tcg-linked-panel {
+            background: #fff;
+            border: 1px solid #c7deff;
+            border-radius: 12px;
+            padding: 16px;
+        }
+        .tcg-unlinked-panel {
+            background: #f8f9fa;
+            border: 2px dashed #dee2e6;
+            border-radius: 12px;
+            padding: 20px;
+        }
+        .tcg-logo-text {
+            font-weight: 800;
+            font-size: 1rem;
+
+        /* Copy-from dropdown */
+        .copy-option {
+            padding: 10px 14px;
+            cursor: pointer;
+            border-bottom: 1px solid #f0f0f0;
+            font-size: 0.875rem;
+            transition: background 0.1s;
+        }
+        .copy-option:last-child { border-bottom: none; }
+        .copy-option:hover, .copy-option.active { background: #f0f6ff; }
+        .copy-option .copy-opt-title { font-weight: 600; }
+        .copy-option .copy-opt-sub { color: #6c757d; font-size: 0.78rem; }
+            color: #e4242b;
+            letter-spacing: -0.5px;
+        }
+        .tcg-logo-text span { color: #212529; }
+
+        .tcg-link-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            background: #e4242b;
+            color: #fff;
+            border: none;
+            border-radius: 8px;
+            padding: 10px 20px;
+            font-weight: 700;
+            font-size: 1rem;
+            text-decoration: none;
+            transition: background 0.15s ease;
+        }
+        .tcg-link-btn:hover { background: #c01e24; color: #fff; }
+
+        .tcg-product-id {
+            font-family: monospace;
+            background: #e9ecef;
+            border-radius: 4px;
+            padding: 2px 6px;
+            font-size: 0.85rem;
+        }
+
+        @media (max-width: 768px) {
+            .nav-tabs-minimal { margin-left: 0; margin-top: 12px; width: 100%; }
+            .nav-tab { flex: 1; text-align: center; }
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+        <div class="container d-flex flex-wrap align-items-center">
+            <a class="navbar-brand" href="{{ url_for('index') }}">
+                <i class="fas fa-barcode me-2"></i>Card Collector Inventory Manager
+            </a>
+            <div class="nav-tabs-minimal">
+                <a href="{{ url_for('import_page') }}" class="nav-tab">Import</a>
+                <a href="{{ url_for('index') }}"        class="nav-tab">Scan</a>
+                <a href="{{ url_for('inventory') }}"    class="nav-tab active">Inventory</a>
+                <a href="{{ url_for('albums_list') }}"  class="nav-tab">Album</a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container py-5">
+
+        <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-3">
+            <div>
+                <h2 class="mb-1"><i class="fas fa-box-open me-2"></i>Inventory Item</h2>
+                <div class="text-muted">
+                    Record #{{ record.id }} • {{ record.scan_date.strftime('%Y-%m-%d %H:%M') }}
+                </div>
+            </div>
+            <div class="d-flex gap-2 flex-wrap">
+                <a href="{{ url_for('inventory') }}" class="btn btn-outline-secondary">
+                    <i class="fas fa-arrow-left me-1"></i>Back to Inventory
+                </a>
+                {% if prev_id %}
+                <a href="{{ url_for('inventory_detail', record_id=prev_id) }}" class="btn btn-outline-primary">
+                    <i class="fas fa-chevron-left me-1"></i>Previous
+                </a>
+                {% else %}
+                <button class="btn btn-outline-primary" disabled>
+                    <i class="fas fa-chevron-left me-1"></i>Previous
+                </button>
+                {% endif %}
+                {% if next_id %}
+                <a href="{{ url_for('inventory_detail', record_id=next_id) }}" class="btn btn-outline-primary">
+                    Next<i class="fas fa-chevron-right ms-1"></i>
+                </a>
+                {% else %}
+                <button class="btn btn-outline-primary" disabled>
+                    Next<i class="fas fa-chevron-right ms-1"></i>
+                </button>
+                {% endif %}
+            </div>
+        </div>
+
+        <div class="row g-4">
+
+            <!-- ==================== LEFT COLUMN ==================== -->
+            <div class="col-lg-5">
+                <div class="card detail-card">
+                    <div class="card-header bg-light"><strong>Scanned Image</strong></div>
+                    <div class="card-body text-center">
+
+                        {% if record.image_path %}
+                        <img id="recordImage"
+                             src="{{ url_for('uploaded_file', filename=record.image_path.replace('\\', '/')) }}"
+                             alt="Scanned inventory image"
+                             class="record-image img-fluid"
+                             title="Click to expand or collapse">
+                        {% else %}
+                        <div class="text-muted py-5">No image available for this record.</div>
+                        {% endif %}
+
+                        <p class="text-muted small mt-2 mb-3">Click image to expand, click again to return.</p>
+
+                        <div class="mt-3 text-start">
+                            <p class="mb-2"><strong>Template:</strong> {{ record.template_used }}</p>
+                            <p class="mb-2"><strong>Matched Product:</strong>
+                                {{ record.matched_product.product_name if record.matched_product else 'None' }}
+                            </p>
+                            <p class="mb-2"><strong>Game:</strong>  {{ record.extracted_data.get('game',  '') }}</p>
+                            <p class="mb-2"><strong>Album:</strong> {{ record.extracted_data.get('album', '') }}</p>
+                            <p class="mb-2"><strong>Page:</strong>  {{ record.extracted_data.get('page',  '') }}</p>
+                            <p class="mb-3"><strong>Slot:</strong>  {{ record.extracted_data.get('slot',  '') }}</p>
+
+                            <form id="imageForm">
+                                <label class="form-label fw-semibold">Replace Image</label>
+                                <input type="file" class="form-control mb-3"
+                                       id="newImage" name="image" accept="image/*">
+                                <button type="submit" class="btn btn-outline-primary w-100">
+                                    <i class="fas fa-image me-1"></i>Update Image
+                                </button>
+                            </form>
+                        </div>
+                        <div id="imageStatusMessage" class="mt-3"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ==================== RIGHT COLUMN ==================== -->
+            <div class="col-lg-7 d-flex flex-column gap-4">
+
+                <!-- Edit form -->
+                <div class="card detail-card">
+                    <div class="card-header bg-light"><strong>Edit Extracted Values</strong></div>
+                    <div class="card-body">
+                        <form id="editForm">
+                            <div class="row g-3">
+                                {% for key, value in record.extracted_data.items() %}
+                                    {% if '__ocr_' not in key
+                                       and key != '__roi_fields_used'
+                                       and key != 'tcgplayer'
+                                       and key != 'card_lookup'
+                                       and key != 'first_edition'
+                                       and key != 'edition' %}
+                                    <div class="col-md-6">
+                                        <label class="form-label">{{ key.replace('_', ' ').title() }}</label>
+                                        <input type="text" class="form-control" name="{{ key }}"
+                                               value="{{ value if value is not none else '' }}">
+                                    </div>
+                                    {% endif %}
+                                {% endfor %}
+                            </div>
+
+                            <!-- First Edition toggle -->
+                            <div class="mt-3 p-3 border rounded-3 bg-light d-flex align-items-center gap-3">
+                                <div class="form-check form-switch mb-0">
+                                    <input class="form-check-input" type="checkbox"
+                                           role="switch" id="firstEditionCheck"
+                                           {% if record.extracted_data.get('first_edition') == true or record.extracted_data.get('first_edition') == 'True' %}checked{% endif %}>
+                                    <label class="form-check-label fw-semibold" for="firstEditionCheck">
+                                        First Edition
+                                    </label>
+                                </div>
+                            </div>
+
+                            <div class="d-flex gap-2 mt-4 flex-wrap">
+                                <button type="submit" class="btn btn-success">
+                                    <i class="fas fa-save me-1"></i>Save Changes
+                                </button>
+                                <button type="button" class="btn btn-danger" id="deleteBtn">
+                                    <i class="fas fa-trash me-1"></i>Delete Item
+                                </button>
+                            </div>
+                        </form>
+                        <div id="statusMessage" class="mt-3"></div>
+                    </div>
+                </div>
+
+                <!-- ==================== COPY FROM ENTRY PANEL ==================== -->
+                <div class="card detail-card">
+                    <div class="card-header bg-light">
+                        <strong><i class="fas fa-copy me-2"></i>Copy Values from Another Entry</strong>
+                    </div>
+                    <div class="card-body">
+                        <p class="text-muted small mb-3">
+                            Search for another inventory entry and copy its field values
+                            (name, serial, set, etc.) into this record. Album, page, slot,
+                            and image are never overwritten.
+                        </p>
+
+                        <!-- Searchable dropdown -->
+                        <div class="mb-3 position-relative">
+                            <label class="form-label small fw-semibold mb-1">Search entries</label>
+                            <input type="text" class="form-control" id="copySearchInput"
+                                   placeholder="Type a name, game, album, or record ID…"
+                                   autocomplete="off">
+                            <div id="copyDropdown"
+                                 class="position-absolute w-100 bg-white border rounded-3 shadow-sm mt-1 d-none"
+                                 style="max-height:260px; overflow-y:auto; z-index:50;">
+                            </div>
+                        </div>
+
+                        <!-- Preview of selected source record -->
+                        <div id="copyPreview" class="d-none">
+                            <div class="border rounded-3 p-3 bg-light mb-3" id="copyPreviewContent"></div>
+                            <div class="d-flex gap-2 align-items-center flex-wrap">
+                                <button class="btn btn-primary" id="applycopying">
+                                    <i class="fas fa-paste me-1"></i>Copy Values into This Entry
+                                </button>
+                                <button class="btn btn-outline-secondary btn-sm" id="clearCopySource">
+                                    <i class="fas fa-times me-1"></i>Clear
+                                </button>
+                            </div>
+                        </div>
+
+                        <div id="copyStatus" class="mt-2"></div>
+                    </div>
+                </div>
+
+                <!-- ==================== TCGPLAYER PANEL ==================== -->
+                {% set tcg = record.extracted_data.get('tcgplayer') %}
+                <div class="card detail-card">
+                    <div class="card-header bg-light d-flex justify-content-between align-items-center">
+                        <strong>
+                            <span class="tcg-logo-text">TCG<span>Player</span></span>
+                            &nbsp;Listing
+                        </strong>
+                        {% if tcg %}
+                        <button class="btn btn-sm btn-outline-danger" id="clearTcgBtn">
+                            <i class="fas fa-unlink me-1"></i>Remove Link
+                        </button>
+                        {% endif %}
+                    </div>
+
+                    <div class="card-body">
+
+                        {% if tcg %}
+                        <!-- ── LINKED: show the saved link prominently ── -->
+                        <div class="tcg-linked-panel mb-3">
+                            <div class="d-flex align-items-center gap-3 flex-wrap">
+                                <a href="{{ tcg.url }}" target="_blank" rel="noopener"
+                                   class="tcg-link-btn">
+                                    <i class="fas fa-dollar-sign"></i>
+                                    View Current Price on TCGPlayer
+                                    <i class="fas fa-external-link-alt" style="font-size:0.8em;"></i>
+                                </a>
+                            </div>
+                            <div class="mt-2 text-muted small">
+                                Product ID: <span class="tcg-product-id">{{ tcg.product_id }}</span>
+                                &nbsp;·&nbsp;
+                                Linked {{ tcg.get('saved_at', '')[:10] }}
+                                &nbsp;·&nbsp;
+                                <a href="{{ tcg.url }}" target="_blank" rel="noopener"
+                                   class="text-muted text-truncate d-inline-block"
+                                   style="max-width: 300px; vertical-align:bottom;">
+                                    {{ tcg.full_url or tcg.url }}
+                                </a>
+                            </div>
+                        </div>
+
+                        <!-- Replace URL -->
+                        <div class="border-top pt-3">
+                            <label class="form-label small fw-semibold mb-1">Update TCGPlayer URL</label>
+                            <div class="input-group">
+                                <input type="url" class="form-control form-control-sm" id="tcgUrlInput"
+                                       placeholder="https://www.tcgplayer.com/product/…"
+                                       value="{{ tcg.full_url or tcg.url }}">
+                                <button class="btn btn-sm btn-primary" id="saveTcgUrlBtn">
+                                    <i class="fas fa-save me-1"></i>Update
+                                </button>
+                            </div>
+                            <div id="tcgStatus" class="mt-2"></div>
+                        </div>
+
+                        {% else %}
+                        <!-- ── UNLINKED: instructions + input ── -->
+                        <div class="tcg-unlinked-panel mb-3">
+                            <p class="fw-semibold mb-1">
+                                <i class="fas fa-link me-1 text-muted"></i>
+                                Link a TCGPlayer product page to this card
+                            </p>
+                            <p class="text-muted small mb-2">
+                                Find this card on
+                                <a href="https://www.tcgplayer.com" target="_blank" rel="noopener">TCGPlayer.com</a>,
+                                copy the URL from your browser, and paste it below.
+                                The link will be saved to this record so you can jump straight to
+                                the current listing and price at any time.
+                            </p>
+                            <p class="text-muted small mb-0">
+                                <strong>Expected format:</strong>&nbsp;
+                                <code>https://www.tcgplayer.com/product/123456/game-card-name</code>
+                            </p>
+                        </div>
+
+                        <div class="input-group">
+                            <input type="url" class="form-control" id="tcgUrlInput"
+                                   placeholder="https://www.tcgplayer.com/product/123456/…">
+                            <button class="btn btn-primary" id="saveTcgUrlBtn">
+                                <i class="fas fa-link me-1"></i>Save Link
+                            </button>
+                        </div>
+                        <div id="tcgStatus" class="mt-2"></div>
+                        {% endif %}
+
+                    </div>
+                </div>
+                <!-- end TCGPlayer panel -->
+
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const recordId = {{ record.id }};
+
+        // ==================== IMAGE ZOOM ====================
+        const recordImage = document.getElementById('recordImage');
+        if (recordImage) {
+            recordImage.addEventListener('click', () => recordImage.classList.toggle('expanded'));
+        }
+
+        // ==================== EDIT FORM ====================
+        document.getElementById('editForm').addEventListener('submit', async function (e) {
+            e.preventDefault();
+            const updated = {};
+            for (const [k, v] of new FormData(this).entries()) updated[k] = v.trim();
+
+            // first_edition is a checkbox outside the FormData — handle explicitly
+            updated['first_edition'] = document.getElementById('firstEditionCheck').checked;
+
+            const res  = await fetch(`/update_scan/${recordId}`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ extracted_data: updated }),
+            });
+            const data = await res.json();
+            document.getElementById('statusMessage').innerHTML = data.status === 'success'
+                ? `<div class="alert alert-success mb-0">${data.message}</div>`
+                : `<div class="alert alert-danger mb-0">${data.message || 'Save failed.'}</div>`;
+        });
+
+        // ==================== IMAGE REPLACE ====================
+        document.getElementById('imageForm').addEventListener('submit', async function (e) {
+            e.preventDefault();
+            const fileInput = document.getElementById('newImage');
+            const statusEl  = document.getElementById('imageStatusMessage');
+            if (!fileInput.files.length) {
+                statusEl.innerHTML = `<div class="alert alert-warning mb-0">Please choose an image first.</div>`;
+                return;
+            }
+            const fd = new FormData();
+            fd.append('image', fileInput.files[0]);
+            const res  = await fetch(`/update_scan_image/${recordId}`, { method: 'POST', body: fd });
+            const data = await res.json();
+            if (data.status === 'success') {
+                if (recordImage && data.image_url) recordImage.src = `${data.image_url}?t=${Date.now()}`;
+                statusEl.innerHTML = `<div class="alert alert-success mb-0">${data.message}</div>`;
+                fileInput.value = '';
+                setTimeout(() => window.location.reload(), 700);
+            } else {
+                statusEl.innerHTML = `<div class="alert alert-danger mb-0">${data.message || 'Image update failed.'}</div>`;
+            }
+        });
+
+        // ==================== DELETE ====================
+        document.getElementById('deleteBtn').addEventListener('click', async function () {
+            if (!confirm('Delete this inventory item and its data? This cannot be undone.')) return;
+            const res  = await fetch(`/delete_scan/${recordId}`, { method: 'POST' });
+            const data = await res.json();
+            if (data.status === 'success') {
+                window.location.href = "{{ url_for('inventory') }}";
+            } else {
+                document.getElementById('statusMessage').innerHTML =
+                    `<div class="alert alert-danger mb-0">${data.message || 'Delete failed.'}</div>`;
+            }
+        });
+
+        // ==================== TCGPLAYER — SAVE URL ====================
+        document.getElementById('saveTcgUrlBtn')?.addEventListener('click', async function () {
+            const url    = document.getElementById('tcgUrlInput').value.trim();
+            const status = document.getElementById('tcgStatus');
+            if (!url) {
+                status.innerHTML = `<div class="alert alert-warning mb-0">Please enter a TCGPlayer URL.</div>`;
+                return;
+            }
+            const res  = await fetch(`/tcg_save_url/${recordId}`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url }),
+            });
+            const data = await res.json();
+            if (data.status === 'success') {
+                status.innerHTML = `<div class="alert alert-success mb-0">Saved! Reloading…</div>`;
+                setTimeout(() => window.location.reload(), 600);
+            } else {
+                status.innerHTML = `<div class="alert alert-danger mb-0">${data.message}</div>`;
+            }
+        });
+
+        // ==================== TCGPLAYER — CLEAR ====================
+        document.getElementById('clearTcgBtn')?.addEventListener('click', async function () {
+            if (!confirm('Remove the TCGPlayer link from this record?')) return;
+            const res  = await fetch(`/tcg_clear_url/${recordId}`, { method: 'POST' });
+            const data = await res.json();
+            if (data.status === 'success') window.location.reload();
+        });
+        // ==================== COPY FROM ENTRY ====================
+        const copySearchInput   = document.getElementById('copySearchInput');
+        const copyDropdown      = document.getElementById('copyDropdown');
+        const copyPreview       = document.getElementById('copyPreview');
+        const copyPreviewContent = document.getElementById('copyPreviewContent');
+        const applycopying      = document.getElementById('applycopying');
+        const clearCopySource   = document.getElementById('clearCopySource');
+        const copyStatus        = document.getElementById('copyStatus');
+
+        // Fields that are never overwritten when copying
+        const NEVER_COPY = new Set([
+            'album', 'page', 'slot', 'image_path',
+            'tcgplayer', 'card_lookup', '__roi_fields_used',
+        ]);
+
+        let allRecords   = [];   // [{ id, label, sub, data }]
+        let selectedSource = null;
+        let searchTimer  = null;
+
+        // Load all records once on focus for instant filtering
+        copySearchInput.addEventListener('focus', async function () {
+            if (allRecords.length) return;  // already loaded
+            try {
+                const res  = await fetch('/records_summary');
+                const data = await res.json();
+                allRecords = data.records || [];
+            } catch (e) {
+                copyStatus.innerHTML = `<div class="alert alert-danger py-1 mb-0">Could not load entries.</div>`;
+            }
+        });
+
+        copySearchInput.addEventListener('input', function () {
+            clearTimeout(searchTimer);
+            searchTimer = setTimeout(() => filterCopyOptions(this.value.trim()), 120);
+        });
+
+        function filterCopyOptions(query) {
+            copyDropdown.innerHTML = '';
+            if (!query) { copyDropdown.classList.add('d-none'); return; }
+
+            const q = query.toLowerCase();
+            const matches = allRecords.filter(r =>
+                r.id !== recordId &&   // exclude current record
+                (
+                    String(r.id).includes(q) ||
+                    r.label.toLowerCase().includes(q) ||
+                    r.sub.toLowerCase().includes(q)
+                )
+            ).slice(0, 30);
+
+            if (!matches.length) {
+                copyDropdown.innerHTML = `<div class="copy-option text-muted">No matching entries found.</div>`;
+                copyDropdown.classList.remove('d-none');
+                return;
+            }
+
+            matches.forEach(record => {
+                const div = document.createElement('div');
+                div.className = 'copy-option';
+                div.innerHTML = `
+                    <div class="copy-opt-title">#${record.id} — ${escHtml(record.label)}</div>
+                    <div class="copy-opt-sub">${escHtml(record.sub)}</div>`;
+                div.addEventListener('mousedown', (e) => {
+                    e.preventDefault();  // prevent input blur before click fires
+                    selectCopySource(record);
+                });
+                copyDropdown.appendChild(div);
+            });
+
+            copyDropdown.classList.remove('d-none');
+        }
+
+        function selectCopySource(record) {
+            selectedSource = record;
+            copySearchInput.value = `#${record.id} — ${record.label}`;
+            copyDropdown.classList.add('d-none');
+
+            // Build preview of copyable fields
+            const skip = new Set([...NEVER_COPY,
+                '__ocr_card_name', '__ocr_set_number', // etc — anything with __ocr_
+            ]);
+            const rows = Object.entries(record.data)
+                .filter(([k]) => !k.startsWith('__ocr_') && !skip.has(k))
+                .map(([k, v]) => {
+                    if (typeof v === 'object' && v !== null) return null;
+                    return `<div class="d-flex gap-2 small">
+                        <span class="text-muted" style="min-width:120px;">${escHtml(k.replace(/_/g,' '))}</span>
+                        <span class="fw-semibold text-truncate">${escHtml(String(v ?? ''))}</span>
+                    </div>`;
+                })
+                .filter(Boolean)
+                .join('');
+
+            copyPreviewContent.innerHTML = rows
+                ? `<div class="fw-semibold mb-2">Fields to be copied from Record #${record.id}:</div>${rows}`
+                : `<div class="text-muted small">No copyable fields found on this record.</div>`;
+
+            copyPreview.classList.remove('d-none');
+        }
+
+        copySearchInput.addEventListener('blur', () => {
+            // Small delay so mousedown on an option fires first
+            setTimeout(() => copyDropdown.classList.add('d-none'), 150);
+        });
+
+        clearCopySource.addEventListener('click', function () {
+            selectedSource  = null;
+            copySearchInput.value = '';
+            copyPreview.classList.add('d-none');
+            copyStatus.innerHTML = '';
+        });
+
+        applycopying.addEventListener('click', function () {
+            if (!selectedSource) return;
+
+            const form   = document.getElementById('editForm');
+            const source = selectedSource.data;
+            let copied   = 0;
+
+            for (const [key, value] of Object.entries(source)) {
+                // Skip internal, structural, and never-copy keys
+                if (NEVER_COPY.has(key)) continue;
+                if (key.startsWith('__ocr_')) continue;
+                if (typeof value === 'object' && value !== null) continue;
+
+                const input = form.querySelector(`[name="${key}"]`);
+                if (input) {
+                    input.value = value ?? '';
+                    input.classList.add('border-primary');  // highlight changed fields
+                    setTimeout(() => input.classList.remove('border-primary'), 2000);
+                    copied++;
+                }
+            }
+
+            // Handle first_edition boolean separately
+            if ('first_edition' in source) {
+                const cb = document.getElementById('firstEditionCheck');
+                if (cb) cb.checked = source.first_edition === true || source.first_edition === 'true';
+            }
+
+            copyStatus.innerHTML = `<div class="alert alert-success py-2 mb-0">
+                Copied ${copied} field(s) from Record #${selectedSource.id}.
+                <strong>Remember to click Save Changes to persist.</strong>
+            </div>`;
+
+            // Clear selection after apply
+            selectedSource = null;
+            copySearchInput.value = '';
+            copyPreview.classList.add('d-none');
+        });
+
+        function escHtml(s) {
+            return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+        }
+    </script>
+</body>
+</html>

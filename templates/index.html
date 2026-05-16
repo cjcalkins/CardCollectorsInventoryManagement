@@ -1,0 +1,826 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Card Collector Inventory Manager</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+
+    <style>
+        body { background: #f8f9fa; }
+
+        .navbar-brand { font-weight: 700; }
+
+        .upload-card, .preview-card, .roi-card, .results-card, .builder-card {
+            border: none;
+            border-radius: 14px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+        }
+
+        /* ── Shared preview wrapper style (scan + builder both use it) ── */
+        .preview-wrapper {
+            position: relative;
+            display: inline-block;
+            max-width: 100%;
+            border: 1px solid #dee2e6;
+            border-radius: 12px;
+            overflow: hidden;
+            background: #fff;
+            cursor: crosshair;
+        }
+        .preview-wrapper img { max-width: 100%; display: block; user-select: none; }
+
+        /* ── ROI boxes (scan) — green ── */
+        .roi-box {
+            position: absolute;
+            border: 2px solid #28a745;
+            background: rgba(40,167,69,0.12);
+            cursor: move;
+            box-sizing: border-box;
+        }
+        .roi-label {
+            position: absolute;
+            top: -24px; left: 0;
+            background: #28a745;
+            color: #fff;
+            font-size: 11px;
+            padding: 2px 6px;
+            border-radius: 6px;
+            white-space: nowrap;
+            pointer-events: none;
+        }
+        .roi-handle {
+            position: absolute;
+            width: 12px; height: 12px;
+            right: -6px; bottom: -6px;
+            background: #28a745;
+            border-radius: 50%;
+            cursor: nwse-resize;
+        }
+
+        /* ── Builder ROI boxes — blue ── */
+        .builder-box {
+            position: absolute;
+            border: 2px solid #0d6efd;
+            background: rgba(13,110,253,0.10);
+            cursor: move;
+            box-sizing: border-box;
+        }
+        .builder-label {
+            position: absolute;
+            top: -22px; left: 0;
+            background: #0d6efd;
+            color: #fff;
+            font-size: 11px;
+            padding: 2px 6px;
+            border-radius: 6px;
+            white-space: nowrap;
+            pointer-events: none;
+        }
+        .builder-handle {
+            position: absolute;
+            width: 12px; height: 12px;
+            right: -6px; bottom: -6px;
+            background: #0d6efd;
+            border-radius: 50%;
+            cursor: nwse-resize;
+        }
+        /* Draw-new-box rubber band */
+        .builder-draw {
+            position: absolute;
+            border: 2px dashed #0d6efd;
+            background: rgba(13,110,253,0.08);
+            box-sizing: border-box;
+            pointer-events: none;
+        }
+
+        .hidden { display: none; }
+
+        .result-pre {
+            white-space: pre-wrap;
+            word-break: break-word;
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 12px;
+            border: 1px solid #dee2e6;
+        }
+
+        .nav-tabs-minimal { display: flex; gap: 10px; margin-left: auto; }
+        .nav-tab {
+            padding: 8px 14px; text-decoration: none; border-radius: 8px;
+            background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.85);
+            font-weight: 600; transition: 0.2s ease;
+        }
+        .nav-tab:hover { background: rgba(255,255,255,0.18); color: #fff; }
+        .nav-tab.active { background: #fff; color: #212529; }
+
+        .field-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 8px;
+            padding: 6px 10px;
+            margin-bottom: 6px;
+        }
+        .field-row .field-swatch {
+            width: 12px; height: 12px;
+            border-radius: 3px;
+            background: #0d6efd;
+            flex-shrink: 0;
+        }
+        .field-row .field-name { font-weight: 600; font-size: 0.85rem; flex: 1; }
+        .field-row .field-coords { font-size: 0.75rem; color: #6c757d; }
+        .field-row .btn-del { padding: 0 4px; font-size: 0.75rem; }
+
+        @media (max-width: 768px) {
+            .nav-tabs-minimal { margin-left: 0; margin-top: 12px; width: 100%; }
+            .nav-tab { flex: 1; text-align: center; }
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+        <div class="container d-flex flex-wrap align-items-center">
+            <a class="navbar-brand" href="{{ url_for('index') }}">
+                <i class="fas fa-barcode me-2"></i>Card Collector Inventory Manager
+            </a>
+            <div class="nav-tabs-minimal">
+                <a href="{{ url_for('import_page') }}" class="nav-tab">Import</a>
+                <a href="{{ url_for('index') }}"        class="nav-tab active">Scan</a>
+                <a href="{{ url_for('inventory') }}"    class="nav-tab">Inventory</a>
+                <a href="{{ url_for('albums_list') }}"  class="nav-tab">Album</a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container-fluid px-4 py-5">
+        <div class="row g-4">
+
+            <!-- ============================================================
+                 LEFT COLUMN — scan controls (unchanged behaviour)
+            ============================================================ -->
+            <div class="col-xl-3 col-lg-4">
+                <div class="card upload-card">
+                    <div class="card-header bg-light">
+                        <strong>Upload Image &amp; Choose Template</strong>
+                    </div>
+                    <div class="card-body">
+                        <form id="uploadForm">
+                            <div class="mb-3">
+                                <label class="form-label">Select Image(s)</label>
+                                <input type="file" class="form-control" id="images"
+                                       name="images" accept="image/*" multiple required>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">Template</label>
+                                <select class="form-select" id="template" name="template">
+                                    {% for t in templates %}
+                                    <option value="{{ t }}">{{ t|replace('_',' ')|title }}</option>
+                                    {% endfor %}
+                                </select>
+                            </div>
+                            <button type="submit" class="btn btn-primary w-100">
+                                <i class="fas fa-upload me-1"></i>Upload &amp; Show Preview
+                            </button>
+                        </form>
+                    </div>
+                </div>
+
+                <div class="card roi-card mt-4 hidden" id="roiCard">
+                    <div class="card-header bg-light d-flex justify-content-between align-items-center">
+                        <strong>ROI Fields</strong>
+                        <button class="btn btn-sm btn-outline-secondary" id="resetTemplateBtn">
+                            Reset
+                        </button>
+                    </div>
+                    <div class="card-body">
+                        <p class="text-muted small mb-2">Drag boxes or edit % values. Click <strong>Run OCR</strong> when ready.</p>
+                        <div id="fieldsEditor"></div>
+                        <button class="btn btn-success w-100 mt-3" id="runOcrBtn">
+                            <i class="fas fa-play me-1"></i>Run OCR
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ============================================================
+                 MIDDLE COLUMN — scan preview + results
+            ============================================================ -->
+            <div class="col-xl-5 col-lg-8">
+                <div class="card preview-card hidden" id="previewCard">
+                    <div class="card-header bg-light">
+                        <strong>Scan Preview – Drag &amp; Resize Boxes</strong>
+                    </div>
+                    <div class="card-body text-center">
+                        <div class="preview-wrapper" id="previewWrapper" style="cursor:default;">
+                            <img id="previewImage" src="" alt="Preview image">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card results-card mt-4 hidden" id="resultsCard">
+                    <div class="card-header bg-light"><strong>OCR Results</strong></div>
+                    <div class="card-body">
+                        <div id="ocrResults" class="result-pre"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ============================================================
+                 RIGHT COLUMN — template builder
+            ============================================================ -->
+            <div class="col-xl-4 col-lg-12">
+                <div class="card builder-card h-100">
+                    <div class="card-header bg-dark text-white d-flex justify-content-between align-items-center">
+                        <strong><i class="fas fa-drafting-compass me-2"></i>Template Builder</strong>
+                        <span class="badge bg-secondary" id="builderFieldCount">0 fields</span>
+                    </div>
+                    <div class="card-body d-flex flex-column gap-3">
+
+                        <!-- Step 1: upload reference image -->
+                        <div>
+                            <label class="form-label fw-semibold small">
+                                <span class="badge bg-dark me-1">1</span>
+                                Upload a reference card image
+                            </label>
+                            <input type="file" class="form-control form-control-sm"
+                                   id="builderImageInput" accept="image/*">
+                        </div>
+
+                        <!-- Builder canvas -->
+                        <div id="builderCanvasWrap" class="hidden">
+                            <div class="text-muted small mb-1">
+                                <i class="fas fa-draw-polygon me-1 text-primary"></i>
+                                <strong>Draw a box</strong> by clicking and dragging on the image.
+                                Drag existing boxes to reposition, drag the corner handle to resize.
+                            </div>
+                            <div class="preview-wrapper w-100" id="builderWrapper">
+                                <img id="builderImage" src="" alt="Template reference image"
+                                     style="width:100%; display:block; user-select:none;">
+                            </div>
+                        </div>
+
+                        <!-- Step 2: name + add field -->
+                        <div id="builderAddWrap" class="hidden">
+                            <label class="form-label fw-semibold small">
+                                <span class="badge bg-dark me-1">2</span>
+                                Name the drawn region, then add it
+                            </label>
+                            <div class="input-group input-group-sm">
+                                <input type="text" class="form-control" id="builderFieldName"
+                                       placeholder="e.g. card_name, set_number, hp …"
+                                       list="commonFieldNames">
+                                <button class="btn btn-primary" id="builderAddFieldBtn">
+                                    <i class="fas fa-plus me-1"></i>Add Field
+                                </button>
+                            </div>
+                            <datalist id="commonFieldNames">
+                                <option value="card_name">
+                                <option value="set_number">
+                                <option value="collector_number">
+                                <option value="hp">
+                                <option value="rarity">
+                                <option value="edition">
+                                <option value="artist">
+                                <option value="description">
+                                <option value="attack">
+                                <option value="type">
+                            </datalist>
+                            <div id="builderDrawHint" class="text-muted small mt-1 hidden">
+                                <i class="fas fa-info-circle text-primary me-1"></i>
+                                Draw a region on the image first, then name it here.
+                            </div>
+                        </div>
+
+                        <!-- Step 3: field list -->
+                        <div id="builderFieldListWrap" class="hidden">
+                            <label class="form-label fw-semibold small">
+                                <span class="badge bg-dark me-1">3</span>
+                                Defined fields
+                            </label>
+                            <div id="builderFieldList"></div>
+                        </div>
+
+                        <!-- Step 4: save -->
+                        <div id="builderSaveWrap" class="hidden mt-auto">
+                            <label class="form-label fw-semibold small">
+                                <span class="badge bg-dark me-1">4</span>
+                                Save as new template
+                            </label>
+                            <div class="input-group input-group-sm mb-2">
+                                <input type="text" class="form-control" id="builderTemplateName"
+                                       placeholder="e.g. pokemon_base, mtg_standard …">
+                                <button class="btn btn-success" id="builderSaveBtn">
+                                    <i class="fas fa-save me-1"></i>Save Template
+                                </button>
+                            </div>
+                            <div class="text-muted small">
+                                Saved templates appear immediately in the Template dropdown above.
+                            </div>
+                            <div id="builderSaveStatus" class="mt-2"></div>
+                        </div>
+
+                    </div>
+                </div>
+            </div>
+
+        </div><!-- /row -->
+    </div><!-- /container -->
+
+    <script>
+    // ===========================================================================
+    // SECTION A — SCAN (existing functionality, percentage-based)
+    // ===========================================================================
+    const uploadForm      = document.getElementById('uploadForm');
+    const previewCard     = document.getElementById('previewCard');
+    const roiCard         = document.getElementById('roiCard');
+    const resultsCard     = document.getElementById('resultsCard');
+    const previewImage    = document.getElementById('previewImage');
+    const previewWrapper  = document.getElementById('previewWrapper');
+    const fieldsEditor    = document.getElementById('fieldsEditor');
+    const ocrResults      = document.getElementById('ocrResults');
+    const runOcrBtn       = document.getElementById('runOcrBtn');
+    const resetTemplateBtn = document.getElementById('resetTemplateBtn');
+
+    let currentFilename     = null;
+    let currentTemplateName = null;
+    let templateFields      = {};
+    let currentFields       = {};
+
+    function toPercent(fields) {
+        const pw = previewImage.clientWidth;
+        const ph = previewImage.clientHeight;
+        const result = {};
+        for (const [key, box] of Object.entries(fields)) {
+            if ('x_pct' in box) {
+                result[key] = { x_pct: +box.x_pct, y_pct: +box.y_pct,
+                                w_pct: +box.w_pct, h_pct: +box.h_pct,
+                                config: box.config || {} };
+            } else {
+                result[key] = {
+                    x_pct: pw > 0 ? +box.x / pw * 100 : 0,
+                    y_pct: ph > 0 ? +box.y / ph * 100 : 0,
+                    w_pct: pw > 0 ? +box.w / pw * 100 : 10,
+                    h_pct: ph > 0 ? +box.h / ph * 100 : 10,
+                    config: box.config || {},
+                };
+            }
+        }
+        return result;
+    }
+
+    function pctToPx(box, img) {
+        const pw = img.clientWidth;
+        const ph = img.clientHeight;
+        return { x: box.x_pct / 100 * pw, y: box.y_pct / 100 * ph,
+                 w: box.w_pct / 100 * pw, h: box.h_pct / 100 * ph };
+    }
+
+    function rnd(n) { return Math.round(n * 10) / 10; }
+
+    uploadForm.addEventListener('submit', async function (e) {
+        e.preventDefault();
+        const res  = await fetch('/preview', { method: 'POST', body: new FormData(uploadForm) });
+        const data = await res.json();
+        if (data.error) { alert(data.error); return; }
+
+        currentFilename     = data.filename;
+        currentTemplateName = document.getElementById('template').value;
+        templateFields      = data.template.fields || {};
+
+        previewImage.onload = function () {
+            currentFields = toPercent(JSON.parse(JSON.stringify(templateFields)));
+            previewCard.classList.remove('hidden');
+            roiCard.classList.remove('hidden');
+            renderScanBoxes();
+            renderFieldEditor();
+        };
+        previewImage.src = data.image_url + '?t=' + Date.now();
+    });
+
+    resetTemplateBtn.addEventListener('click', function () {
+        currentFields = toPercent(JSON.parse(JSON.stringify(templateFields)));
+        renderScanBoxes();
+        renderFieldEditor();
+    });
+
+    runOcrBtn.addEventListener('click', async function () {
+        if (!currentFilename) return;
+        const res  = await fetch('/run_custom_ocr', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                image_path:    currentFilename,
+                template_name: currentTemplateName,
+                fields:        currentFields,
+                preview_meta: { width: previewImage.clientWidth, height: previewImage.clientHeight }
+            })
+        });
+        const data = await res.json();
+        resultsCard.classList.remove('hidden');
+        ocrResults.textContent = JSON.stringify(data, null, 2);
+    });
+
+    function renderScanBoxes() {
+        previewWrapper.querySelectorAll('.roi-box').forEach(el => el.remove());
+        Object.entries(currentFields).forEach(([key, box]) => {
+            const px  = pctToPx(box, previewImage);
+            const div = document.createElement('div');
+            div.className  = 'roi-box';
+            div.style.left = px.x + 'px'; div.style.top    = px.y + 'px';
+            div.style.width = px.w + 'px'; div.style.height = px.h + 'px';
+            div.dataset.key = key;
+            const lbl = document.createElement('div');
+            lbl.className = 'roi-label'; lbl.textContent = key;
+            const hdl = document.createElement('div');
+            hdl.className = 'roi-handle';
+            div.appendChild(lbl); div.appendChild(hdl);
+            previewWrapper.appendChild(div);
+            makeScanBoxInteractive(div, key);
+        });
+    }
+
+    function renderFieldEditor() {
+        let html = '<div class="row g-3">';
+        Object.entries(currentFields).forEach(([key, box]) => {
+            html += `<div class="col-md-6">
+                <label class="form-label fw-semibold">${key}</label>
+                <div class="row g-2">
+                    <div class="col-6"><div class="input-group input-group-sm">
+                        <span class="input-group-text">X</span>
+                        <input class="form-control" type="number" step="0.1" min="0" max="100"
+                               value="${rnd(box.x_pct)}"
+                               onchange="updateFieldPct('${key}','x_pct',this.value)">
+                        <span class="input-group-text">%</span>
+                    </div></div>
+                    <div class="col-6"><div class="input-group input-group-sm">
+                        <span class="input-group-text">Y</span>
+                        <input class="form-control" type="number" step="0.1" min="0" max="100"
+                               value="${rnd(box.y_pct)}"
+                               onchange="updateFieldPct('${key}','y_pct',this.value)">
+                        <span class="input-group-text">%</span>
+                    </div></div>
+                    <div class="col-6"><div class="input-group input-group-sm">
+                        <span class="input-group-text">W</span>
+                        <input class="form-control" type="number" step="0.1" min="0.1" max="100"
+                               value="${rnd(box.w_pct)}"
+                               onchange="updateFieldPct('${key}','w_pct',this.value)">
+                        <span class="input-group-text">%</span>
+                    </div></div>
+                    <div class="col-6"><div class="input-group input-group-sm">
+                        <span class="input-group-text">H</span>
+                        <input class="form-control" type="number" step="0.1" min="0.1" max="100"
+                               value="${rnd(box.h_pct)}"
+                               onchange="updateFieldPct('${key}','h_pct',this.value)">
+                        <span class="input-group-text">%</span>
+                    </div></div>
+                </div>
+            </div>`;
+        });
+        html += '</div>';
+        fieldsEditor.innerHTML = html;
+    }
+
+    function updateFieldPct(key, prop, value) {
+        currentFields[key][prop] = Math.max(0, Math.min(100, parseFloat(value) || 0));
+        renderScanBoxes();
+    }
+
+    function makeScanBoxInteractive(boxEl, key) {
+        const handle = boxEl.querySelector('.roi-handle');
+        let startX, startY, sXp, sYp, sWp, sHp, mode;
+
+        boxEl.addEventListener('mousedown', function (e) {
+            mode = (e.target === handle) ? 'resize' : 'drag';
+            startX = e.clientX; startY = e.clientY;
+            sXp = currentFields[key].x_pct; sYp = currentFields[key].y_pct;
+            sWp = currentFields[key].w_pct; sHp = currentFields[key].h_pct;
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp);
+            e.preventDefault(); e.stopPropagation();
+        });
+
+        function onMove(e) {
+            const pw = previewImage.clientWidth, ph = previewImage.clientHeight;
+            const dpx = pw > 0 ? (e.clientX - startX) / pw * 100 : 0;
+            const dpy = ph > 0 ? (e.clientY - startY) / ph * 100 : 0;
+            if (mode === 'drag') {
+                currentFields[key].x_pct = Math.max(0, Math.min(100, sXp + dpx));
+                currentFields[key].y_pct = Math.max(0, Math.min(100, sYp + dpy));
+            } else {
+                currentFields[key].w_pct = Math.max(0.5, Math.min(100, sWp + dpx));
+                currentFields[key].h_pct = Math.max(0.5, Math.min(100, sHp + dpy));
+            }
+            renderScanBoxes(); renderFieldEditor();
+        }
+
+        function onUp() {
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup', onUp);
+        }
+    }
+
+
+    // ===========================================================================
+    // SECTION B — TEMPLATE BUILDER
+    // ===========================================================================
+    const builderImageInput   = document.getElementById('builderImageInput');
+    const builderCanvasWrap   = document.getElementById('builderCanvasWrap');
+    const builderWrapper      = document.getElementById('builderWrapper');
+    const builderImage        = document.getElementById('builderImage');
+    const builderAddWrap      = document.getElementById('builderAddWrap');
+    const builderFieldName    = document.getElementById('builderFieldName');
+    const builderAddFieldBtn  = document.getElementById('builderAddFieldBtn');
+    const builderDrawHint     = document.getElementById('builderDrawHint');
+    const builderFieldListWrap = document.getElementById('builderFieldListWrap');
+    const builderFieldList    = document.getElementById('builderFieldList');
+    const builderSaveWrap     = document.getElementById('builderSaveWrap');
+    const builderTemplateName = document.getElementById('builderTemplateName');
+    const builderSaveBtn      = document.getElementById('builderSaveBtn');
+    const builderSaveStatus   = document.getElementById('builderSaveStatus');
+    const builderFieldCount   = document.getElementById('builderFieldCount');
+
+    // State
+    let builderFields   = {};       // { fieldName: { x_pct, y_pct, w_pct, h_pct } }
+    let pendingBox      = null;     // pct coords of the region currently drawn but not yet named
+    let drawState       = null;     // { startX, startY } during rubber-band draw
+
+    // ── Load reference image ──────────────────────────────────────────────────
+    builderImageInput.addEventListener('change', function () {
+        const file = this.files[0];
+        if (!file) return;
+        const url = URL.createObjectURL(file);
+        builderImage.onload = function () {
+            builderCanvasWrap.classList.remove('hidden');
+            builderAddWrap.classList.remove('hidden');
+            builderSaveWrap.classList.remove('hidden');
+            renderBuilderBoxes();
+        };
+        builderImage.src = url;
+    });
+
+    // ── Draw new region by click-drag on the image ────────────────────────────
+    builderWrapper.addEventListener('mousedown', function (e) {
+        // Only start a draw if clicking directly on the image (not on an existing box)
+        if (e.target !== builderImage) return;
+        e.preventDefault();
+
+        const rect   = builderImage.getBoundingClientRect();
+        drawState    = { startX: e.clientX - rect.left, startY: e.clientY - rect.top };
+        pendingBox   = null;
+
+        // Create rubber-band div
+        const band = document.createElement('div');
+        band.className = 'builder-draw';
+        band.id = '__drawBand';
+        band.style.left = drawState.startX + 'px';
+        band.style.top  = drawState.startY + 'px';
+        band.style.width = '0'; band.style.height = '0';
+        builderWrapper.appendChild(band);
+
+        function onMove(e) {
+            const rect = builderImage.getBoundingClientRect();
+            const cx   = Math.max(0, Math.min(builderImage.clientWidth,  e.clientX - rect.left));
+            const cy   = Math.max(0, Math.min(builderImage.clientHeight, e.clientY - rect.top));
+            const x    = Math.min(drawState.startX, cx);
+            const y    = Math.min(drawState.startY, cy);
+            const w    = Math.abs(cx - drawState.startX);
+            const h    = Math.abs(cy - drawState.startY);
+            band.style.left   = x + 'px'; band.style.top    = y + 'px';
+            band.style.width  = w + 'px'; band.style.height = h + 'px';
+        }
+
+        function onUp(e) {
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup', onUp);
+            band.remove();
+
+            const rect = builderImage.getBoundingClientRect();
+            const cx   = Math.max(0, Math.min(builderImage.clientWidth,  e.clientX - rect.left));
+            const cy   = Math.max(0, Math.min(builderImage.clientHeight, e.clientY - rect.top));
+            const pw   = builderImage.clientWidth;
+            const ph   = builderImage.clientHeight;
+
+            const x_px = Math.min(drawState.startX, cx);
+            const y_px = Math.min(drawState.startY, cy);
+            const w_px = Math.abs(cx - drawState.startX);
+            const h_px = Math.abs(cy - drawState.startY);
+
+            // Ignore tiny accidental clicks
+            if (w_px < 5 || h_px < 5) { drawState = null; return; }
+
+            pendingBox = {
+                x_pct: x_px / pw * 100,
+                y_pct: y_px / ph * 100,
+                w_pct: w_px / pw * 100,
+                h_pct: h_px / ph * 100,
+            };
+            drawState = null;
+
+            builderDrawHint.classList.add('hidden');
+            builderFieldName.focus();
+            renderBuilderBoxes(); // show the pending (dashed) preview
+        }
+
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+    });
+
+    // ── Add field button ──────────────────────────────────────────────────────
+    builderAddFieldBtn.addEventListener('click', addBuilderField);
+    builderFieldName.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') { e.preventDefault(); addBuilderField(); }
+    });
+
+    function addBuilderField() {
+        const name = builderFieldName.value.trim().toLowerCase().replace(/\s+/g, '_');
+        if (!name) {
+            builderFieldName.classList.add('is-invalid');
+            setTimeout(() => builderFieldName.classList.remove('is-invalid'), 1500);
+            return;
+        }
+        if (!pendingBox) {
+            builderDrawHint.classList.remove('hidden');
+            return;
+        }
+        builderFields[name] = { ...pendingBox };
+        pendingBox = null;
+        builderFieldName.value = '';
+        refreshBuilderUI();
+    }
+
+    function refreshBuilderUI() {
+        renderBuilderBoxes();
+        renderBuilderFieldList();
+        const count = Object.keys(builderFields).length;
+        builderFieldCount.textContent = count + ' field' + (count !== 1 ? 's' : '');
+        if (count > 0) builderFieldListWrap.classList.remove('hidden');
+    }
+
+    // ── Render all saved builder boxes ───────────────────────────────────────
+    function renderBuilderBoxes() {
+        builderWrapper.querySelectorAll('.builder-box').forEach(el => el.remove());
+        const pw = builderImage.clientWidth;
+        const ph = builderImage.clientHeight;
+
+        Object.entries(builderFields).forEach(([key, box]) => {
+            const div  = document.createElement('div');
+            div.className = 'builder-box';
+            div.style.left   = (box.x_pct / 100 * pw) + 'px';
+            div.style.top    = (box.y_pct / 100 * ph) + 'px';
+            div.style.width  = (box.w_pct / 100 * pw) + 'px';
+            div.style.height = (box.h_pct / 100 * ph) + 'px';
+            div.dataset.key  = key;
+
+            const lbl = document.createElement('div');
+            lbl.className = 'builder-label'; lbl.textContent = key;
+            const hdl = document.createElement('div');
+            hdl.className = 'builder-handle';
+            div.appendChild(lbl); div.appendChild(hdl);
+            builderWrapper.appendChild(div);
+            makeBuilderBoxInteractive(div, key);
+        });
+
+        // Show pending box with dashed outline if a region is drawn but not yet named
+        if (pendingBox) {
+            const prev = document.createElement('div');
+            prev.className  = 'builder-draw';
+            prev.style.left   = (pendingBox.x_pct / 100 * pw) + 'px';
+            prev.style.top    = (pendingBox.y_pct / 100 * ph) + 'px';
+            prev.style.width  = (pendingBox.w_pct / 100 * pw) + 'px';
+            prev.style.height = (pendingBox.h_pct / 100 * ph) + 'px';
+            prev.style.pointerEvents = 'none';
+            builderWrapper.appendChild(prev);
+        }
+    }
+
+    // ── Make saved builder boxes draggable / resizable ───────────────────────
+    function makeBuilderBoxInteractive(boxEl, key) {
+        const handle = boxEl.querySelector('.builder-handle');
+        let startX, startY, sXp, sYp, sWp, sHp, mode;
+
+        boxEl.addEventListener('mousedown', function (e) {
+            mode = (e.target === handle) ? 'resize' : 'drag';
+            startX = e.clientX; startY = e.clientY;
+            sXp = builderFields[key].x_pct; sYp = builderFields[key].y_pct;
+            sWp = builderFields[key].w_pct; sHp = builderFields[key].h_pct;
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp);
+            e.preventDefault(); e.stopPropagation();
+        });
+
+        function onMove(e) {
+            const pw = builderImage.clientWidth, ph = builderImage.clientHeight;
+            const dpx = pw > 0 ? (e.clientX - startX) / pw * 100 : 0;
+            const dpy = ph > 0 ? (e.clientY - startY) / ph * 100 : 0;
+            if (mode === 'drag') {
+                builderFields[key].x_pct = Math.max(0, Math.min(100, sXp + dpx));
+                builderFields[key].y_pct = Math.max(0, Math.min(100, sYp + dpy));
+            } else {
+                builderFields[key].w_pct = Math.max(0.5, Math.min(100, sWp + dpx));
+                builderFields[key].h_pct = Math.max(0.5, Math.min(100, sHp + dpy));
+            }
+            renderBuilderBoxes();
+            renderBuilderFieldList();
+        }
+
+        function onUp() {
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup', onUp);
+        }
+    }
+
+    // ── Render field list with coords + delete ───────────────────────────────
+    function renderBuilderFieldList() {
+        builderFieldList.innerHTML = '';
+        Object.entries(builderFields).forEach(([key, box]) => {
+            const row = document.createElement('div');
+            row.className = 'field-row';
+            row.innerHTML = `
+                <div class="field-swatch"></div>
+                <div class="field-name">${key}</div>
+                <div class="field-coords">
+                    x:${rnd(box.x_pct)}% y:${rnd(box.y_pct)}%
+                    w:${rnd(box.w_pct)}% h:${rnd(box.h_pct)}%
+                </div>
+                <button class="btn btn-sm btn-outline-danger btn-del"
+                        onclick="deleteBuilderField('${key}')">
+                    <i class="fas fa-times"></i>
+                </button>`;
+            builderFieldList.appendChild(row);
+        });
+    }
+
+    function deleteBuilderField(key) {
+        delete builderFields[key];
+        refreshBuilderUI();
+        if (Object.keys(builderFields).length === 0) {
+            builderFieldListWrap.classList.add('hidden');
+        }
+    }
+
+    // ── Save template ─────────────────────────────────────────────────────────
+    builderSaveBtn.addEventListener('click', async function () {
+        const name = builderTemplateName.value.trim()
+                        .toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+        const status = builderSaveStatus;
+
+        if (!name) {
+            status.innerHTML = `<div class="alert alert-warning py-1 mb-0">Enter a template name.</div>`;
+            return;
+        }
+        if (Object.keys(builderFields).length === 0) {
+            status.innerHTML = `<div class="alert alert-warning py-1 mb-0">Add at least one field first.</div>`;
+            return;
+        }
+
+        const payload = { name, fields: builderFields };
+
+        try {
+            const res  = await fetch('/template_save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            const data = await res.json();
+
+            if (data.status === 'success') {
+                status.innerHTML = `<div class="alert alert-success py-1 mb-0">
+                    Template <strong>${name}</strong> saved! Refreshing template list…</div>`;
+
+                // Add to the scan template dropdown without full reload
+                const sel = document.getElementById('template');
+                const exists = Array.from(sel.options).some(o => o.value === name);
+                if (!exists) {
+                    const opt = document.createElement('option');
+                    opt.value = opt.textContent = name;
+                    sel.appendChild(opt);
+                }
+                sel.value = name;
+
+                // Reset builder for next template
+                setTimeout(() => {
+                    builderFields  = {};
+                    pendingBox     = null;
+                    builderTemplateName.value = '';
+                    builderFieldName.value    = '';
+                    builderFieldList.innerHTML = '';
+                    builderFieldListWrap.classList.add('hidden');
+                    builderFieldCount.textContent = '0 fields';
+                    builderWrapper.querySelectorAll('.builder-box').forEach(el => el.remove());
+                    status.innerHTML = '';
+                }, 2500);
+            } else {
+                status.innerHTML = `<div class="alert alert-danger py-1 mb-0">${data.message || 'Save failed.'}</div>`;
+            }
+        } catch (err) {
+            status.innerHTML = `<div class="alert alert-danger py-1 mb-0">Error: ${err.message}</div>`;
+        }
+    });
+
+    </script>
+</body>
+</html>

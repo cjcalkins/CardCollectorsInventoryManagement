@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Duplicate Images – Card Collector Inventory Manager</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <style>
+        body { background: #f8f9fa; }
+
+        .nav-tabs-minimal { display: flex; gap: 10px; margin-left: auto; }
+        .nav-tab {
+            padding: 8px 14px; text-decoration: none; border-radius: 8px;
+            background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.85);
+            font-weight: 600; transition: 0.2s ease;
+        }
+        .nav-tab:hover  { background: rgba(255,255,255,0.18); color: #fff; }
+        .nav-tab.active { background: #fff; color: #212529; }
+
+        .page-card {
+            border: none; border-radius: 14px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+        }
+
+        /* ── Group card ── */
+        .dup-group {
+            border: 1px solid #dee2e6; border-radius: 12px;
+            background: #fff; overflow: hidden;
+            transition: box-shadow 0.15s, opacity 0.3s, max-height 0.4s;
+        }
+        .dup-group:hover { box-shadow: 0 4px 18px rgba(0,0,0,0.09); }
+
+        /* Collapse animation on removal */
+        .dup-group.removing {
+            opacity: 0;
+            max-height: 0 !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            overflow: hidden;
+            pointer-events: none;
+        }
+
+        .dup-group-header {
+            background: #f8f9fa; border-bottom: 1px solid #dee2e6;
+            padding: 12px 16px;
+            display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+        }
+        .dup-group-title  { font-weight: 700; font-size: 0.95rem; flex: 1; min-width: 0; }
+        .dup-group-body   { padding: 14px 16px; }
+
+        /* ── Record row ── */
+        .dup-record {
+            display: flex; align-items: center; gap: 12px;
+            padding: 10px 12px;
+            border: 2px solid #dee2e6; border-radius: 10px;
+            cursor: pointer;
+            transition: border-color 0.15s, background 0.15s;
+            background: #fff;
+        }
+        .dup-record:hover { border-color: #0d6efd; background: #f8fbff; }
+        .dup-record.selected-canonical {
+            border-color: #198754; background: #f0fff4;
+        }
+        .dup-record.selected-canonical .canonical-badge { display: inline-flex; }
+
+        .canonical-badge {
+            display: none; align-items: center; gap: 4px;
+            background: #198754; color: #fff;
+            font-size: 0.72rem; font-weight: 700;
+            padding: 2px 8px; border-radius: 20px;
+            white-space: nowrap;
+        }
+
+        .dup-thumb {
+            width: 60px; height: 84px; object-fit: contain;
+            border-radius: 6px; border: 1px solid #dee2e6;
+            background: #f1f3f5; flex-shrink: 0;
+        }
+        .dup-thumb-empty {
+            width: 60px; height: 84px; border-radius: 6px;
+            border: 1px dashed #dee2e6; background: #f8f9fa;
+            display: flex; align-items: center; justify-content: center;
+            color: #adb5bd; font-size: 0.7rem; text-align: center;
+            flex-shrink: 0;
+        }
+
+        .dup-record-info { flex: 1; min-width: 0; }
+        .dup-record-id   { font-weight: 700; font-size: 0.9rem; }
+        .dup-record-meta { font-size: 0.78rem; color: #6c757d; }
+
+        .resolve-bar {
+            border-top: 1px solid #dee2e6; padding: 12px 16px;
+            background: #f8f9fa;
+            display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+        }
+
+        /* Empty-state after all groups resolved */
+        #allResolvedMsg { display: none; }
+
+        @media (max-width: 768px) {
+            .nav-tabs-minimal { margin-left: 0; margin-top: 12px; width: 100%; }
+            .nav-tab { flex: 1; text-align: center; }
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+        <div class="container d-flex flex-wrap align-items-center">
+            <a class="navbar-brand" href="{{ url_for('index') }}">
+                <i class="fas fa-barcode me-2"></i>Card Collector Inventory Manager
+            </a>
+            <div class="nav-tabs-minimal">
+                <a href="{{ url_for('import_page') }}" class="nav-tab">Import</a>
+                <a href="{{ url_for('index') }}"        class="nav-tab">Scan</a>
+                <a href="{{ url_for('inventory') }}"    class="nav-tab active">Inventory</a>
+                <a href="{{ url_for('albums_list') }}"  class="nav-tab">Album</a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container py-5">
+
+        <!-- Page header -->
+        <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-3">
+            <div>
+                <h2 class="mb-1"><i class="fas fa-clone me-2"></i>Duplicate Image Manager</h2>
+                <div class="text-muted small">
+                    Records are grouped where <strong>name</strong>,
+                    <strong>serial / number</strong>, and
+                    <strong>first edition</strong> all match.
+                    Select the canonical image for each group and apply.
+                </div>
+            </div>
+            <a href="{{ url_for('inventory') }}" class="btn btn-outline-secondary">
+                <i class="fas fa-arrow-left me-1"></i>Back to Inventory
+            </a>
+        </div>
+
+        {% if not groups %}
+        <!-- No duplicates -->
+        <div class="card page-card">
+            <div class="card-body text-center py-5">
+                <i class="fas fa-check-circle text-success mb-3" style="font-size:2.5rem;"></i>
+                <h5 class="mb-1">No duplicates found</h5>
+                <p class="text-muted mb-0">
+                    Every combination of name + serial + first edition is unique.
+                </p>
+            </div>
+        </div>
+
+        {% else %}
+
+        <!-- Summary banner -->
+        <div class="alert alert-warning d-flex align-items-center gap-3 mb-4">
+            <i class="fas fa-triangle-exclamation fa-lg flex-shrink-0"></i>
+            <div>
+                Found <strong>{{ groups|length }} duplicate group{{ 's' if groups|length != 1 }}</strong>
+                across <strong>{{ total_records }} records</strong>.
+                Click the record whose image should be kept in each group, then apply.
+                The chosen image will be shared across all records in the group;
+                the other image files will be permanently deleted.
+            </div>
+        </div>
+
+        <!-- Action bar -->
+        <div class="d-flex gap-2 mb-4 flex-wrap">
+            <button class="btn btn-success" id="applyAllBtn">
+                <i class="fas fa-check-double me-1"></i>Apply All Resolved Groups
+            </button>
+            <button class="btn btn-outline-secondary" id="autoSelectBtn">
+                <i class="fas fa-magic me-1"></i>Auto-select Most Recent per Group
+            </button>
+        </div>
+
+        <div id="globalStatus" class="mb-3"></div>
+
+        <!-- All-resolved message (hidden until all groups removed) -->
+        <div id="allResolvedMsg" class="card page-card">
+            <div class="card-body text-center py-5">
+                <i class="fas fa-check-circle text-success mb-3" style="font-size:2.5rem;"></i>
+                <h5 class="mb-1">All duplicates resolved</h5>
+                <p class="text-muted mb-0">Every group has been processed.</p>
+            </div>
+        </div>
+
+        <!-- Duplicate groups -->
+        <div class="d-flex flex-column gap-4" id="groupContainer">
+            {% for group in groups %}
+            {% set group_idx = loop.index0 %}
+            <div class="dup-group"
+                 id="group-{{ group_idx }}"
+                 data-group-idx="{{ group_idx }}">
+
+                <div class="dup-group-header">
+                    <div class="dup-group-title">
+                        {{ group.name or '(no name)' }}
+                        {% if group.serial %}
+                        &nbsp;·&nbsp;
+                        <span class="fw-normal text-muted">{{ group.serial }}</span>
+                        {% endif %}
+                    </div>
+
+                    <!-- First Edition indicator -->
+                    {% if group.first_edition %}
+                    <span class="badge"
+                          style="background:#7c3aed; color:#fff;"
+                          title="These records are all marked as First Edition">
+                        <i class="fas fa-star me-1"></i>1st Edition
+                    </span>
+                    {% else %}
+                    <span class="badge bg-light text-muted border"
+                          title="These records are all non-First Edition">
+                        Standard
+                    </span>
+                    {% endif %}
+
+                    <span class="badge bg-warning text-dark">
+                        {{ group.records|length }} duplicates
+                    </span>
+                    <span class="badge bg-secondary"
+                          id="group-status-{{ group_idx }}">
+                        No selection
+                    </span>
+                </div>
+
+                <div class="dup-group-body">
+                    <p class="text-muted small mb-3">
+                        Click the record whose image should be kept.
+                        All {{ group.records|length }} entries share the same
+                        name, serial, and first-edition status — only the image
+                        differs.
+                    </p>
+
+                    <div class="d-flex flex-column gap-2">
+                        {% for rec in group.records %}
+                        <div class="dup-record"
+                             id="rec-{{ group_idx }}-{{ rec.id }}"
+                             data-record-id="{{ rec.id }}"
+                             data-group-idx="{{ group_idx }}">
+
+                            {% if rec.image_path %}
+                            <img src="{{ url_for('uploaded_file', filename=rec.image_path.replace('\\', '/')) }}"
+                                 alt="Record #{{ rec.id }}"
+                                 class="dup-thumb">
+                            {% else %}
+                            <div class="dup-thumb-empty">no image</div>
+                            {% endif %}
+
+                            <div class="dup-record-info">
+                                <div class="dup-record-id">
+                                    Record #{{ rec.id }}
+                                    <span class="canonical-badge">
+                                        <i class="fas fa-check"></i>&nbsp;Keep this image
+                                    </span>
+                                </div>
+                                <div class="dup-record-meta">
+                                    Album: {{ rec.extracted_data.get('album','—') }}
+                                    &nbsp;·&nbsp; Page: {{ rec.extracted_data.get('page','—') }}
+                                    &nbsp;·&nbsp; Slot: {{ rec.extracted_data.get('slot','—') }}
+                                    &nbsp;·&nbsp; {{ rec.scan_date.strftime('%Y-%m-%d %H:%M') }}
+                                </div>
+                                <div class="dup-record-meta mt-1 d-flex align-items-center gap-2 flex-wrap">
+                                    {% if rec.image_path %}
+                                    <span class="text-success">
+                                        <i class="fas fa-image me-1"></i>Has image
+                                    </span>
+                                    {% else %}
+                                    <span class="text-muted">
+                                        <i class="fas fa-image me-1"></i>No image
+                                    </span>
+                                    {% endif %}
+                                    <a href="{{ url_for('inventory_detail', record_id=rec.id) }}"
+                                       target="_blank" class="text-muted">
+                                        Open
+                                        <i class="fas fa-external-link-alt ms-1"
+                                           style="font-size:0.7em;"></i>
+                                    </a>
+                                </div>
+                            </div>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
+
+                <div class="resolve-bar">
+                    <span class="text-muted small me-auto"
+                          id="resolve-hint-{{ group_idx }}">
+                        Select a record above to designate its image as canonical.
+                    </span>
+                    <button class="btn btn-sm btn-success d-none"
+                            id="apply-group-{{ group_idx }}"
+                            data-group-idx="{{ group_idx }}">
+                        <i class="fas fa-check me-1"></i>Apply This Group
+                    </button>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+
+        {% endif %}
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        const selections   = {};   // { groupIdx: canonicalRecordId }
+        let remainingGroups = {{ groups|length }};
+
+        // ── Select canonical record ───────────────────────────────────────────
+        document.querySelectorAll('.dup-record').forEach(el => {
+            el.addEventListener('click', function () {
+                const gIdx = parseInt(this.dataset.groupIdx);
+                const rId  = parseInt(this.dataset.recordId);
+
+                document.querySelectorAll(`[data-group-idx="${gIdx}"].dup-record`)
+                    .forEach(r => r.classList.remove('selected-canonical'));
+                this.classList.add('selected-canonical');
+
+                selections[gIdx] = rId;
+
+                const badge = document.getElementById(`group-status-${gIdx}`);
+                badge.textContent = 'Ready';
+                badge.className   = 'badge bg-success';
+
+                document.getElementById(`resolve-hint-${gIdx}`).textContent =
+                    `Record #${rId} selected — its image will be kept and shared.`;
+
+                document.getElementById(`apply-group-${gIdx}`)
+                    .classList.remove('d-none');
+            });
+        });
+
+        // ── Auto-select most recent (first rendered = newest) ─────────────────
+        document.getElementById('autoSelectBtn')?.addEventListener('click', () => {
+            document.querySelectorAll('.dup-group').forEach(group => {
+                group.querySelector('.dup-record')?.click();
+            });
+        });
+
+        // ── Per-group apply buttons ───────────────────────────────────────────
+        document.querySelectorAll('[id^="apply-group-"]').forEach(btn => {
+            btn.addEventListener('click', function () {
+                applyGroup(parseInt(this.dataset.groupIdx), this);
+            });
+        });
+
+        // ── Apply all ─────────────────────────────────────────────────────────
+        document.getElementById('applyAllBtn')?.addEventListener('click', async function () {
+            const pending = Object.keys(selections).map(Number);
+            if (!pending.length) {
+                document.getElementById('globalStatus').innerHTML =
+                    `<div class="alert alert-warning mb-0">
+                        No groups selected yet. Click a record in each group first,
+                        or use <strong>Auto-select Most Recent</strong>.
+                    </div>`;
+                return;
+            }
+            this.disabled = true;
+            this.innerHTML =
+                '<span class="spinner-border spinner-border-sm me-1"></span>Applying…';
+
+            let ok = 0, fail = 0;
+            for (const idx of pending) {
+                (await applyGroup(idx, null)) ? ok++ : fail++;
+            }
+
+            this.disabled = false;
+            this.innerHTML =
+                '<i class="fas fa-check-double me-1"></i>Apply All Resolved Groups';
+
+            if (!fail) {
+                document.getElementById('globalStatus').innerHTML = '';
+            } else {
+                document.getElementById('globalStatus').innerHTML =
+                    `<div class="alert alert-warning mb-0">
+                        ${ok} group(s) applied.
+                        ${fail} failed — check individual groups above.
+                    </div>`;
+            }
+        });
+
+        // ── Core resolve — removes group from DOM on success ──────────────────
+        async function applyGroup(gIdx, btnEl) {
+            const canonicalId = selections[gIdx];
+            if (canonicalId === undefined) return false;
+
+            const allIds = Array.from(
+                document.querySelectorAll(`[data-group-idx="${gIdx}"].dup-record`)
+            ).map(el => parseInt(el.dataset.recordId));
+
+            if (btnEl) {
+                btnEl.disabled = true;
+                btnEl.innerHTML =
+                    '<span class="spinner-border spinner-border-sm"></span>';
+            }
+
+            try {
+                const res  = await fetch('/duplicates/resolve', {
+                    method:  'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body:    JSON.stringify({
+                        canonical_id: canonicalId,
+                        record_ids:   allIds,
+                    }),
+                });
+                const data = await res.json();
+
+                if (data.status === 'success') {
+                    // Animate group out then remove it from the DOM entirely
+                    const groupEl = document.getElementById(`group-${gIdx}`);
+                    groupEl.style.maxHeight = groupEl.offsetHeight + 'px';
+                    // Force reflow so transition fires
+                    groupEl.offsetHeight;  // eslint-disable-line no-unused-expressions
+                    groupEl.classList.add('removing');
+
+                    groupEl.addEventListener('transitionend', () => {
+                        groupEl.remove();
+                        remainingGroups--;
+                        checkAllResolved();
+                    }, { once: true });
+
+                    delete selections[gIdx];
+                    return true;
+
+                } else {
+                    document.getElementById(`resolve-hint-${gIdx}`).innerHTML =
+                        `<span class="text-danger">${data.message || 'Failed.'}</span>`;
+                    if (btnEl) {
+                        btnEl.disabled = false;
+                        btnEl.innerHTML =
+                            '<i class="fas fa-check me-1"></i>Retry';
+                    }
+                    return false;
+                }
+
+            } catch (err) {
+                document.getElementById(`resolve-hint-${gIdx}`).innerHTML =
+                    `<span class="text-danger">Error: ${err.message}</span>`;
+                if (btnEl) {
+                    btnEl.disabled = false;
+                    btnEl.innerHTML = '<i class="fas fa-check me-1"></i>Retry';
+                }
+                return false;
+            }
+        }
+
+        // ── Show all-resolved message when no groups remain ───────────────────
+        function checkAllResolved() {
+            if (remainingGroups <= 0) {
+                document.getElementById('groupContainer').style.display = 'none';
+                document.getElementById('allResolvedMsg').style.display = 'block';
+            }
+        }
+    </script>
+</body>
+</html>
