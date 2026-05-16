@@ -1,0 +1,1 @@
+This is where your local inventory database file is stored
