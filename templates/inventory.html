@@ -246,6 +246,7 @@
                                 <th data-col="page" class="sortable" data-sort-type="num">Page <span class="sort-icon">⇅</span></th>
                                 <th data-col="slot" class="sortable" data-sort-type="num">Slot <span class="sort-icon">⇅</span></th>
                                 <th data-col="template" class="sortable" data-sort-type="text">Template <span class="sort-icon">⇅</span></th>
+                                <th data-col="tcg_url" class="sortable" data-sort-type="text">Price URL <span class="sort-icon">⇅</span></th>
                                 {% for field in entry_fields %}
                                 <th data-col="entry_{{ field | e }}" data-entry-field="{{ field | e }}" class="sortable" data-sort-type="text">{{ field | replace('_', ' ') | title }} <span class="sort-icon">⇅</span></th>
                                 {% endfor %}
@@ -276,6 +277,13 @@
                                 <td>{{ record.extracted_data.get('slot', '') }}</td>
                                 <td>
                                     <span class="badge bg-secondary">{{ record.template_used }}</span>
+                                </td>
+                                <td data-col-static="tcg_url">
+                                    {% if record.extracted_data.get('tcgplayer', {}).get('url') %}
+                                    <span class="badge bg-success">True</span>
+                                    {% else %}
+                                    <span class="badge bg-secondary text-white" style="opacity:0.5;">False</span>
+                                    {% endif %}
                                 </td>
                                 {% for field in entry_fields %}
                                 <td data-entry-field="{{ field | e }}">{{ record.extracted_data.get(field, '') | e }}</td>
@@ -594,7 +602,7 @@
 
         // Storage key bumped to v3 to drop old hidden-col state
         // that referenced the removed matched_product column.
-        const COL_STORAGE_KEY  = 'inventory_hidden_cols_v3';
+        const COL_STORAGE_KEY  = 'inventory_hidden_cols_v4';
         const COL_WIDTHS_KEY   = 'inventory_col_widths_v1';
 
         // Entry fields discovered server-side and injected as JSON.
@@ -610,6 +618,7 @@
             { key: 'page',            label: 'Page' },
             { key: 'slot',            label: 'Slot' },
             { key: 'template',        label: 'Template' },
+            { key: 'tcg_url',         label: 'Price URL' },
         ];
 
         // OCR metadata suffixes that must never appear as column chooser options.
@@ -647,6 +656,7 @@
         const STATIC_COL_INDEX = {
             select: 0, date: 1, image: 2, game: 3,
             album: 4, page: 5, slot: 6, template: 7,
+            // tcg_url is at index 8; looked up by data-col-static attribute
             // actions column is always last; excluded from toggles
         };
 
@@ -671,6 +681,16 @@
                 allRows.forEach(row => {
                     const cell = row.cells[idx];
                     if (cell) cell.style.display = hide ? 'none' : '';
+                });
+            }
+
+            // Apply visibility for tcg_url column (by data-col / data-col-static attribute)
+            {
+                const hide = hiddenSet.has('tcg_url');
+                const th = table.querySelector('thead th[data-col="tcg_url"]');
+                if (th) th.style.display = hide ? 'none' : '';
+                table.querySelectorAll('tbody td[data-col-static="tcg_url"]').forEach(td => {
+                    td.style.display = hide ? 'none' : '';
                 });
             }
 
@@ -739,6 +759,12 @@
         let sortState = { col: null, dir: 'asc' };
 
         function getCellValue(row, colKey) {
+            // tcg_url: read from the data-col-static td, return "True"/"False" for sorting
+            if (colKey === 'tcg_url') {
+                const td = row.querySelector('td[data-col-static="tcg_url"]');
+                if (!td) return 'False';
+                return td.querySelector('.badge.bg-success') ? 'True' : 'False';
+            }
             // Dynamic entry columns: look up <td data-entry-field="fieldKey">
             if (colKey.startsWith('entry_')) {
                 const fieldKey = colKey.slice('entry_'.length);
