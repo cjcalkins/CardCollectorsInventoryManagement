@@ -248,6 +248,7 @@
                                 <th data-col="template" class="sortable" data-sort-type="text">Template <span class="sort-icon">⇅</span></th>
                                 <th data-col="tcg_url" class="sortable" data-sort-type="text">Price URL <span class="sort-icon">⇅</span></th>
                                 <th data-col="holographic" class="sortable" data-sort-type="enum">Holographic <span class="sort-icon">⇅</span></th>
+                                <th data-col="finalized" class="sortable" data-sort-type="text">Finalized <span class="sort-icon">⇅</span></th>
                                 {% for field in entry_fields %}
                                 <th data-col="entry_{{ field | e }}" data-entry-field="{{ field | e }}" class="sortable" data-sort-type="text">{{ field | replace('_', ' ') | title }} <span class="sort-icon">⇅</span></th>
                                 {% endfor %}
@@ -299,6 +300,12 @@
                                     {% else %}
                                         <span class="badge bg-secondary" style="opacity:0.45;">None</span>
                                     {% endif %}
+                                </td>
+                                <td data-col-static="finalized" class="text-center">
+                                    <input type="checkbox" class="form-check-input finalized-toggle"
+                                           data-record-id="{{ record.id }}"
+                                           {% if record.extracted_data.get('finalized') == true or record.extracted_data.get('finalized') == 'True' %}checked{% endif %}
+                                           title="Toggle Finalized">
                                 </td>
                                 {% for field in entry_fields %}
                                 <td data-entry-field="{{ field | e }}">{{ record.extracted_data.get(field, '') | e }}</td>
@@ -613,11 +620,36 @@
             }
         });
 
+        // ====================== FINALIZED INLINE TOGGLE ======================
+        document.addEventListener('change', async function (e) {
+            const cb = e.target.closest('.finalized-toggle');
+            if (!cb) return;
+
+            const recordId = cb.dataset.recordId;
+            const checked  = cb.checked;
+
+            // Optimistically keep the checkbox at its new state; revert on error
+            try {
+                const res  = await fetch(`/update_scan/${recordId}`, {
+                    method:  'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body:    JSON.stringify({ extracted_data: { finalized: checked } }),
+                });
+                const data = await res.json();
+                if (data.status !== 'success') {
+                    cb.checked = !checked;  // revert
+                }
+            } catch (err) {
+                console.error('Failed to save finalized state:', err);
+                cb.checked = !checked;  // revert
+            }
+        });
+
         // ====================== COLUMN VISIBILITY & SORTING ======================
 
         // Storage key bumped to v3 to drop old hidden-col state
         // that referenced the removed matched_product column.
-        const COL_STORAGE_KEY  = 'inventory_hidden_cols_v5';
+        const COL_STORAGE_KEY  = 'inventory_hidden_cols_v6';
         const COL_WIDTHS_KEY   = 'inventory_col_widths_v1';
 
         // Entry fields discovered server-side and injected as JSON.
@@ -635,6 +667,7 @@
             { key: 'template',        label: 'Template' },
             { key: 'tcg_url',         label: 'Price URL' },
             { key: 'holographic',     label: 'Holographic' },
+            { key: 'finalized',       label: 'Finalized' },
         ];
 
         // OCR metadata suffixes that must never appear as column chooser options.
@@ -720,6 +753,16 @@
                 });
             }
 
+            // Apply visibility for finalized column
+            {
+                const hide = hiddenSet.has('finalized');
+                const th = table.querySelector('thead th[data-col="finalized"]');
+                if (th) th.style.display = hide ? 'none' : '';
+                table.querySelectorAll('tbody td[data-col-static="finalized"]').forEach(td => {
+                    td.style.display = hide ? 'none' : '';
+                });
+            }
+
             // Apply visibility for ALL dynamic entry columns (by data-col / data-entry-field).
             // OCR meta fields (e.g. name__ocr_conf) are always force-hidden.
             ALL_DYNAMIC_COLS.forEach(({ key, fieldKey }) => {
@@ -796,6 +839,12 @@
                 const td = row.querySelector('td[data-col-static="holographic"]');
                 if (!td) return 'None';
                 return td.querySelector('.badge')?.textContent.trim() || 'None';
+            }
+            // finalized: return "True"/"False" based on checkbox state
+            if (colKey === 'finalized') {
+                const td = row.querySelector('td[data-col-static="finalized"]');
+                if (!td) return 'False';
+                return td.querySelector('input[type="checkbox"]')?.checked ? 'True' : 'False';
             }
             // Dynamic entry columns: look up <td data-entry-field="fieldKey">
             if (colKey.startsWith('entry_')) {

@@ -623,7 +623,7 @@ def index():
 # They are excluded from the dynamic entry-field columns.
 _STATIC_ENTRY_KEYS = frozenset({
     "game", "album", "page", "slot",
-    "holographic",
+    "holographic", "finalized",
     "__roi_fields_used",
 })
 _INTERNAL_KEY_PREFIXES = ("__ocr_", "__")
@@ -751,6 +751,7 @@ def inventory_export_csv():
         "template":     ("Template",     lambda r: str(r.template_used or "")),
         "tcg_url":      ("Price URL",    lambda r: str(((r.extracted_data or {}).get("tcgplayer") or {}).get("url", ""))),
         "holographic":  ("Holographic",  lambda r: str((r.extracted_data or {}).get("holographic", "None"))),
+        "finalized":    ("Finalized",    lambda r: "True" if (r.extracted_data or {}).get("finalized") in (True, "True", "true") else "False"),
     }
 
     # Parse the requested columns; fall back to all non-image/action static cols + all entry fields
