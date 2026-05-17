@@ -706,6 +706,100 @@ def inventory():
     )
 
 
+@app.route("/inventory/export_csv")
+def inventory_export_csv():
+    """
+    Export the currently filtered inventory to a CSV file.
+    Accepts the same filter params as /inventory (search, game, album, template)
+    plus a `columns` param (comma-separated list of column keys to include).
+    Column keys follow the same convention as the HTML: static keys like
+    'date', 'game', 'album', 'page', 'slot', 'template', and dynamic keys
+    prefixed with 'entry_' (e.g. 'entry_name', 'entry_atk').
+    """
+    import csv
+    import io
+    from flask import Response
+
+    search     = request.args.get("search", "").strip()
+    f_game     = request.args.get("game", "").strip()
+    f_album    = request.args.get("album", "").strip()
+    f_template = request.args.get("template", "").strip()
+    columns_param = request.args.get("columns", "").strip()
+
+    # Build query — same logic as /inventory, but no pagination
+    query = ScanRecord.query.order_by(ScanRecord.scan_date.desc())
+    if f_game:
+        query = query.filter(ScanRecord.extracted_data["game"].astext == f_game)
+    if f_album:
+        query = query.filter(ScanRecord.extracted_data["album"].astext == f_album)
+    if f_template:
+        query = query.filter(ScanRecord.template_used == f_template)
+    if search:
+        query = query.filter(ScanRecord.extracted_data.cast(db.Text).ilike(f"%{search}%"))
+
+    records = query.all()
+
+    # Determine which columns to export
+    # Static column key → (header label, value extractor)
+    STATIC_COL_MAP = {
+        "date":     ("Date",     lambda r: r.scan_date.strftime("%Y-%m-%d %H:%M") if r.scan_date else ""),
+        "game":     ("Game",     lambda r: str((r.extracted_data or {}).get("game", ""))),
+        "album":    ("Album",    lambda r: str((r.extracted_data or {}).get("album", ""))),
+        "page":     ("Page",     lambda r: str((r.extracted_data or {}).get("page", ""))),
+        "slot":     ("Slot",     lambda r: str((r.extracted_data or {}).get("slot", ""))),
+        "template": ("Template", lambda r: str(r.template_used or "")),
+    }
+
+    # Parse the requested columns; fall back to all non-image/action static cols + all entry fields
+    if columns_param:
+        requested = [c.strip() for c in columns_param.split(",") if c.strip()]
+    else:
+        # Default: all static cols (except image/select/actions) + all discovered entry fields
+        entry_fields = discover_entry_fields(records)
+        requested = list(STATIC_COL_MAP.keys()) + [f"entry_{f}" for f in entry_fields]
+
+    # Build ordered list of (header, extractor) for columns that are valid
+    columns = []
+    for col_key in requested:
+        if col_key in STATIC_COL_MAP:
+            label, extractor = STATIC_COL_MAP[col_key]
+            columns.append((label, extractor))
+        elif col_key.startswith("entry_"):
+            field_key = col_key[len("entry_"):]
+            label = field_key.replace("_", " ").title()
+            extractor = (lambda fk: lambda r: str((r.extracted_data or {}).get(fk, "")))(field_key)
+            columns.append((label, extractor))
+        # 'image', 'select', 'actions' are silently skipped — not meaningful in CSV
+
+    if not columns:
+        return jsonify({"status": "error", "message": "No exportable columns selected"}), 400
+
+    # Build CSV in memory
+    output = io.StringIO()
+    writer = csv.writer(output, lineterminator="\r\n")
+
+    # Header row
+    writer.writerow([label for label, _ in columns])
+
+    # Data rows
+    for record in records:
+        writer.writerow([extractor(record) for _, extractor in columns])
+
+    csv_bytes = output.getvalue().encode("utf-8-sig")  # utf-8-sig adds BOM for Excel
+
+    filename = "inventory_export.csv"
+    if f_game:
+        filename = f"inventory_{f_game}_export.csv"
+    elif f_album:
+        filename = f"inventory_{f_album}_export.csv"
+
+    return Response(
+        csv_bytes,
+        mimetype="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.route("/inventory/filter_options")
 def inventory_filter_options():
     """

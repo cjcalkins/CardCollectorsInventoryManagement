@@ -151,10 +151,13 @@
                 <i class="fas fa-boxes-stacked me-2"></i>Inventory Records
             </h2>
 
-            <div class="d-flex gap-2">
+            <div class="d-flex gap-2 flex-wrap">
                 <a href="{{ url_for('duplicates') }}" class="btn btn-outline-warning">
                     <i class="fas fa-clone me-1"></i>Find Duplicates
                 </a>
+                <button class="btn btn-outline-success" id="exportCsvBtn" type="button">
+                    <i class="fas fa-file-csv me-1"></i>Export CSV
+                </button>
                 <button class="btn btn-success" id="addCustomFieldBtn" type="button">
                     <i class="fas fa-plus me-1"></i>Add Field to Game
                 </button>
@@ -485,6 +488,42 @@
             } else {
                 alert(data.message || 'Delete failed.');
             }
+        });
+
+        // ====================== EXPORT CSV ======================
+        document.getElementById('exportCsvBtn')?.addEventListener('click', function () {
+            // Collect the currently VISIBLE column keys from the table headers.
+            // We skip 'select', 'image', and 'actions' — not useful in a CSV.
+            const SKIP_COLS = new Set(['select', 'image', 'actions']);
+            const visibleCols = [];
+
+            document.querySelectorAll('#inventoryTable thead th[data-col]').forEach(th => {
+                const key = th.dataset.col;
+                if (!key || SKIP_COLS.has(key)) return;
+                // A column is visible if it is not display:none
+                if (th.style.display === 'none') return;
+                visibleCols.push(key);
+            });
+
+            if (!visibleCols.length) {
+                alert('No visible columns to export. Please show at least one column first.');
+                return;
+            }
+
+            // Build the export URL, passing along current filters + the visible column list
+            const params = new URLSearchParams({
+                search:   activeFilters.search   || '',
+                game:     activeFilters.game     || '',
+                album:    activeFilters.album    || '',
+                template: activeFilters.template || '',
+                columns:  visibleCols.join(','),
+            });
+            // Strip blank params for cleaner URLs
+            for (const [k, v] of [...params.entries()]) {
+                if (!v) params.delete(k);
+            }
+
+            window.location.href = '/inventory/export_csv?' + params.toString();
         });
 
         // ====================== ADD CUSTOM FIELD MODAL ======================
