@@ -188,6 +188,35 @@
                         <div id="imageStatusMessage" class="mt-3"></div>
                     </div>
                 </div>
+
+                {% if quantity_group is defined and quantity_group.count > 1 %}
+                <!-- ==================== QUANTITY PANEL ==================== -->
+                <div class="card detail-card mt-4">
+                    <div class="card-header bg-light d-flex align-items-center justify-content-between">
+                        <strong><i class="fas fa-layer-group me-2"></i>Quantity</strong>
+                        <span class="badge bg-primary fs-6">{{ quantity_group.count }}</span>
+                    </div>
+                    <div class="card-body p-0">
+                        <ul class="list-group list-group-flush rounded-bottom-3">
+                            {% for loc in quantity_group.locations %}
+                            {% set loc_id = quantity_group.all_ids[loop.index0] %}
+                            <li class="list-group-item d-flex justify-content-between align-items-center py-2 px-3">
+                                <span class="text-muted small font-monospace">{{ loc }}</span>
+                                {% if loc_id != record.id %}
+                                <a href="{{ url_for('inventory_detail', record_id=loc_id) }}"
+                                   class="btn btn-outline-secondary btn-sm py-0 px-2"
+                                   title="Open this copy">
+                                    <i class="fas fa-arrow-right"></i>
+                                </a>
+                                {% else %}
+                                <span class="badge bg-secondary-subtle text-secondary border small">This entry</span>
+                                {% endif %}
+                            </li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                </div>
+                {% endif %}
             </div>
 
             <!-- ==================== RIGHT COLUMN ==================== -->
@@ -205,7 +234,9 @@
                                        and key != 'tcgplayer'
                                        and key != 'card_lookup'
                                        and key != 'first_edition'
-                                       and key != 'edition' %}
+                                       and key != 'edition'
+                                       and key != 'holographic'
+                                       and key != 'finalized' %}
                                     <div class="col-md-6">
                                         <label class="form-label">{{ key.replace('_', ' ').title() }}</label>
                                         <input type="text" class="form-control" name="{{ key }}"
@@ -223,6 +254,33 @@
                                            {% if record.extracted_data.get('first_edition') == true or record.extracted_data.get('first_edition') == 'True' %}checked{% endif %}>
                                     <label class="form-check-label fw-semibold" for="firstEditionCheck">
                                         First Edition
+                                    </label>
+                                </div>
+                            </div>
+
+                            <!-- Holographic dropdown -->
+                            <div class="mt-3 p-3 border rounded-3 bg-light">
+                                <label class="form-label fw-semibold mb-2" for="holographicSelect">
+                                    <i class="fas fa-star me-1 text-warning"></i>Holographic
+                                </label>
+                                <select class="form-select" id="holographicSelect">
+                                    {% set holo_val = record.extracted_data.get('holographic', 'None') %}
+                                    <option value="None"       {% if holo_val == 'None'       %}selected{% endif %}>None</option>
+                                    <option value="Shiny Text" {% if holo_val == 'Shiny Text' %}selected{% endif %}>Shiny Text</option>
+                                    <option value="Regular"    {% if holo_val == 'Regular'    %}selected{% endif %}>Regular</option>
+                                    <option value="Reverse"    {% if holo_val == 'Reverse'    %}selected{% endif %}>Reverse</option>
+                                    <option value="Special"    {% if holo_val == 'Special'    %}selected{% endif %}>Special</option>
+                                </select>
+                            </div>
+
+                            <!-- Finalized toggle -->
+                            <div class="mt-3 p-3 border rounded-3 bg-light d-flex align-items-center gap-3">
+                                <div class="form-check form-switch mb-0">
+                                    <input class="form-check-input" type="checkbox"
+                                           role="switch" id="finalizedCheck"
+                                           {% if record.extracted_data.get('finalized') == true or record.extracted_data.get('finalized') == 'True' %}checked{% endif %}>
+                                    <label class="form-check-label fw-semibold" for="finalizedCheck">
+                                        <i class="fas fa-check-circle me-1 text-success"></i>Finalized
                                     </label>
                                 </div>
                             </div>
@@ -375,6 +433,12 @@
 
             // first_edition is a checkbox outside the FormData — handle explicitly
             updated['first_edition'] = document.getElementById('firstEditionCheck').checked;
+
+            // holographic is a select outside the generic inputs — handle explicitly
+            updated['holographic'] = document.getElementById('holographicSelect').value;
+
+            // finalized is a checkbox outside the FormData — handle explicitly
+            updated['finalized'] = document.getElementById('finalizedCheck').checked;
 
             const res  = await fetch(`/update_scan/${recordId}`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -588,6 +652,18 @@
             if ('first_edition' in source) {
                 const cb = document.getElementById('firstEditionCheck');
                 if (cb) cb.checked = source.first_edition === true || source.first_edition === 'true';
+            }
+
+            // Handle holographic select separately
+            if ('holographic' in source) {
+                const sel = document.getElementById('holographicSelect');
+                if (sel) sel.value = source.holographic || 'None';
+            }
+
+            // Handle finalized boolean separately
+            if ('finalized' in source) {
+                const cb = document.getElementById('finalizedCheck');
+                if (cb) cb.checked = source.finalized === true || source.finalized === 'true';
             }
 
             copyStatus.innerHTML = `<div class="alert alert-success py-2 mb-0">

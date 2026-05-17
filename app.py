@@ -623,6 +623,7 @@ def index():
 # They are excluded from the dynamic entry-field columns.
 _STATIC_ENTRY_KEYS = frozenset({
     "game", "album", "page", "slot",
+    "holographic", "finalized",
     "__roi_fields_used",
 })
 _INTERNAL_KEY_PREFIXES = ("__ocr_", "__")
@@ -654,7 +655,6 @@ def discover_entry_fields(records) -> list:
         for key in data.keys():
             if _is_entry_field(key):
                 seen.add(key)
-    # Sort: put well-known name-like keys first, then alphabetically
     priority = ("name", "product_name", "card_name", "title")
     def _sort_key(k):
         try:
@@ -662,6 +662,97 @@ def discover_entry_fields(records) -> list:
         except ValueError:
             return (1, k)
     return sorted(seen, key=_sort_key)
+
+
+# ── Duplicate-grouping helpers ────────────────────────────────────────────────
+
+def _record_group_key(record):
+    """
+    Return a normalised 4-tuple (name, serial, first_edition, holographic) for
+    a *finalized* record, or None if the record is not finalized.
+    Only finalized records with an identical tuple are collapsed into one row.
+    """
+    data = record.extracted_data or {}
+    if data.get("finalized") not in (True, "True", "true"):
+        return None
+    return (
+        _get_name(data),
+        _get_serial(data),
+        str(_get_first_edition(data)),
+        str(data.get("holographic", "None")).strip(),
+    )
+
+
+def _location_label(record) -> str:
+    """Return 'Album-Page-Slot' string for a record."""
+    data  = record.extracted_data or {}
+    parts = [
+        str(data.get("album", "")).strip(),
+        str(data.get("page",  "")).strip(),
+        str(data.get("slot",  "")).strip(),
+    ]
+    return "-".join(p for p in parts if p) or f"Record #{record.id}"
+
+
+def _collapse_duplicates(all_records: list) -> tuple:
+    """
+    Collapse finalized duplicate groups so only one representative per group
+    (the one with the lowest id) is shown in the inventory list.
+
+    Returns:
+        display_records – ordered list of representative ScanRecord objects
+        group_info      – dict keyed by representative id:
+                          { 'count': int, 'locations': [str], 'all_ids': [int] }
+    """
+    from collections import OrderedDict
+    groups = OrderedDict()
+    solo_counter = [0]
+
+    for record in all_records:
+        key = _record_group_key(record)
+        if key is None:
+            # Non-finalized records each get a unique solo key
+            solo_counter[0] += 1
+            key = ("__solo__", solo_counter[0], record.id)
+        groups.setdefault(key, []).append(record)
+
+    display_records = []
+    group_info      = {}
+
+    for members in groups.values():
+        rep = min(members, key=lambda r: r.id)
+        display_records.append(rep)
+        sorted_members = sorted(members, key=lambda r: r.id)
+        group_info[rep.id] = {
+            "count":     len(members),
+            "locations": [_location_label(r) for r in sorted_members],
+            "all_ids":   [r.id for r in sorted_members],
+        }
+
+    return display_records, group_info
+
+
+def _find_group_info_for_record(record) -> dict:
+    """
+    Find every record that belongs to the same finalized group as `record`
+    and return a group_info dict.  Falls back to a single-member group for
+    non-finalized records or when no siblings exist.
+    """
+    key = _record_group_key(record)
+    if key is None:
+        return {
+            "count":     1,
+            "locations": [_location_label(record)],
+            "all_ids":   [record.id],
+        }
+
+    members = [r for r in ScanRecord.query.all() if _record_group_key(r) == key]
+    sorted_members = sorted(members, key=lambda r: r.id)
+    return {
+        "count":     len(sorted_members),
+        "locations": [_location_label(r) for r in sorted_members],
+        "all_ids":   [r.id for r in sorted_members],
+    }
 
 
 @app.route("/inventory")
@@ -686,24 +777,54 @@ def inventory():
     if search:
         query = query.filter(ScanRecord.extracted_data.cast(db.Text).ilike(f"%{search}%"))
 
-    pagination = query.paginate(page=page, per_page=per_page, error_out=False)
+    all_records  = query.all()
+    entry_fields = discover_entry_fields(all_records[:500])
 
-    # Discover dynamic entry fields from ALL filtered records (not just current page)
-    # so the column set is stable across pages. Cap the scan to 500 rows for performance.
-    all_sample = query.limit(500).all()
-    entry_fields = discover_entry_fields(all_sample)
+    # Collapse finalized duplicates into single representative rows
+    display_records, group_info = _collapse_duplicates(all_records)
+
+    # Manual pagination over the collapsed list
+    total        = len(display_records)
+    total_pages  = max(1, (total + per_page - 1) // per_page)
+    page         = max(1, min(page, total_pages))
+    offset       = (page - 1) * per_page
+    page_records = display_records[offset: offset + per_page]
+
+    class _Pagination:
+        def __init__(self):
+            self.page     = page
+            self.pages    = total_pages
+            self.total    = total
+            self.first    = offset + 1 if total else 0
+            self.last     = min(offset + per_page, total)
+            self.has_prev = page > 1
+            self.has_next = page < total_pages
+            self.prev_num = page - 1
+            self.next_num = page + 1
+            self.items    = page_records
+
+        def iter_pages(self, left_edge=1, right_edge=1, left_current=2, right_current=2):
+            result = []
+            for p in range(1, self.pages + 1):
+                if (p <= left_edge
+                        or (self.page - left_current <= p <= self.page + right_current)
+                        or p > self.pages - right_edge):
+                    if result and result[-1] is not None and p - result[-1] > 1:
+                        result.append(None)
+                    result.append(p)
+            return result
 
     return render_template(
         "inventory.html",
-        records=pagination.items,
-        pagination=pagination,
+        records=page_records,
+        group_info=group_info,
+        pagination=_Pagination(),
         search=search,
         f_game=f_game,
         f_album=f_album,
         f_template=f_template,
         per_page=per_page,
         entry_fields=entry_fields,
-        group_info={},
     )
 
 
@@ -743,13 +864,15 @@ def inventory_export_csv():
     # Determine which columns to export
     # Static column key → (header label, value extractor)
     STATIC_COL_MAP = {
-        "date":     ("Date",      lambda r: r.scan_date.strftime("%Y-%m-%d %H:%M") if r.scan_date else ""),
-        "game":     ("Game",      lambda r: str((r.extracted_data or {}).get("game", ""))),
-        "album":    ("Album",     lambda r: str((r.extracted_data or {}).get("album", ""))),
-        "page":     ("Page",      lambda r: str((r.extracted_data or {}).get("page", ""))),
-        "slot":     ("Slot",      lambda r: str((r.extracted_data or {}).get("slot", ""))),
-        "template": ("Template",  lambda r: str(r.template_used or "")),
-        "tcg_url":  ("Price URL", lambda r: str(((r.extracted_data or {}).get("tcgplayer") or {}).get("url", ""))),
+        "date":        ("Date",        lambda r: r.scan_date.strftime("%Y-%m-%d %H:%M") if r.scan_date else ""),
+        "game":        ("Game",        lambda r: str((r.extracted_data or {}).get("game", ""))),
+        "album":       ("Album",       lambda r: str((r.extracted_data or {}).get("album", ""))),
+        "page":        ("Page",        lambda r: str((r.extracted_data or {}).get("page", ""))),
+        "slot":        ("Slot",        lambda r: str((r.extracted_data or {}).get("slot", ""))),
+        "template":    ("Template",    lambda r: str(r.template_used or "")),
+        "tcg_url":     ("Price URL",   lambda r: str(((r.extracted_data or {}).get("tcgplayer") or {}).get("url", ""))),
+        "holographic": ("Holographic", lambda r: str((r.extracted_data or {}).get("holographic", "None"))),
+        "finalized":   ("Finalized",   lambda r: "True" if (r.extracted_data or {}).get("finalized") in (True, "True", "true") else "False"),
     }
 
     # Parse the requested columns; fall back to all non-image/action static cols + all entry fields
@@ -889,6 +1012,7 @@ def inventory_detail(record_id):
         record=record,
         prev_id=prev_record.id if prev_record else None,
         next_id=next_record.id if next_record else None,
+        quantity_group=_find_group_info_for_record(record),
     )
 
 
