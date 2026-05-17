@@ -1,0 +1,40 @@
+# Python cache and local environment files
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+ENV/
+
+# Local database
+inventory.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Generated inventory/upload images
+uploads/
+static/uploads/
+inventory_images/
+generated_images/
+
+# Temporary import/scan processing folders
+temp/
+tmp/
+temp_*/
+tmp_*/
+*/temp/
+*/tmp/
+*/temp_*/
+*/tmp_*/
+
+# Common temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
