@@ -19,6 +19,7 @@ uploads/
 static/uploads/
 inventory_images/
 generated_images/
+templates/roi/
 
 # Temporary import/scan processing folders
 temp/
