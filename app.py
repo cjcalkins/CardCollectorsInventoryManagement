@@ -703,6 +703,7 @@ def inventory():
         f_template=f_template,
         per_page=per_page,
         entry_fields=entry_fields,
+        group_info={},
     )
 
 

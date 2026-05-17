@@ -258,7 +258,7 @@
                         </thead>
                         <tbody>
                             {% for record in records %}
-                            {% set ginfo = group_info.get(record.id, {'count': 1, 'locations': [], 'all_ids': [record.id]}) %}
+                            {% set ginfo = (group_info | default({})).get(record.id, {'count': 1, 'locations': [], 'all_ids': [record.id]}) %}
                             <tr data-game="{{ record.extracted_data.get('game', '') }}"
                                 data-group-ids="{{ ginfo.all_ids | join(',') }}">
                                 <td>
