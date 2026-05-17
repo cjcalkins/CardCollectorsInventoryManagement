@@ -655,7 +655,6 @@ def discover_entry_fields(records) -> list:
         for key in data.keys():
             if _is_entry_field(key):
                 seen.add(key)
-    # Sort: put well-known name-like keys first, then alphabetically
     priority = ("name", "product_name", "card_name", "title")
     def _sort_key(k):
         try:
@@ -663,6 +662,112 @@ def discover_entry_fields(records) -> list:
         except ValueError:
             return (1, k)
     return sorted(seen, key=_sort_key)
+
+
+# ── Duplicate-grouping helpers ───────────────────────────────────────────────
+
+_NAME_KEYS_GROUP   = ("name", "product_name", "card_name", "title")
+_SERIAL_KEYS_GROUP = ("serial", "number", "collector_number", "set_number", "card_number")
+
+
+def _group_field(data: dict, keys: tuple) -> str:
+    for k in keys:
+        v = str(data.get(k, "")).strip()
+        if v:
+            return v.lower()
+    return ""
+
+
+def _record_group_key(record):
+    """
+    Return a normalised grouping tuple for a finalized record, or None if
+    the record is not finalized (it should always appear individually).
+    Groups by: (name, serial, first_edition, holographic).
+    """
+    data = record.extracted_data or {}
+    if data.get("finalized") not in (True, "True", "true"):
+        return None
+    return (
+        _group_field(data, _NAME_KEYS_GROUP),
+        _group_field(data, _SERIAL_KEYS_GROUP),
+        str(_get_first_edition(data)),
+        str(data.get("holographic", "None")).strip(),
+    )
+
+
+def _location_label(record) -> str:
+    """Return 'Album-Page-Slot' string for a record."""
+    data  = record.extracted_data or {}
+    parts = [
+        str(data.get("album", "")).strip(),
+        str(data.get("page",  "")).strip(),
+        str(data.get("slot",  "")).strip(),
+    ]
+    parts = [p for p in parts if p]
+    return "-".join(parts) if parts else f"Record #{record.id}"
+
+
+def _collapse_duplicates(all_records: list) -> tuple:
+    """
+    Collapse finalized duplicate groups so only one representative per group
+    is shown in the inventory list.
+
+    Returns:
+        display_records – ordered list of representative ScanRecord objects
+        group_info      – dict: representative_id → {
+                              'count':     int,
+                              'locations': [str, ...],
+                              'all_ids':   [int, ...],
+                          }
+    """
+    # Build group_key → [records] map, preserving encounter order
+    from collections import OrderedDict
+    groups: OrderedDict = OrderedDict()
+    solo_counter = [0]
+
+    for record in all_records:
+        key = _record_group_key(record)
+        if key is None:
+            solo_counter[0] += 1
+            key = ("__solo__", solo_counter[0], record.id)
+        groups.setdefault(key, []).append(record)
+
+    display_records = []
+    group_info: dict = {}
+
+    for members in groups.values():
+        rep = min(members, key=lambda r: r.id)
+        display_records.append(rep)
+        group_info[rep.id] = {
+            "count":     len(members),
+            "locations": [_location_label(r) for r in sorted(members, key=lambda r: r.id)],
+            "all_ids":   [r.id for r in sorted(members, key=lambda r: r.id)],
+        }
+
+    return display_records, group_info
+
+
+def _find_group_info_for_record(record) -> dict:
+    """
+    Find all records that belong to the same group as `record` and return
+    a group_info dict (same shape as _collapse_duplicates produces).
+    Returns a single-member group if not finalized or no matches.
+    """
+    key = _record_group_key(record)
+    if key is None:
+        return {
+            "count":     1,
+            "locations": [_location_label(record)],
+            "all_ids":   [record.id],
+        }
+
+    all_records = ScanRecord.query.all()
+    members = [r for r in all_records if _record_group_key(r) == key]
+    return {
+        "count":     len(members),
+        "locations": [_location_label(r) for r in sorted(members, key=lambda r: r.id)],
+        "all_ids":   [r.id for r in sorted(members, key=lambda r: r.id)],
+    }
 
 
 @app.route("/inventory")
@@ -687,17 +792,52 @@ def inventory():
     if search:
         query = query.filter(ScanRecord.extracted_data.cast(db.Text).ilike(f"%{search}%"))
 
-    pagination = query.paginate(page=page, per_page=per_page, error_out=False)
+    # Fetch all filtered records for collapsing; also sample for entry-field discovery
+    all_records  = query.all()
+    entry_fields = discover_entry_fields(all_records[:500])
 
-    # Discover dynamic entry fields from ALL filtered records (not just current page)
-    # so the column set is stable across pages. Cap the scan to 500 rows for performance.
-    all_sample = query.limit(500).all()
-    entry_fields = discover_entry_fields(all_sample)
+    # Collapse finalized duplicates into single representative rows
+    display_records, group_info = _collapse_duplicates(all_records)
+
+    # Manual pagination over the collapsed list
+    total       = len(display_records)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page        = max(1, min(page, total_pages))
+    offset      = (page - 1) * per_page
+    page_records = display_records[offset: offset + per_page]
+
+    first_item = offset + 1 if total else 0
+    last_item  = min(offset + per_page, total)
+
+    class _Pagination:
+        def __init__(self):
+            self.page     = page
+            self.pages    = total_pages
+            self.total    = total
+            self.first    = first_item
+            self.last     = last_item
+            self.has_prev = page > 1
+            self.has_next = page < total_pages
+            self.prev_num = page - 1
+            self.next_num = page + 1
+            self.items    = page_records
+
+        def iter_pages(self, left_edge=1, right_edge=1, left_current=2, right_current=2):
+            result = []
+            for p in range(1, self.pages + 1):
+                if (p <= left_edge
+                        or (self.page - left_current <= p <= self.page + right_current)
+                        or p > self.pages - right_edge):
+                    if result and result[-1] is not None and p - result[-1] > 1:
+                        result.append(None)
+                    result.append(p)
+            return result
 
     return render_template(
         "inventory.html",
-        records=pagination.items,
-        pagination=pagination,
+        records=page_records,
+        group_info=group_info,
+        pagination=_Pagination(),
         search=search,
         f_game=f_game,
         f_album=f_album,
@@ -891,6 +1031,7 @@ def inventory_detail(record_id):
         record=record,
         prev_id=prev_record.id if prev_record else None,
         next_id=next_record.id if next_record else None,
+        quantity_group=_find_group_info_for_record(record),
     )
 
 

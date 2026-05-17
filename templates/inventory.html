@@ -249,6 +249,7 @@
                                 <th data-col="tcg_url" class="sortable" data-sort-type="text">Price URL <span class="sort-icon">⇅</span></th>
                                 <th data-col="holographic" class="sortable" data-sort-type="enum">Holographic <span class="sort-icon">⇅</span></th>
                                 <th data-col="finalized" class="sortable" data-sort-type="text">Finalized <span class="sort-icon">⇅</span></th>
+                                <th data-col="qty" class="sortable" data-sort-type="num">Qty <span class="sort-icon">⇅</span></th>
                                 {% for field in entry_fields %}
                                 <th data-col="entry_{{ field | e }}" data-entry-field="{{ field | e }}" class="sortable" data-sort-type="text">{{ field | replace('_', ' ') | title }} <span class="sort-icon">⇅</span></th>
                                 {% endfor %}
@@ -257,9 +258,12 @@
                         </thead>
                         <tbody>
                             {% for record in records %}
-                            <tr data-game="{{ record.extracted_data.get('game', '') }}">
+                            {% set ginfo = group_info.get(record.id, {'count': 1, 'locations': [], 'all_ids': [record.id]}) %}
+                            <tr data-game="{{ record.extracted_data.get('game', '') }}"
+                                data-group-ids="{{ ginfo.all_ids | join(',') }}">
                                 <td>
-                                    <input type="checkbox" class="record-checkbox" value="{{ record.id }}">
+                                    <input type="checkbox" class="record-checkbox" value="{{ record.id }}"
+                                           data-all-ids="{{ ginfo.all_ids | join(',') }}">
                                 </td>
                                 <td>{{ record.scan_date.strftime('%Y-%m-%d %H:%M') }}</td>
                                 <td>
@@ -306,6 +310,13 @@
                                            data-record-id="{{ record.id }}"
                                            {% if record.extracted_data.get('finalized') == true or record.extracted_data.get('finalized') == 'True' %}checked{% endif %}
                                            title="Toggle Finalized">
+                                </td>
+                                <td data-col-static="qty" class="text-center">
+                                    {% if ginfo.count > 1 %}
+                                    <span class="badge bg-primary">{{ ginfo.count }}</span>
+                                    {% else %}
+                                    <span class="text-muted small">1</span>
+                                    {% endif %}
                                 </td>
                                 {% for field in entry_fields %}
                                 <td data-entry-field="{{ field | e }}">{{ record.extracted_data.get(field, '') | e }}</td>
@@ -494,15 +505,21 @@
 
         // ====================== DELETE SELECTED ======================
         document.getElementById('deleteSelectedBtn')?.addEventListener('click', async function () {
-            const selected = Array.from(document.querySelectorAll('.record-checkbox:checked'))
-                .map(cb => parseInt(cb.value, 10));
+            // Collect ALL sibling IDs for each checked row (so grouped duplicates are fully deleted)
+            const allIds = new Set();
+            document.querySelectorAll('.record-checkbox:checked').forEach(cb => {
+                const ids = (cb.dataset.allIds || cb.value).split(',').map(s => parseInt(s.trim(), 10));
+                ids.forEach(id => allIds.add(id));
+            });
+
+            const selected = [...allIds];
 
             if (!selected.length) {
                 alert('Please select at least one record.');
                 return;
             }
 
-            const confirmed = confirm(`Delete ${selected.length} selected record(s)? This cannot be undone.`);
+            const confirmed = confirm(`Delete ${selected.length} record(s)? This cannot be undone.`);
             if (!confirmed) return;
 
             const response = await fetch('/delete_scans', {
@@ -517,6 +534,30 @@
                 location.reload();
             } else {
                 alert(data.message || 'Delete failed.');
+            }
+        });
+
+        // ====================== FINALIZED INLINE TOGGLE ======================
+        document.addEventListener('change', async function (e) {
+            const cb = e.target.closest('.finalized-toggle');
+            if (!cb) return;
+
+            const recordId = cb.dataset.recordId;
+            const checked  = cb.checked;
+
+            try {
+                const res  = await fetch(`/update_scan/${recordId}`, {
+                    method:  'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body:    JSON.stringify({ extracted_data: { finalized: checked } }),
+                });
+                const data = await res.json();
+                if (data.status !== 'success') {
+                    cb.checked = !checked;  // revert on failure
+                }
+            } catch (err) {
+                console.error('Failed to save finalized state:', err);
+                cb.checked = !checked;
             }
         });
 
@@ -620,36 +661,11 @@
             }
         });
 
-        // ====================== FINALIZED INLINE TOGGLE ======================
-        document.addEventListener('change', async function (e) {
-            const cb = e.target.closest('.finalized-toggle');
-            if (!cb) return;
-
-            const recordId = cb.dataset.recordId;
-            const checked  = cb.checked;
-
-            // Optimistically keep the checkbox at its new state; revert on error
-            try {
-                const res  = await fetch(`/update_scan/${recordId}`, {
-                    method:  'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body:    JSON.stringify({ extracted_data: { finalized: checked } }),
-                });
-                const data = await res.json();
-                if (data.status !== 'success') {
-                    cb.checked = !checked;  // revert
-                }
-            } catch (err) {
-                console.error('Failed to save finalized state:', err);
-                cb.checked = !checked;  // revert
-            }
-        });
-
         // ====================== COLUMN VISIBILITY & SORTING ======================
 
         // Storage key bumped to v3 to drop old hidden-col state
         // that referenced the removed matched_product column.
-        const COL_STORAGE_KEY  = 'inventory_hidden_cols_v6';
+        const COL_STORAGE_KEY  = 'inventory_hidden_cols_v7';
         const COL_WIDTHS_KEY   = 'inventory_col_widths_v1';
 
         // Entry fields discovered server-side and injected as JSON.
@@ -658,16 +674,17 @@
 
         // Static columns that can be toggled (key matches data-col on <th>)
         const STATIC_TOGGLEABLE_COLS = [
-            { key: 'date',            label: 'Date' },
-            { key: 'image',           label: 'Image' },
-            { key: 'game',            label: 'Game' },
-            { key: 'album',           label: 'Album' },
-            { key: 'page',            label: 'Page' },
-            { key: 'slot',            label: 'Slot' },
-            { key: 'template',        label: 'Template' },
-            { key: 'tcg_url',         label: 'Price URL' },
-            { key: 'holographic',     label: 'Holographic' },
-            { key: 'finalized',       label: 'Finalized' },
+            { key: 'date',        label: 'Date' },
+            { key: 'image',       label: 'Image' },
+            { key: 'game',        label: 'Game' },
+            { key: 'album',       label: 'Album' },
+            { key: 'page',        label: 'Page' },
+            { key: 'slot',        label: 'Slot' },
+            { key: 'template',    label: 'Template' },
+            { key: 'tcg_url',     label: 'Price URL' },
+            { key: 'holographic', label: 'Holographic' },
+            { key: 'finalized',   label: 'Finalized' },
+            { key: 'qty',         label: 'Qty' },
         ];
 
         // OCR metadata suffixes that must never appear as column chooser options.
@@ -733,44 +750,22 @@
                 });
             }
 
-            // Apply visibility for tcg_url column (by data-col / data-col-static attribute)
-            {
-                const hide = hiddenSet.has('tcg_url');
-                const th = table.querySelector('thead th[data-col="tcg_url"]');
+            // Apply visibility for data-col-static columns (tcg_url, holographic, finalized, qty)
+            ['tcg_url', 'holographic', 'finalized', 'qty'].forEach(colKey => {
+                const hide = hiddenSet.has(colKey);
+                const th = table.querySelector(`thead th[data-col="${colKey}"]`);
                 if (th) th.style.display = hide ? 'none' : '';
-                table.querySelectorAll('tbody td[data-col-static="tcg_url"]').forEach(td => {
+                table.querySelectorAll(`tbody td[data-col-static="${colKey}"]`).forEach(td => {
                     td.style.display = hide ? 'none' : '';
                 });
-            }
-
-            // Apply visibility for holographic column
-            {
-                const hide = hiddenSet.has('holographic');
-                const th = table.querySelector('thead th[data-col="holographic"]');
-                if (th) th.style.display = hide ? 'none' : '';
-                table.querySelectorAll('tbody td[data-col-static="holographic"]').forEach(td => {
-                    td.style.display = hide ? 'none' : '';
-                });
-            }
-
-            // Apply visibility for finalized column
-            {
-                const hide = hiddenSet.has('finalized');
-                const th = table.querySelector('thead th[data-col="finalized"]');
-                if (th) th.style.display = hide ? 'none' : '';
-                table.querySelectorAll('tbody td[data-col-static="finalized"]').forEach(td => {
-                    td.style.display = hide ? 'none' : '';
-                });
-            }
+            });
 
             // Apply visibility for ALL dynamic entry columns (by data-col / data-entry-field).
             // OCR meta fields (e.g. name__ocr_conf) are always force-hidden.
             ALL_DYNAMIC_COLS.forEach(({ key, fieldKey }) => {
                 const hide = hiddenSet.has(key) || isOcrMetaField(fieldKey);
-                // Hide/show header <th>
                 const th = table.querySelector(`thead th[data-col="${CSS.escape(key)}"]`);
                 if (th) th.style.display = hide ? 'none' : '';
-                // Hide/show body <td>
                 table.querySelectorAll(`tbody td[data-entry-field="${CSS.escape(fieldKey)}"]`).forEach(td => {
                     td.style.display = hide ? 'none' : '';
                 });
@@ -827,32 +822,36 @@
         // ── Sorting ─────────────────────────────────────────────────────────────
         let sortState = { col: null, dir: 'asc' };
 
+        // Defined sort order for the Holographic enum column.
+        const HOLO_ORDER = { 'None': 0, 'Shiny Text': 1, 'Regular': 2, 'Reverse': 3, 'Special': 4 };
+
         function getCellValue(row, colKey) {
-            // tcg_url: read from the data-col-static td, return "True"/"False" for sorting
             if (colKey === 'tcg_url') {
                 const td = row.querySelector('td[data-col-static="tcg_url"]');
                 if (!td) return 'False';
                 return td.querySelector('.badge.bg-success') ? 'True' : 'False';
             }
-            // holographic: read text content from the badge
             if (colKey === 'holographic') {
                 const td = row.querySelector('td[data-col-static="holographic"]');
                 if (!td) return 'None';
                 return td.querySelector('.badge')?.textContent.trim() || 'None';
             }
-            // finalized: return "True"/"False" based on checkbox state
             if (colKey === 'finalized') {
                 const td = row.querySelector('td[data-col-static="finalized"]');
                 if (!td) return 'False';
                 return td.querySelector('input[type="checkbox"]')?.checked ? 'True' : 'False';
             }
-            // Dynamic entry columns: look up <td data-entry-field="fieldKey">
+            if (colKey === 'qty') {
+                const td = row.querySelector('td[data-col-static="qty"]');
+                if (!td) return '1';
+                const badge = td.querySelector('.badge');
+                return badge ? badge.textContent.trim() : '1';
+            }
             if (colKey.startsWith('entry_')) {
                 const fieldKey = colKey.slice('entry_'.length);
                 const td = row.querySelector(`td[data-entry-field="${CSS.escape(fieldKey)}"]`);
                 return td ? td.textContent.trim() : '';
             }
-            // Static columns: look up by numeric cell index
             const idx = STATIC_COL_INDEX[colKey];
             if (idx === undefined) return '';
             const cell = row.cells[idx];
@@ -860,17 +859,12 @@
             return cell.textContent.trim();
         }
 
-        // Defined sort order for the Holographic enum column.
-        // Asc: None first → up through Special. Desc: reverses.
-        const HOLO_ORDER = { 'None': 0, 'Shiny Text': 1, 'Regular': 2, 'Reverse': 3, 'Special': 4 };
-
         function sortTable(colKey, sortType) {
             const tbody = document.querySelector('#inventoryTable tbody');
             if (!tbody) return;
 
             const rows = Array.from(tbody.querySelectorAll('tr'));
 
-            // Toggle direction if same column clicked again
             if (sortState.col === colKey) {
                 sortState.dir = sortState.dir === 'asc' ? 'desc' : 'asc';
             } else {
@@ -885,27 +879,19 @@
                 const vb = getCellValue(b, colKey);
 
                 if (sortType === 'num') {
-                    const na = parseFloat(va) || 0;
-                    const nb = parseFloat(vb) || 0;
-                    return (na - nb) * dir;
+                    return ((parseFloat(va) || 0) - (parseFloat(vb) || 0)) * dir;
                 }
                 if (sortType === 'date') {
-                    const da = new Date(va);
-                    const db = new Date(vb);
-                    return (da - db) * dir;
+                    return (new Date(va) - new Date(vb)) * dir;
                 }
                 if (sortType === 'enum') {
-                    const na = HOLO_ORDER[va] ?? 99;
-                    const nb = HOLO_ORDER[vb] ?? 99;
-                    return (na - nb) * dir;
+                    return ((HOLO_ORDER[va] ?? 99) - (HOLO_ORDER[vb] ?? 99)) * dir;
                 }
-                // text
                 return va.localeCompare(vb, undefined, { sensitivity: 'base' }) * dir;
             });
 
             rows.forEach(r => tbody.appendChild(r));
 
-            // Update header indicators
             document.querySelectorAll('#inventoryTable thead th.sortable').forEach(th => {
                 th.classList.remove('sort-asc', 'sort-desc');
                 if (th.dataset.col === colKey) {
