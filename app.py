@@ -623,6 +623,7 @@ def index():
 # They are excluded from the dynamic entry-field columns.
 _STATIC_ENTRY_KEYS = frozenset({
     "game", "album", "page", "slot",
+    "holographic",
     "__roi_fields_used",
 })
 _INTERNAL_KEY_PREFIXES = ("__ocr_", "__")
@@ -742,13 +743,14 @@ def inventory_export_csv():
     # Determine which columns to export
     # Static column key → (header label, value extractor)
     STATIC_COL_MAP = {
-        "date":     ("Date",      lambda r: r.scan_date.strftime("%Y-%m-%d %H:%M") if r.scan_date else ""),
-        "game":     ("Game",      lambda r: str((r.extracted_data or {}).get("game", ""))),
-        "album":    ("Album",     lambda r: str((r.extracted_data or {}).get("album", ""))),
-        "page":     ("Page",      lambda r: str((r.extracted_data or {}).get("page", ""))),
-        "slot":     ("Slot",      lambda r: str((r.extracted_data or {}).get("slot", ""))),
-        "template": ("Template",  lambda r: str(r.template_used or "")),
-        "tcg_url":  ("Price URL", lambda r: str(((r.extracted_data or {}).get("tcgplayer") or {}).get("url", ""))),
+        "date":         ("Date",         lambda r: r.scan_date.strftime("%Y-%m-%d %H:%M") if r.scan_date else ""),
+        "game":         ("Game",         lambda r: str((r.extracted_data or {}).get("game", ""))),
+        "album":        ("Album",        lambda r: str((r.extracted_data or {}).get("album", ""))),
+        "page":         ("Page",         lambda r: str((r.extracted_data or {}).get("page", ""))),
+        "slot":         ("Slot",         lambda r: str((r.extracted_data or {}).get("slot", ""))),
+        "template":     ("Template",     lambda r: str(r.template_used or "")),
+        "tcg_url":      ("Price URL",    lambda r: str(((r.extracted_data or {}).get("tcgplayer") or {}).get("url", ""))),
+        "holographic":  ("Holographic",  lambda r: str((r.extracted_data or {}).get("holographic", "None"))),
     }
 
     # Parse the requested columns; fall back to all non-image/action static cols + all entry fields

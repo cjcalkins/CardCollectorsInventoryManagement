@@ -205,7 +205,8 @@
                                        and key != 'tcgplayer'
                                        and key != 'card_lookup'
                                        and key != 'first_edition'
-                                       and key != 'edition' %}
+                                       and key != 'edition'
+                                       and key != 'holographic' %}
                                     <div class="col-md-6">
                                         <label class="form-label">{{ key.replace('_', ' ').title() }}</label>
                                         <input type="text" class="form-control" name="{{ key }}"
@@ -225,6 +226,21 @@
                                         First Edition
                                     </label>
                                 </div>
+                            </div>
+
+                            <!-- Holographic dropdown -->
+                            <div class="mt-3 p-3 border rounded-3 bg-light">
+                                <label class="form-label fw-semibold mb-2" for="holographicSelect">
+                                    <i class="fas fa-star me-1 text-warning"></i>Holographic
+                                </label>
+                                <select class="form-select" id="holographicSelect">
+                                    {% set holo_val = record.extracted_data.get('holographic', 'None') %}
+                                    <option value="None"        {% if holo_val == 'None'        %}selected{% endif %}>None</option>
+                                    <option value="Shiny Text"  {% if holo_val == 'Shiny Text'  %}selected{% endif %}>Shiny Text</option>
+                                    <option value="Regular"     {% if holo_val == 'Regular'     %}selected{% endif %}>Regular</option>
+                                    <option value="Reverse"     {% if holo_val == 'Reverse'     %}selected{% endif %}>Reverse</option>
+                                    <option value="Special"     {% if holo_val == 'Special'     %}selected{% endif %}>Special</option>
+                                </select>
                             </div>
 
                             <div class="d-flex gap-2 mt-4 flex-wrap">
@@ -391,6 +407,9 @@
 
             // first_edition is a checkbox outside the FormData — handle explicitly
             updated['first_edition'] = document.getElementById('firstEditionCheck').checked;
+
+            // holographic is a select outside the generic inputs — handle explicitly
+            updated['holographic'] = document.getElementById('holographicSelect').value;
 
             const res  = await fetch(`/update_scan/${recordId}`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -604,6 +623,12 @@
             if ('first_edition' in source) {
                 const cb = document.getElementById('firstEditionCheck');
                 if (cb) cb.checked = source.first_edition === true || source.first_edition === 'true';
+            }
+
+            // Handle holographic select separately
+            if ('holographic' in source) {
+                const sel = document.getElementById('holographicSelect');
+                if (sel) sel.value = source.holographic || 'None';
             }
 
             copyStatus.innerHTML = `<div class="alert alert-success py-2 mb-0">
