@@ -33,28 +33,80 @@
         }
         .record-image.expanded { max-height: none; width: auto; height: auto; cursor: zoom-out; }
 
-        /* TCGPlayer linked state */
-        .tcg-linked-panel {
+        /* JustTCG price panel */
+        .jtcg-linked-panel {
             background: #fff;
-            border: 1px solid #c7deff;
+            border: 1px solid #b8ddb8;
             border-radius: 12px;
             padding: 16px;
         }
-        .tcg-unlinked-panel {
+        .jtcg-unlinked-panel {
             background: #f8f9fa;
             border: 2px dashed #dee2e6;
             border-radius: 12px;
             padding: 20px;
         }
-        .tcg-logo-text {
+        .jtcg-logo-text {
             font-weight: 800;
             font-size: 1rem;
-            color: #e4242b;
+            color: #1a7a3c;
             letter-spacing: -0.5px;
         }
-        .tcg-logo-text span { color: #212529; }
+        .jtcg-price-badge {
+            display: inline-block;
+            background: #1a7a3c;
+            color: #fff;
+            border-radius: 8px;
+            padding: 4px 12px;
+            font-size: 1.05rem;
+            font-weight: 700;
+        }
+        .jtcg-price-row {
+            display: flex;
+            gap: 18px;
+            flex-wrap: wrap;
+            margin-top: 10px;
+        }
+        .jtcg-price-item {
+            text-align: center;
+            min-width: 60px;
+        }
+        .jtcg-price-item .label {
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            color: #6c757d;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+        }
+        .jtcg-price-item .value {
+            font-size: 1rem;
+            font-weight: 700;
+            color: #212529;
+        }
+        .jtcg-fetch-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            background: #1a7a3c;
+            color: #fff;
+            border: none;
+            border-radius: 8px;
+            padding: 10px 20px;
+            font-weight: 700;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: background 0.15s ease;
+        }
+        .jtcg-fetch-btn:hover:not(:disabled) { background: #145f2e; }
+        .jtcg-fetch-btn:disabled { opacity: 0.65; cursor: not-allowed; }
 
-        /* Copy-from dropdown */
+        .tcg-product-id {
+            font-family: monospace;
+            background: #e9ecef;
+            border-radius: 4px;
+            padding: 2px 6px;
+            font-size: 0.85rem;
+        }
         .copy-option {
             padding: 10px 14px;
             cursor: pointer;
@@ -67,29 +119,6 @@
         .copy-option .copy-opt-title { font-weight: 600; }
         .copy-option .copy-opt-sub { color: #6c757d; font-size: 0.78rem; }
 
-        .tcg-link-btn {
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            background: #e4242b;
-            color: #fff;
-            border: none;
-            border-radius: 8px;
-            padding: 10px 20px;
-            font-weight: 700;
-            font-size: 1rem;
-            text-decoration: none;
-            transition: background 0.15s ease;
-        }
-        .tcg-link-btn:hover { background: #c01e24; color: #fff; }
-
-        .tcg-product-id {
-            font-family: monospace;
-            background: #e9ecef;
-            border-radius: 4px;
-            padding: 2px 6px;
-            font-size: 0.85rem;
-        }
 
         @media (max-width: 768px) {
             .nav-tabs-minimal { margin-left: 0; margin-top: 12px; width: 100%; }
@@ -282,78 +311,115 @@
                     </div>
                 </div>
 
-                <!-- ==================== PRICE URL PANEL ==================== -->
+                <!-- ==================== JUSTTCG PRICE PANEL ==================== -->
                 {% set tcg = record.extracted_data.get('tcgplayer') %}
-                <div class="card detail-card">
+                <div class="card detail-card" id="jtcgCard">
                     <div class="card-header bg-light d-flex justify-content-between align-items-center">
-                        <strong><i class="fas fa-tag me-2"></i>Price Lookup URL</strong>
+                        <strong><i class="fas fa-tag me-2"></i>JustTCG Price</strong>
                         {% if tcg %}
                         <button class="btn btn-sm btn-outline-danger" id="clearTcgBtn">
-                            <i class="fas fa-unlink me-1"></i>Remove Link
+                            <i class="fas fa-unlink me-1"></i>Clear Data
                         </button>
                         {% endif %}
                     </div>
 
-                    <div class="card-body">
+                    <div class="card-body" id="jtcgBody">
 
-                        {% if tcg %}
-                        <!-- ── LINKED: show the saved link prominently ── -->
-                        <div class="tcg-linked-panel mb-3">
-                            <div class="d-flex align-items-center gap-3 flex-wrap">
-                                <a href="{{ tcg.url }}" target="_blank" rel="noopener"
-                                   class="tcg-link-btn">
-                                    <i class="fas fa-dollar-sign"></i>
-                                    View Price Listing
-                                    <i class="fas fa-external-link-alt" style="font-size:0.8em;"></i>
-                                </a>
-                            </div>
-                            <div class="mt-2 text-muted small">
-                                Saved {{ tcg.get('saved_at', '')[:10] }}
-                                {% if tcg.get('product_id') %}
-                                &nbsp;·&nbsp;TCGPlayer ID: <span class="tcg-product-id">{{ tcg.product_id }}</span>
+                        {% if tcg and tcg.get('source') == 'justtcg' %}
+                        <!-- ── HAS JUSTTCG DATA ── -->
+                        <div class="jtcg-linked-panel mb-3">
+                            <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-2">
+                                <span class="jtcg-logo-text">JustTCG</span>
+                                {% set market = tcg.get('prices', {}).get('market') %}
+                                {% if market %}
+                                <span class="jtcg-price-badge">${{ '%.2f' | format(market | float) }}</span>
                                 {% endif %}
-                                &nbsp;·&nbsp;
+                            </div>
+
+                            <div class="text-muted small mb-2">
+                                <strong>{{ tcg.get('product_name', '') }}</strong>
+                                {% if tcg.get('set_name') %}&nbsp;·&nbsp;{{ tcg.set_name }}{% endif %}
+                                {% if tcg.get('set_number') %}&nbsp;·&nbsp;<span class="tcg-product-id">{{ tcg.set_number }}</span>{% endif %}
+                            </div>
+
+                            {% set prices = tcg.get('prices', {}) %}
+                            {% if prices %}
+                            <div class="jtcg-price-row">
+                                {% if prices.get('low') %}
+                                <div class="jtcg-price-item">
+                                    <div class="label">Low</div>
+                                    <div class="value">${{ '%.2f' | format(prices.low | float) }}</div>
+                                </div>
+                                {% endif %}
+                                {% if prices.get('mid') %}
+                                <div class="jtcg-price-item">
+                                    <div class="label">Mid</div>
+                                    <div class="value">${{ '%.2f' | format(prices.mid | float) }}</div>
+                                </div>
+                                {% endif %}
+                                {% if prices.get('market') %}
+                                <div class="jtcg-price-item">
+                                    <div class="label">Market</div>
+                                    <div class="value">${{ '%.2f' | format(prices.market | float) }}</div>
+                                </div>
+                                {% endif %}
+                                {% if prices.get('high') %}
+                                <div class="jtcg-price-item">
+                                    <div class="label">High</div>
+                                    <div class="value">${{ '%.2f' | format(prices.high | float) }}</div>
+                                </div>
+                                {% endif %}
+                            </div>
+                            {% endif %}
+
+                            <div class="mt-3 d-flex align-items-center gap-3 flex-wrap">
                                 <a href="{{ tcg.url }}" target="_blank" rel="noopener"
-                                   class="text-muted text-truncate d-inline-block"
-                                   style="max-width: 300px; vertical-align:bottom;">
-                                    {{ tcg.url }}
+                                   class="btn btn-sm btn-outline-success">
+                                    <i class="fas fa-external-link-alt me-1"></i>View on JustTCG
                                 </a>
+                                <span class="text-muted small">Fetched {{ tcg.get('saved_at', '')[:10] }}</span>
                             </div>
                         </div>
 
-                        <!-- Replace URL -->
                         <div class="border-top pt-3">
-                            <label class="form-label small fw-semibold mb-1">Update URL</label>
-                            <div class="input-group">
-                                <input type="url" class="form-control form-control-sm" id="tcgUrlInput"
-                                       placeholder="https://…"
-                                       value="{{ tcg.url }}">
-                                <button class="btn btn-sm btn-primary" id="saveTcgUrlBtn">
-                                    <i class="fas fa-save me-1"></i>Update
-                                </button>
-                            </div>
-                            <div id="tcgStatus" class="mt-2"></div>
-                        </div>
-
-                        {% else %}
-                        <!-- ── UNLINKED: simple input ── -->
-                        <p class="text-muted small mb-3">
-                            Paste any price lookup URL (TCGPlayer, eBay, etc.) to save it with this record.
-                        </p>
-
-                        <div class="input-group">
-                            <input type="url" class="form-control" id="tcgUrlInput"
-                                   placeholder="https://…">
-                            <button class="btn btn-primary" id="saveTcgUrlBtn">
-                                <i class="fas fa-link me-1"></i>Save URL
+                            <button class="jtcg-fetch-btn btn-sm" id="jtcgFetchBtn" style="font-size:0.875rem;padding:7px 14px;">
+                                <i class="fas fa-sync-alt me-1"></i>Refresh Price
                             </button>
                         </div>
-                        <div id="tcgStatus" class="mt-2"></div>
+
+                        {% elif tcg %}
+                        <!-- ── HAS LEGACY URL ENTRY ── -->
+                        <div class="alert alert-light border mb-3">
+                            <i class="fas fa-link me-1"></i>
+                            Manual URL saved: <a href="{{ tcg.url }}" target="_blank" rel="noopener" class="text-truncate">{{ tcg.url }}</a>
+                        </div>
+                        <p class="text-muted small mb-3">
+                            Click below to replace this with live JustTCG data for
+                            <strong>{{ record.extracted_data.get('product_name') or record.extracted_data.get('name') or record.extracted_data.get('card_name') or 'this card' }}</strong>.
+                        </p>
+                        <button class="jtcg-fetch-btn" id="jtcgFetchBtn">
+                            <i class="fas fa-search-dollar me-1"></i>Fetch Price from JustTCG
+                        </button>
+
+                        {% else %}
+                        <!-- ── NO DATA YET ── -->
+                        <div class="jtcg-unlinked-panel mb-3">
+                            <p class="mb-1 fw-semibold">No price data yet</p>
+                            <p class="text-muted small mb-0">
+                                Click the button below to fetch the current market price from
+                                <strong>JustTCG</strong> for
+                                <strong>{{ record.extracted_data.get('product_name') or record.extracted_data.get('name') or record.extracted_data.get('card_name') or 'this card' }}</strong>.
+                            </p>
+                        </div>
+                        <button class="jtcg-fetch-btn" id="jtcgFetchBtn">
+                            <i class="fas fa-search-dollar me-1"></i>Fetch Price from JustTCG
+                        </button>
                         {% endif %}
 
+                        <div id="jtcgStatus" class="mt-3"></div>
                     </div>
                 </div>
-                <!-- end Price URL panel -->
+                <!-- end JustTCG Price panel -->
 
             </div>
         </div>
@@ -438,30 +504,47 @@
             }
         });
 
-        // ==================== PRICE URL — SAVE ====================
-        document.getElementById('saveTcgUrlBtn')?.addEventListener('click', async function () {
-            const url    = document.getElementById('tcgUrlInput').value.trim();
-            const status = document.getElementById('tcgStatus');
-            if (!url) {
-                status.innerHTML = `<div class="alert alert-warning mb-0">Please enter a URL.</div>`;
-                return;
-            }
-            const res  = await fetch(`/tcg_save_url/${recordId}`, {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ url }),
-            });
-            const data = await res.json();
-            if (data.status === 'success') {
-                status.innerHTML = `<div class="alert alert-success mb-0">Saved! Reloading…</div>`;
-                setTimeout(() => window.location.reload(), 600);
-            } else {
-                status.innerHTML = `<div class="alert alert-danger mb-0">${data.message}</div>`;
+        // ==================== JUSTTCG PRICE FETCH ====================
+        document.getElementById('jtcgFetchBtn')?.addEventListener('click', async function () {
+            const btn    = this;
+            const status = document.getElementById('jtcgStatus');
+
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Fetching…';
+            status.innerHTML = '';
+
+            try {
+                const res  = await fetch(`/justtcg_fetch/${recordId}`, { method: 'POST' });
+                const data = await res.json();
+
+                if (data.status === 'success') {
+                    status.innerHTML = `<div class="alert alert-success mb-0">
+                        <i class="fas fa-check-circle me-1"></i>${data.message} Reloading…
+                    </div>`;
+                    setTimeout(() => window.location.reload(), 800);
+                } else if (data.status === 'not_found') {
+                    status.innerHTML = `<div class="alert alert-warning mb-0">
+                        <i class="fas fa-search me-1"></i>${data.message}
+                    </div>`;
+                    btn.disabled = false;
+                    btn.innerHTML = '<i class="fas fa-search-dollar me-1"></i>Fetch Price from JustTCG';
+                } else {
+                    status.innerHTML = `<div class="alert alert-danger mb-0">
+                        <i class="fas fa-exclamation-triangle me-1"></i>${data.message || 'Fetch failed.'}
+                    </div>`;
+                    btn.disabled = false;
+                    btn.innerHTML = '<i class="fas fa-search-dollar me-1"></i>Fetch Price from JustTCG';
+                }
+            } catch (err) {
+                status.innerHTML = `<div class="alert alert-danger mb-0">Network error: ${err.message}</div>`;
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fas fa-search-dollar me-1"></i>Fetch Price from JustTCG';
             }
         });
 
-        // ==================== PRICE URL — CLEAR ====================
+        // ==================== JUSTTCG — CLEAR ====================
         document.getElementById('clearTcgBtn')?.addEventListener('click', async function () {
-            if (!confirm('Remove the TCGPlayer link from this record?')) return;
+            if (!confirm('Remove the saved JustTCG price data from this record?')) return;
             const res  = await fetch(`/tcg_clear_url/${recordId}`, { method: 'POST' });
             const data = await res.json();
             if (data.status === 'success') window.location.reload();

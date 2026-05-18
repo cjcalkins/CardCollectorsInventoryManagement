@@ -1383,38 +1383,147 @@ def records_summary():
     return jsonify({"records": records})
 
 
-# ====================== TCGPLAYER ROUTES ======================
-def _extract_tcgplayer_id(url: str):
-    """Extract numeric product ID from a TCGPlayer URL."""
-    match = _re.search(r"tcgplayer\.com/product/(\d+)", url or "")
-    return match.group(1) if match else None
+# ====================== JUSTTCG ROUTES ======================
+# JustTCG public API — https://justtcg.com
+# Search endpoint: GET https://justtcg.com/api/products/search
+#   ?name=<card name>          required
+#   &number=<set number>       optional but improves match accuracy
+#   &game=<game name>          optional
+# Returns JSON with a `products` array; each product has:
+#   id, name, set_name, number, prices (market, low, mid, high), url
+
+import urllib.request
+import urllib.parse
+import urllib.error
+
+JUSTTCG_SEARCH_URL = "https://justtcg.com/api/products/search"
+JUSTTCG_TIMEOUT    = 10  # seconds
 
 
-@app.route("/tcg_save_url/<int:record_id>", methods=["POST"])
-def tcg_save_url(record_id):
-    """Save a price-lookup URL to the record. Accepts any valid URL.
-    If it's a TCGPlayer product URL the product ID is also extracted and stored."""
+def _justtcg_search(name: str, number: str = "", game: str = "") -> dict:
+    """
+    Call the JustTCG search API and return the parsed JSON response.
+    Raises urllib.error.URLError / ValueError on failure.
+    """
+    params = {"name": name.strip()}
+    if number:
+        params["number"] = number.strip()
+    if game:
+        params["game"] = game.strip()
+
+    url = JUSTTCG_SEARCH_URL + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept":     "application/json",
+            "User-Agent": "CardCollectorInventoryManager/1.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=JUSTTCG_TIMEOUT) as resp:
+        raw = resp.read().decode("utf-8")
+    return json.loads(raw)
+
+
+@app.route("/justtcg_fetch/<int:record_id>", methods=["POST"])
+def justtcg_fetch(record_id):
+    """
+    Manually triggered endpoint: queries the JustTCG API for the card
+    associated with this inventory record, then persists the result.
+
+    The record's extracted_data is searched for the card name (product_name /
+    name / card_name) and optional set number (serial / set_number / number).
+
+    On success the pricing snapshot is stored under extracted_data['tcgplayer']
+    using the same schema as the old URL-save feature so the rest of the app
+    (copy-from, duplicate resolver, etc.) remains unchanged.
+    """
     record = ScanRecord.query.get_or_404(record_id)
-    data   = request.get_json() or {}
-    url    = data.get("url", "").strip()
+    ext    = record.extracted_data or {}
 
-    if not url:
-        return jsonify({"status": "error", "message": "No URL provided"}), 400
+    # ── Resolve card name ─────────────────────────────────────────────────────
+    card_name = (
+        ext.get("product_name") or
+        ext.get("name")         or
+        ext.get("card_name")    or
+        ext.get("title")        or
+        ""
+    ).strip()
 
-    # Basic sanity check — must look like a URL
-    if not (url.startswith("http://") or url.startswith("https://")):
-        url = "https://" + url
+    if not card_name:
+        return jsonify({
+            "status":  "error",
+            "message": "No card name found on this record (product_name / name / card_name).",
+        }), 400
 
-    # Optionally extract a TCGPlayer product ID if the URL happens to be one
-    product_id = _extract_tcgplayer_id(url)
+    # ── Resolve optional set number ───────────────────────────────────────────
+    set_number = (
+        ext.get("serial")     or
+        ext.get("set_number") or
+        ext.get("number")     or
+        ""
+    ).strip()
+
+    game = ext.get("game", "").strip()
+
+    # ── Call JustTCG ──────────────────────────────────────────────────────────
+    try:
+        api_data = _justtcg_search(card_name, number=set_number, game=game)
+    except urllib.error.HTTPError as exc:
+        return jsonify({
+            "status":  "error",
+            "message": f"JustTCG API returned HTTP {exc.code}: {exc.reason}",
+        }), 502
+    except urllib.error.URLError as exc:
+        return jsonify({
+            "status":  "error",
+            "message": f"Could not reach JustTCG: {exc.reason}",
+        }), 502
+    except (json.JSONDecodeError, ValueError) as exc:
+        return jsonify({
+            "status":  "error",
+            "message": f"Unexpected response from JustTCG: {exc}",
+        }), 502
+
+    products = api_data.get("products") or api_data.get("results") or api_data.get("data") or []
+
+    if not products:
+        return jsonify({
+            "status":   "not_found",
+            "message":  f'No results found on JustTCG for "{card_name}".',
+            "searched": {"name": card_name, "number": set_number, "game": game},
+        })
+
+    # Use the first (best-ranked) result
+    hit      = products[0]
+    prices   = hit.get("prices") or {}
+    market   = prices.get("market") or prices.get("marketPrice")
+    low      = prices.get("low")    or prices.get("lowPrice")
+    mid      = prices.get("mid")    or prices.get("midPrice")
+    high     = prices.get("high")   or prices.get("highPrice")
+
+    product_url = (
+        hit.get("url") or
+        f"https://justtcg.com/product/{hit['id']}" if hit.get("id") else
+        "https://justtcg.com"
+    )
 
     entry = {
-        "url":      url,
-        "full_url": url,
-        "saved_at": datetime.utcnow().isoformat(),
+        # Keep the `url` key so copy-from and other existing code still works
+        "url":         product_url,
+        "full_url":    product_url,
+        "saved_at":    datetime.utcnow().isoformat(),
+        "source":      "justtcg",
+        "product_id":  str(hit.get("id", "")),
+        "product_name": hit.get("name", card_name),
+        "set_name":    hit.get("set_name") or hit.get("setName") or "",
+        "set_number":  hit.get("number")   or hit.get("cardNumber") or set_number,
+        "prices": {
+            "market": market,
+            "low":    low,
+            "mid":    mid,
+            "high":   high,
+        },
     }
-    if product_id:
-        entry["product_id"] = product_id
 
     updated = dict(record.extracted_data or {})
     updated["tcgplayer"] = entry
@@ -1422,22 +1531,53 @@ def tcg_save_url(record_id):
     db.session.commit()
 
     return jsonify({
-        "status":     "success",
-        "message":    "URL saved",
-        "url":        url,
-        "product_id": product_id or "",
+        "status":  "success",
+        "message": f'Price data fetched for "{hit.get("name", card_name)}".',
+        "entry":   entry,
     })
+
+
+@app.route("/tcg_save_url/<int:record_id>", methods=["POST"])
+def tcg_save_url(record_id):
+    """
+    Legacy compatibility shim — kept so the copy-from feature (which may copy
+    a pricing URL from an older record) still works without errors.
+    Saves a plain URL entry under extracted_data['tcgplayer'].
+    """
+    record = ScanRecord.query.get_or_404(record_id)
+    data   = request.get_json() or {}
+    url    = data.get("url", "").strip()
+
+    if not url:
+        return jsonify({"status": "error", "message": "No URL provided"}), 400
+
+    if not (url.startswith("http://") or url.startswith("https://")):
+        url = "https://" + url
+
+    entry = {
+        "url":      url,
+        "full_url": url,
+        "saved_at": datetime.utcnow().isoformat(),
+        "source":   "manual",
+    }
+
+    updated = dict(record.extracted_data or {})
+    updated["tcgplayer"] = entry
+    record.extracted_data = updated
+    db.session.commit()
+
+    return jsonify({"status": "success", "message": "URL saved", "url": url})
 
 
 @app.route("/tcg_clear_url/<int:record_id>", methods=["POST"])
 def tcg_clear_url(record_id):
-    """Remove the saved TCGPlayer URL from this record."""
+    """Remove the saved JustTCG / pricing data from this record."""
     record  = ScanRecord.query.get_or_404(record_id)
     updated = dict(record.extracted_data or {})
     updated.pop("tcgplayer", None)
     record.extracted_data = updated
     db.session.commit()
-    return jsonify({"status": "success", "message": "TCGPlayer link removed"})
+    return jsonify({"status": "success", "message": "Pricing data removed"})
 
 
 # ====================== DUPLICATE IMAGE MANAGER ROUTES ======================
@@ -1885,7 +2025,8 @@ if __name__ == "__main__":
     print(" • /import       — 3x3 split, alignment, manual corner override, batch OCR")
     print(" • /records_summary — Copy-from dropdown API")
     print(" • /template_save   — Save new percentage-based ROI template")
-    print(" • /tcg_save_url/<id>, /tcg_clear_url/<id> — TCGPlayer link management")
+    print(" • /justtcg_fetch/<id>              — Fetch live price from JustTCG API (POST, manual trigger)")
+    print(" • /tcg_save_url/<id>, /tcg_clear_url/<id> — Legacy URL save / pricing data clear")
     print(" • Visit: http://127.0.0.1:5000")
 
     app.run(host="0.0.0.0", port=5005, debug=True)
