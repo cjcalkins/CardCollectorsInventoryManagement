@@ -623,7 +623,6 @@ def index():
 # They are excluded from the dynamic entry-field columns.
 _STATIC_ENTRY_KEYS = frozenset({
     "game", "album", "page", "slot",
-    "holographic", "finalized", "empty",
     "__roi_fields_used",
 })
 _INTERNAL_KEY_PREFIXES = ("__ocr_", "__")
@@ -843,8 +842,31 @@ def inventory_filter_options():
     })
 
 
-@app.route("/inventory/<int:record_id>")
-def inventory_detail(record_id):
+@app.route("/game_fields")
+def game_fields():
+    """
+    Return the distinct entry-field keys used by existing records for a given game,
+    plus albums that exist for that game.
+    Used by the scan page to pre-populate a new entry with the correct field set.
+    """
+    game = request.args.get("game", "").strip()
+    if not game:
+        return jsonify({"fields": [], "albums": []})
+
+    records = ScanRecord.query.filter(
+        ScanRecord.extracted_data["game"].astext == game
+    ).limit(200).all()
+
+    fields = discover_entry_fields(records)
+    albums = sorted({
+        str((r.extracted_data or {}).get("album", "")).strip()
+        for r in records
+        if (r.extracted_data or {}).get("album")
+    })
+    return jsonify({"fields": fields, "albums": albums})
+
+
+
     record = ScanRecord.query.get_or_404(record_id)
 
     # Determine prev/next IDs using the same ordering as the inventory list:
@@ -1032,62 +1054,7 @@ def update_scan_image(record_id):
     })
 
 
-@app.route("/set_empty/<int:record_id>", methods=["POST"])
-def set_empty(record_id):
-    """
-    Mark a record as Empty:
-      - Sets extracted_data['empty'] = True
-      - Overwrites every editable string field to 'EMPTY'
-      - Sets image_path to the '__blank__' sentinel so the template
-        renders static/blank.jpg instead of the original scan.
-    Fields that are structural / non-display are left untouched.
-    """
-    record = ScanRecord.query.get_or_404(record_id)
-    data = dict(record.extracted_data or {})
-
-    _SKIP_EMPTY = frozenset({
-        "game", "album", "page", "slot",
-        "tcgplayer", "card_lookup", "__roi_fields_used",
-        "first_edition", "edition",
-        "holographic", "finalized",
-    })
-
-    for key, value in data.items():
-        if key in _SKIP_EMPTY:
-            continue
-        if key.startswith("__"):
-            continue
-        if isinstance(value, str):
-            data[key] = "EMPTY"
-
-    data["empty"] = True
-    record.extracted_data = data
-    record.image_path = "__blank__"
-    db.session.commit()
-
-    return jsonify({"status": "success", "message": "Record marked as empty"})
-
-
-@app.route("/clear_empty/<int:record_id>", methods=["POST"])
-def clear_empty(record_id):
-    """
-    Unmark a record as Empty:
-      - Sets extracted_data['empty'] = False
-      - Clears image_path so the 'No image' state shows (user can re-upload).
-      Field values are NOT automatically restored — user must re-enter them.
-    """
-    record = ScanRecord.query.get_or_404(record_id)
-    data = dict(record.extracted_data or {})
-    data["empty"] = False
-    record.extracted_data = data
-    if record.image_path == "__blank__":
-        record.image_path = ""
-    db.session.commit()
-
-    return jsonify({"status": "success", "message": "Empty flag cleared"})
-
-
-
+@app.route("/delete_scan/<int:record_id>", methods=["POST"])
 def delete_scan(record_id):
     record = ScanRecord.query.get_or_404(record_id)
     image_path = record.image_path
@@ -1537,6 +1504,12 @@ def run_custom_ocr():
     )
 
     extracted = ocr_with_custom_fields(image_path, normalized_fields)
+
+    # Merge in the manually supplied location/game metadata
+    for key in ("game", "album", "page", "slot"):
+        val = str(data.get(key, "")).strip()
+        if val:
+            extracted[key] = val
 
     matched_product, record = create_scan_record(
         image_path=filename,

@@ -205,6 +205,47 @@
                         </button>
                     </div>
                 </div>
+
+                <!-- Entry metadata — shown alongside ROI card after upload -->
+                <div class="card mt-4 hidden" id="entryMetaCard" style="border:none;border-radius:14px;box-shadow:0 4px 20px rgba(0,0,0,0.08);">
+                    <div class="card-header bg-light">
+                        <strong><i class="fas fa-tags me-2"></i>Entry Details</strong>
+                    </div>
+                    <div class="card-body d-flex flex-column gap-3">
+
+                        <!-- Game -->
+                        <div>
+                            <label class="form-label fw-semibold small mb-1">Game <span class="text-danger">*</span></label>
+                            <select class="form-select form-select-sm" id="entryGame">
+                                <option value="">— select game —</option>
+                            </select>
+                        </div>
+
+                        <!-- Album — filtered by game -->
+                        <div>
+                            <label class="form-label fw-semibold small mb-1">Album <span class="text-danger">*</span></label>
+                            <select class="form-select form-select-sm" id="entryAlbum" disabled>
+                                <option value="">— select game first —</option>
+                            </select>
+                        </div>
+
+                        <!-- Page -->
+                        <div>
+                            <label class="form-label fw-semibold small mb-1">Page <span class="text-danger">*</span></label>
+                            <input type="number" class="form-control form-control-sm" id="entryPage"
+                                   min="1" placeholder="e.g. 1">
+                        </div>
+
+                        <!-- Slot -->
+                        <div>
+                            <label class="form-label fw-semibold small mb-1">Slot <span class="text-danger">*</span></label>
+                            <input type="number" class="form-control form-control-sm" id="entrySlot"
+                                   min="1" placeholder="e.g. 3">
+                        </div>
+
+                        <div id="entryMetaStatus"></div>
+                    </div>
+                </div>
             </div>
 
             <!-- ============================================================
@@ -225,7 +266,7 @@
                 <div class="card results-card mt-4 hidden" id="resultsCard">
                     <div class="card-header bg-light"><strong>OCR Results</strong></div>
                     <div class="card-body">
-                        <div id="ocrResults" class="result-pre"></div>
+                        <div id="ocrResults"></div>
                     </div>
                 </div>
             </div>
@@ -396,10 +437,14 @@
             currentFields = toPercent(JSON.parse(JSON.stringify(templateFields)));
             previewCard.classList.remove('hidden');
             roiCard.classList.remove('hidden');
+            entryMetaCard.classList.remove('hidden');
             renderScanBoxes();
             renderFieldEditor();
         };
         previewImage.src = data.image_url + '?t=' + Date.now();
+
+        // Populate the game dropdown from existing inventory
+        populateGames();
     });
 
     resetTemplateBtn.addEventListener('click', function () {
@@ -408,21 +453,136 @@
         renderFieldEditor();
     });
 
+    // ── Entry metadata elements ──────────────────────────────────────────────
+    const entryMetaCard   = document.getElementById('entryMetaCard');
+    const entryGame       = document.getElementById('entryGame');
+    const entryAlbum      = document.getElementById('entryAlbum');
+    const entryPage       = document.getElementById('entryPage');
+    const entrySlot       = document.getElementById('entrySlot');
+    const entryMetaStatus = document.getElementById('entryMetaStatus');
+
+    async function populateGames() {
+        try {
+            const res  = await fetch('/inventory/filter_options');
+            const data = await res.json();
+            entryGame.innerHTML = '<option value="">— select game —</option>';
+            (data.games || []).forEach(g => {
+                const o = document.createElement('option');
+                o.value = o.textContent = g;
+                entryGame.appendChild(o);
+            });
+        } catch (e) {
+            console.error('Could not load games:', e);
+        }
+    }
+
+    entryGame.addEventListener('change', async function () {
+        const game = this.value;
+        entryAlbum.innerHTML = '<option value="">— loading… —</option>';
+        entryAlbum.disabled = true;
+
+        if (!game) {
+            entryAlbum.innerHTML = '<option value="">— select game first —</option>';
+            return;
+        }
+
+        try {
+            const res  = await fetch(`/game_fields?game=${encodeURIComponent(game)}`);
+            const data = await res.json();
+            entryAlbum.innerHTML = '<option value="">— select album —</option>';
+            (data.albums || []).forEach(a => {
+                const o = document.createElement('option');
+                o.value = o.textContent = a;
+                entryAlbum.appendChild(o);
+            });
+            entryAlbum.disabled = false;
+        } catch (e) {
+            entryAlbum.innerHTML = '<option value="">— error loading albums —</option>';
+        }
+    });
+
+    function validateEntryMeta() {
+        const missing = [];
+        if (!entryGame.value)  missing.push('Game');
+        if (!entryAlbum.value) missing.push('Album');
+        if (!entryPage.value)  missing.push('Page');
+        if (!entrySlot.value)  missing.push('Slot');
+        return missing;
+    }
+
     runOcrBtn.addEventListener('click', async function () {
         if (!currentFilename) return;
-        const res  = await fetch('/run_custom_ocr', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                image_path:    currentFilename,
-                template_name: currentTemplateName,
-                fields:        currentFields,
-                preview_meta: { width: previewImage.clientWidth, height: previewImage.clientHeight }
-            })
-        });
-        const data = await res.json();
-        resultsCard.classList.remove('hidden');
-        ocrResults.textContent = JSON.stringify(data, null, 2);
+
+        // Validate entry metadata before running
+        const missing = validateEntryMeta();
+        if (missing.length) {
+            entryMetaStatus.innerHTML = `<div class="alert alert-warning py-2 mb-0">
+                Please fill in: <strong>${missing.join(', ')}</strong></div>`;
+            entryMetaCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            return;
+        }
+        entryMetaStatus.innerHTML = '';
+
+        runOcrBtn.disabled = true;
+        runOcrBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Running…';
+
+        try {
+            const res  = await fetch('/run_custom_ocr', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    image_path:    currentFilename,
+                    template_name: currentTemplateName,
+                    fields:        currentFields,
+                    preview_meta:  { width: previewImage.clientWidth, height: previewImage.clientHeight },
+                    game:  entryGame.value,
+                    album: entryAlbum.value,
+                    page:  entryPage.value,
+                    slot:  entrySlot.value,
+                })
+            });
+            const data = await res.json();
+
+            resultsCard.classList.remove('hidden');
+
+            if (data.error) {
+                ocrResults.innerHTML = `<div class="alert alert-danger mb-0">${data.error}</div>`;
+                return;
+            }
+
+            // Build a friendly results summary
+            const extracted = data.extracted || {};
+            const fieldRows = Object.entries(extracted)
+                .filter(([k]) => !k.startsWith('__') && k !== 'game' && k !== 'album' && k !== 'page' && k !== 'slot')
+                .map(([k, v]) => `<tr><td class="text-muted small pe-3">${k.replace(/_/g,' ')}</td>
+                                      <td class="small fw-semibold">${v ?? ''}</td></tr>`)
+                .join('');
+
+            ocrResults.innerHTML = `
+                <div class="alert alert-success d-flex align-items-center gap-2 mb-3 py-2">
+                    <i class="fas fa-check-circle"></i>
+                    <span>Entry saved — Record #${data.record_id}</span>
+                    <a href="/inventory/${data.record_id}" class="btn btn-sm btn-success ms-auto">
+                        Open Entry <i class="fas fa-arrow-right ms-1"></i>
+                    </a>
+                </div>
+                <div class="mb-2 small text-muted">
+                    <strong>Game:</strong> ${entryGame.value} &nbsp;·&nbsp;
+                    <strong>Album:</strong> ${entryAlbum.value} &nbsp;·&nbsp;
+                    <strong>Page:</strong> ${entryPage.value} &nbsp;·&nbsp;
+                    <strong>Slot:</strong> ${entrySlot.value}
+                </div>
+                ${fieldRows ? `<table class="table table-sm mb-0">${fieldRows}</table>` : ''}`;
+
+            // Reset OCR button for next scan
+            runOcrBtn.disabled = false;
+            runOcrBtn.innerHTML = '<i class="fas fa-play me-1"></i>Run OCR';
+
+        } catch (err) {
+            ocrResults.innerHTML = `<div class="alert alert-danger mb-0">Error: ${err.message}</div>`;
+            runOcrBtn.disabled = false;
+            runOcrBtn.innerHTML = '<i class="fas fa-play me-1"></i>Run OCR';
+        }
     });
 
     function renderScanBoxes() {
