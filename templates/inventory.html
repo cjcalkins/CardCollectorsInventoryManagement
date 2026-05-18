@@ -267,7 +267,13 @@
                                 </td>
                                 <td>{{ record.scan_date.strftime('%Y-%m-%d %H:%M') }}</td>
                                 <td>
-                                    {% if record.image_path %}
+                                    {% if record.image_path == '__blank__' %}
+                                    <img
+                                        src="{{ url_for('static', filename='blank.jpg') }}"
+                                        class="thumbnail"
+                                        alt="Empty slot"
+                                    >
+                                    {% elif record.image_path %}
                                     <img
                                         src="{{ url_for('uploaded_file', filename=record.image_path.replace('\\', '/')) }}"
                                         class="thumbnail"

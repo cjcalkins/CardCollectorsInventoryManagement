@@ -147,7 +147,9 @@
                         {% set img_url = build_uploaded_file_url(item.record.image_path) %}
                         <a href="{{ url_for('inventory_detail', record_id=item.record.id) }}" class="slot-link" title="{{ item.name }}">
                             <div class="slot-image-wrap">
-                                {% if img_url %}
+                                {% if item.record.image_path == '__blank__' %}
+                                <img src="{{ url_for('static', filename='blank.jpg') }}" alt="Empty slot" class="slot-image">
+                                {% elif img_url %}
                                 <img src="{{ img_url }}" alt="{{ item.name }}" class="slot-image">
                                 {% else %}
                                 <span class="text-muted small">No image</span>
