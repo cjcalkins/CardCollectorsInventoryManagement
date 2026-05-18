@@ -718,6 +718,8 @@ def utility_functions():
             album=request.args.get("album", ""),
             template=request.args.get("template", ""),
             per_page=request.args.get("per_page", 50),
+            sort=request.args.get("sort", ""),
+            sort_dir=request.args.get("sort_dir", "asc"),
         )
     return dict(
         build_inventory_url=build_inventory_url,
@@ -781,6 +783,50 @@ def discover_entry_fields(records) -> list:
     return sorted(seen, key=_sort_key)
 
 
+_EDITION_SORT_ORDER = {"Standard Edition": 0, "First Edition": 1, "Limited Edition": 2}
+
+
+def _rep_sort_key(record, sort_col, group_info):
+    """Return a comparable sort key for a representative ScanRecord."""
+    data = record.extracted_data or {}
+
+    if sort_col == "date":
+        return record.scan_date or datetime.min
+    if sort_col == "game":
+        return (data.get("game") or "").lower()
+    if sort_col == "album":
+        return (data.get("album") or "").lower()
+    if sort_col == "page":
+        try:
+            return int(data.get("page") or 0)
+        except (ValueError, TypeError):
+            return 0
+    if sort_col == "slot":
+        try:
+            return int(data.get("slot") or 0)
+        except (ValueError, TypeError):
+            return 0
+    if sort_col == "template":
+        return (record.template_used or "").lower()
+    if sort_col == "tcg_url":
+        return 0 if bool((data.get("tcgplayer") or {}).get("url")) else 1
+    if sort_col == "market_price":
+        try:
+            return float((data.get("tcgplayer") or {}).get("prices", {}).get("market") or 0)
+        except (ValueError, TypeError):
+            return 0.0
+    if sort_col == "finalized":
+        fin = data.get("finalized", False)
+        return 0 if (fin is True or str(fin).strip().lower() == "true") else 1
+    if sort_col == "edition":
+        ed = data.get("edition", "Standard Edition") or "Standard Edition"
+        return _EDITION_SORT_ORDER.get(ed, 99)
+    if sort_col == "qty":
+        return group_info.get(record.id, {}).get("count", 1)
+    # Dynamic entry field (sort_col is the raw extracted_data key, e.g. "name", "atk")
+    return (data.get(sort_col) or "").lower()
+
+
 @app.route("/inventory")
 def inventory():
     page       = request.args.get("page", 1, type=int)
@@ -789,6 +835,11 @@ def inventory():
     f_game     = request.args.get("game", "").strip()
     f_album    = request.args.get("album", "").strip()
     f_template = request.args.get("template", "").strip()
+    sort_col   = request.args.get("sort", "").strip()
+    sort_dir   = request.args.get("sort_dir", "asc").strip()
+
+    if sort_dir not in ("asc", "desc"):
+        sort_dir = "asc"
 
     per_page = min(per_page, 200)
 
@@ -808,7 +859,23 @@ def inventory():
     all_records = query.all()
     group_info, rep_records = build_group_info(all_records)
 
-    # Paginate over the deduplicated representative list
+    # Apply server-side sort across ALL representative records before paginating.
+    # Columns named "entry_<field>" (matching the JS data-col convention) have their
+    # prefix stripped so we look up the raw extracted_data key.
+    effective_sort = sort_col
+    if effective_sort.startswith("entry_"):
+        effective_sort = effective_sort[len("entry_"):]
+
+    if effective_sort:
+        try:
+            rep_records.sort(
+                key=lambda r: _rep_sort_key(r, effective_sort, group_info),
+                reverse=(sort_dir == "desc"),
+            )
+        except Exception:
+            pass  # fall back to default ordering if sort fails
+
+    # Paginate over the deduplicated (and now sorted) representative list
     total_reps = len(rep_records)
     start      = (page - 1) * per_page
     end        = start + per_page
@@ -858,6 +925,8 @@ def inventory():
         per_page=per_page,
         entry_fields=entry_fields,
         group_info=group_info,
+        sort_col=sort_col,
+        sort_dir=sort_dir,
     )
 
 
@@ -1066,11 +1135,48 @@ def inventory_detail(record_id):
         .first()
     )
 
+    # ── Find all duplicate records that belong to the same stack ──
+    # A stack is defined by matching: name, serial, edition, holographic, finalized==True.
+    # Only groups where finalized is True are stacked (same logic as build_group_info).
+    data = record.extracted_data or {}
+    finalized = data.get("finalized", False)
+    is_final = finalized is True or str(finalized).strip().lower() == "true"
+
+    stack_locations = []  # list of dicts: {id, album, page, slot, record_id}
+    if is_final:
+        name   = _get_name(data)
+        serial = _get_serial(data)
+        edition = _get_edition(data)
+        holo   = str(data.get("holographic", "")).strip().lower()
+
+        # Fetch all finalized records and filter to the same group key
+        all_records = ScanRecord.query.order_by(ScanRecord.scan_date.asc(), ScanRecord.id.asc()).all()
+        for r in all_records:
+            if r.id == record.id:
+                continue
+            rdata = r.extracted_data or {}
+            rfin = rdata.get("finalized", False)
+            if not (rfin is True or str(rfin).strip().lower() == "true"):
+                continue
+            if (
+                _get_name(rdata)   == name
+                and _get_serial(rdata) == serial
+                and _get_edition(rdata) == edition
+                and str(rdata.get("holographic", "")).strip().lower() == holo
+            ):
+                stack_locations.append({
+                    "record_id": r.id,
+                    "album": rdata.get("album", ""),
+                    "page":  rdata.get("page",  ""),
+                    "slot":  rdata.get("slot",  ""),
+                })
+
     return render_template(
         "inventory_detail.html",
         record=record,
         prev_id=prev_record.id if prev_record else None,
         next_id=next_record.id if next_record else None,
+        stack_locations=stack_locations,
     )
 
 

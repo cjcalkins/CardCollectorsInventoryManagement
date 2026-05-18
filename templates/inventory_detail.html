@@ -217,6 +217,43 @@
                         <div id="imageStatusMessage" class="mt-3"></div>
                     </div>
                 </div>
+
+                {% if stack_locations %}
+                <!-- ==================== LOCATIONS PANE ==================== -->
+                <div class="card detail-card">
+                    <div class="card-header bg-light d-flex align-items-center gap-2">
+                        <strong><i class="fas fa-map-marker-alt me-2"></i>Locations</strong>
+                        <span class="badge bg-secondary ms-auto">{{ stack_locations | length + 1 }} copies</span>
+                    </div>
+                    <div class="card-body p-0">
+                        <ul class="list-group list-group-flush rounded-bottom-3">
+                            <!-- This record's own location (always first) -->
+                            <li class="list-group-item d-flex align-items-center gap-2 py-2 px-3"
+                                style="background:rgba(13,110,253,0.07);border-left:3px solid #0d6efd;">
+                                <i class="fas fa-circle-dot text-primary" style="font-size:0.7rem;"></i>
+                                <span class="fw-semibold text-primary small">This record</span>
+                                <span class="ms-auto text-muted small font-monospace">
+                                    {{ record.extracted_data.get('album', '—') }} &mdash;
+                                    Pg&nbsp;{{ record.extracted_data.get('page', '?') }}&nbsp;/&nbsp;Slot&nbsp;{{ record.extracted_data.get('slot', '?') }}
+                                </span>
+                            </li>
+                            {% for loc in stack_locations %}
+                            <li class="list-group-item d-flex align-items-center gap-2 py-2 px-3">
+                                <i class="fas fa-circle text-secondary" style="font-size:0.5rem;opacity:0.5;"></i>
+                                <a href="{{ url_for('inventory_detail', record_id=loc.record_id) }}"
+                                   class="text-decoration-none small fw-semibold text-body">
+                                    #{{ loc.record_id }}
+                                </a>
+                                <span class="ms-auto text-muted small font-monospace">
+                                    {{ loc.album or '&mdash;' }} &mdash;
+                                    Pg&nbsp;{{ loc.page or '?' }}&nbsp;/&nbsp;Slot&nbsp;{{ loc.slot or '?' }}
+                                </span>
+                            </li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                </div>
+                {% endif %}
             </div>
 
             <!-- ==================== RIGHT COLUMN ==================== -->
@@ -233,7 +270,9 @@
                                        and key != '__roi_fields_used'
                                        and key != 'tcgplayer'
                                        and key != 'card_lookup'
-                                       and key != 'edition' %}
+                                       and key != 'edition'
+                                       and key != 'holographic'
+                                       and key != 'finalized' %}
                                     <div class="col-md-6">
                                         <label class="form-label">{{ key.replace('_', ' ').title() }}</label>
                                         <input type="text" class="form-control" name="{{ key }}"
@@ -255,6 +294,39 @@
                                     <option value="First Edition"    {% if sel_edition == 'First Edition'    %}selected{% endif %}>First Edition</option>
                                     <option value="Limited Edition"  {% if sel_edition == 'Limited Edition'  %}selected{% endif %}>Limited Edition</option>
                                 </select>
+                            </div>
+
+                            <!-- Holographic dropdown -->
+                            <div class="mt-3 p-3 border rounded-3 bg-light">
+                                <label class="form-label fw-semibold mb-2" for="holographicSelect">Holographic</label>
+                                <select class="form-select" id="holographicSelect" name="holographic">
+                                    {% set sel_holo = record.extracted_data.get('holographic', 'Standard') %}
+                                    {% if sel_holo not in ('Standard', 'Regular', 'Reverse', 'Special') %}
+                                        {% set sel_holo = 'Standard' %}
+                                    {% endif %}
+                                    <option value="Standard" {% if sel_holo == 'Standard' %}selected{% endif %}>Standard</option>
+                                    <option value="Regular"  {% if sel_holo == 'Regular'  %}selected{% endif %}>Regular</option>
+                                    <option value="Reverse"  {% if sel_holo == 'Reverse'  %}selected{% endif %}>Reverse</option>
+                                    <option value="Special"  {% if sel_holo == 'Special'  %}selected{% endif %}>Special</option>
+                                </select>
+                            </div>
+
+                            <!-- Finalized toggle -->
+                            <div class="mt-3 p-3 border rounded-3 bg-light">
+                                <label class="form-label fw-semibold mb-2 d-block">Finalized</label>
+                                {% set fin_val = record.extracted_data.get('finalized') %}
+                                {% set fin_bool = fin_val | string | lower in ('true', '1', 'yes') %}
+                                <div class="d-flex align-items-center gap-3">
+                                    <div class="form-check form-switch mb-0">
+                                        <input class="form-check-input" type="checkbox" role="switch"
+                                               id="finalizedToggle" name="finalized"
+                                               {% if fin_bool %}checked{% endif %}
+                                               style="width:3em; height:1.5em; cursor:pointer;">
+                                    </div>
+                                    <span id="finalizedLabel" class="fw-semibold {% if fin_bool %}text-success{% else %}text-secondary{% endif %}">
+                                        {% if fin_bool %}True{% else %}False{% endif %}
+                                    </span>
+                                </div>
                             </div>
 
                             <div class="d-flex gap-2 mt-4 flex-wrap">
@@ -440,16 +512,45 @@
             const updated = {};
             for (const [k, v] of new FormData(this).entries()) updated[k] = v.trim();
 
-            // edition is a <select> inside the form — FormData picks it up automatically.
+            // edition and holographic are <select> elements — FormData picks them up automatically.
+            // finalized is a checkbox; explicitly capture its boolean state since unchecked
+            // checkboxes are omitted from FormData.
+            const finalizedEl = document.getElementById('finalizedToggle');
+            if (finalizedEl) updated['finalized'] = finalizedEl.checked ? 'True' : 'False';
 
             const res  = await fetch(`/update_scan/${recordId}`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ extracted_data: updated }),
             });
             const data = await res.json();
-            document.getElementById('statusMessage').innerHTML = data.status === 'success'
-                ? `<div class="alert alert-success mb-0">${data.message}</div>`
-                : `<div class="alert alert-danger mb-0">${data.message || 'Save failed.'}</div>`;
+            const statusEl = document.getElementById('statusMessage');
+
+            if (data.status !== 'success') {
+                statusEl.innerHTML = `<div class="alert alert-danger mb-0">${data.message || 'Save failed.'}</div>`;
+                return;
+            }
+
+            // If a JustTCG URL was staged via "Copy from Entry", save it now
+            // alongside the rest of the form so it only persists on Save Changes.
+            if (pendingTcgUrl) {
+                try {
+                    const urlRes  = await fetch(`/tcg_save_url/${recordId}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ url: pendingTcgUrl }),
+                    });
+                    const urlData = await urlRes.json();
+                    if (urlData.status !== 'success') {
+                        console.error('Failed to save staged JustTCG URL:', urlData.message);
+                    }
+                } catch (err) {
+                    console.error('Failed to save staged JustTCG URL:', err);
+                }
+                pendingTcgUrl = null;
+            }
+
+            statusEl.innerHTML = `<div class="alert alert-success mb-0">${data.message}</div>`;
+            setTimeout(() => window.location.reload(), 700);
         });
 
         // ==================== IMAGE REPLACE ====================
@@ -542,6 +643,16 @@
             }
         });
 
+        // ==================== FINALIZED TOGGLE ====================
+        const finalizedToggle = document.getElementById('finalizedToggle');
+        const finalizedLabel  = document.getElementById('finalizedLabel');
+        if (finalizedToggle && finalizedLabel) {
+            finalizedToggle.addEventListener('change', function () {
+                finalizedLabel.textContent = this.checked ? 'True' : 'False';
+                finalizedLabel.className = 'fw-semibold ' + (this.checked ? 'text-success' : 'text-secondary');
+            });
+        }
+
         // ==================== JUSTTCG — CLEAR ====================
         document.getElementById('clearTcgBtn')?.addEventListener('click', async function () {
             if (!confirm('Remove the saved JustTCG price data from this record?')) return;
@@ -557,6 +668,10 @@
         const applycopying      = document.getElementById('applycopying');
         const clearCopySource   = document.getElementById('clearCopySource');
         const copyStatus        = document.getElementById('copyStatus');
+
+        // Staged JustTCG URL — set when copying from another entry,
+        // persisted to the server only when Save Changes is clicked.
+        let pendingTcgUrl = null;
 
         // Fields that are never overwritten when copying
         const NEVER_COPY = new Set([
@@ -670,7 +785,7 @@
             copyStatus.innerHTML = '';
         });
 
-        applycopying.addEventListener('click', async function () {
+        applycopying.addEventListener('click', function () {
             if (!selectedSource) return;
 
             const form   = document.getElementById('editForm');
@@ -702,36 +817,46 @@
                 }
             }
 
-            // Copy pricing URL if the source has one
+            // Handle holographic (string select)
+            {
+                const sel = document.getElementById('holographicSelect');
+                if (sel) {
+                    const opts = ['Standard', 'Regular', 'Reverse', 'Special'];
+                    sel.value = opts.includes(source.holographic) ? source.holographic : 'Standard';
+                }
+            }
+
+            // Handle finalized (toggle)
+            {
+                const tog = document.getElementById('finalizedToggle');
+                const lbl = document.getElementById('finalizedLabel');
+                if (tog && source.finalized !== undefined) {
+                    const val = String(source.finalized).toLowerCase() in {true:1,1:1,yes:1};
+                    tog.checked = val;
+                    lbl.textContent = val ? 'True' : 'False';
+                    lbl.className = 'fw-semibold ' + (val ? 'text-success' : 'text-secondary');
+                }
+            }
+
+            // Stage the pricing URL — it will be saved when Save Changes is clicked,
+            // not immediately. This avoids an auto-save + page reload here.
             const tcgUrl = source?.tcgplayer?.url;
             if (tcgUrl) {
-                try {
-                    const res = await fetch(`/tcg_save_url/${recordId}`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ url: tcgUrl }),
-                    });
-                    const data = await res.json();
-                    if (data.status === 'success') copied++;
-                } catch (e) {
-                    console.error('Failed to copy pricing URL:', e);
-                }
+                pendingTcgUrl = tcgUrl;
+                copied++;
             }
 
             const savedId = selectedSource.id;
 
-            // Clear selection before any reload
+            // Clear selection state
             selectedSource = null;
             copySearchInput.value = '';
             copyPreview.classList.add('d-none');
 
             copyStatus.innerHTML = `<div class="alert alert-success py-2 mb-0">
                 Copied ${copied} field(s)${tcgUrl ? ' (including pricing URL)' : ''} from Record #${savedId}.
-                <strong>Remember to click Save Changes to persist.</strong>
+                <strong>Click Save Changes to persist.</strong>
             </div>`;
-
-            // Reload if the URL was copied so the Price URL panel updates
-            if (tcgUrl) setTimeout(() => window.location.reload(), 1200);
         });
 
         function escHtml(s) {

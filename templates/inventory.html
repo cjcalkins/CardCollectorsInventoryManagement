@@ -498,6 +498,12 @@
             per_page: {{ per_page   | tojson }},
         };
 
+        // Current sort state injected from server so header indicators survive page loads
+        let sortState = {
+            col: {{ sort_col | tojson }},
+            dir: {{ sort_dir | tojson }},
+        };
+
         // ====================== LOAD DROPDOWN OPTIONS FROM SERVER ======================
         async function loadFilterOptions() {
             try {
@@ -898,97 +904,48 @@
         });
 
         // ── Sorting ─────────────────────────────────────────────────────────────
-        let sortState = { col: null, dir: 'asc' };
+        // sortState is already declared above, seeded from the server.
 
-        // Defined sort order for the Edition enum column.
+        // Defined sort order for the Edition enum column (used only for icon display).
         const EDITION_ORDER = { 'Standard Edition': 0, 'First Edition': 1, 'Limited Edition': 2 };
 
-        function getCellValue(row, colKey) {
-            if (colKey === 'tcg_url') {
-                const td = row.querySelector('td[data-col-static="tcg_url"]');
-                if (!td) return 'False';
-                return td.querySelector('.badge.bg-success') ? 'True' : 'False';
+        function sortTable(colKey /*, sortType — unused, server decides */) {
+            // Toggle direction if same column, otherwise start ascending.
+            let newDir = 'asc';
+            if (sortState.col === colKey) {
+                newDir = sortState.dir === 'asc' ? 'desc' : 'asc';
             }
-            if (colKey === 'market_price') {
-                const td = row.querySelector('td[data-col-static="market_price"]');
-                if (!td) return '0';
-                const span = td.querySelector('.text-success');
-                if (!span) return '0';
-                return span.textContent.replace('$', '').trim();
+
+            const params = new URLSearchParams({
+                search:   activeFilters.search   || '',
+                game:     activeFilters.game     || '',
+                album:    activeFilters.album    || '',
+                template: activeFilters.template || '',
+                per_page: activeFilters.per_page || 50,
+                page:     '1',   // always reset to page 1 on sort change
+                sort:     colKey,
+                sort_dir: newDir,
+            });
+            for (const [k, v] of [...params.entries()]) {
+                if (!v) params.delete(k);
             }
-            if (colKey === 'finalized') {
-                const td = row.querySelector('td[data-col-static="finalized"]');
-                if (!td) return 'False';
-                return td.querySelector('input[type="checkbox"]')?.checked ? 'True' : 'False';
-            }
-            if (colKey === 'edition') {
-                const td = row.querySelector('td[data-col-static="edition"]');
-                if (!td) return 'Standard Edition';
-                return td.querySelector('.badge')?.textContent.trim() || 'Standard Edition';
-            }
-            if (colKey === 'qty') {
-                const td = row.querySelector('td[data-col-static="qty"]');
-                if (!td) return '1';
-                const badge = td.querySelector('.badge');
-                return badge ? badge.textContent.trim() : '1';
-            }
-            if (colKey.startsWith('entry_')) {
-                const fieldKey = colKey.slice('entry_'.length);
-                const td = row.querySelector(`td[data-entry-field="${CSS.escape(fieldKey)}"]`);
-                return td ? td.textContent.trim() : '';
-            }
-            const idx = STATIC_COL_INDEX[colKey];
-            if (idx === undefined) return '';
-            const cell = row.cells[idx];
-            if (!cell) return '';
-            return cell.textContent.trim();
+            window.location.href = '/inventory?' + params.toString();
         }
 
-        function sortTable(colKey, sortType) {
-            const tbody = document.querySelector('#inventoryTable tbody');
-            if (!tbody) return;
-
-            const rows = Array.from(tbody.querySelectorAll('tr'));
-
-            if (sortState.col === colKey) {
-                sortState.dir = sortState.dir === 'asc' ? 'desc' : 'asc';
-            } else {
-                sortState.col = colKey;
-                sortState.dir = 'asc';
-            }
-
-            const dir = sortState.dir === 'asc' ? 1 : -1;
-
-            rows.sort((a, b) => {
-                const va = getCellValue(a, colKey);
-                const vb = getCellValue(b, colKey);
-
-                if (sortType === 'num') {
-                    return ((parseFloat(va) || 0) - (parseFloat(vb) || 0)) * dir;
-                }
-                if (sortType === 'date') {
-                    return (new Date(va) - new Date(vb)) * dir;
-                }
-                if (sortType === 'enum') {
-                    return ((EDITION_ORDER[va] ?? 99) - (EDITION_ORDER[vb] ?? 99)) * dir;
-                }
-                return va.localeCompare(vb, undefined, { sensitivity: 'base' }) * dir;
-            });
-
-            rows.forEach(r => tbody.appendChild(r));
-
+        // Apply visual sort indicators based on the server-injected sortState.
+        (function applySortIndicators() {
+            if (!sortState.col) return;
             document.querySelectorAll('#inventoryTable thead th.sortable').forEach(th => {
                 th.classList.remove('sort-asc', 'sort-desc');
-                if (th.dataset.col === colKey) {
+                const icon = th.querySelector('.sort-icon');
+                if (th.dataset.col === sortState.col) {
                     th.classList.add(sortState.dir === 'asc' ? 'sort-asc' : 'sort-desc');
-                    const icon = th.querySelector('.sort-icon');
                     if (icon) icon.textContent = sortState.dir === 'asc' ? '↑' : '↓';
                 } else {
-                    const icon = th.querySelector('.sort-icon');
                     if (icon) icon.textContent = '⇅';
                 }
             });
-        }
+        })();
 
         // Attach sort click handlers to ALL sortable headers.
         // The handler checks that the click did not originate on the resize handle.
