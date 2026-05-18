@@ -158,6 +158,9 @@
                 <button class="btn btn-outline-success" id="exportCsvBtn" type="button">
                     <i class="fas fa-file-csv me-1"></i>Export CSV
                 </button>
+                <button class="btn btn-outline-info" id="fetchMissingPricesBtn" type="button">
+                    <i class="fas fa-tags me-1"></i>Fetch Missing Prices
+                </button>
                 <button class="btn btn-success" id="addCustomFieldBtn" type="button">
                     <i class="fas fa-plus me-1"></i>Add Field to Game
                 </button>
@@ -247,6 +250,7 @@
                                 <th data-col="slot" class="sortable" data-sort-type="num">Slot <span class="sort-icon">⇅</span></th>
                                 <th data-col="template" class="sortable" data-sort-type="text">Template <span class="sort-icon">⇅</span></th>
                                 <th data-col="tcg_url" class="sortable" data-sort-type="text">Price URL <span class="sort-icon">⇅</span></th>
+                                <th data-col="market_price" class="sortable" data-sort-type="num">Market Price <span class="sort-icon">⇅</span></th>
                                 <th data-col="finalized" class="sortable" data-sort-type="text">Finalized <span class="sort-icon">⇅</span></th>
                                 <th data-col="edition" class="sortable" data-sort-type="enum">Edition <span class="sort-icon">⇅</span></th>
                                 <th data-col="qty" class="sortable" data-sort-type="num">Qty <span class="sort-icon">⇅</span></th>
@@ -295,6 +299,14 @@
                                     <span class="badge bg-success">True</span>
                                     {% else %}
                                     <span class="badge bg-secondary text-white" style="opacity:0.5;">False</span>
+                                    {% endif %}
+                                </td>
+                                <td data-col-static="market_price" class="text-end">
+                                    {% set mp = record.extracted_data.get('tcgplayer', {}).get('prices', {}).get('market') %}
+                                    {% if mp is not none and mp != '' %}
+                                    <span class="text-success fw-semibold">${{ "%.2f"|format(mp|float) }}</span>
+                                    {% else %}
+                                    <span class="text-muted small">—</span>
                                     {% endif %}
                                 </td>
                                 <td data-col-static="finalized" class="text-center">
@@ -408,6 +420,68 @@
                 <div class="modal-footer">
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
                     <button type="button" id="applyCustomFieldBtn" class="btn btn-primary">Apply to All Matching Records</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Fetch Missing Prices Modal -->
+    <div class="modal fade" id="fetchPricesModal" tabindex="-1" aria-labelledby="fetchPricesModalLabel" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="fetchPricesModalLabel">
+                        <i class="fas fa-tags me-2"></i>Fetch Missing Prices
+                    </h5>
+                </div>
+                <div class="modal-body">
+                    <!-- Pre-run state -->
+                    <div id="fetchPricesIdle">
+                        <p class="mb-1 text-muted small" id="fetchPricesIdleMsg">
+                            Loading…
+                        </p>
+                    </div>
+                    <!-- Running state -->
+                    <div id="fetchPricesRunning" style="display:none;">
+                        <div class="mb-2 d-flex justify-content-between align-items-center">
+                            <span class="small fw-semibold text-muted">Progress</span>
+                            <span class="small text-muted" id="fetchPricesCounter">0 / 0</span>
+                        </div>
+                        <div class="progress mb-3" style="height:10px;">
+                            <div id="fetchPricesBar" class="progress-bar progress-bar-striped progress-bar-animated bg-info"
+                                 role="progressbar" style="width:0%"></div>
+                        </div>
+                        <div class="border rounded px-3 py-2 bg-light mb-3" style="min-height:48px;">
+                            <div class="small text-muted mb-1">Current card</div>
+                            <div id="fetchPricesCurrentCard" class="fw-semibold text-truncate">—</div>
+                        </div>
+                        <div class="d-flex gap-3 justify-content-center small">
+                            <span class="text-success"><i class="fas fa-check-circle me-1"></i><span id="fetchCountOk">0</span> fetched</span>
+                            <span class="text-warning"><i class="fas fa-minus-circle me-1"></i><span id="fetchCountSkip">0</span> skipped</span>
+                            <span class="text-danger"><i class="fas fa-times-circle me-1"></i><span id="fetchCountErr">0</span> errors</span>
+                        </div>
+                    </div>
+                    <!-- Done state -->
+                    <div id="fetchPricesDone" style="display:none;">
+                        <div class="alert alert-success mb-2" id="fetchPricesDoneMsg"></div>
+                        <div class="d-flex gap-3 justify-content-center small">
+                            <span class="text-success"><i class="fas fa-check-circle me-1"></i><span id="fetchDoneOk">0</span> fetched</span>
+                            <span class="text-warning"><i class="fas fa-minus-circle me-1"></i><span id="fetchDoneSkip">0</span> skipped</span>
+                            <span class="text-danger"><i class="fas fa-times-circle me-1"></i><span id="fetchDoneErr">0</span> errors</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" id="fetchPricesCancelBtn">Cancel</button>
+                    <button type="button" class="btn btn-info text-white" id="fetchPricesStartBtn" disabled>
+                        <i class="fas fa-play me-1"></i>Start
+                    </button>
+                    <button type="button" class="btn btn-warning" id="fetchPricesStopBtn" style="display:none;">
+                        <i class="fas fa-stop me-1"></i>Stop
+                    </button>
+                    <button type="button" class="btn btn-primary" id="fetchPricesCloseBtn" style="display:none;" data-bs-dismiss="modal">
+                        <i class="fas fa-check me-1"></i>Done
+                    </button>
                 </div>
             </div>
         </div>
@@ -668,7 +742,7 @@
 
         // Storage key bumped to v3 to drop old hidden-col state
         // that referenced the removed matched_product column.
-        const COL_STORAGE_KEY  = 'inventory_hidden_cols_v8';
+        const COL_STORAGE_KEY  = 'inventory_hidden_cols_v9';
         const COL_WIDTHS_KEY   = 'inventory_col_widths_v1';
 
         // Entry fields discovered server-side and injected as JSON.
@@ -684,7 +758,8 @@
             { key: 'page',        label: 'Page' },
             { key: 'slot',        label: 'Slot' },
             { key: 'template',    label: 'Template' },
-            { key: 'tcg_url',     label: 'Price URL' },
+            { key: 'tcg_url',      label: 'Price URL' },
+            { key: 'market_price', label: 'Market Price' },
             { key: 'finalized',   label: 'Finalized' },
             { key: 'edition',     label: 'Edition' },
             { key: 'qty',         label: 'Qty' },
@@ -753,8 +828,8 @@
                 });
             }
 
-            // Apply visibility for data-col-static columns (tcg_url, finalized, edition, qty)
-            ['tcg_url', 'finalized', 'edition', 'qty'].forEach(colKey => {
+            // Apply visibility for data-col-static columns (tcg_url, market_price, finalized, edition, qty)
+            ['tcg_url', 'market_price', 'finalized', 'edition', 'qty'].forEach(colKey => {
                 const hide = hiddenSet.has(colKey);
                 const th = table.querySelector(`thead th[data-col="${colKey}"]`);
                 if (th) th.style.display = hide ? 'none' : '';
@@ -833,6 +908,13 @@
                 const td = row.querySelector('td[data-col-static="tcg_url"]');
                 if (!td) return 'False';
                 return td.querySelector('.badge.bg-success') ? 'True' : 'False';
+            }
+            if (colKey === 'market_price') {
+                const td = row.querySelector('td[data-col-static="market_price"]');
+                if (!td) return '0';
+                const span = td.querySelector('.text-success');
+                if (!span) return '0';
+                return span.textContent.replace('$', '').trim();
             }
             if (colKey === 'finalized') {
                 const td = row.querySelector('td[data-col-static="finalized"]');
@@ -1005,6 +1087,164 @@
             applyColVisibility(hidden);
             attachResizeHandles();
             restoreColWidths();
+        })();
+
+        // ====================== FETCH MISSING PRICES ======================
+        (function () {
+            const modal       = new bootstrap.Modal(document.getElementById('fetchPricesModal'));
+            const idleDiv     = document.getElementById('fetchPricesIdle');
+            const runningDiv  = document.getElementById('fetchPricesRunning');
+            const doneDiv     = document.getElementById('fetchPricesDone');
+            const idleMsg     = document.getElementById('fetchPricesIdleMsg');
+            const counter     = document.getElementById('fetchPricesCounter');
+            const bar         = document.getElementById('fetchPricesBar');
+            const currentCard = document.getElementById('fetchPricesCurrentCard');
+            const countOk     = document.getElementById('fetchCountOk');
+            const countSkip   = document.getElementById('fetchCountSkip');
+            const countErr    = document.getElementById('fetchCountErr');
+            const doneMsg     = document.getElementById('fetchPricesDoneMsg');
+            const doneOk      = document.getElementById('fetchDoneOk');
+            const doneSkip    = document.getElementById('fetchDoneSkip');
+            const doneErr     = document.getElementById('fetchDoneErr');
+            const startBtn    = document.getElementById('fetchPricesStartBtn');
+            const stopBtn     = document.getElementById('fetchPricesStopBtn');
+            const cancelBtn   = document.getElementById('fetchPricesCancelBtn');
+            const closeBtn    = document.getElementById('fetchPricesCloseBtn');
+
+            let missingIds = [];
+            let stopRequested = false;
+            const DELAY_MS = 600; // ms between API calls — keeps server load low
+
+            function resetModal() {
+                idleDiv.style.display    = '';
+                runningDiv.style.display = 'none';
+                doneDiv.style.display    = 'none';
+                startBtn.style.display   = '';
+                stopBtn.style.display    = 'none';
+                cancelBtn.style.display  = '';
+                closeBtn.style.display   = 'none';
+                startBtn.disabled = true;
+                idleMsg.textContent = 'Loading…';
+                missingIds = [];
+                stopRequested = false;
+            }
+
+            async function loadMissingIds() {
+                try {
+                    const res  = await fetch('/justtcg_missing_ids');
+                    const data = await res.json();
+                    missingIds = data.ids || [];
+                    if (missingIds.length === 0) {
+                        idleMsg.textContent = '✅ All records already have a market price. Nothing to fetch.';
+                        startBtn.disabled = true;
+                    } else {
+                        idleMsg.textContent = `Found ${missingIds.length} record${missingIds.length !== 1 ? 's' : ''} without a market price. Click Start to begin fetching.`;
+                        startBtn.disabled = false;
+                    }
+                } catch (err) {
+                    idleMsg.textContent = '⚠️ Could not load missing IDs. Is the server running?';
+                    startBtn.disabled = true;
+                }
+            }
+
+            document.getElementById('fetchMissingPricesBtn')?.addEventListener('click', function () {
+                resetModal();
+                modal.show();
+                loadMissingIds();
+            });
+
+            startBtn.addEventListener('click', async function () {
+                if (!missingIds.length) return;
+                stopRequested = false;
+
+                // Switch to running UI
+                idleDiv.style.display    = 'none';
+                runningDiv.style.display = '';
+                startBtn.style.display   = 'none';
+                stopBtn.style.display    = '';
+                cancelBtn.style.display  = 'none';
+
+                const total = missingIds.length;
+                let done = 0, ok = 0, skip = 0, err = 0;
+
+                function updateProgress(label) {
+                    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+                    bar.style.width        = pct + '%';
+                    bar.setAttribute('aria-valuenow', pct);
+                    counter.textContent    = `${done} / ${total}`;
+                    currentCard.textContent = label;
+                    countOk.textContent    = ok;
+                    countSkip.textContent  = skip;
+                    countErr.textContent   = err;
+                }
+
+                updateProgress('Starting…');
+
+                for (let i = 0; i < missingIds.length; i++) {
+                    if (stopRequested) break;
+
+                    const id = missingIds[i];
+
+                    try {
+                        const res  = await fetch(`/justtcg_fetch/${id}`, { method: 'POST' });
+                        const data = await res.json();
+
+                        if (data.status === 'success') {
+                            ok++;
+                            const name = data.entry?.product_name || `#${id}`;
+                            updateProgress(name);
+                        } else if (data.status === 'not_found') {
+                            skip++;
+                            updateProgress(`Not found: #${id}`);
+                        } else {
+                            err++;
+                            updateProgress(`Error on #${id}`);
+                        }
+                    } catch (e) {
+                        err++;
+                        updateProgress(`Network error on #${id}`);
+                    }
+
+                    done++;
+                    updateProgress(currentCard.textContent); // refresh counters with incremented done
+
+                    // Delay between calls (skip delay after last item)
+                    if (i < missingIds.length - 1 && !stopRequested) {
+                        await new Promise(resolve => setTimeout(resolve, DELAY_MS));
+                    }
+                }
+
+                // Done — switch to finished UI
+                runningDiv.style.display = 'none';
+                doneDiv.style.display    = '';
+                stopBtn.style.display    = 'none';
+                closeBtn.style.display   = '';
+
+                const stopped = stopRequested && done < total;
+                doneMsg.textContent = stopped
+                    ? `Stopped after ${done} of ${total} record${total !== 1 ? 's' : ''}. Reload the page to see updated prices.`
+                    : `Finished! Processed ${total} record${total !== 1 ? 's' : ''}. Reload the page to see updated prices.`;
+                doneOk.textContent   = ok;
+                doneSkip.textContent = skip;
+                doneErr.textContent  = err;
+            });
+
+            stopBtn.addEventListener('click', function () {
+                stopRequested = true;
+                stopBtn.disabled = true;
+                stopBtn.textContent = 'Stopping…';
+            });
+
+            cancelBtn.addEventListener('click', function () {
+                modal.hide();
+            });
+
+            // Reset state when modal is fully hidden so re-opening is clean
+            document.getElementById('fetchPricesModal').addEventListener('hidden.bs.modal', function () {
+                stopRequested = true; // abort any in-flight loop
+                stopBtn.disabled = false;
+                stopBtn.innerHTML = '<i class="fas fa-stop me-1"></i>Stop';
+            });
         })();
 
         // ====================== INIT ======================

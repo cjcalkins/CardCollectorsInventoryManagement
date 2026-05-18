@@ -10,6 +10,8 @@ from datetime import datetime
 from PIL import Image
 from werkzeug.utils import secure_filename
 from models import db, Product, ScanRecord
+from dotenv import load_dotenv
+load_dotenv()
 
 app = Flask(__name__, template_folder="templates")
 
@@ -633,6 +635,77 @@ def _get_edition(data: dict) -> str:
     return EDITION_DEFAULT
 
 
+# ====================== GROUPING HELPER ======================
+def build_group_info(records):
+    """
+    Group a list of ScanRecord objects by (name, serial, edition, holographic).
+    Only records whose extracted_data has finalized == True (or 'True') are grouped;
+    unfinalized records are treated as singletons.
+
+    Returns:
+        group_info  – dict mapping representative record.id -> {
+                          'count':     int,
+                          'all_ids':   [int, ...],   # all IDs in the group
+                          'locations': [str, ...],   # "page/slot" strings for duplicates
+                      }
+        rep_records – list of the one representative ScanRecord per group,
+                      in the same relative order as the input list.
+    """
+    from collections import OrderedDict
+
+    # key -> list of records
+    groups: dict = OrderedDict()
+    singletons = []
+
+    for record in records:
+        data = record.extracted_data or {}
+
+        finalized = data.get("finalized", False)
+        is_final = finalized is True or str(finalized).strip().lower() == "true"
+
+        if not is_final:
+            singletons.append(record)
+            continue
+
+        name  = _get_name(data)
+        serial = _get_serial(data)
+        edition = _get_edition(data)
+        holo = str(data.get("holographic", "")).strip().lower()
+
+        group_key = (name, serial, edition, holo)
+        groups.setdefault(group_key, []).append(record)
+
+    group_info = {}
+    rep_records = []
+
+    for group_key, members in groups.items():
+        rep = members[0]  # representative = first encountered (most recent due to DESC ordering)
+        all_ids = [r.id for r in members]
+        locations = [
+            "{}/{}".format(
+                (r.extracted_data or {}).get("page", "?"),
+                (r.extracted_data or {}).get("slot", "?"),
+            )
+            for r in members[1:]  # skip the rep itself
+        ]
+        group_info[rep.id] = {
+            "count":     len(members),
+            "all_ids":   all_ids,
+            "locations": locations,
+        }
+        rep_records.append(rep)
+
+    for record in singletons:
+        group_info[record.id] = {
+            "count":     1,
+            "all_ids":   [record.id],
+            "locations": [],
+        }
+        rep_records.append(record)
+
+    return group_info, rep_records
+
+
 # ====================== CONTEXT PROCESSOR ======================
 @app.context_processor
 def utility_functions():
@@ -730,11 +803,48 @@ def inventory():
     if search:
         query = query.filter(ScanRecord.extracted_data.cast(db.Text).ilike(f"%{search}%"))
 
-    pagination = query.paginate(page=page, per_page=per_page, error_out=False)
+    # Build groups across the full filtered set so duplicates on other pages
+    # are still counted in the quantity badge.
+    all_records = query.all()
+    group_info, rep_records = build_group_info(all_records)
 
-    # Discover dynamic entry fields from ALL filtered records (not just current page)
-    # so the column set is stable across pages. Cap the scan to 500 rows for performance.
-    all_sample = query.limit(500).all()
+    # Paginate over the deduplicated representative list
+    total_reps = len(rep_records)
+    start      = (page - 1) * per_page
+    end        = start + per_page
+    page_reps  = rep_records[start:end]
+
+    # Lightweight pagination object compatible with the template
+    class _Pagination:
+        def __init__(self, items, total, cur_page, pp):
+            self.items    = items
+            self.total    = total
+            self.page     = cur_page
+            self.per_page = pp
+            self.pages    = max(1, -(-total // pp))  # ceiling division
+            self.has_prev = cur_page > 1
+            self.has_next = cur_page < self.pages
+            self.prev_num = cur_page - 1
+            self.next_num = cur_page + 1
+            self.first    = start + 1 if items else 0
+            self.last     = min(start + len(items), total)
+
+        def iter_pages(self, left_edge=1, right_edge=1, left_current=2, right_current=2):
+            last = self.pages
+            for num in range(1, last + 1):
+                if (
+                    num <= left_edge
+                    or num > last - right_edge
+                    or (self.page - left_current <= num <= self.page + right_current)
+                ):
+                    yield num
+                else:
+                    yield None
+
+    pagination = _Pagination(page_reps, total_reps, page, per_page)
+
+    # Discover dynamic entry fields from a sample of all filtered records
+    all_sample = all_records[:500]
     entry_fields = discover_entry_fields(all_sample)
 
     return render_template(
@@ -747,7 +857,7 @@ def inventory():
         f_template=f_template,
         per_page=per_page,
         entry_fields=entry_fields,
-        group_info={},
+        group_info=group_info,
     )
 
 
@@ -793,7 +903,8 @@ def inventory_export_csv():
         "page":     ("Page",      lambda r: str((r.extracted_data or {}).get("page", ""))),
         "slot":     ("Slot",      lambda r: str((r.extracted_data or {}).get("slot", ""))),
         "template": ("Template",  lambda r: str(r.template_used or "")),
-        "tcg_url":  ("Price URL", lambda r: str(((r.extracted_data or {}).get("tcgplayer") or {}).get("url", ""))),
+        "tcg_url":      ("Price URL",    lambda r: str(((r.extracted_data or {}).get("tcgplayer") or {}).get("url", ""))),
+        "market_price": ("Market Price", lambda r: str(((r.extracted_data or {}).get("tcgplayer") or {}).get("prices", {}).get("market", "") or "")),
     }
 
     # Parse the requested columns; fall back to all non-image/action static cols + all entry fields
@@ -1396,32 +1507,74 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
-JUSTTCG_SEARCH_URL = "https://justtcg.com/api/products/search"
+JUSTTCG_SEARCH_URL = "https://api.justtcg.com/v1/cards"
 JUSTTCG_TIMEOUT    = 10  # seconds
+JUSTTCG_API_KEY    = os.environ.get("JUSTTCG_API_KEY", "")
 
 
 def _justtcg_search(name: str, number: str = "", game: str = "") -> dict:
     """
-    Call the JustTCG search API and return the parsed JSON response.
+    Call the JustTCG /v1/cards search endpoint and return the parsed JSON response.
+    Uses `q` for card name search and `game` for game filtering.
     Raises urllib.error.URLError / ValueError on failure.
     """
-    params = {"name": name.strip()}
-    if number:
-        params["number"] = number.strip()
+    params = {"q": name.strip(), "include_price_history": "false"}
     if game:
         params["game"] = game.strip()
 
     url = JUSTTCG_SEARCH_URL + "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Accept":     "application/json",
-            "User-Agent": "CardCollectorInventoryManager/1.0",
-        },
-    )
+    headers = {
+        "Accept":     "application/json",
+        "User-Agent": "CardCollectorInventoryManager/1.0",
+        "x-api-key":  JUSTTCG_API_KEY,
+    }
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=JUSTTCG_TIMEOUT) as resp:
         raw = resp.read().decode("utf-8")
     return json.loads(raw)
+
+
+@app.route("/justtcg_missing_ids")
+def justtcg_missing_ids():
+    """
+    Return a list of all ScanRecord IDs that do not yet have a market price
+    stored under extracted_data['tcgplayer']['prices']['market'].
+    Used by the bulk-fetch UI to know which records still need pricing.
+    Only includes records that have a card name, so the fetch is likely to succeed.
+    """
+    rows = (
+        ScanRecord.query
+        .with_entities(ScanRecord.id, ScanRecord.extracted_data)
+        .order_by(ScanRecord.id.asc())
+        .all()
+    )
+
+    missing = []
+    for row_id, extracted_data in rows:
+        if isinstance(extracted_data, dict):
+            data = extracted_data
+        else:
+            try:
+                data = json.loads(extracted_data or "{}")
+            except (ValueError, TypeError):
+                data = {}
+
+        # Must have a usable card name or the fetch will fail immediately
+        card_name = (
+            data.get("product_name") or data.get("name") or
+            data.get("card_name")    or data.get("title") or ""
+        ).strip()
+        if not card_name:
+            continue
+
+        # Check whether a market price is already present
+        tcg = data.get("tcgplayer") or {}
+        prices = tcg.get("prices") or {}
+        market = prices.get("market")
+        if market is None or market == "":
+            missing.append(row_id)
+
+    return jsonify({"ids": missing, "count": len(missing)})
 
 
 @app.route("/justtcg_fetch/<int:record_id>", methods=["POST"])
@@ -1484,7 +1637,8 @@ def justtcg_fetch(record_id):
             "message": f"Unexpected response from JustTCG: {exc}",
         }), 502
 
-    products = api_data.get("products") or api_data.get("results") or api_data.get("data") or []
+    # Real API returns {"data": [...]} — each item is a Card object with a `variants` array
+    products = api_data.get("data") or []
 
     if not products:
         return jsonify({
@@ -1493,18 +1647,30 @@ def justtcg_fetch(record_id):
             "searched": {"name": card_name, "number": set_number, "game": game},
         })
 
-    # Use the first (best-ranked) result
-    hit      = products[0]
-    prices   = hit.get("prices") or {}
-    market   = prices.get("market") or prices.get("marketPrice")
-    low      = prices.get("low")    or prices.get("lowPrice")
-    mid      = prices.get("mid")    or prices.get("midPrice")
-    high     = prices.get("high")   or prices.get("highPrice")
+    # Use the first (best-ranked) result; narrow by set number if provided
+    hit = products[0]
+    if set_number:
+        for card in products:
+            if str(card.get("number", "")).strip().lower() == set_number.lower():
+                hit = card
+                break
 
-    product_url = (
+    # Prices live inside variants (condition/printing combos); pick the best Near Mint Normal price
+    variants = hit.get("variants") or []
+    nm_normal = next(
+        (v for v in variants if v.get("condition") in ("Near Mint", "NM") and v.get("printing") == "Normal"),
+        variants[0] if variants else {},
+    )
+    market = nm_normal.get("price")
+    low    = nm_normal.get("low_price")
+    mid    = nm_normal.get("mid_price")
+    high   = nm_normal.get("high_price")
+
+    card_id      = hit.get("id", "")
+    tcgplayer_id = hit.get("tcgplayerId", "")
+    product_url  = (
         hit.get("url") or
-        f"https://justtcg.com/product/{hit['id']}" if hit.get("id") else
-        "https://justtcg.com"
+        (f"https://justtcg.com/cards/{card_id}" if card_id else "https://justtcg.com")
     )
 
     entry = {
@@ -1513,10 +1679,11 @@ def justtcg_fetch(record_id):
         "full_url":    product_url,
         "saved_at":    datetime.utcnow().isoformat(),
         "source":      "justtcg",
-        "product_id":  str(hit.get("id", "")),
+        "product_id":  str(card_id),
+        "tcgplayer_id": str(tcgplayer_id),
         "product_name": hit.get("name", card_name),
-        "set_name":    hit.get("set_name") or hit.get("setName") or "",
-        "set_number":  hit.get("number")   or hit.get("cardNumber") or set_number,
+        "set_name":    hit.get("set_name") or hit.get("set") or "",
+        "set_number":  hit.get("number") or set_number,
         "prices": {
             "market": market,
             "low":    low,

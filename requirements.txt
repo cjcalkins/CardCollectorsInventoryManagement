@@ -14,3 +14,4 @@ opencv-python>=4.8,<4.11
 pytesseract>=0.3.10,<0.4
 numpy>=1.24,<2.1
 Pillow>=9.5,<11.0
+dotenv
