@@ -606,6 +606,8 @@ def _get_serial(data: dict) -> str:
 EDITION_OPTIONS = ("Standard Edition", "First Edition", "Limited Edition")
 EDITION_DEFAULT = "Standard Edition"
 
+_HOLOGRAPHIC_OPTIONS = ("None", "Regular", "Reverse", "Shiny Text", "Special")
+
 
 def _get_edition(data: dict) -> str:
     """Normalise edition to one of the known option strings.
@@ -629,82 +631,6 @@ def _get_edition(data: dict) -> str:
         return "Limited Edition"
 
     return EDITION_DEFAULT
-
-
-_HOLOGRAPHIC_OPTIONS = ("None", "Regular", "Reverse", "Shiny Text", "Special")
-
-
-def _get_holographic(data: dict) -> str:
-    """Normalise holographic to one of the known option strings. Absence → 'None'."""
-    raw = str(data.get("holographic", "")).strip()
-    return raw if raw in _HOLOGRAPHIC_OPTIONS else "None"
-
-
-def _get_finalized(data: dict) -> bool:
-    """Normalise finalized to a strict bool. Absence → False."""
-    raw = data.get("finalized", False)
-    return raw is True or str(raw).strip().lower() == "true"
-
-
-def build_inventory_group_info(records: list) -> dict:
-    """
-    Group inventory records that represent the same physical card so the
-    inventory table can display a stacked Qty badge.
-
-    Matching criteria — ALL five must be equal:
-      - name         (case-insensitive, first non-empty of _NAME_KEYS)
-      - serial       (case-insensitive, first non-empty of _SERIAL_KEYS)
-      - edition      (normalised string via _get_edition)
-      - holographic  (normalised string via _get_holographic)
-      - finalized    must be True for ALL records in the group
-
-    Records that are missing name or serial, or where finalized is False,
-    are never grouped — they appear as individual rows (count = 1).
-
-    Returns a dict keyed by record.id:
-      {
-        record_id: {
-          "count":     int,          # total records in the group
-          "all_ids":   [int, ...],   # every record.id in the group
-        },
-        ...
-      }
-    Records not part of any multi-record group still get an entry with
-    count=1 and all_ids=[record.id] so the template never needs a fallback.
-    """
-    # First pass: build candidate groups
-    groups_map: dict = {}
-    ungrouped_ids: list = []
-
-    for record in records:
-        data   = record.extracted_data or {}
-        name   = _get_name(data)
-        serial = _get_serial(data)
-
-        if not name or not serial or not _get_finalized(data):
-            ungrouped_ids.append(record.id)
-            continue
-
-        edition    = _get_edition(data)
-        holographic = _get_holographic(data)
-        key = (name, serial, edition, holographic)
-        groups_map.setdefault(key, []).append(record.id)
-
-    # Second pass: build the output dict
-    result: dict = {}
-
-    for ids in groups_map.values():
-        if len(ids) == 1:
-            # Only one record matched this key — treat as ungrouped
-            ungrouped_ids.append(ids[0])
-        else:
-            for rid in ids:
-                result[rid] = {"count": len(ids), "all_ids": ids}
-
-    for rid in ungrouped_ids:
-        result[rid] = {"count": 1, "all_ids": [rid]}
-
-    return result
 
 
 # ====================== CONTEXT PROCESSOR ======================
@@ -737,6 +663,11 @@ def index():
 _STATIC_ENTRY_KEYS = frozenset({
     "game", "album", "page", "slot",
     "__roi_fields_used",
+    # Dedicated static columns and legacy/superseded keys that must never
+    # surface as dynamic ad-hoc text columns.
+    "edition", "holographic", "finalized", "tcgplayer",
+    "first_edition", "limited_edition",
+    "empty",
 })
 _INTERNAL_KEY_PREFIXES = ("__ocr_", "__")
 _INTERNAL_KEY_SUFFIXES = ("__ocr_conf", "__ocr_variant")
@@ -806,11 +737,6 @@ def inventory():
     all_sample = query.limit(500).all()
     entry_fields = discover_entry_fields(all_sample)
 
-    # Build stacking groups for the current page only (all_ids references are
-    # page-scoped; the Qty badge and bulk-delete still work correctly because
-    # delete_scans accepts any list of IDs regardless of page).
-    group_info = build_inventory_group_info(pagination.items)
-
     return render_template(
         "inventory.html",
         records=pagination.items,
@@ -821,7 +747,7 @@ def inventory():
         f_template=f_template,
         per_page=per_page,
         entry_fields=entry_fields,
-        group_info=group_info,
+        group_info={},
     )
 
 
@@ -1209,6 +1135,69 @@ def delete_scans():
     return jsonify({"status": "success", "message": f"Deleted {len(records)} record(s)"})
 
 
+@app.route("/migrate_clean_legacy_fields", methods=["POST"])
+def migrate_clean_legacy_fields():
+    """
+    One-shot migration that scrubs superseded/legacy fields from every record:
+
+      - first_edition   (boolean) -> promoted to edition='First Edition' if no
+                                      edition key exists, then deleted
+      - limited_edition (boolean) -> promoted to edition='Limited Edition' if no
+                                      edition key exists, then deleted
+      - holographic as a boolean  -> replaced with 'None' (enum string)
+      - empty           (boolean) -> deleted entirely
+
+    Safe to run multiple times — already-migrated records are left unchanged.
+    """
+    records = ScanRecord.query.all()
+    updated = 0
+
+    for record in records:
+        data = dict(record.extracted_data or {})
+        changed = False
+
+        # ── Edition: promote legacy booleans, then delete them ────────────
+        if data.get("edition", "") not in EDITION_OPTIONS:
+            fe = data.get("first_edition", False)
+            le = data.get("limited_edition", False)
+            if fe is True or str(fe).strip().lower() == "true":
+                data["edition"] = "First Edition"
+            elif le is True or str(le).strip().lower() == "true":
+                data["edition"] = "Limited Edition"
+            else:
+                data["edition"] = EDITION_DEFAULT
+            changed = True
+
+        for legacy_key in ("first_edition", "limited_edition"):
+            if legacy_key in data:
+                del data[legacy_key]
+                changed = True
+
+        # ── Holographic: replace any non-enum value with 'None' ───────────
+        holo_raw = data.get("holographic")
+        if holo_raw is not None and holo_raw not in _HOLOGRAPHIC_OPTIONS:
+            data["holographic"] = "None"
+            changed = True
+
+        # ── Empty: delete entirely ─────────────────────────────────────────
+        if "empty" in data:
+            del data["empty"]
+            changed = True
+
+        if changed:
+            record.extracted_data = data
+            updated += 1
+
+    if updated:
+        db.session.commit()
+
+    return jsonify({
+        "status":  "success",
+        "message": f"Migration complete. {updated} record(s) updated.",
+        "updated": updated,
+    })
+
+
 @app.route("/add_custom_field", methods=["POST"])
 def add_custom_field():
     """
@@ -1458,9 +1447,8 @@ def duplicates():
     Group records that share all three of:
       - name         (case-insensitive, first non-empty of _NAME_KEYS)
       - serial       (case-insensitive, first non-empty of _SERIAL_KEYS)
-      - edition      (normalised string)
+      - edition    (normalised string)
 
-    Used for IMAGE deduplication only (not inventory stacking).
     All three must match. Records missing name or serial are excluded.
     Groups where all members already share the same image_path are also
     excluded — they are already resolved and won't reappear after a reload.
@@ -1892,6 +1880,7 @@ if __name__ == "__main__":
     print(" • /inventory/<id> — Record detail with edit, TCGPlayer link, copy-from, edition")
     print(" • /inventory/filter_options — Dropdown options API")
     print(" • /duplicates   — Duplicate image manager (name + serial + edition)")
+    print(" • /migrate_clean_legacy_fields — POST: scrub first_edition, limited_edition, boolean holographic, empty")
     print(" • /albums       — Album grid view")
     print(" • /import       — 3x3 split, alignment, manual corner override, batch OCR")
     print(" • /records_summary — Copy-from dropdown API")

@@ -204,8 +204,6 @@
                                        and key != '__roi_fields_used'
                                        and key != 'tcgplayer'
                                        and key != 'card_lookup'
-                                       and key != 'first_edition'
-                                       and key != 'limited_edition'
                                        and key != 'edition' %}
                                     <div class="col-md-6">
                                         <label class="form-label">{{ key.replace('_', ' ').title() }}</label>
@@ -220,14 +218,8 @@
                             <div class="mt-3 p-3 border rounded-3 bg-light">
                                 <label class="form-label fw-semibold mb-2" for="editionSelect">Edition</label>
                                 <select class="form-select" id="editionSelect" name="edition">
-                                    {% set cur_edition = record.extracted_data.get('edition', '') %}
-                                    {% set legacy_fe   = record.extracted_data.get('first_edition', false) %}
-                                    {% set legacy_le   = record.extracted_data.get('limited_edition', false) %}
-                                    {% if cur_edition == 'First Edition' or (not cur_edition and (legacy_fe == true or legacy_fe == 'True')) %}
-                                        {% set sel_edition = 'First Edition' %}
-                                    {% elif cur_edition == 'Limited Edition' or (not cur_edition and (legacy_le == true or legacy_le == 'True')) %}
-                                        {% set sel_edition = 'Limited Edition' %}
-                                    {% else %}
+                                    {% set sel_edition = record.extracted_data.get('edition', 'Standard Edition') %}
+                                    {% if sel_edition not in ('First Edition', 'Limited Edition', 'Standard Edition') %}
                                         {% set sel_edition = 'Standard Edition' %}
                                     {% endif %}
                                     <option value="Standard Edition" {% if sel_edition == 'Standard Edition' %}selected{% endif %}>Standard Edition</option>
@@ -383,9 +375,6 @@
             for (const [k, v] of new FormData(this).entries()) updated[k] = v.trim();
 
             // edition is a <select> inside the form — FormData picks it up automatically.
-            // Explicitly remove legacy boolean keys so they are cleared on save.
-            delete updated['first_edition'];
-            delete updated['limited_edition'];
 
             const res  = await fetch(`/update_scan/${recordId}`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -621,19 +610,12 @@
                 }
             }
 
-            // Handle edition (string select) — also migrate legacy boolean fields from old records
+            // Handle edition (string select)
             {
                 const sel = document.getElementById('editionSelect');
                 if (sel) {
-                    let editionVal = 'Standard Edition';
-                    if (source.edition && ['Standard Edition', 'First Edition', 'Limited Edition'].includes(source.edition)) {
-                        editionVal = source.edition;
-                    } else if (source.first_edition === true || source.first_edition === 'true') {
-                        editionVal = 'First Edition';
-                    } else if (source.limited_edition === true || source.limited_edition === 'true') {
-                        editionVal = 'Limited Edition';
-                    }
-                    sel.value = editionVal;
+                    const opts = ['Standard Edition', 'First Edition', 'Limited Edition'];
+                    sel.value = opts.includes(source.edition) ? source.edition : 'Standard Edition';
                 }
             }
 

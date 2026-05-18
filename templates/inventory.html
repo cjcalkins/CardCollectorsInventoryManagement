@@ -247,7 +247,6 @@
                                 <th data-col="slot" class="sortable" data-sort-type="num">Slot <span class="sort-icon">⇅</span></th>
                                 <th data-col="template" class="sortable" data-sort-type="text">Template <span class="sort-icon">⇅</span></th>
                                 <th data-col="tcg_url" class="sortable" data-sort-type="text">Price URL <span class="sort-icon">⇅</span></th>
-                                <th data-col="holographic" class="sortable" data-sort-type="enum">Holographic <span class="sort-icon">⇅</span></th>
                                 <th data-col="finalized" class="sortable" data-sort-type="text">Finalized <span class="sort-icon">⇅</span></th>
                                 <th data-col="edition" class="sortable" data-sort-type="enum">Edition <span class="sort-icon">⇅</span></th>
                                 <th data-col="qty" class="sortable" data-sort-type="num">Qty <span class="sort-icon">⇅</span></th>
@@ -298,20 +297,6 @@
                                     <span class="badge bg-secondary text-white" style="opacity:0.5;">False</span>
                                     {% endif %}
                                 </td>
-                                <td data-col-static="holographic">
-                                    {% set holo = record.extracted_data.get('holographic', 'None') %}
-                                    {% if holo == 'Regular' %}
-                                        <span class="badge" style="background:#7c3aed;">Regular</span>
-                                    {% elif holo == 'Reverse' %}
-                                        <span class="badge" style="background:#0ea5e9;">Reverse</span>
-                                    {% elif holo == 'Shiny Text' %}
-                                        <span class="badge" style="background:#f59e0b; color:#1a1a1a;">Shiny Text</span>
-                                    {% elif holo == 'Special' %}
-                                        <span class="badge" style="background:#e4242b;">Special</span>
-                                    {% else %}
-                                        <span class="badge bg-secondary" style="opacity:0.45;">None</span>
-                                    {% endif %}
-                                </td>
                                 <td data-col-static="finalized" class="text-center">
                                     <input type="checkbox" class="form-check-input finalized-toggle"
                                            data-record-id="{{ record.id }}"
@@ -319,16 +304,15 @@
                                            title="Toggle Finalized">
                                 </td>
                                 <td data-col-static="edition">
-                                    {% set ed = record.extracted_data.get('edition', '') %}
-                                    {% set legacy_fe = record.extracted_data.get('first_edition', false) %}
-                                    {% set legacy_le = record.extracted_data.get('limited_edition', false) %}
-                                    {% if ed == 'First Edition' or (not ed and (legacy_fe == true or legacy_fe == 'True')) %}
+                                    {% set ed = record.extracted_data.get('edition', 'Standard Edition') %}
+                                    {% if ed == 'First Edition' %}
                                         <span class="badge" style="background:#7c3aed;">First Edition</span>
-                                    {% elif ed == 'Limited Edition' or (not ed and (legacy_le == true or legacy_le == 'True')) %}
+                                    {% elif ed == 'Limited Edition' %}
                                         <span class="badge" style="background:#e4242b;">Limited Edition</span>
                                     {% else %}
                                         <span class="badge bg-secondary" style="opacity:0.55;">Standard</span>
                                     {% endif %}
+                                </td>
                                 </td>
                                 <td data-col-static="qty" class="text-center">
                                     {% if ginfo.count > 1 %}
@@ -701,7 +685,6 @@
             { key: 'slot',        label: 'Slot' },
             { key: 'template',    label: 'Template' },
             { key: 'tcg_url',     label: 'Price URL' },
-            { key: 'holographic', label: 'Holographic' },
             { key: 'finalized',   label: 'Finalized' },
             { key: 'edition',     label: 'Edition' },
             { key: 'qty',         label: 'Qty' },
@@ -770,8 +753,8 @@
                 });
             }
 
-            // Apply visibility for data-col-static columns (tcg_url, holographic, finalized, edition, qty)
-            ['tcg_url', 'holographic', 'finalized', 'edition', 'qty'].forEach(colKey => {
+            // Apply visibility for data-col-static columns (tcg_url, finalized, edition, qty)
+            ['tcg_url', 'finalized', 'edition', 'qty'].forEach(colKey => {
                 const hide = hiddenSet.has(colKey);
                 const th = table.querySelector(`thead th[data-col="${colKey}"]`);
                 if (th) th.style.display = hide ? 'none' : '';
@@ -842,8 +825,6 @@
         // ── Sorting ─────────────────────────────────────────────────────────────
         let sortState = { col: null, dir: 'asc' };
 
-        // Defined sort order for the Holographic enum column.
-        const HOLO_ORDER    = { 'None': 0, 'Shiny Text': 1, 'Regular': 2, 'Reverse': 3, 'Special': 4 };
         // Defined sort order for the Edition enum column.
         const EDITION_ORDER = { 'Standard Edition': 0, 'First Edition': 1, 'Limited Edition': 2 };
 
@@ -852,11 +833,6 @@
                 const td = row.querySelector('td[data-col-static="tcg_url"]');
                 if (!td) return 'False';
                 return td.querySelector('.badge.bg-success') ? 'True' : 'False';
-            }
-            if (colKey === 'holographic') {
-                const td = row.querySelector('td[data-col-static="holographic"]');
-                if (!td) return 'None';
-                return td.querySelector('.badge')?.textContent.trim() || 'None';
             }
             if (colKey === 'finalized') {
                 const td = row.querySelector('td[data-col-static="finalized"]');
@@ -912,9 +888,7 @@
                     return (new Date(va) - new Date(vb)) * dir;
                 }
                 if (sortType === 'enum') {
-                    const orderA = HOLO_ORDER[va] ?? EDITION_ORDER[va] ?? 99;
-                    const orderB = HOLO_ORDER[vb] ?? EDITION_ORDER[vb] ?? 99;
-                    return (orderA - orderB) * dir;
+                    return ((EDITION_ORDER[va] ?? 99) - (EDITION_ORDER[vb] ?? 99)) * dir;
                 }
                 return va.localeCompare(vb, undefined, { sensitivity: 'base' }) * dir;
             });
