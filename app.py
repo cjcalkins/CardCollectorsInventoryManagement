@@ -557,10 +557,25 @@ def create_scan_record(image_path, template_name, extracted, normalized_fields):
 
 
 def remove_file_if_exists(path_value):
+    """Delete an uploaded image file, with safety guards:
+    - Ignores the '__blank__' sentinel (points to static/blank.jpg, never touched).
+    - Only deletes files inside the inventory_cards subdirectory so nothing
+      outside that folder can be accidentally removed.
+    """
     if not path_value:
         return
 
+    # Never delete the blank-slot sentinel — it maps to a static asset
+    if str(path_value).strip() == "__blank__":
+        return
+
     relative_path = normalize_to_upload_relative(path_value)
+
+    # Safety: only allow deletion of files inside inventory_cards/
+    normalised = relative_path.replace("\\", "/")
+    if not normalised.startswith("inventory_cards/"):
+        return
+
     absolute_path = os.path.join(app.config["UPLOAD_FOLDER"], relative_path)
 
     if os.path.exists(absolute_path) and os.path.isfile(absolute_path):
@@ -591,6 +606,12 @@ def _get_serial(data: dict) -> str:
 def _get_first_edition(data: dict) -> bool:
     """Normalise first_edition to a strict bool. Absence → False."""
     raw = data.get("first_edition", False)
+    return raw is True or str(raw).strip().lower() == "true"
+
+
+def _get_limited_edition(data: dict) -> bool:
+    """Normalise limited_edition to a strict bool. Absence → False."""
+    raw = data.get("limited_edition", False)
     return raw is True or str(raw).strip().lower() == "true"
 
 
@@ -853,9 +874,12 @@ def game_fields():
     if not game:
         return jsonify({"fields": [], "albums": []})
 
-    records = ScanRecord.query.filter(
-        ScanRecord.extracted_data["game"].astext == game
-    ).limit(200).all()
+    # Filter in Python — .astext requires PostgreSQL JSONB and is not available here
+    all_records = ScanRecord.query.all()
+    records = [
+        r for r in all_records
+        if str((r.extracted_data or {}).get("game", "")).strip() == game
+    ]
 
     fields = discover_entry_fields(records)
     albums = sorted({
@@ -866,7 +890,8 @@ def game_fields():
     return jsonify({"fields": fields, "albums": albums})
 
 
-
+@app.route("/inventory/<int:record_id>")
+def inventory_detail(record_id):
     record = ScanRecord.query.get_or_404(record_id)
 
     # Determine prev/next IDs using the same ordering as the inventory list:
@@ -1351,13 +1376,14 @@ def duplicates():
         serial   = _get_serial(data)
         if not name or not serial:
             continue
-        first_ed = _get_first_edition(data)
-        groups_map.setdefault((name, serial, first_ed), []).append(record)
+        first_ed   = _get_first_edition(data)
+        limited_ed = _get_limited_edition(data)
+        groups_map.setdefault((name, serial, first_ed, limited_ed), []).append(record)
 
     groups        = []
     total_records = 0
 
-    for (name, serial, first_ed), recs in groups_map.items():
+    for (name, serial, first_ed, limited_ed), recs in groups_map.items():
         if len(recs) < 2:
             continue
         # Skip groups where all image paths are already identical (already resolved)
@@ -1371,10 +1397,11 @@ def duplicates():
             or name
         )
         groups.append({
-            "name":          display_name,
-            "serial":        serial,
-            "first_edition": first_ed,
-            "records":       recs,
+            "name":            display_name,
+            "serial":          serial,
+            "first_edition":   first_ed,
+            "limited_edition": limited_ed,
+            "records":         recs,
         })
         total_records += len(recs)
 
@@ -1510,6 +1537,31 @@ def run_custom_ocr():
         val = str(data.get(key, "")).strip()
         if val:
             extracted[key] = val
+
+    # Delete any existing record(s) occupying the same game/album/page/slot
+    # so the new scan cleanly replaces whatever was there before.
+    game  = extracted.get("game",  "")
+    album = extracted.get("album", "")
+    page  = extracted.get("page",  "")
+    slot  = extracted.get("slot",  "")
+
+    if game and album and page and slot:
+        existing = [
+            r for r in ScanRecord.query.all()
+            if (
+                str((r.extracted_data or {}).get("game",  "")).strip() == game  and
+                str((r.extracted_data or {}).get("album", "")).strip() == album and
+                str((r.extracted_data or {}).get("page",  "")).strip() == page  and
+                str((r.extracted_data or {}).get("slot",  "")).strip() == slot
+            )
+        ]
+        old_image_paths = [r.image_path for r in existing]
+        for old in existing:
+            db.session.delete(old)
+        db.session.commit()
+        for old_image in old_image_paths:
+            if old_image and old_image != "__blank__":
+                remove_file_if_exists(old_image)
 
     matched_product, record = create_scan_record(
         image_path=filename,

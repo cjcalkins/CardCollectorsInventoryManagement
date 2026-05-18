@@ -190,24 +190,15 @@
                     </div>
                 </div>
 
-                <div class="card roi-card mt-4 hidden" id="roiCard">
-                    <div class="card-header bg-light d-flex justify-content-between align-items-center">
-                        <strong>ROI Fields</strong>
-                        <button class="btn btn-sm btn-outline-secondary" id="resetTemplateBtn">
-                            Reset
-                        </button>
-                    </div>
-                    <div class="card-body">
-                        <p class="text-muted small mb-2">Drag boxes or edit % values. Click <strong>Run OCR</strong> when ready.</p>
-                        <div id="fieldsEditor"></div>
-                        <button class="btn btn-success w-100 mt-3" id="runOcrBtn">
-                            <i class="fas fa-play me-1"></i>Run OCR
-                        </button>
-                    </div>
+                <!-- Hidden elements kept so existing JS references don't break -->
+                <div class="hidden">
+                    <div id="fieldsEditor"></div>
+                    <button id="resetTemplateBtn"></button>
                 </div>
 
-                <!-- Entry metadata — shown alongside ROI card after upload -->
-                <div class="card mt-4 hidden" id="entryMetaCard" style="border:none;border-radius:14px;box-shadow:0 4px 20px rgba(0,0,0,0.08);">
+                <!-- Entry Details — shown after image preview loads -->
+                <div class="card mt-4 hidden" id="entryMetaCard"
+                     style="border:none;border-radius:14px;box-shadow:0 4px 20px rgba(0,0,0,0.08);">
                     <div class="card-header bg-light">
                         <strong><i class="fas fa-tags me-2"></i>Entry Details</strong>
                     </div>
@@ -215,7 +206,9 @@
 
                         <!-- Game -->
                         <div>
-                            <label class="form-label fw-semibold small mb-1">Game <span class="text-danger">*</span></label>
+                            <label class="form-label fw-semibold small mb-1">
+                                Game <span class="text-danger">*</span>
+                            </label>
                             <select class="form-select form-select-sm" id="entryGame">
                                 <option value="">— select game —</option>
                             </select>
@@ -223,7 +216,9 @@
 
                         <!-- Album — filtered by game -->
                         <div>
-                            <label class="form-label fw-semibold small mb-1">Album <span class="text-danger">*</span></label>
+                            <label class="form-label fw-semibold small mb-1">
+                                Album <span class="text-danger">*</span>
+                            </label>
                             <select class="form-select form-select-sm" id="entryAlbum" disabled>
                                 <option value="">— select game first —</option>
                             </select>
@@ -231,19 +226,28 @@
 
                         <!-- Page -->
                         <div>
-                            <label class="form-label fw-semibold small mb-1">Page <span class="text-danger">*</span></label>
-                            <input type="number" class="form-control form-control-sm" id="entryPage"
-                                   min="1" placeholder="e.g. 1">
+                            <label class="form-label fw-semibold small mb-1">
+                                Page <span class="text-danger">*</span>
+                            </label>
+                            <input type="number" class="form-control form-control-sm"
+                                   id="entryPage" min="1" placeholder="e.g. 1">
                         </div>
 
                         <!-- Slot -->
                         <div>
-                            <label class="form-label fw-semibold small mb-1">Slot <span class="text-danger">*</span></label>
-                            <input type="number" class="form-control form-control-sm" id="entrySlot"
-                                   min="1" placeholder="e.g. 3">
+                            <label class="form-label fw-semibold small mb-1">
+                                Slot <span class="text-danger">*</span>
+                            </label>
+                            <input type="number" class="form-control form-control-sm"
+                                   id="entrySlot" min="1" placeholder="e.g. 3">
                         </div>
 
                         <div id="entryMetaStatus"></div>
+
+                        <button class="btn btn-success w-100" id="runOcrBtn">
+                            <i class="fas fa-play me-1"></i>Run OCR
+                        </button>
+
                     </div>
                 </div>
             </div>
@@ -266,7 +270,7 @@
                 <div class="card results-card mt-4 hidden" id="resultsCard">
                     <div class="card-header bg-light"><strong>OCR Results</strong></div>
                     <div class="card-body">
-                        <div id="ocrResults"></div>
+                        <div id="ocrResults" class="result-pre"></div>
                     </div>
                 </div>
             </div>
@@ -378,7 +382,7 @@
     // ===========================================================================
     const uploadForm      = document.getElementById('uploadForm');
     const previewCard     = document.getElementById('previewCard');
-    const roiCard         = document.getElementById('roiCard');
+    const entryMetaCard   = document.getElementById('entryMetaCard');
     const resultsCard     = document.getElementById('resultsCard');
     const previewImage    = document.getElementById('previewImage');
     const previewWrapper  = document.getElementById('previewWrapper');
@@ -386,6 +390,12 @@
     const ocrResults      = document.getElementById('ocrResults');
     const runOcrBtn       = document.getElementById('runOcrBtn');
     const resetTemplateBtn = document.getElementById('resetTemplateBtn');
+
+    const entryGame       = document.getElementById('entryGame');
+    const entryAlbum      = document.getElementById('entryAlbum');
+    const entryPage       = document.getElementById('entryPage');
+    const entrySlot       = document.getElementById('entrySlot');
+    const entryMetaStatus = document.getElementById('entryMetaStatus');
 
     let currentFilename     = null;
     let currentTemplateName = null;
@@ -436,7 +446,6 @@
         previewImage.onload = function () {
             currentFields = toPercent(JSON.parse(JSON.stringify(templateFields)));
             previewCard.classList.remove('hidden');
-            roiCard.classList.remove('hidden');
             entryMetaCard.classList.remove('hidden');
             renderScanBoxes();
             renderFieldEditor();
@@ -453,13 +462,7 @@
         renderFieldEditor();
     });
 
-    // ── Entry metadata elements ──────────────────────────────────────────────
-    const entryMetaCard   = document.getElementById('entryMetaCard');
-    const entryGame       = document.getElementById('entryGame');
-    const entryAlbum      = document.getElementById('entryAlbum');
-    const entryPage       = document.getElementById('entryPage');
-    const entrySlot       = document.getElementById('entrySlot');
-    const entryMetaStatus = document.getElementById('entryMetaStatus');
+    // ── Entry metadata helpers ────────────────────────────────────────────────
 
     async function populateGames() {
         try {
@@ -501,24 +504,19 @@
         }
     });
 
-    function validateEntryMeta() {
+    runOcrBtn.addEventListener('click', async function () {
+        if (!currentFilename) return;
+
+        // Validate all required entry fields
         const missing = [];
         if (!entryGame.value)  missing.push('Game');
         if (!entryAlbum.value) missing.push('Album');
         if (!entryPage.value)  missing.push('Page');
         if (!entrySlot.value)  missing.push('Slot');
-        return missing;
-    }
 
-    runOcrBtn.addEventListener('click', async function () {
-        if (!currentFilename) return;
-
-        // Validate entry metadata before running
-        const missing = validateEntryMeta();
         if (missing.length) {
             entryMetaStatus.innerHTML = `<div class="alert alert-warning py-2 mb-0">
                 Please fill in: <strong>${missing.join(', ')}</strong></div>`;
-            entryMetaCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
             return;
         }
         entryMetaStatus.innerHTML = '';
@@ -547,39 +545,35 @@
 
             if (data.error) {
                 ocrResults.innerHTML = `<div class="alert alert-danger mb-0">${data.error}</div>`;
-                return;
+            } else {
+                const extracted = data.extracted || {};
+                const fieldRows = Object.entries(extracted)
+                    .filter(([k]) => !k.startsWith('__') && k !== 'game' && k !== 'album' && k !== 'page' && k !== 'slot')
+                    .map(([k, v]) => `<tr>
+                        <td class="text-muted small pe-3">${k.replace(/_/g,' ')}</td>
+                        <td class="small fw-semibold">${v ?? ''}</td></tr>`)
+                    .join('');
+
+                ocrResults.innerHTML = `
+                    <div class="alert alert-success d-flex align-items-center gap-2 mb-3 py-2">
+                        <i class="fas fa-check-circle"></i>
+                        <span>Entry saved — Record #${data.record_id}</span>
+                        <a href="/inventory/${data.record_id}" class="btn btn-sm btn-success ms-auto">
+                            Open Entry <i class="fas fa-arrow-right ms-1"></i>
+                        </a>
+                    </div>
+                    <div class="mb-2 small text-muted">
+                        <strong>Game:</strong> ${entryGame.value} &nbsp;·&nbsp;
+                        <strong>Album:</strong> ${entryAlbum.value} &nbsp;·&nbsp;
+                        <strong>Page:</strong> ${entryPage.value} &nbsp;·&nbsp;
+                        <strong>Slot:</strong> ${entrySlot.value}
+                    </div>
+                    ${fieldRows ? `<table class="table table-sm mb-0">${fieldRows}</table>` : ''}`;
             }
-
-            // Build a friendly results summary
-            const extracted = data.extracted || {};
-            const fieldRows = Object.entries(extracted)
-                .filter(([k]) => !k.startsWith('__') && k !== 'game' && k !== 'album' && k !== 'page' && k !== 'slot')
-                .map(([k, v]) => `<tr><td class="text-muted small pe-3">${k.replace(/_/g,' ')}</td>
-                                      <td class="small fw-semibold">${v ?? ''}</td></tr>`)
-                .join('');
-
-            ocrResults.innerHTML = `
-                <div class="alert alert-success d-flex align-items-center gap-2 mb-3 py-2">
-                    <i class="fas fa-check-circle"></i>
-                    <span>Entry saved — Record #${data.record_id}</span>
-                    <a href="/inventory/${data.record_id}" class="btn btn-sm btn-success ms-auto">
-                        Open Entry <i class="fas fa-arrow-right ms-1"></i>
-                    </a>
-                </div>
-                <div class="mb-2 small text-muted">
-                    <strong>Game:</strong> ${entryGame.value} &nbsp;·&nbsp;
-                    <strong>Album:</strong> ${entryAlbum.value} &nbsp;·&nbsp;
-                    <strong>Page:</strong> ${entryPage.value} &nbsp;·&nbsp;
-                    <strong>Slot:</strong> ${entrySlot.value}
-                </div>
-                ${fieldRows ? `<table class="table table-sm mb-0">${fieldRows}</table>` : ''}`;
-
-            // Reset OCR button for next scan
-            runOcrBtn.disabled = false;
-            runOcrBtn.innerHTML = '<i class="fas fa-play me-1"></i>Run OCR';
-
         } catch (err) {
+            resultsCard.classList.remove('hidden');
             ocrResults.innerHTML = `<div class="alert alert-danger mb-0">Error: ${err.message}</div>`;
+        } finally {
             runOcrBtn.disabled = false;
             runOcrBtn.innerHTML = '<i class="fas fa-play me-1"></i>Run OCR';
         }

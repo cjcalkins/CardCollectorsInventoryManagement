@@ -205,6 +205,7 @@
                                        and key != 'tcgplayer'
                                        and key != 'card_lookup'
                                        and key != 'first_edition'
+                                       and key != 'limited_edition'
                                        and key != 'edition' %}
                                     <div class="col-md-6">
                                         <label class="form-label">{{ key.replace('_', ' ').title() }}</label>
@@ -223,6 +224,18 @@
                                            {% if record.extracted_data.get('first_edition') == true or record.extracted_data.get('first_edition') == 'True' %}checked{% endif %}>
                                     <label class="form-check-label fw-semibold" for="firstEditionCheck">
                                         First Edition
+                                    </label>
+                                </div>
+                            </div>
+
+                            <!-- Limited Edition toggle -->
+                            <div class="mt-2 p-3 border rounded-3 bg-light d-flex align-items-center gap-3">
+                                <div class="form-check form-switch mb-0">
+                                    <input class="form-check-input" type="checkbox"
+                                           role="switch" id="limitedEditionCheck"
+                                           {% if record.extracted_data.get('limited_edition') == true or record.extracted_data.get('limited_edition') == 'True' %}checked{% endif %}>
+                                    <label class="form-check-label fw-semibold" for="limitedEditionCheck">
+                                        Limited Edition
                                     </label>
                                 </div>
                             </div>
@@ -374,7 +387,8 @@
             for (const [k, v] of new FormData(this).entries()) updated[k] = v.trim();
 
             // first_edition is a checkbox outside the FormData — handle explicitly
-            updated['first_edition'] = document.getElementById('firstEditionCheck').checked;
+            updated['first_edition']   = document.getElementById('firstEditionCheck').checked;
+            updated['limited_edition'] = document.getElementById('limitedEditionCheck').checked;
 
             const res  = await fetch(`/update_scan/${recordId}`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -478,7 +492,7 @@
         // Fields that are never overwritten when copying
         const NEVER_COPY = new Set([
             'album', 'page', 'slot', 'image_path',
-            'tcgplayer', 'card_lookup', '__roi_fields_used',
+            'card_lookup', '__roi_fields_used',
         ]);
 
         let allRecords   = [];   // [{ id, label, sub, data }]
@@ -548,7 +562,7 @@
                 '__ocr_card_name', '__ocr_set_number', // etc — anything with __ocr_
             ]);
             const rows = Object.entries(record.data)
-                .filter(([k]) => !k.startsWith('__ocr_') && !skip.has(k))
+                .filter(([k]) => !k.startsWith('__ocr_') && !skip.has(k) && k !== 'tcgplayer')
                 .map(([k, v]) => {
                     if (typeof v === 'object' && v !== null) return null;
                     return `<div class="d-flex gap-2 small">
@@ -559,8 +573,17 @@
                 .filter(Boolean)
                 .join('');
 
-            copyPreviewContent.innerHTML = rows
-                ? `<div class="fw-semibold mb-2">Fields to be copied from Record #${record.id}:</div>${rows}`
+            // Show pricing URL row if present
+            const tcgUrl = record.data?.tcgplayer?.url;
+            const urlRow = tcgUrl
+                ? `<div class="d-flex gap-2 small mt-1">
+                       <span class="text-muted" style="min-width:120px;">price url</span>
+                       <span class="fw-semibold text-truncate text-primary">${escHtml(tcgUrl)}</span>
+                   </div>`
+                : '';
+
+            copyPreviewContent.innerHTML = (rows || urlRow)
+                ? `<div class="fw-semibold mb-2">Fields to be copied from Record #${record.id}:</div>${rows}${urlRow}`
                 : `<div class="text-muted small">No copyable fields found on this record.</div>`;
 
             copyPreview.classList.remove('d-none');
@@ -578,7 +601,7 @@
             copyStatus.innerHTML = '';
         });
 
-        applycopying.addEventListener('click', function () {
+        applycopying.addEventListener('click', async function () {
             if (!selectedSource) return;
 
             const form   = document.getElementById('editForm');
@@ -588,13 +611,14 @@
             for (const [key, value] of Object.entries(source)) {
                 // Skip internal, structural, and never-copy keys
                 if (NEVER_COPY.has(key)) continue;
+                if (key === 'tcgplayer') continue;  // handled separately below
                 if (key.startsWith('__ocr_')) continue;
                 if (typeof value === 'object' && value !== null) continue;
 
                 const input = form.querySelector(`[name="${key}"]`);
                 if (input) {
                     input.value = value ?? '';
-                    input.classList.add('border-primary');  // highlight changed fields
+                    input.classList.add('border-primary');
                     setTimeout(() => input.classList.remove('border-primary'), 2000);
                     copied++;
                 }
@@ -606,15 +630,42 @@
                 if (cb) cb.checked = source.first_edition === true || source.first_edition === 'true';
             }
 
-            copyStatus.innerHTML = `<div class="alert alert-success py-2 mb-0">
-                Copied ${copied} field(s) from Record #${selectedSource.id}.
-                <strong>Remember to click Save Changes to persist.</strong>
-            </div>`;
+            // Handle limited_edition boolean separately
+            if ('limited_edition' in source) {
+                const cb = document.getElementById('limitedEditionCheck');
+                if (cb) cb.checked = source.limited_edition === true || source.limited_edition === 'true';
+            }
 
-            // Clear selection after apply
+            // Copy pricing URL if the source has one
+            const tcgUrl = source?.tcgplayer?.url;
+            if (tcgUrl) {
+                try {
+                    const res = await fetch(`/tcg_save_url/${recordId}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ url: tcgUrl }),
+                    });
+                    const data = await res.json();
+                    if (data.status === 'success') copied++;
+                } catch (e) {
+                    console.error('Failed to copy pricing URL:', e);
+                }
+            }
+
+            const savedId = selectedSource.id;
+
+            // Clear selection before any reload
             selectedSource = null;
             copySearchInput.value = '';
             copyPreview.classList.add('d-none');
+
+            copyStatus.innerHTML = `<div class="alert alert-success py-2 mb-0">
+                Copied ${copied} field(s)${tcgUrl ? ' (including pricing URL)' : ''} from Record #${savedId}.
+                <strong>Remember to click Save Changes to persist.</strong>
+            </div>`;
+
+            // Reload if the URL was copied so the Price URL panel updates
+            if (tcgUrl) setTimeout(() => window.location.reload(), 1200);
         });
 
         function escHtml(s) {

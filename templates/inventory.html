@@ -249,6 +249,8 @@
                                 <th data-col="tcg_url" class="sortable" data-sort-type="text">Price URL <span class="sort-icon">⇅</span></th>
                                 <th data-col="holographic" class="sortable" data-sort-type="enum">Holographic <span class="sort-icon">⇅</span></th>
                                 <th data-col="finalized" class="sortable" data-sort-type="text">Finalized <span class="sort-icon">⇅</span></th>
+                                <th data-col="first_edition" class="sortable" data-sort-type="text">1st Ed <span class="sort-icon">⇅</span></th>
+                                <th data-col="limited_edition" class="sortable" data-sort-type="text">Ltd Ed <span class="sort-icon">⇅</span></th>
                                 <th data-col="qty" class="sortable" data-sort-type="num">Qty <span class="sort-icon">⇅</span></th>
                                 {% for field in entry_fields %}
                                 <th data-col="entry_{{ field | e }}" data-entry-field="{{ field | e }}" class="sortable" data-sort-type="text">{{ field | replace('_', ' ') | title }} <span class="sort-icon">⇅</span></th>
@@ -316,6 +318,21 @@
                                            data-record-id="{{ record.id }}"
                                            {% if record.extracted_data.get('finalized') == true or record.extracted_data.get('finalized') == 'True' %}checked{% endif %}
                                            title="Toggle Finalized">
+                                </td>
+                                <td data-col-static="first_edition" class="text-center">
+                                    <input type="checkbox" class="form-check-input boolean-toggle"
+                                           data-record-id="{{ record.id }}"
+                                           data-field="first_edition"
+                                           {% if record.extracted_data.get('first_edition') == true or record.extracted_data.get('first_edition') == 'True' %}checked{% endif %}
+                                           title="Toggle First Edition">
+                                </td>
+                                <td data-col-static="limited_edition" class="text-center">
+                                    <input type="checkbox" class="form-check-input boolean-toggle"
+                                           data-record-id="{{ record.id }}"
+                                           data-field="limited_edition"
+                                           {% if record.extracted_data.get('limited_edition') == true or record.extracted_data.get('limited_edition') == 'True' %}checked{% endif %}
+                                           title="Toggle Limited Edition">
+                                </td>
                                 </td>
                                 <td data-col-static="qty" class="text-center">
                                     {% if ginfo.count > 1 %}
@@ -567,6 +584,31 @@
             }
         });
 
+        // ====================== BOOLEAN INLINE TOGGLES (first_edition, limited_edition) ======================
+        document.addEventListener('change', async function (e) {
+            const cb = e.target.closest('.boolean-toggle');
+            if (!cb) return;
+
+            const recordId = cb.dataset.recordId;
+            const field    = cb.dataset.field;
+            const checked  = cb.checked;
+
+            try {
+                const res  = await fetch(`/update_scan/${recordId}`, {
+                    method:  'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body:    JSON.stringify({ extracted_data: { [field]: checked } }),
+                });
+                const data = await res.json();
+                if (data.status !== 'success') {
+                    cb.checked = !checked;  // revert on failure
+                }
+            } catch (err) {
+                console.error(`Failed to save ${field} state:`, err);
+                cb.checked = !checked;
+            }
+        });
+
         // ====================== EXPORT CSV ======================
         document.getElementById('exportCsvBtn')?.addEventListener('click', function () {
             // Collect the currently VISIBLE column keys from the table headers.
@@ -671,7 +713,7 @@
 
         // Storage key bumped to v3 to drop old hidden-col state
         // that referenced the removed matched_product column.
-        const COL_STORAGE_KEY  = 'inventory_hidden_cols_v7';
+        const COL_STORAGE_KEY  = 'inventory_hidden_cols_v8';
         const COL_WIDTHS_KEY   = 'inventory_col_widths_v1';
 
         // Entry fields discovered server-side and injected as JSON.
@@ -680,17 +722,19 @@
 
         // Static columns that can be toggled (key matches data-col on <th>)
         const STATIC_TOGGLEABLE_COLS = [
-            { key: 'date',        label: 'Date' },
-            { key: 'image',       label: 'Image' },
-            { key: 'game',        label: 'Game' },
-            { key: 'album',       label: 'Album' },
-            { key: 'page',        label: 'Page' },
-            { key: 'slot',        label: 'Slot' },
-            { key: 'template',    label: 'Template' },
-            { key: 'tcg_url',     label: 'Price URL' },
-            { key: 'holographic', label: 'Holographic' },
-            { key: 'finalized',   label: 'Finalized' },
-            { key: 'qty',         label: 'Qty' },
+            { key: 'date',            label: 'Date' },
+            { key: 'image',           label: 'Image' },
+            { key: 'game',            label: 'Game' },
+            { key: 'album',           label: 'Album' },
+            { key: 'page',            label: 'Page' },
+            { key: 'slot',            label: 'Slot' },
+            { key: 'template',        label: 'Template' },
+            { key: 'tcg_url',         label: 'Price URL' },
+            { key: 'holographic',     label: 'Holographic' },
+            { key: 'finalized',       label: 'Finalized' },
+            { key: 'first_edition',   label: '1st Edition' },
+            { key: 'limited_edition', label: 'Ltd Edition' },
+            { key: 'qty',             label: 'Qty' },
         ];
 
         // OCR metadata suffixes that must never appear as column chooser options.
@@ -756,8 +800,8 @@
                 });
             }
 
-            // Apply visibility for data-col-static columns (tcg_url, holographic, finalized, qty)
-            ['tcg_url', 'holographic', 'finalized', 'qty'].forEach(colKey => {
+            // Apply visibility for data-col-static columns (tcg_url, holographic, finalized, first_edition, limited_edition, qty)
+            ['tcg_url', 'holographic', 'finalized', 'first_edition', 'limited_edition', 'qty'].forEach(colKey => {
                 const hide = hiddenSet.has(colKey);
                 const th = table.querySelector(`thead th[data-col="${colKey}"]`);
                 if (th) th.style.display = hide ? 'none' : '';
@@ -844,6 +888,16 @@
             }
             if (colKey === 'finalized') {
                 const td = row.querySelector('td[data-col-static="finalized"]');
+                if (!td) return 'False';
+                return td.querySelector('input[type="checkbox"]')?.checked ? 'True' : 'False';
+            }
+            if (colKey === 'first_edition') {
+                const td = row.querySelector('td[data-col-static="first_edition"]');
+                if (!td) return 'False';
+                return td.querySelector('input[type="checkbox"]')?.checked ? 'True' : 'False';
+            }
+            if (colKey === 'limited_edition') {
+                const td = row.querySelector('td[data-col-static="limited_edition"]');
                 if (!td) return 'False';
                 return td.querySelector('input[type="checkbox"]')?.checked ? 'True' : 'False';
             }
