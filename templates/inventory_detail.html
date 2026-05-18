@@ -216,28 +216,24 @@
                                 {% endfor %}
                             </div>
 
-                            <!-- First Edition toggle -->
-                            <div class="mt-3 p-3 border rounded-3 bg-light d-flex align-items-center gap-3">
-                                <div class="form-check form-switch mb-0">
-                                    <input class="form-check-input" type="checkbox"
-                                           role="switch" id="firstEditionCheck"
-                                           {% if record.extracted_data.get('first_edition') == true or record.extracted_data.get('first_edition') == 'True' %}checked{% endif %}>
-                                    <label class="form-check-label fw-semibold" for="firstEditionCheck">
-                                        First Edition
-                                    </label>
-                                </div>
-                            </div>
-
-                            <!-- Limited Edition toggle -->
-                            <div class="mt-2 p-3 border rounded-3 bg-light d-flex align-items-center gap-3">
-                                <div class="form-check form-switch mb-0">
-                                    <input class="form-check-input" type="checkbox"
-                                           role="switch" id="limitedEditionCheck"
-                                           {% if record.extracted_data.get('limited_edition') == true or record.extracted_data.get('limited_edition') == 'True' %}checked{% endif %}>
-                                    <label class="form-check-label fw-semibold" for="limitedEditionCheck">
-                                        Limited Edition
-                                    </label>
-                                </div>
+                            <!-- Edition dropdown -->
+                            <div class="mt-3 p-3 border rounded-3 bg-light">
+                                <label class="form-label fw-semibold mb-2" for="editionSelect">Edition</label>
+                                <select class="form-select" id="editionSelect" name="edition">
+                                    {% set cur_edition = record.extracted_data.get('edition', '') %}
+                                    {% set legacy_fe   = record.extracted_data.get('first_edition', false) %}
+                                    {% set legacy_le   = record.extracted_data.get('limited_edition', false) %}
+                                    {% if cur_edition == 'First Edition' or (not cur_edition and (legacy_fe == true or legacy_fe == 'True')) %}
+                                        {% set sel_edition = 'First Edition' %}
+                                    {% elif cur_edition == 'Limited Edition' or (not cur_edition and (legacy_le == true or legacy_le == 'True')) %}
+                                        {% set sel_edition = 'Limited Edition' %}
+                                    {% else %}
+                                        {% set sel_edition = 'Standard Edition' %}
+                                    {% endif %}
+                                    <option value="Standard Edition" {% if sel_edition == 'Standard Edition' %}selected{% endif %}>Standard Edition</option>
+                                    <option value="First Edition"    {% if sel_edition == 'First Edition'    %}selected{% endif %}>First Edition</option>
+                                    <option value="Limited Edition"  {% if sel_edition == 'Limited Edition'  %}selected{% endif %}>Limited Edition</option>
+                                </select>
                             </div>
 
                             <div class="d-flex gap-2 mt-4 flex-wrap">
@@ -386,9 +382,10 @@
             const updated = {};
             for (const [k, v] of new FormData(this).entries()) updated[k] = v.trim();
 
-            // first_edition is a checkbox outside the FormData — handle explicitly
-            updated['first_edition']   = document.getElementById('firstEditionCheck').checked;
-            updated['limited_edition'] = document.getElementById('limitedEditionCheck').checked;
+            // edition is a <select> inside the form — FormData picks it up automatically.
+            // Explicitly remove legacy boolean keys so they are cleared on save.
+            delete updated['first_edition'];
+            delete updated['limited_edition'];
 
             const res  = await fetch(`/update_scan/${recordId}`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -624,16 +621,20 @@
                 }
             }
 
-            // Handle first_edition boolean separately
-            if ('first_edition' in source) {
-                const cb = document.getElementById('firstEditionCheck');
-                if (cb) cb.checked = source.first_edition === true || source.first_edition === 'true';
-            }
-
-            // Handle limited_edition boolean separately
-            if ('limited_edition' in source) {
-                const cb = document.getElementById('limitedEditionCheck');
-                if (cb) cb.checked = source.limited_edition === true || source.limited_edition === 'true';
+            // Handle edition (string select) — also migrate legacy boolean fields from old records
+            {
+                const sel = document.getElementById('editionSelect');
+                if (sel) {
+                    let editionVal = 'Standard Edition';
+                    if (source.edition && ['Standard Edition', 'First Edition', 'Limited Edition'].includes(source.edition)) {
+                        editionVal = source.edition;
+                    } else if (source.first_edition === true || source.first_edition === 'true') {
+                        editionVal = 'First Edition';
+                    } else if (source.limited_edition === true || source.limited_edition === 'true') {
+                        editionVal = 'Limited Edition';
+                    }
+                    sel.value = editionVal;
+                }
             }
 
             // Copy pricing URL if the source has one

@@ -249,8 +249,7 @@
                                 <th data-col="tcg_url" class="sortable" data-sort-type="text">Price URL <span class="sort-icon">⇅</span></th>
                                 <th data-col="holographic" class="sortable" data-sort-type="enum">Holographic <span class="sort-icon">⇅</span></th>
                                 <th data-col="finalized" class="sortable" data-sort-type="text">Finalized <span class="sort-icon">⇅</span></th>
-                                <th data-col="first_edition" class="sortable" data-sort-type="text">1st Ed <span class="sort-icon">⇅</span></th>
-                                <th data-col="limited_edition" class="sortable" data-sort-type="text">Ltd Ed <span class="sort-icon">⇅</span></th>
+                                <th data-col="edition" class="sortable" data-sort-type="enum">Edition <span class="sort-icon">⇅</span></th>
                                 <th data-col="qty" class="sortable" data-sort-type="num">Qty <span class="sort-icon">⇅</span></th>
                                 {% for field in entry_fields %}
                                 <th data-col="entry_{{ field | e }}" data-entry-field="{{ field | e }}" class="sortable" data-sort-type="text">{{ field | replace('_', ' ') | title }} <span class="sort-icon">⇅</span></th>
@@ -319,20 +318,17 @@
                                            {% if record.extracted_data.get('finalized') == true or record.extracted_data.get('finalized') == 'True' %}checked{% endif %}
                                            title="Toggle Finalized">
                                 </td>
-                                <td data-col-static="first_edition" class="text-center">
-                                    <input type="checkbox" class="form-check-input boolean-toggle"
-                                           data-record-id="{{ record.id }}"
-                                           data-field="first_edition"
-                                           {% if record.extracted_data.get('first_edition') == true or record.extracted_data.get('first_edition') == 'True' %}checked{% endif %}
-                                           title="Toggle First Edition">
-                                </td>
-                                <td data-col-static="limited_edition" class="text-center">
-                                    <input type="checkbox" class="form-check-input boolean-toggle"
-                                           data-record-id="{{ record.id }}"
-                                           data-field="limited_edition"
-                                           {% if record.extracted_data.get('limited_edition') == true or record.extracted_data.get('limited_edition') == 'True' %}checked{% endif %}
-                                           title="Toggle Limited Edition">
-                                </td>
+                                <td data-col-static="edition">
+                                    {% set ed = record.extracted_data.get('edition', '') %}
+                                    {% set legacy_fe = record.extracted_data.get('first_edition', false) %}
+                                    {% set legacy_le = record.extracted_data.get('limited_edition', false) %}
+                                    {% if ed == 'First Edition' or (not ed and (legacy_fe == true or legacy_fe == 'True')) %}
+                                        <span class="badge" style="background:#7c3aed;">First Edition</span>
+                                    {% elif ed == 'Limited Edition' or (not ed and (legacy_le == true or legacy_le == 'True')) %}
+                                        <span class="badge" style="background:#e4242b;">Limited Edition</span>
+                                    {% else %}
+                                        <span class="badge bg-secondary" style="opacity:0.55;">Standard</span>
+                                    {% endif %}
                                 </td>
                                 <td data-col-static="qty" class="text-center">
                                     {% if ginfo.count > 1 %}
@@ -584,31 +580,6 @@
             }
         });
 
-        // ====================== BOOLEAN INLINE TOGGLES (first_edition, limited_edition) ======================
-        document.addEventListener('change', async function (e) {
-            const cb = e.target.closest('.boolean-toggle');
-            if (!cb) return;
-
-            const recordId = cb.dataset.recordId;
-            const field    = cb.dataset.field;
-            const checked  = cb.checked;
-
-            try {
-                const res  = await fetch(`/update_scan/${recordId}`, {
-                    method:  'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body:    JSON.stringify({ extracted_data: { [field]: checked } }),
-                });
-                const data = await res.json();
-                if (data.status !== 'success') {
-                    cb.checked = !checked;  // revert on failure
-                }
-            } catch (err) {
-                console.error(`Failed to save ${field} state:`, err);
-                cb.checked = !checked;
-            }
-        });
-
         // ====================== EXPORT CSV ======================
         document.getElementById('exportCsvBtn')?.addEventListener('click', function () {
             // Collect the currently VISIBLE column keys from the table headers.
@@ -722,19 +693,18 @@
 
         // Static columns that can be toggled (key matches data-col on <th>)
         const STATIC_TOGGLEABLE_COLS = [
-            { key: 'date',            label: 'Date' },
-            { key: 'image',           label: 'Image' },
-            { key: 'game',            label: 'Game' },
-            { key: 'album',           label: 'Album' },
-            { key: 'page',            label: 'Page' },
-            { key: 'slot',            label: 'Slot' },
-            { key: 'template',        label: 'Template' },
-            { key: 'tcg_url',         label: 'Price URL' },
-            { key: 'holographic',     label: 'Holographic' },
-            { key: 'finalized',       label: 'Finalized' },
-            { key: 'first_edition',   label: '1st Edition' },
-            { key: 'limited_edition', label: 'Ltd Edition' },
-            { key: 'qty',             label: 'Qty' },
+            { key: 'date',        label: 'Date' },
+            { key: 'image',       label: 'Image' },
+            { key: 'game',        label: 'Game' },
+            { key: 'album',       label: 'Album' },
+            { key: 'page',        label: 'Page' },
+            { key: 'slot',        label: 'Slot' },
+            { key: 'template',    label: 'Template' },
+            { key: 'tcg_url',     label: 'Price URL' },
+            { key: 'holographic', label: 'Holographic' },
+            { key: 'finalized',   label: 'Finalized' },
+            { key: 'edition',     label: 'Edition' },
+            { key: 'qty',         label: 'Qty' },
         ];
 
         // OCR metadata suffixes that must never appear as column chooser options.
@@ -800,8 +770,8 @@
                 });
             }
 
-            // Apply visibility for data-col-static columns (tcg_url, holographic, finalized, first_edition, limited_edition, qty)
-            ['tcg_url', 'holographic', 'finalized', 'first_edition', 'limited_edition', 'qty'].forEach(colKey => {
+            // Apply visibility for data-col-static columns (tcg_url, holographic, finalized, edition, qty)
+            ['tcg_url', 'holographic', 'finalized', 'edition', 'qty'].forEach(colKey => {
                 const hide = hiddenSet.has(colKey);
                 const th = table.querySelector(`thead th[data-col="${colKey}"]`);
                 if (th) th.style.display = hide ? 'none' : '';
@@ -873,7 +843,9 @@
         let sortState = { col: null, dir: 'asc' };
 
         // Defined sort order for the Holographic enum column.
-        const HOLO_ORDER = { 'None': 0, 'Shiny Text': 1, 'Regular': 2, 'Reverse': 3, 'Special': 4 };
+        const HOLO_ORDER    = { 'None': 0, 'Shiny Text': 1, 'Regular': 2, 'Reverse': 3, 'Special': 4 };
+        // Defined sort order for the Edition enum column.
+        const EDITION_ORDER = { 'Standard Edition': 0, 'First Edition': 1, 'Limited Edition': 2 };
 
         function getCellValue(row, colKey) {
             if (colKey === 'tcg_url') {
@@ -891,15 +863,10 @@
                 if (!td) return 'False';
                 return td.querySelector('input[type="checkbox"]')?.checked ? 'True' : 'False';
             }
-            if (colKey === 'first_edition') {
-                const td = row.querySelector('td[data-col-static="first_edition"]');
-                if (!td) return 'False';
-                return td.querySelector('input[type="checkbox"]')?.checked ? 'True' : 'False';
-            }
-            if (colKey === 'limited_edition') {
-                const td = row.querySelector('td[data-col-static="limited_edition"]');
-                if (!td) return 'False';
-                return td.querySelector('input[type="checkbox"]')?.checked ? 'True' : 'False';
+            if (colKey === 'edition') {
+                const td = row.querySelector('td[data-col-static="edition"]');
+                if (!td) return 'Standard Edition';
+                return td.querySelector('.badge')?.textContent.trim() || 'Standard Edition';
             }
             if (colKey === 'qty') {
                 const td = row.querySelector('td[data-col-static="qty"]');
@@ -945,7 +912,9 @@
                     return (new Date(va) - new Date(vb)) * dir;
                 }
                 if (sortType === 'enum') {
-                    return ((HOLO_ORDER[va] ?? 99) - (HOLO_ORDER[vb] ?? 99)) * dir;
+                    const orderA = HOLO_ORDER[va] ?? EDITION_ORDER[va] ?? 99;
+                    const orderB = HOLO_ORDER[vb] ?? EDITION_ORDER[vb] ?? 99;
+                    return (orderA - orderB) * dir;
                 }
                 return va.localeCompare(vb, undefined, { sensitivity: 'base' }) * dir;
             });
