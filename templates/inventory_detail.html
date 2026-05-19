@@ -151,9 +151,16 @@
                 </div>
             </div>
             <div class="d-flex gap-2 flex-wrap">
+                {% set _game = record.extracted_data.get('game', '') if record.extracted_data else '' %}
+                {% if _game %}
+                <a href="{{ url_for('inventory', game=_game) }}" class="btn btn-outline-secondary">
+                    <i class="fas fa-arrow-left me-1"></i>Back to {{ _game }}
+                </a>
+                {% else %}
                 <a href="{{ url_for('inventory') }}" class="btn btn-outline-secondary">
                     <i class="fas fa-arrow-left me-1"></i>Back to Inventory
                 </a>
+                {% endif %}
                 {% if prev_id %}
                 <a href="{{ url_for('inventory_detail', record_id=prev_id) }}" class="btn btn-outline-primary">
                     <i class="fas fa-chevron-left me-1"></i>Previous

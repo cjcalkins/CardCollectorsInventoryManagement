@@ -827,6 +827,53 @@ def _rep_sort_key(record, sort_col, group_info):
     return (data.get(sort_col) or "").lower()
 
 
+# ====================== GAME SELECTION HELPER ======================
+def _inventory_game_select():
+    """Render the game selection landing page for /inventory."""
+    rows = (
+        ScanRecord.query
+        .with_entities(ScanRecord.extracted_data)
+        .all()
+    )
+
+    game_map = {}
+    for (extracted_data,) in rows:
+        if isinstance(extracted_data, dict):
+            data = extracted_data
+        else:
+            try:
+                data = json.loads(extracted_data or "{}")
+            except (ValueError, TypeError):
+                data = {}
+
+        game_name = str(data.get("game", "")).strip()
+        if not game_name:
+            game_name = "(Unknown Game)"
+
+        if game_name not in game_map:
+            game_map[game_name] = {"name": game_name, "count": 0, "albums": set(), "all_data": []}
+        game_map[game_name]["count"] += 1
+        album = str(data.get("album", "")).strip()
+        if album:
+            game_map[game_name]["albums"].add(album)
+        game_map[game_name]["all_data"].append(data)
+
+    games = []
+    for info in game_map.values():
+        # Discover fields for this game using a sample
+        sample_records_fake = [type("R", (), {"extracted_data": d})() for d in info["all_data"][:200]]
+        fields = discover_entry_fields(sample_records_fake)
+        games.append({
+            "name":        info["name"],
+            "count":       info["count"],
+            "album_count": len(info["albums"]),
+            "fields":      fields,
+        })
+
+    games.sort(key=lambda g: g["name"].lower())
+    return render_template("inventory_game_select.html", games=games)
+
+
 @app.route("/inventory")
 def inventory():
     page       = request.args.get("page", 1, type=int)
@@ -838,25 +885,41 @@ def inventory():
     sort_col   = request.args.get("sort", "").strip()
     sort_dir   = request.args.get("sort_dir", "asc").strip()
 
+    # If no filter is active, show the game selection landing page.
+    if not f_game and not f_album and not f_template and not search:
+        return _inventory_game_select()
+
     if sort_dir not in ("asc", "desc"):
         sort_dir = "asc"
 
     per_page = min(per_page, 200)
 
+    # Fetch base query — JSON key filters are done in Python for SQLite compatibility
+    # (.astext is PostgreSQL-only; SQLite stores JSON as plain text)
     query = ScanRecord.query.order_by(ScanRecord.scan_date.desc())
 
-    if f_game:
-        query = query.filter(ScanRecord.extracted_data["game"].astext == f_game)
-    if f_album:
-        query = query.filter(ScanRecord.extracted_data["album"].astext == f_album)
     if f_template:
         query = query.filter(ScanRecord.template_used == f_template)
     if search:
         query = query.filter(ScanRecord.extracted_data.cast(db.Text).ilike(f"%{search}%"))
 
+    all_records_raw = query.all()
+
+    # Python-side filtering for game / album (SQLite-safe)
+    all_records = all_records_raw
+    if f_game:
+        all_records = [
+            r for r in all_records
+            if str((r.extracted_data or {}).get("game", "")).strip() == f_game
+        ]
+    if f_album:
+        all_records = [
+            r for r in all_records
+            if str((r.extracted_data or {}).get("album", "")).strip() == f_album
+        ]
+
     # Build groups across the full filtered set so duplicates on other pages
     # are still counted in the quantity badge.
-    all_records = query.all()
     group_info, rep_records = build_group_info(all_records)
 
     # Apply server-side sort across ALL representative records before paginating.
@@ -951,17 +1014,24 @@ def inventory_export_csv():
     columns_param = request.args.get("columns", "").strip()
 
     # Build query — same logic as /inventory, but no pagination
+    # Python-side filtering for game/album for SQLite compatibility (.astext is PostgreSQL-only)
     query = ScanRecord.query.order_by(ScanRecord.scan_date.desc())
-    if f_game:
-        query = query.filter(ScanRecord.extracted_data["game"].astext == f_game)
-    if f_album:
-        query = query.filter(ScanRecord.extracted_data["album"].astext == f_album)
     if f_template:
         query = query.filter(ScanRecord.template_used == f_template)
     if search:
         query = query.filter(ScanRecord.extracted_data.cast(db.Text).ilike(f"%{search}%"))
 
     records = query.all()
+    if f_game:
+        records = [
+            r for r in records
+            if str((r.extracted_data or {}).get("game", "")).strip() == f_game
+        ]
+    if f_album:
+        records = [
+            r for r in records
+            if str((r.extracted_data or {}).get("album", "")).strip() == f_album
+        ]
 
     # Determine which columns to export
     # Static column key → (header label, value extractor)

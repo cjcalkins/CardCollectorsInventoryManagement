@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <link rel="icon" type="image/jpeg" href="{{ url_for('static', filename='favicon.jpg') }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Inventory - Card Collector Inventory Manager</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+
+    <style>
+        body { background-color: #f8f9fa; }
+
+        .nav-tabs-minimal { display: flex; gap: 10px; margin-left: auto; }
+        .nav-tab {
+            padding: 8px 14px; text-decoration: none; border-radius: 8px;
+            background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.85);
+            font-weight: 600; transition: 0.2s ease;
+        }
+        .nav-tab:hover { background: rgba(255,255,255,0.18); color: #fff; }
+        .nav-tab.active { background: #fff; color: #212529; }
+
+        .game-card {
+            border: none;
+            border-radius: 16px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+            transition: transform 0.18s ease, box-shadow 0.18s ease;
+            cursor: pointer;
+            text-decoration: none;
+            color: inherit;
+            display: block;
+            overflow: hidden;
+            position: relative;
+        }
+        .game-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 10px 30px rgba(0,0,0,0.14);
+            color: inherit;
+        }
+        .game-card .card-body {
+            padding: 2rem 1.75rem;
+            position: relative;
+            z-index: 1;
+        }
+        /* Full-card custom image */
+        .game-card-bg-img {
+            position: absolute;
+            inset: 0;
+            width: 100%; height: 100%;
+            object-fit: cover;
+            border-radius: 16px;
+            z-index: 0;
+            display: block;
+        }
+        /* When custom image is set: hide all text, fix card height so image fills it */
+        .game-card.has-custom-img { min-height: 180px; }
+        .game-card.has-custom-img .card-body { visibility: hidden; }
+        /* Camera button floats top-right */
+        .game-img-btn {
+            position: absolute;
+            top: 12px; right: 12px;
+            width: 34px; height: 34px;
+            border-radius: 50%;
+            background: rgba(0,0,0,0.55);
+            border: none;
+            display: flex; align-items: center; justify-content: center;
+            opacity: 0;
+            transition: opacity 0.18s ease, background 0.18s ease;
+            cursor: pointer;
+            z-index: 3;
+        }
+        .game-img-btn i { font-size: 0.85rem; color: #fff; }
+        .game-card:hover .game-img-btn { opacity: 1; }
+        .game-img-btn:hover { background: rgba(0,0,0,0.78); }
+        /* Default icon (hidden when custom image set) */
+        .game-icon {
+            width: 56px; height: 56px;
+            border-radius: 14px;
+            background: linear-gradient(135deg, #343a40 0%, #495057 100%);
+            display: flex; align-items: center; justify-content: center;
+            margin-bottom: 1rem;
+            flex-shrink: 0;
+        }
+        .game-icon i { font-size: 1.5rem; color: #fff; }
+        .game-card.has-custom-img .game-icon { display: none; }
+        input.game-img-input { display: none; }
+        .game-title {
+            font-size: 1.2rem;
+            font-weight: 700;
+            margin-bottom: 0.25rem;
+        }
+        .game-meta {
+            font-size: 0.82rem;
+            color: #6c757d;
+        }
+        .game-fields-preview {
+            margin-top: 0.75rem;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+        }
+        .field-pill {
+            font-size: 0.72rem;
+            background: #e9ecef;
+            color: #495057;
+            border-radius: 20px;
+            padding: 2px 9px;
+            font-weight: 500;
+        }
+        .field-pill-more {
+            font-size: 0.72rem;
+            background: #dee2e6;
+            color: #6c757d;
+            border-radius: 20px;
+            padding: 2px 9px;
+        }
+        .empty-state {
+            text-align: center;
+            padding: 5rem 1rem;
+            color: #6c757d;
+        }
+        .empty-state i { font-size: 3.5rem; margin-bottom: 1.5rem; opacity: 0.35; }
+
+        @media (max-width: 768px) {
+            .nav-tabs-minimal { margin-left: 0; margin-top: 12px; width: 100%; }
+            .nav-tab { flex: 1; text-align: center; }
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+        <div class="container d-flex flex-wrap align-items-center">
+            <a class="navbar-brand" href="{{ url_for('index') }}">
+                <img src="{{ url_for('static', filename='favicon.jpg') }}" alt="logo" width="24" height="24"
+                     style="object-fit:cover;border-radius:4px;margin-right:0.5rem;" class="me-2">Card Collector Inventory Manager
+            </a>
+            <div class="nav-tabs-minimal">
+                <a href="{{ url_for('import_page') }}" class="nav-tab">Import</a>
+                <a href="{{ url_for('index') }}"        class="nav-tab">Scan</a>
+                <a href="{{ url_for('inventory') }}"    class="nav-tab active">Inventory</a>
+                <a href="{{ url_for('albums_list') }}"  class="nav-tab">Album</a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container py-5">
+        <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-3">
+            <div>
+                <h2 class="mb-1"><i class="fas fa-boxes-stacked me-2"></i>Inventory</h2>
+                <div class="text-muted">Select a game to view its inventory</div>
+            </div>
+        </div>
+
+        {% if games %}
+        <div class="row g-4">
+            {% for game in games %}
+            <div class="col-12 col-sm-6 col-lg-4">
+                <a href="{{ url_for('inventory', game=game.name) }}" class="game-card card" id="game-card-{{ loop.index }}">
+                    <!-- Full-card background image (injected by JS when set) -->
+                    <!-- Camera button -->
+                    <button class="game-img-btn"
+                            onclick="triggerImageUpload(event, '{{ game.name | e }}', {{ loop.index }})"
+                            title="Set custom image">
+                        <i class="fas fa-camera"></i>
+                    </button>
+                    <input type="file" accept="image/*"
+                           class="game-img-input"
+                           id="game-img-input-{{ loop.index }}"
+                           onchange="handleImageUpload(event, '{{ game.name | e }}', {{ loop.index }})">
+                    <div class="card-body">
+                        <div class="game-icon" id="game-icon-{{ loop.index }}">
+                            <i class="fas fa-layer-group"></i>
+                        </div>
+                        <div class="game-title">{{ game.name }}</div>
+                        <div class="game-meta">
+                            <i class="fas fa-database me-1"></i>{{ game.count }} record{{ 's' if game.count != 1 else '' }}
+                            {% if game.album_count %}
+                            &nbsp;·&nbsp;<i class="fas fa-book-open me-1"></i>{{ game.album_count }} album{{ 's' if game.album_count != 1 else '' }}
+                            {% endif %}
+                        </div>
+                        {% if game.fields %}
+                        <div class="game-fields-preview">
+                            {% for field in game.fields[:6] %}
+                            <span class="field-pill">{{ field | replace('_', ' ') }}</span>
+                            {% endfor %}
+                            {% if game.fields | length > 6 %}
+                            <span class="field-pill-more">+{{ (game.fields | length) - 6 }} more</span>
+                            {% endif %}
+                        </div>
+                        {% endif %}
+                    </div>
+                </a>
+            </div>
+            {% endfor %}
+        </div>
+        {% else %}
+        <div class="empty-state">
+            <i class="fas fa-inbox d-block"></i>
+            <h4>No inventory records yet</h4>
+            <p>Scan or import cards to get started.</p>
+            <a href="{{ url_for('import_page') }}" class="btn btn-dark mt-2">
+                <i class="fas fa-file-import me-1"></i>Go to Import
+            </a>
+        </div>
+        {% endif %}
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        function storageKey(gameName) {
+            return 'game_icon_img__' + gameName;
+        }
+
+        function applyImage(gameName, index, dataUrl) {
+            const card = document.getElementById('game-card-' + index);
+            if (!card) return;
+            // Remove existing bg img if any
+            const existing = card.querySelector('img.game-card-bg-img');
+            if (existing) existing.remove();
+            if (dataUrl) {
+                const img = document.createElement('img');
+                img.src = dataUrl;
+                img.className = 'game-card-bg-img';
+                img.alt = gameName;
+                card.insertBefore(img, card.firstChild);
+                card.classList.add('has-custom-img');
+            } else {
+                card.classList.remove('has-custom-img');
+            }
+        }
+
+        function triggerImageUpload(e, gameName, index) {
+            e.preventDefault();
+            e.stopPropagation();
+            document.getElementById('game-img-input-' + index).click();
+        }
+
+        function handleImageUpload(e, gameName, index) {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = function(ev) {
+                const dataUrl = ev.target.result;
+                try { localStorage.setItem(storageKey(gameName), dataUrl); } catch(err) {}
+                applyImage(gameName, index, dataUrl);
+            };
+            reader.readAsDataURL(file);
+        }
+
+        // Restore saved images on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('.game-img-input').forEach(function(input) {
+                const id = input.id; // game-img-input-N
+                const index = id.split('-').pop();
+                const gameName = input.getAttribute('onchange').match(/'([^']+)',\s*\d+\)/)[1];
+                const saved = localStorage.getItem(storageKey(gameName));
+                if (saved) applyImage(gameName, index, saved);
+            });
+        });
+    </script>
+</html>

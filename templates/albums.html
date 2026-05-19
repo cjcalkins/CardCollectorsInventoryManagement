@@ -21,6 +21,8 @@
             transition: transform 0.2s ease, box-shadow 0.2s ease;
             display: block;
             height: 100%;
+            overflow: hidden;
+            position: relative;
         }
 
         .album-card:hover {
@@ -55,10 +57,39 @@
             color: #212529;
         }
 
-        .album-meta {
-            color: #6c757d;
-            margin-bottom: 0.35rem;
+        .album-card-bg-img {
+            position: absolute;
+            inset: 0;
+            width: 100%; height: 100%;
+            object-fit: cover;
+            border-radius: 14px;
+            z-index: 0;
+            display: block;
         }
+        .album-card .card-body {
+            position: relative;
+            z-index: 1;
+        }
+        .album-card.has-custom-img { min-height: 180px; }
+        .album-card.has-custom-img .card-body { visibility: hidden; }
+        /* Camera button */
+        .album-img-btn {
+            position: absolute;
+            top: 12px; right: 12px;
+            width: 34px; height: 34px;
+            border-radius: 50%;
+            background: rgba(0,0,0,0.55);
+            border: none;
+            display: flex; align-items: center; justify-content: center;
+            opacity: 0;
+            transition: opacity 0.18s ease, background 0.18s ease;
+            cursor: pointer;
+            z-index: 3;
+        }
+        .album-img-btn i { font-size: 0.85rem; color: #fff; }
+        .album-card:hover .album-img-btn { opacity: 1; }
+        .album-img-btn:hover { background: rgba(0,0,0,0.78); }
+        input.album-img-input { display: none; }
 
         .album-icon {
             width: 52px;
@@ -137,7 +168,17 @@
         <div class="row g-4">
             {% for album in albums %}
                 <div class="col-md-6 col-lg-4">
-                    <a href="{{ url_for('album_detail', album_name=album.name) }}" class="card album-card">
+                    <a href="{{ url_for('album_detail', album_name=album.name) }}" class="card album-card" id="album-card-{{ loop.index }}">
+                        <!-- Camera button -->
+                        <button class="album-img-btn"
+                                onclick="triggerAlbumImageUpload(event, '{{ album.name | e }}', {{ loop.index }})"
+                                title="Set custom image">
+                            <i class="fas fa-camera"></i>
+                        </button>
+                        <input type="file" accept="image/*"
+                               class="album-img-input"
+                               id="album-img-input-{{ loop.index }}"
+                               onchange="handleAlbumImageUpload(event, '{{ album.name | e }}', {{ loop.index }})">
                         <div class="card-body">
                             <div class="album-icon">
                                 <i class="fas fa-book-open"></i>
@@ -174,5 +215,55 @@
             </div>
         {% endif %}
     </div>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        function albumStorageKey(albumName) {
+            return 'album_card_img__' + albumName;
+        }
+
+        function applyAlbumImage(albumName, index, dataUrl) {
+            const card = document.getElementById('album-card-' + index);
+            if (!card) return;
+            const existing = card.querySelector('img.album-card-bg-img');
+            if (existing) existing.remove();
+            if (dataUrl) {
+                const img = document.createElement('img');
+                img.src = dataUrl;
+                img.className = 'album-card-bg-img';
+                img.alt = albumName;
+                card.insertBefore(img, card.firstChild);
+                card.classList.add('has-custom-img');
+            } else {
+                card.classList.remove('has-custom-img');
+            }
+        }
+
+        function triggerAlbumImageUpload(e, albumName, index) {
+            e.preventDefault();
+            e.stopPropagation();
+            document.getElementById('album-img-input-' + index).click();
+        }
+
+        function handleAlbumImageUpload(e, albumName, index) {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = function(ev) {
+                const dataUrl = ev.target.result;
+                try { localStorage.setItem(albumStorageKey(albumName), dataUrl); } catch(err) {}
+                applyAlbumImage(albumName, index, dataUrl);
+            };
+            reader.readAsDataURL(file);
+        }
+
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('.album-img-input').forEach(function(input) {
+                const index = input.id.split('-').pop();
+                const albumName = input.getAttribute('onchange').match(/'([^']+)',\s*\d+\)/)[1];
+                const saved = localStorage.getItem(albumStorageKey(albumName));
+                if (saved) applyAlbumImage(albumName, index, saved);
+            });
+        });
+    </script>
 </body>
 </html>
