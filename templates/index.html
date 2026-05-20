@@ -136,6 +136,71 @@
         .field-row .field-coords { font-size: 0.75rem; color: #6c757d; }
         .field-row .btn-del { padding: 0 4px; font-size: 0.75rem; }
 
+        /* ── OCR Progress Overlay ── */
+        #ocrProgressOverlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(15, 23, 42, 0.72);
+            z-index: 10000;
+            align-items: center;
+            justify-content: center;
+        }
+        #ocrProgressOverlay.visible {
+            display: flex;
+        }
+        .ocr-progress-dialog {
+            background: white;
+            border-radius: 20px;
+            padding: 36px 40px;
+            width: min(480px, 90vw);
+            box-shadow: 0 24px 64px rgba(0,0,0,0.35);
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+            align-items: center;
+            text-align: center;
+        }
+        .ocr-progress-icon {
+            width: 54px;
+            height: 54px;
+            border-radius: 50%;
+            background: #dbeafe;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 26px;
+        }
+        .ocr-progress-title {
+            font-size: 20px;
+            font-weight: 700;
+            color: #1e293b;
+        }
+        .ocr-progress-sub {
+            font-size: 14px;
+            color: #64748b;
+            min-height: 20px;
+        }
+        .ocr-progress-track {
+            width: 100%;
+            height: 12px;
+            background: #e2e8f0;
+            border-radius: 999px;
+            overflow: hidden;
+        }
+        .ocr-progress-fill {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #1d4ed8, #2563eb);
+            border-radius: 999px;
+            transition: width 0.45s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        .ocr-progress-count {
+            font-size: 13px;
+            font-weight: 700;
+            color: #64748b;
+        }
+
         @media (max-width: 768px) {
             .nav-tabs-minimal { margin-left: 0; margin-top: 12px; width: 100%; }
             .nav-tab { flex: 1; text-align: center; }
@@ -267,12 +332,7 @@
                     </div>
                 </div>
 
-                <div class="card results-card mt-4 hidden" id="resultsCard">
-                    <div class="card-header bg-light"><strong>OCR Results</strong></div>
-                    <div class="card-body">
-                        <div id="ocrResults" class="result-pre"></div>
-                    </div>
-                </div>
+
             </div>
 
             <!-- ============================================================
@@ -376,6 +436,19 @@
         </div><!-- /row -->
     </div><!-- /container -->
 
+    <!-- OCR Progress Overlay -->
+    <div id="ocrProgressOverlay">
+        <div class="ocr-progress-dialog">
+            <div class="ocr-progress-icon">🔍</div>
+            <div class="ocr-progress-title">Running OCR</div>
+            <div id="ocrProgressSub" class="ocr-progress-sub">Processing image…</div>
+            <div class="ocr-progress-track">
+                <div id="ocrProgressFill" class="ocr-progress-fill"></div>
+            </div>
+            <div id="ocrProgressCount" class="ocr-progress-count">Scanning…</div>
+        </div>
+    </div>
+
     <script>
     // ===========================================================================
     // SECTION A — SCAN (existing functionality, percentage-based)
@@ -383,11 +456,9 @@
     const uploadForm      = document.getElementById('uploadForm');
     const previewCard     = document.getElementById('previewCard');
     const entryMetaCard   = document.getElementById('entryMetaCard');
-    const resultsCard     = document.getElementById('resultsCard');
     const previewImage    = document.getElementById('previewImage');
     const previewWrapper  = document.getElementById('previewWrapper');
     const fieldsEditor    = document.getElementById('fieldsEditor');
-    const ocrResults      = document.getElementById('ocrResults');
     const runOcrBtn       = document.getElementById('runOcrBtn');
     const resetTemplateBtn = document.getElementById('resetTemplateBtn');
 
@@ -504,6 +575,35 @@
         }
     });
 
+    // ── OCR Progress Overlay helpers ─────────────────────────────────────────
+    const ocrProgressOverlay = document.getElementById('ocrProgressOverlay');
+    const ocrProgressFill    = document.getElementById('ocrProgressFill');
+    const ocrProgressSub     = document.getElementById('ocrProgressSub');
+    const ocrProgressCount   = document.getElementById('ocrProgressCount');
+
+    function showOcrProgress() {
+        ocrProgressFill.style.width  = '0%';
+        ocrProgressSub.textContent   = 'Processing image…';
+        ocrProgressCount.textContent = 'Scanning…';
+        ocrProgressOverlay.classList.add('visible');
+    }
+
+    function advanceOcrProgress(pct, subText) {
+        ocrProgressFill.style.width  = pct + '%';
+        ocrProgressSub.textContent   = subText || '';
+    }
+
+    function finishOcrProgress() {
+        ocrProgressFill.style.width  = '100%';
+        ocrProgressSub.textContent   = 'Done!';
+        ocrProgressCount.textContent = '✓ Saved';
+        return new Promise(resolve => setTimeout(() => {
+            ocrProgressOverlay.classList.remove('visible');
+            resolve();
+        }, 520));
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     runOcrBtn.addEventListener('click', async function () {
         if (!currentFilename) return;
 
@@ -522,10 +622,11 @@
         entryMetaStatus.innerHTML = '';
 
         runOcrBtn.disabled = true;
-        runOcrBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Running…';
+        showOcrProgress();
+        advanceOcrProgress(20, 'Sending to OCR engine…');
 
         try {
-            const res  = await fetch('/run_custom_ocr', {
+            const res = await fetch('/run_custom_ocr', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -539,43 +640,25 @@
                     slot:  entrySlot.value,
                 })
             });
+
+            advanceOcrProgress(75, 'Extracting fields…');
             const data = await res.json();
 
-            resultsCard.classList.remove('hidden');
-
             if (data.error) {
-                ocrResults.innerHTML = `<div class="alert alert-danger mb-0">${data.error}</div>`;
-            } else {
-                const extracted = data.extracted || {};
-                const fieldRows = Object.entries(extracted)
-                    .filter(([k]) => !k.startsWith('__') && k !== 'game' && k !== 'album' && k !== 'page' && k !== 'slot')
-                    .map(([k, v]) => `<tr>
-                        <td class="text-muted small pe-3">${k.replace(/_/g,' ')}</td>
-                        <td class="small fw-semibold">${v ?? ''}</td></tr>`)
-                    .join('');
-
-                ocrResults.innerHTML = `
-                    <div class="alert alert-success d-flex align-items-center gap-2 mb-3 py-2">
-                        <i class="fas fa-check-circle"></i>
-                        <span>Entry saved — Record #${data.record_id}</span>
-                        <a href="/inventory/${data.record_id}" class="btn btn-sm btn-success ms-auto">
-                            Open Entry <i class="fas fa-arrow-right ms-1"></i>
-                        </a>
-                    </div>
-                    <div class="mb-2 small text-muted">
-                        <strong>Game:</strong> ${entryGame.value} &nbsp;·&nbsp;
-                        <strong>Album:</strong> ${entryAlbum.value} &nbsp;·&nbsp;
-                        <strong>Page:</strong> ${entryPage.value} &nbsp;·&nbsp;
-                        <strong>Slot:</strong> ${entrySlot.value}
-                    </div>
-                    ${fieldRows ? `<table class="table table-sm mb-0">${fieldRows}</table>` : ''}`;
+                await finishOcrProgress();
+                entryMetaStatus.innerHTML = `<div class="alert alert-danger py-2 mb-0">${data.error}</div>`;
+                runOcrBtn.disabled = false;
+                return;
             }
+
+            advanceOcrProgress(95, 'Saving entry…');
+            await finishOcrProgress();
+            window.location.reload();
+
         } catch (err) {
-            resultsCard.classList.remove('hidden');
-            ocrResults.innerHTML = `<div class="alert alert-danger mb-0">Error: ${err.message}</div>`;
-        } finally {
+            await finishOcrProgress();
+            entryMetaStatus.innerHTML = `<div class="alert alert-danger py-2 mb-0">Error: ${err.message}</div>`;
             runOcrBtn.disabled = false;
-            runOcrBtn.innerHTML = '<i class="fas fa-play me-1"></i>Run OCR';
         }
     });
 

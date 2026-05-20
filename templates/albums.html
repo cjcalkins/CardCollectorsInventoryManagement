@@ -215,7 +215,8 @@
                            class="album-img-area" id="album-img-area-{{ loop.index }}">
 
                             <!-- Placeholder (shown by default, hidden when image loaded) -->
-                            <div class="album-placeholder" id="album-placeholder-{{ loop.index }}">
+                            <div class="album-placeholder" id="album-placeholder-{{ loop.index }}"
+                                 {% if album.image_url %}style="display:none;"{% endif %}>
                                 <div class="album-icon"><i class="fas fa-book-open"></i></div>
                                 <div class="album-meta-inner">
                                     <h5>{{ album.name }}</h5>
@@ -238,9 +239,9 @@
                             </div>
 
                             <!-- Custom image (hidden until set) -->
-                            <img src="" alt="{{ album.name }}" class="album-bg"
+                            <img src="{{ album.image_url or '' }}" alt="{{ album.name }}" class="album-bg"
                                  id="album-bg-{{ loop.index }}"
-                                 style="display:none;">
+                                 {% if not album.image_url %}style="display:none;"{% endif %}>
 
                             <!-- Upload spinner -->
                             <div class="upload-spinner" id="album-spinner-{{ loop.index }}">
@@ -321,7 +322,7 @@
             .then(data => {
                 if (spinner) spinner.classList.remove('active');
                 if (data.status === 'success') {
-                    // Cache the server URL in localStorage to avoid re-fetching on reload
+                    // Cache the server URL — just a short string, safe on mobile.
                     try { localStorage.setItem(albumStorageKey(albumName), data.url); } catch(err) {}
                     showAlbumImage(index, data.url);
                 } else {
@@ -338,12 +339,18 @@
             e.target.value = '';
         }
 
-        // On page load: restore any previously saved image URLs from localStorage
+        // On page load: the server already rendered images that exist on disk.
+        // localStorage is checked only as a fast-path cache for images the server
+        // might not know about yet (race condition edge case).
         document.addEventListener('DOMContentLoaded', function() {
             document.querySelectorAll('[data-album]').forEach(function(card) {
                 const albumName = card.getAttribute('data-album');
                 const index     = card.getAttribute('data-index');
-                const saved     = localStorage.getItem(albumStorageKey(albumName));
+                const bg        = document.getElementById('album-bg-' + index);
+                // If the server already provided an image src, nothing to do.
+                if (bg && bg.src && !bg.src.endsWith('/') && bg.style.display !== 'none') return;
+                // Otherwise try localStorage as a fallback cache.
+                const saved = localStorage.getItem(albumStorageKey(albumName));
                 if (saved) showAlbumImage(index, saved);
             });
         });

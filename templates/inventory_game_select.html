@@ -155,8 +155,11 @@
         <div class="row g-4">
             {% for game in games %}
             <div class="col-12 col-sm-6 col-lg-4">
-                <a href="{{ url_for('inventory', game=game.name) }}" class="game-card card" id="game-card-{{ loop.index }}">
-                    <!-- Full-card background image (injected by JS when set) -->
+                <a href="{{ url_for('inventory', game=game.name) }}" class="game-card card{% if game.image_url %} has-custom-img{% endif %}" id="game-card-{{ loop.index }}">
+                    <!-- Full-card background image (set by server if image exists) -->
+                    {% if game.image_url %}
+                    <img src="{{ game.image_url }}" class="game-card-bg-img" alt="{{ game.name }}">
+                    {% endif %}
                     <!-- Camera button -->
                     <button class="game-img-btn"
                             onclick="triggerImageUpload(event, '{{ game.name | e }}', {{ loop.index }})"
@@ -208,18 +211,17 @@
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         function storageKey(gameName) {
-            return 'game_icon_img__' + gameName;
+            return 'game_icon_img_url__' + gameName;
         }
 
-        function applyImage(gameName, index, dataUrl) {
+        function applyImage(gameName, index, imageUrl) {
             const card = document.getElementById('game-card-' + index);
             if (!card) return;
-            // Remove existing bg img if any
             const existing = card.querySelector('img.game-card-bg-img');
             if (existing) existing.remove();
-            if (dataUrl) {
+            if (imageUrl) {
                 const img = document.createElement('img');
-                img.src = dataUrl;
+                img.src = imageUrl;
                 img.className = 'game-card-bg-img';
                 img.alt = gameName;
                 card.insertBefore(img, card.firstChild);
@@ -238,20 +240,46 @@
         function handleImageUpload(e, gameName, index) {
             const file = e.target.files[0];
             if (!file) return;
+
+            // Show instant local preview while upload completes
             const reader = new FileReader();
-            reader.onload = function(ev) {
-                const dataUrl = ev.target.result;
-                try { localStorage.setItem(storageKey(gameName), dataUrl); } catch(err) {}
-                applyImage(gameName, index, dataUrl);
-            };
+            reader.onload = function(ev) { applyImage(gameName, index, ev.target.result); };
             reader.readAsDataURL(file);
+
+            // Upload to server; store only the short URL (not base64) in localStorage
+            // so images survive across devices, browsers, and origins.
+            const formData = new FormData();
+            formData.append('game_name', gameName);
+            formData.append('image', file);
+
+            fetch('/inventory/upload_game_image', {
+                method: 'POST',
+                body: formData
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    try { localStorage.setItem(storageKey(gameName), data.url); } catch(err) {}
+                    applyImage(gameName, index, data.url);
+                } else {
+                    console.error('Game image upload failed:', data.message);
+                }
+            })
+            .catch(err => console.error('Game image upload error:', err));
+
+            e.target.value = '';
         }
 
-        // Restore saved images on page load
+        // The server already renders saved images in the HTML.
+        // localStorage is checked only as a fallback for any image the server
+        // didn't know about (e.g. uploaded in this session before a reload).
         document.addEventListener('DOMContentLoaded', function() {
             document.querySelectorAll('.game-img-input').forEach(function(input) {
-                const id = input.id; // game-img-input-N
+                const id = input.id;
                 const index = id.split('-').pop();
+                const card = document.getElementById('game-card-' + index);
+                // Skip if the server already placed an image on this card
+                if (card && card.classList.contains('has-custom-img')) return;
                 const gameName = input.getAttribute('onchange').match(/'([^']+)',\s*\d+\)/)[1];
                 const saved = localStorage.getItem(storageKey(gameName));
                 if (saved) applyImage(gameName, index, saved);

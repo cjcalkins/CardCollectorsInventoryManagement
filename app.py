@@ -106,6 +106,22 @@ def get_record_value(record, key, default=""):
     return str(value).strip()
 
 
+def find_saved_image(subfolder, name):
+    """
+    Return the URL for a previously uploaded cover image, or None.
+    Scans uploads/<subfolder>/ for any file whose stem matches secure_filename(name).
+    """
+    folder = os.path.join(app.config["UPLOAD_FOLDER"], subfolder)
+    if not os.path.isdir(folder):
+        return None
+    safe_stem = os.path.splitext(secure_filename(name))[0]
+    for fname in os.listdir(folder):
+        stem, _ = os.path.splitext(fname)
+        if stem == safe_stem:
+            return url_for("uploaded_file", filename=f"{subfolder}/{fname}")
+    return None
+
+
 def build_album_index():
     records = ScanRecord.query.order_by(ScanRecord.scan_date.desc()).all()
     album_map = {}
@@ -871,6 +887,8 @@ def _inventory_game_select():
         })
 
     games.sort(key=lambda g: g["name"].lower())
+    for game in games:
+        game["image_url"] = find_saved_image("game_icons", game["name"])
     return render_template("inventory_game_select.html", games=games)
 
 
@@ -1298,6 +1316,8 @@ def albums():
 @app.route("/albums/list")
 def albums_list():
     album_list = build_album_index()
+    for album in album_list:
+        album["image_url"] = find_saved_image("albums", album["name"])
     return render_template("albums.html", albums=album_list)
 
 
@@ -1323,6 +1343,31 @@ def album_upload_image():
     file.save(save_path)
 
     relative_path = f"albums/{filename}"
+    image_url = url_for("uploaded_file", filename=relative_path)
+    return jsonify({"status": "success", "url": image_url})
+
+
+@app.route("/inventory/upload_game_image", methods=["POST"])
+def inventory_upload_game_image():
+    game_name = request.form.get("game_name", "").strip()
+    file = request.files.get("image")
+
+    if not game_name or not file or not file.filename:
+        return jsonify({"status": "error", "message": "Game name and image file are required"}), 400
+
+    game_img_folder = os.path.join(app.config["UPLOAD_FOLDER"], "game_icons")
+    os.makedirs(game_img_folder, exist_ok=True)
+
+    _, ext = os.path.splitext(file.filename)
+    if not ext:
+        ext = ".jpg"
+
+    safe_game = secure_filename(game_name)
+    filename = f"{safe_game}{ext}"
+    save_path = os.path.join(game_img_folder, filename)
+    file.save(save_path)
+
+    relative_path = f"game_icons/{filename}"
     image_url = url_for("uploaded_file", filename=relative_path)
     return jsonify({"status": "success", "url": image_url})
 
