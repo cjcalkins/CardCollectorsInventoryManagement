@@ -170,6 +170,9 @@
                 <button class="btn btn-success" id="addCustomFieldBtn" type="button">
                     <i class="fas fa-plus me-1"></i>Add Field to Game
                 </button>
+                <button class="btn btn-warning" id="editSelectedBtn" type="button">
+                    <i class="fas fa-pen-to-square me-1"></i>Edit Selected
+                </button>
                 <button class="btn btn-danger" id="deleteSelectedBtn" type="button">
                     <i class="fas fa-trash me-1"></i>Delete Selected
                 </button>
@@ -245,8 +248,15 @@
                     <table class="table table-hover align-middle mb-0" id="inventoryTable">
                         <thead class="table-dark">
                             <tr>
-                                <th style="width: 40px;" data-col="select">
-                                    <input type="checkbox" id="selectAll">
+                                <th style="width: 140px;" data-col="select">
+                                    <div class="d-flex align-items-center gap-2">
+                                        <input type="checkbox" id="selectAll" title="Select all on this page">
+                                        <button class="btn btn-outline-light btn-sm py-0 px-2" id="selectAllFilterBtn"
+                                                title="Select all records matching current filter (all pages)"
+                                                style="font-size:0.7rem;white-space:nowrap;line-height:1.6;">
+                                            <i class="fas fa-check-double me-1"></i>All
+                                        </button>
+                                    </div>
                                 </th>
                                 <th data-col="date" class="sortable" data-sort-type="date">Date <span class="sort-icon">⇅</span></th>
                                 <th data-col="image">Image</th>
@@ -431,6 +441,66 @@
         </div>
     </div>
 
+    <!-- Selection Status Banner -->
+    <div id="selectionBanner" class="alert alert-info alert-dismissible d-none mx-0 mb-0 rounded-0 border-0 border-bottom py-2" role="alert"
+         style="position:sticky;top:0;z-index:1040;border-radius:0!important;">
+        <div class="container d-flex align-items-center gap-3 flex-wrap">
+            <span id="selectionCount" class="fw-semibold"></span>
+            <button class="btn btn-sm btn-outline-secondary" id="clearSelectionBtn" type="button">
+                <i class="fas fa-times me-1"></i>Clear Selection
+            </button>
+        </div>
+    </div>
+
+    <!-- Bulk Edit Modal -->
+    <div class="modal fade" id="bulkEditModal" tabindex="-1" aria-labelledby="bulkEditModalLabel" aria-hidden="true">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="bulkEditModalLabel">
+                        <i class="fas fa-pen-to-square me-2"></i>Bulk Edit Selected Cards
+                    </h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="text-muted small mb-3" id="bulkEditCountMsg"></p>
+                    <div class="mb-3">
+                        <label for="bulkEditField" class="form-label fw-semibold">Field to Update</label>
+                        <select id="bulkEditField" class="form-select">
+                            <option value="">Select a field…</option>
+                            <optgroup label="Core Fields">
+                                <option value="album">Album</option>
+                                <option value="page">Page</option>
+                                <option value="slot">Slot</option>
+                                <option value="edition">Edition</option>
+                                <option value="finalized">Finalized</option>
+                            </optgroup>
+                            <optgroup label="Custom Fields" id="bulkEditCustomGroup">
+                                <!-- populated by JS -->
+                            </optgroup>
+                        </select>
+                    </div>
+                    <div class="mb-3" id="bulkEditValueWrap">
+                        <label for="bulkEditValue" class="form-label fw-semibold">New Value</label>
+                        <!-- swapped to a <select> for enum fields, <input> otherwise -->
+                        <input type="text" id="bulkEditValue" class="form-control" placeholder="Enter new value…">
+                        <select id="bulkEditValueSelect" class="form-select d-none"></select>
+                    </div>
+                    <div class="alert alert-warning small py-2 mb-0" id="bulkEditWarning" style="display:none!important;">
+                        <i class="fas fa-triangle-exclamation me-1"></i>
+                        This will overwrite the chosen field on <strong id="bulkEditWarningCount"></strong> records. This cannot be undone.
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" id="applyBulkEditBtn" class="btn btn-warning">
+                        <i class="fas fa-check me-1"></i>Apply to Selected
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Fetch Missing Prices Modal -->
     <div class="modal fade" id="fetchPricesModal" tabindex="-1" aria-labelledby="fetchPricesModalLabel" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
         <div class="modal-dialog modal-dialog-centered">
@@ -592,29 +662,236 @@
             });
         });
 
-        // ====================== DELETE SELECTED ======================
-        document.getElementById('deleteSelectedBtn')?.addEventListener('click', async function () {
-            // Collect ALL sibling IDs for each checked row (so grouped duplicates are fully deleted)
-            const allIds = new Set();
-            document.querySelectorAll('.record-checkbox:checked').forEach(cb => {
-                const ids = (cb.dataset.allIds || cb.value).split(',').map(s => parseInt(s.trim(), 10));
-                ids.forEach(id => allIds.add(id));
+        // ====================== SELECTION STATE ======================
+        // selectedIds tracks ALL selected IDs across pages (superset of current page checkboxes)
+        const selectedIds = new Set();
+
+        function updateSelectionUI() {
+            const banner = document.getElementById('selectionBanner');
+            const countEl = document.getElementById('selectionCount');
+            if (selectedIds.size > 0) {
+                countEl.textContent = `${selectedIds.size} record${selectedIds.size !== 1 ? 's' : ''} selected`;
+                banner.classList.remove('d-none');
+            } else {
+                banner.classList.add('d-none');
+            }
+        }
+
+        // Sync checkbox changes into selectedIds
+        document.addEventListener('change', function (e) {
+            const cb = e.target.closest('.record-checkbox');
+            if (!cb) return;
+            const id = parseInt(cb.value, 10);
+            if (cb.checked) {
+                selectedIds.add(id);
+            } else {
+                selectedIds.delete(id);
+                // also uncheck select-all header if any unchecked
+                const selectAll = document.getElementById('selectAll');
+                if (selectAll) selectAll.checked = false;
+            }
+            updateSelectionUI();
+        });
+
+        // Override the existing selectAll handler to also update selectedIds
+        document.getElementById('selectAll')?.addEventListener('change', function () {
+            document.querySelectorAll('.record-checkbox').forEach(cb => {
+                cb.checked = this.checked;
+                const id = parseInt(cb.value, 10);
+                if (this.checked) selectedIds.add(id); else selectedIds.delete(id);
+            });
+            updateSelectionUI();
+        });
+
+        document.getElementById('clearSelectionBtn')?.addEventListener('click', function () {
+            selectedIds.clear();
+            document.querySelectorAll('.record-checkbox').forEach(cb => cb.checked = false);
+            const selectAll = document.getElementById('selectAll');
+            if (selectAll) selectAll.checked = false;
+            updateSelectionUI();
+        });
+
+        // ====================== SELECT ALL IN FILTER ======================
+        document.getElementById('selectAllFilterBtn')?.addEventListener('click', async function () {
+            const btn = this;
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Loading…';
+
+            try {
+                const params = new URLSearchParams({
+                    search:   activeFilters.search   || '',
+                    game:     activeFilters.game     || '',
+                    album:    activeFilters.album    || '',
+                    template: activeFilters.template || '',
+                });
+                for (const [k, v] of [...params.entries()]) { if (!v) params.delete(k); }
+
+                const res  = await fetch('/inventory/all_ids?' + params.toString());
+                const data = await res.json();
+
+                (data.ids || []).forEach(id => selectedIds.add(id));
+
+                // Check boxes for IDs visible on this page
+                document.querySelectorAll('.record-checkbox').forEach(cb => {
+                    if (selectedIds.has(parseInt(cb.value, 10))) cb.checked = true;
+                });
+
+                updateSelectionUI();
+            } catch (err) {
+                console.error('Failed to load all IDs:', err);
+                alert('Failed to load all record IDs. Please try again.');
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fas fa-check-double me-1"></i>All';
+            }
+        });
+
+        // ====================== BULK EDIT SELECTED ======================
+        (function () {
+            const modal        = new bootstrap.Modal(document.getElementById('bulkEditModal'));
+            const fieldSel     = document.getElementById('bulkEditField');
+            const valueInput   = document.getElementById('bulkEditValue');
+            const valueSel     = document.getElementById('bulkEditValueSelect');
+            const customGroup  = document.getElementById('bulkEditCustomGroup');
+            const countMsg     = document.getElementById('bulkEditCountMsg');
+            const warningEl    = document.getElementById('bulkEditWarning');
+            const warningCount = document.getElementById('bulkEditWarningCount');
+
+            // Enum field definitions (mirror server-side constants)
+            const EDITION_OPTIONS    = ['Standard Edition', 'First Edition', 'Limited Edition'];
+            const FINALIZED_OPTIONS  = ['true', 'false'];
+            const ENUM_FIELDS = {
+                edition:   EDITION_OPTIONS,
+                finalized: FINALIZED_OPTIONS,
+            };
+
+            function switchValueControl(fieldKey) {
+                if (ENUM_FIELDS[fieldKey]) {
+                    valueInput.classList.add('d-none');
+                    valueSel.classList.remove('d-none');
+                    valueSel.innerHTML = ENUM_FIELDS[fieldKey]
+                        .map(opt => `<option value="${opt}">${opt}</option>`)
+                        .join('');
+                } else {
+                    valueSel.classList.add('d-none');
+                    valueInput.classList.remove('d-none');
+                    valueInput.value = '';
+                    valueInput.placeholder = `Enter new value for "${fieldKey}"…`;
+                }
+            }
+
+            fieldSel.addEventListener('change', function () {
+                switchValueControl(this.value);
+                if (this.value) {
+                    warningCount.textContent = selectedIds.size;
+                    warningEl.style.setProperty('display', '', 'important');
+                } else {
+                    warningEl.style.setProperty('display', 'none', 'important');
+                }
             });
 
-            const selected = [...allIds];
+            document.getElementById('editSelectedBtn')?.addEventListener('click', function () {
+                if (!selectedIds.size) {
+                    alert('Please select at least one record first.');
+                    return;
+                }
 
-            if (!selected.length) {
+                // Populate custom fields from visible columns
+                customGroup.innerHTML = '';
+                document.querySelectorAll('#inventoryTable thead th[data-entry-field]').forEach(th => {
+                    const fieldKey = th.dataset.entryField;
+                    const opt = document.createElement('option');
+                    opt.value = fieldKey;
+                    opt.textContent = fieldKey.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+                    customGroup.appendChild(opt);
+                });
+                if (!customGroup.children.length) {
+                    customGroup.innerHTML = '<option disabled>(none in current view)</option>';
+                }
+
+                countMsg.textContent = `Updating ${selectedIds.size} selected record${selectedIds.size !== 1 ? 's' : ''}.`;
+                fieldSel.value = '';
+                valueInput.value = '';
+                valueInput.classList.remove('d-none');
+                valueSel.classList.add('d-none');
+                warningEl.style.setProperty('display', 'none', 'important');
+                modal.show();
+            });
+
+            document.getElementById('applyBulkEditBtn')?.addEventListener('click', async function () {
+                const field = fieldSel.value.trim();
+                const isEnum = !!ENUM_FIELDS[field];
+                const value = isEnum ? valueSel.value : valueInput.value.trim();
+
+                if (!field) { alert('Please select a field to update.'); return; }
+                if (value === '') { alert('Please enter a value.'); return; }
+
+                const confirmed = confirm(
+                    `Set "${field}" = "${value}" on ${selectedIds.size} record(s)? This cannot be undone.`
+                );
+                if (!confirmed) return;
+
+                const btn = this;
+                btn.disabled = true;
+                btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Applying…';
+
+                try {
+                    const res = await fetch('/add_custom_field', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            record_ids: [...selectedIds],
+                            key:   field,
+                            value: value,
+                        }),
+                    });
+                    const data = await res.json();
+
+                    if (data.status === 'success') {
+                        alert(`✅ ${data.message}`);
+                        modal.hide();
+                        location.reload();
+                    } else {
+                        alert(data.message || 'Update failed.');
+                    }
+                } catch (err) {
+                    console.error(err);
+                    alert('An error occurred while applying the update.');
+                } finally {
+                    btn.disabled = false;
+                    btn.innerHTML = '<i class="fas fa-check me-1"></i>Apply to Selected';
+                }
+            });
+        })();
+
+        // ====================== DELETE SELECTED (updated to use selectedIds) ======================
+        document.getElementById('deleteSelectedBtn')?.addEventListener('click', async function () {
+            // Use the cross-page selectedIds set (falls back to checkboxes if set is empty)
+            let ids;
+            if (selectedIds.size > 0) {
+                ids = [...selectedIds];
+            } else {
+                // Legacy fallback: collect checked boxes on current page
+                const allIds = new Set();
+                document.querySelectorAll('.record-checkbox:checked').forEach(cb => {
+                    const cbIds = (cb.dataset.allIds || cb.value).split(',').map(s => parseInt(s.trim(), 10));
+                    cbIds.forEach(id => allIds.add(id));
+                });
+                ids = [...allIds];
+            }
+
+            if (!ids.length) {
                 alert('Please select at least one record.');
                 return;
             }
 
-            const confirmed = confirm(`Delete ${selected.length} record(s)? This cannot be undone.`);
+            const confirmed = confirm(`Delete ${ids.length} record(s)? This cannot be undone.`);
             if (!confirmed) return;
 
             const response = await fetch('/delete_scans', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ record_ids: selected })
+                body: JSON.stringify({ record_ids: ids })
             });
 
             const data = await response.json();

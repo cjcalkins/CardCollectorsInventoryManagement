@@ -12,31 +12,12 @@
             background: #f8f9fa;
         }
 
-        .album-card {
-            text-decoration: none;
-            color: inherit;
-            border: none;
-            border-radius: 14px;
-            box-shadow: 0 4px 18px rgba(0,0,0,0.08);
-            transition: transform 0.2s ease, box-shadow 0.2s ease;
-            display: block;
-            height: 100%;
-            overflow: hidden;
-            position: relative;
-        }
-
-        .album-card:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 8px 24px rgba(0,0,0,0.12);
-            color: inherit;
-        }
-
+        /* ── Nav ── */
         .nav-tabs-minimal {
             display: flex;
             gap: 10px;
             margin-left: auto;
         }
-
         .nav-tab {
             padding: 8px 14px;
             text-decoration: none;
@@ -46,103 +27,160 @@
             font-weight: 600;
             transition: 0.2s ease;
         }
-
         .nav-tab:hover {
             background: rgba(255, 255, 255, 0.18);
             color: #fff;
         }
-
         .nav-tab.active {
             background: #fff;
             color: #212529;
         }
+        @media (max-width: 768px) {
+            .nav-tabs-minimal { margin-left: 0; margin-top: 12px; width: 100%; }
+            .nav-tab { flex: 1; text-align: center; }
+        }
 
-        .album-card-bg-img {
-            position: absolute;
-            inset: 0;
-            width: 100%; height: 100%;
-            object-fit: cover;
+        /* ── Album card wrapper ── */
+        .album-card-wrap {
+            display: flex;
+            flex-direction: column;
+            text-decoration: none;
+            color: inherit;
             border-radius: 14px;
-            z-index: 0;
+            box-shadow: 0 4px 18px rgba(0,0,0,0.08);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+            overflow: hidden;
+            position: relative;
+        }
+        .album-card-wrap:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 24px rgba(0,0,0,0.14);
+            color: inherit;
+        }
+
+        /* ── Image area — 3:4 ratio ── */
+        .album-img-area {
+            position: relative;
+            width: 100%;
+            aspect-ratio: 3 / 4;
+            background: #e9ecef;
+            overflow: hidden;
+            border-radius: 14px 14px 0 0;
+        }
+        .album-img-area img.album-bg {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
             display: block;
         }
-        .album-card .card-body {
-            position: relative;
-            z-index: 1;
+        /* Placeholder shown when no custom image */
+        .album-placeholder {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: #212529;
+            color: #fff;
+            padding: 1.5rem;
+            gap: 0.75rem;
         }
-        .album-card.has-custom-img { min-height: 180px; }
-        .album-card.has-custom-img .card-body { visibility: hidden; }
-        /* Camera button */
+        .album-placeholder .album-icon {
+            font-size: 2rem;
+            opacity: 0.7;
+        }
+        .album-placeholder .album-meta-inner {
+            text-align: center;
+        }
+        .album-placeholder h5 {
+            font-size: 1rem;
+            font-weight: 700;
+            margin-bottom: 0.25rem;
+        }
+        .album-placeholder p {
+            font-size: 0.8rem;
+            margin-bottom: 0.2rem;
+            opacity: 0.75;
+        }
+        .game-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 5px;
+            justify-content: center;
+            margin-top: 0.5rem;
+        }
+        .game-tag {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.2rem 0.55rem;
+            border-radius: 999px;
+            background: rgba(255,255,255,0.15);
+            color: #fff;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        /* ── Camera button (hover reveals) ── */
         .album-img-btn {
             position: absolute;
-            top: 12px; right: 12px;
-            width: 34px; height: 34px;
+            top: 10px;
+            right: 10px;
+            width: 34px;
+            height: 34px;
             border-radius: 50%;
             background: rgba(0,0,0,0.55);
             border: none;
-            display: flex; align-items: center; justify-content: center;
+            display: flex;
+            align-items: center;
+            justify-content: center;
             opacity: 0;
             transition: opacity 0.18s ease, background 0.18s ease;
             cursor: pointer;
             z-index: 3;
         }
         .album-img-btn i { font-size: 0.85rem; color: #fff; }
-        .album-card:hover .album-img-btn { opacity: 1; }
+        .album-card-wrap:hover .album-img-btn { opacity: 1; }
         .album-img-btn:hover { background: rgba(0,0,0,0.78); }
         input.album-img-input { display: none; }
 
-        .album-icon {
-            width: 52px;
-            height: 52px;
-            border-radius: 12px;
-            background: #212529;
-            color: #fff;
-            display: inline-flex;
+        /* ── Name label below the image ── */
+        .album-name-label {
+            background: #fff;
+            border-top: 1px solid #dee2e6;
+            padding: 10px 14px;
+            font-size: 0.95rem;
+            font-weight: 700;
+            color: #212529;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            border-radius: 0 0 14px 14px;
+        }
+
+        /* ── Upload spinner overlay ── */
+        .upload-spinner {
+            display: none;
+            position: absolute;
+            inset: 0;
+            background: rgba(0,0,0,0.45);
             align-items: center;
             justify-content: center;
-            font-size: 1.15rem;
-            margin-bottom: 1rem;
+            z-index: 4;
+            border-radius: 14px 14px 0 0;
         }
-
-        .game-tags {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 6px;
-            margin-top: 0.85rem;
-        }
-
-        .game-tag {
-            display: inline-flex;
-            align-items: center;
-            padding: 0.28rem 0.6rem;
-            border-radius: 999px;
-            background: #e9ecef;
-            color: #212529;
-            font-size: 0.8rem;
-            font-weight: 600;
-        }
-
-        @media (max-width: 768px) {
-            .nav-tabs-minimal {
-                margin-left: 0;
-                margin-top: 12px;
-                width: 100%;
-            }
-
-            .nav-tab {
-                flex: 1;
-                text-align: center;
-            }
-        }
+        .upload-spinner.active { display: flex; }
+        .upload-spinner i { font-size: 1.6rem; color: #fff; animation: spin 0.8s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
     </style>
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
         <div class="container d-flex flex-wrap align-items-center">
             <a class="navbar-brand" href="{{ url_for('index') }}">
-                <img src="{{ url_for('static', filename='favicon.jpg') }}" alt="logo" width="24" height="24" style="object-fit:cover;border-radius:4px;margin-right:0.5rem;" class="me-2">Card Collector Inventory Manager
+                <img src="{{ url_for('static', filename='favicon.jpg') }}" alt="logo" width="24" height="24"
+                     style="object-fit:cover;border-radius:4px;margin-right:0.5rem;" class="me-2">Card Collector Inventory Manager
             </a>
-
             <div class="nav-tabs-minimal">
                 <a href="{{ url_for('import_page') }}" class="nav-tab">Import</a>
                 <a href="{{ url_for('index') }}"        class="nav-tab">Scan</a>
@@ -157,7 +195,6 @@
             <h2 class="mb-0">
                 <i class="fas fa-book me-2"></i>Albums
             </h2>
-
             {% if albums %}
                 <a href="{{ url_for('album_detail', album_name=albums[0].name) }}" class="btn btn-primary">
                     Open First Album
@@ -167,43 +204,70 @@
 
         <div class="row g-4">
             {% for album in albums %}
-                <div class="col-md-6 col-lg-4">
-                    <a href="{{ url_for('album_detail', album_name=album.name) }}" class="card album-card" id="album-card-{{ loop.index }}">
-                        <!-- Camera button -->
+                <div class="col-6 col-md-4 col-lg-3">
+                    <div class="album-card-wrap"
+                         id="album-card-{{ loop.index }}"
+                         data-album="{{ album.name | e }}"
+                         data-index="{{ loop.index }}">
+
+                        <!-- Clickable image area -->
+                        <a href="{{ url_for('album_detail', album_name=album.name) }}"
+                           class="album-img-area" id="album-img-area-{{ loop.index }}">
+
+                            <!-- Placeholder (shown by default, hidden when image loaded) -->
+                            <div class="album-placeholder" id="album-placeholder-{{ loop.index }}">
+                                <div class="album-icon"><i class="fas fa-book-open"></i></div>
+                                <div class="album-meta-inner">
+                                    <h5>{{ album.name }}</h5>
+                                    <p>Entries: {{ album.count }}</p>
+                                    <p>
+                                        {% if album.latest_scan %}
+                                            {{ album.latest_scan.strftime('%Y-%m-%d') }}
+                                        {% else %}
+                                            No scans yet
+                                        {% endif %}
+                                    </p>
+                                    {% if album.games %}
+                                        <div class="game-tags">
+                                            {% for game in album.games %}
+                                                <span class="game-tag">{{ game }}</span>
+                                            {% endfor %}
+                                        </div>
+                                    {% endif %}
+                                </div>
+                            </div>
+
+                            <!-- Custom image (hidden until set) -->
+                            <img src="" alt="{{ album.name }}" class="album-bg"
+                                 id="album-bg-{{ loop.index }}"
+                                 style="display:none;">
+
+                            <!-- Upload spinner -->
+                            <div class="upload-spinner" id="album-spinner-{{ loop.index }}">
+                                <i class="fas fa-circle-notch"></i>
+                            </div>
+                        </a>
+
+                        <!-- Camera button sits over the image area -->
                         <button class="album-img-btn"
                                 onclick="triggerAlbumImageUpload(event, '{{ album.name | e }}', {{ loop.index }})"
                                 title="Set custom image">
                             <i class="fas fa-camera"></i>
                         </button>
-                        <input type="file" accept="image/*"
+
+                        <!-- File input — no accept restriction so any image type works -->
+                        <input type="file"
                                class="album-img-input"
                                id="album-img-input-{{ loop.index }}"
                                onchange="handleAlbumImageUpload(event, '{{ album.name | e }}', {{ loop.index }})">
-                        <div class="card-body">
-                            <div class="album-icon">
-                                <i class="fas fa-book-open"></i>
-                            </div>
 
-                            <h5 class="card-title mb-2">{{ album.name }}</h5>
-                            <p class="album-meta mb-1">Entries: {{ album.count }}</p>
-                            <p class="album-meta mb-0">
-                                Latest Scan:
-                                {% if album.latest_scan %}
-                                    {{ album.latest_scan.strftime('%Y-%m-%d %H:%M') }}
-                                {% else %}
-                                    Unknown
-                                {% endif %}
-                            </p>
-
-                            {% if album.games %}
-                                <div class="game-tags">
-                                    {% for game in album.games %}
-                                        <span class="game-tag">{{ game }}</span>
-                                    {% endfor %}
-                                </div>
-                            {% endif %}
-                        </div>
-                    </a>
+                        <!-- Name label always shown below image -->
+                        <a href="{{ url_for('album_detail', album_name=album.name) }}"
+                           class="album-name-label"
+                           style="text-decoration:none;">
+                            {{ album.name }}
+                        </a>
+                    </div>
                 </div>
             {% endfor %}
         </div>
@@ -215,27 +279,21 @@
             </div>
         {% endif %}
     </div>
+
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         function albumStorageKey(albumName) {
-            return 'album_card_img__' + albumName;
+            return 'album_card_img_url__' + albumName;
         }
 
-        function applyAlbumImage(albumName, index, dataUrl) {
-            const card = document.getElementById('album-card-' + index);
-            if (!card) return;
-            const existing = card.querySelector('img.album-card-bg-img');
-            if (existing) existing.remove();
-            if (dataUrl) {
-                const img = document.createElement('img');
-                img.src = dataUrl;
-                img.className = 'album-card-bg-img';
-                img.alt = albumName;
-                card.insertBefore(img, card.firstChild);
-                card.classList.add('has-custom-img');
-            } else {
-                card.classList.remove('has-custom-img');
-            }
+        function showAlbumImage(index, imageUrl) {
+            const placeholder = document.getElementById('album-placeholder-' + index);
+            const bg          = document.getElementById('album-bg-' + index);
+            if (!bg) return;
+
+            bg.src = imageUrl;
+            bg.style.display = 'block';
+            if (placeholder) placeholder.style.display = 'none';
         }
 
         function triggerAlbumImageUpload(e, albumName, index) {
@@ -247,21 +305,46 @@
         function handleAlbumImageUpload(e, albumName, index) {
             const file = e.target.files[0];
             if (!file) return;
-            const reader = new FileReader();
-            reader.onload = function(ev) {
-                const dataUrl = ev.target.result;
-                try { localStorage.setItem(albumStorageKey(albumName), dataUrl); } catch(err) {}
-                applyAlbumImage(albumName, index, dataUrl);
-            };
-            reader.readAsDataURL(file);
+
+            const spinner = document.getElementById('album-spinner-' + index);
+            if (spinner) spinner.classList.add('active');
+
+            const formData = new FormData();
+            formData.append('album_name', albumName);
+            formData.append('image', file);
+
+            fetch('/albums/upload_image', {
+                method: 'POST',
+                body: formData
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (spinner) spinner.classList.remove('active');
+                if (data.status === 'success') {
+                    // Cache the server URL in localStorage to avoid re-fetching on reload
+                    try { localStorage.setItem(albumStorageKey(albumName), data.url); } catch(err) {}
+                    showAlbumImage(index, data.url);
+                } else {
+                    alert('Upload failed: ' + (data.message || 'Unknown error'));
+                }
+            })
+            .catch(err => {
+                if (spinner) spinner.classList.remove('active');
+                console.error('Upload error:', err);
+                alert('Upload failed. Please try again.');
+            });
+
+            // Reset input so the same file can be re-selected if needed
+            e.target.value = '';
         }
 
+        // On page load: restore any previously saved image URLs from localStorage
         document.addEventListener('DOMContentLoaded', function() {
-            document.querySelectorAll('.album-img-input').forEach(function(input) {
-                const index = input.id.split('-').pop();
-                const albumName = input.getAttribute('onchange').match(/'([^']+)',\s*\d+\)/)[1];
-                const saved = localStorage.getItem(albumStorageKey(albumName));
-                if (saved) applyAlbumImage(albumName, index, saved);
+            document.querySelectorAll('[data-album]').forEach(function(card) {
+                const albumName = card.getAttribute('data-album');
+                const index     = card.getAttribute('data-index');
+                const saved     = localStorage.getItem(albumStorageKey(albumName));
+                if (saved) showAlbumImage(index, saved);
             });
         });
     </script>

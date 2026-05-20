@@ -1136,6 +1136,46 @@ def inventory_filter_options():
     })
 
 
+@app.route("/inventory/all_ids")
+def inventory_all_ids():
+    """
+    Return all ScanRecord IDs that match the current filter params
+    (search, game, album, template).  Used by the "Select All in Filter"
+    button to collect IDs across every page before a bulk operation.
+    """
+    search     = request.args.get("search",   "").strip()
+    f_game     = request.args.get("game",     "").strip()
+    f_album    = request.args.get("album",    "").strip()
+    f_template = request.args.get("template", "").strip()
+
+    query = ScanRecord.query.with_entities(ScanRecord.id, ScanRecord.extracted_data)
+
+    if f_template:
+        query = query.filter(ScanRecord.template_used == f_template)
+    if search:
+        query = query.filter(ScanRecord.extracted_data.cast(db.Text).ilike(f"%{search}%"))
+
+    rows = query.all()
+
+    # Python-side filtering for game / album (SQLite-safe)
+    ids = []
+    for row_id, extracted_data in rows:
+        if isinstance(extracted_data, dict):
+            data = extracted_data
+        else:
+            try:
+                data = json.loads(extracted_data or "{}")
+            except (ValueError, TypeError):
+                data = {}
+        if f_game and str(data.get("game", "")).strip() != f_game:
+            continue
+        if f_album and str(data.get("album", "")).strip() != f_album:
+            continue
+        ids.append(row_id)
+
+    return jsonify({"ids": ids, "count": len(ids)})
+
+
 @app.route("/game_fields")
 def game_fields():
     """
@@ -1262,6 +1302,32 @@ def albums():
 def albums_list():
     album_list = build_album_index()
     return render_template("albums.html", albums=album_list)
+
+
+@app.route("/albums/upload_image", methods=["POST"])
+def album_upload_image():
+    album_name = request.form.get("album_name", "").strip()
+    file = request.files.get("image")
+
+    if not album_name or not file or not file.filename:
+        return jsonify({"status": "error", "message": "Album name and image file are required"}), 400
+
+    album_img_folder = os.path.join(app.config["UPLOAD_FOLDER"], "albums")
+    os.makedirs(album_img_folder, exist_ok=True)
+
+    # Preserve original extension; fall back to .jpg
+    _, ext = os.path.splitext(file.filename)
+    if not ext:
+        ext = ".jpg"
+
+    safe_album = secure_filename(album_name)
+    filename = f"{safe_album}{ext}"
+    save_path = os.path.join(album_img_folder, filename)
+    file.save(save_path)
+
+    relative_path = f"albums/{filename}"
+    image_url = url_for("uploaded_file", filename=relative_path)
+    return jsonify({"status": "success", "url": image_url})
 
 
 @app.route("/albums/<path:album_name>")
