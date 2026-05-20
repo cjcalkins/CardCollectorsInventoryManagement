@@ -456,6 +456,79 @@
       color: var(--muted);
     }
 
+    /* ── OCR Progress Overlay ── */
+    #ocrProgressOverlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.72);
+      z-index: 10000;
+      align-items: center;
+      justify-content: center;
+    }
+
+    #ocrProgressOverlay.visible {
+      display: flex;
+    }
+
+    .ocr-progress-dialog {
+      background: white;
+      border-radius: 20px;
+      padding: 36px 40px;
+      width: min(480px, 90vw);
+      box-shadow: 0 24px 64px rgba(0, 0, 0, 0.35);
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+      align-items: center;
+      text-align: center;
+    }
+
+    .ocr-progress-icon {
+      width: 54px;
+      height: 54px;
+      border-radius: 50%;
+      background: #dbeafe;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 26px;
+    }
+
+    .ocr-progress-title {
+      font-size: 20px;
+      font-weight: 700;
+      color: var(--text);
+    }
+
+    .ocr-progress-sub {
+      font-size: 14px;
+      color: var(--muted);
+      min-height: 20px;
+    }
+
+    .ocr-progress-track {
+      width: 100%;
+      height: 12px;
+      background: #e2e8f0;
+      border-radius: 999px;
+      overflow: hidden;
+    }
+
+    .ocr-progress-fill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #1d4ed8, #2563eb);
+      border-radius: 999px;
+      transition: width 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    .ocr-progress-count {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--muted);
+    }
+
     @media (max-width: 980px) {
       .layout {
         grid-template-columns: 1fr;
@@ -628,6 +701,19 @@
       </section>
     </div>
   </main>
+
+  <!-- OCR Progress Overlay -->
+  <div id="ocrProgressOverlay">
+    <div class="ocr-progress-dialog">
+      <div class="ocr-progress-icon">🔍</div>
+      <div class="ocr-progress-title">Running OCR Import</div>
+      <div id="ocrProgressSub" class="ocr-progress-sub">Preparing cards…</div>
+      <div class="ocr-progress-track">
+        <div id="ocrProgressFill" class="ocr-progress-fill"></div>
+      </div>
+      <div id="ocrProgressCount" class="ocr-progress-count">0 / 9</div>
+    </div>
+  </div>
 
   <div id="manualModal" class="manual-modal">
     <div class="manual-dialog">
@@ -1019,8 +1105,39 @@
       });
     }
 
+    // ── OCR Progress helpers ──────────────────────────────────────────────
+    const ocrProgressOverlay = document.getElementById('ocrProgressOverlay');
+    const ocrProgressFill    = document.getElementById('ocrProgressFill');
+    const ocrProgressSub     = document.getElementById('ocrProgressSub');
+    const ocrProgressCount   = document.getElementById('ocrProgressCount');
+
+    function showOcrProgress() {
+      ocrProgressFill.style.width  = '0%';
+      ocrProgressSub.textContent   = '';
+      ocrProgressCount.textContent = '0 / 9';
+      ocrProgressOverlay.classList.add('visible');
+    }
+
+    function updateOcrProgress(done, total, result) {
+      const pct   = Math.round((done / total) * 100);
+      ocrProgressFill.style.width   = pct + '%';
+      ocrProgressCount.textContent  = `${done} / ${total}`;
+      if (result && result.status === 'error') ocrProgressSub.textContent = `Card ${done}: ⚠ Error`;
+    }
+
+    function hideOcrProgress() {
+      ocrProgressFill.style.width  = '100%';
+      ocrProgressCount.textContent = '9 / 9';
+      ocrProgressSub.textContent   = 'Done!';
+      return new Promise(resolve => setTimeout(() => {
+        ocrProgressOverlay.classList.remove('visible');
+        resolve();
+      }, 520));
+    }
+    // ─────────────────────────────────────────────────────────────────────
+
     async function runBatchOcrImport() {
-      const filenames = getAlignedFilenames();
+      const filenames    = getAlignedFilenames();
       const templateName = templateSelect.value;
 
       if (filenames.length !== 9) {
@@ -1030,32 +1147,79 @@
 
       runBatchOcrBtn.disabled = true;
       runBatchOcrBtn.textContent = 'Running OCR...';
+      showOcrProgress();
+      setStatus('Running OCR import on all 9 aligned cards...', 'info');
 
       try {
-        setStatus('Running OCR import on all 9 aligned cards...', 'info');
-
+        // POST the filenames/template via fetch first so the server knows what
+        // to process, then open the SSE stream to receive per-card events.
+        // Because EventSource only supports GET, we instead POST and stream
+        // the response body directly as a ReadableStream.
         const response = await fetch('/import_run_ocr_batch', {
-          method: 'POST',
+          method:  'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            template_name: templateName,
-            filenames: filenames
-          })
+          body:    JSON.stringify({ template_name: templateName, filenames }),
         });
 
-        const data = await response.json();
-        if (!response.ok || data.status !== 'success') {
-          throw new Error(data.message || 'Batch OCR import failed.');
+        if (!response.ok) {
+          const err = await response.json().catch(() => ({}));
+          throw new Error(err.message || `Server error ${response.status}`);
         }
 
-        renderOcrResults(data.results);
-        setStatus(data.message || 'Batch OCR import completed.', 'success');
+        // Read the SSE stream line-by-line using the Streams API.
+        const reader  = response.body.getReader();
+        const decoder = new TextDecoder();
+        let   buffer  = '';
+        let   allResults = [];
+        let   doneData   = null;
 
-        // OCR import done — full page reload resets all UI state to the
-        // initial empty import screen, ready for the next batch.
+        outer: while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+
+          // SSE messages are separated by double newlines.
+          const parts = buffer.split('\n\n');
+          buffer = parts.pop(); // keep incomplete trailing chunk
+
+          for (const part of parts) {
+            if (!part.trim()) continue;
+
+            let eventType = 'message';
+            let dataLine  = '';
+
+            for (const line of part.split('\n')) {
+              if (line.startsWith('event: ')) eventType = line.slice(7).trim();
+              if (line.startsWith('data: '))  dataLine  = line.slice(6).trim();
+            }
+
+            if (!dataLine) continue;
+            let payload;
+            try { payload = JSON.parse(dataLine); } catch { continue; }
+
+            if (eventType === 'progress') {
+              allResults.push(payload.result);
+              updateOcrProgress(payload.slot, payload.total, payload.result);
+            } else if (eventType === 'done') {
+              doneData = payload;
+              break outer;
+            } else if (eventType === 'error') {
+              throw new Error(payload.message || 'Batch OCR import failed.');
+            }
+          }
+        }
+
+        if (!doneData) throw new Error('Stream ended without a completion event.');
+
+        renderOcrResults(doneData.results || allResults);
+        setStatus(doneData.message || 'Batch OCR import completed.', 'success');
+
+        await hideOcrProgress();
         window.location.reload();
+
       } catch (err) {
         console.error(err);
+        await hideOcrProgress();
         setStatus(err.message || 'Batch OCR import failed.', 'error');
       } finally {
         updateBatchOcrButton();

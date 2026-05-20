@@ -91,8 +91,8 @@ def parse_card_filename(filename):
         return {}
 
     return {
-        "game": parts[0],
-        "album": "-".join(parts[1:-2]),
+        "game": parts[0].replace("_", " "),
+        "album": "-".join(parts[1:-2]).replace("_", " "),
         "page": parts[-2],
         "slot": parts[-1],
     }
@@ -2348,72 +2348,101 @@ def manual_process_card():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# ====================== BATCH OCR IMPORT ROUTE ======================
+# ====================== BATCH OCR IMPORT ROUTE (SSE streaming) ======================
 @app.route("/import_run_ocr_batch", methods=["POST"])
 def import_run_ocr_batch():
-    data      = request.get_json() or {}
+    """
+    Streams Server-Sent Events so the browser can show real per-card progress.
+
+    Event types
+    -----------
+    progress  — one card finished; payload has slot index + result data
+    done      — all cards finished; payload has summary + full results list
+    error     — fatal setup error before processing began
+    """
+    from flask import stream_with_context, Response
+
+    data          = request.get_json() or {}
     template_name = data.get("template_name", "product_label")
     filenames     = data.get("filenames", [])
 
-    if not filenames or len(filenames) != 9:
-        return jsonify({
-            "status":  "error",
-            "message": "Exactly 9 aligned card filenames are required",
-        }), 400
+    def sse(event, payload):
+        return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
 
-    try:
-        template = load_template(template_name)
-    except Exception as e:
-        return jsonify({"status": "error", "message": f"Could not load template: {e}"}), 400
-
-    fields  = template.get("fields", {})
-    results = []
-
-    for filename in filenames:
-        temp_image_path = os.path.join(app.config["TEMP_CARD_FOLDER"], filename)
-
-        if not os.path.exists(temp_image_path):
-            results.append({"filename": filename, "status": "error", "message": "Aligned card image not found"})
-            continue
-
-        img = cv2.imread(temp_image_path)
-        if img is None:
-            results.append({"filename": filename, "status": "error", "message": "Could not read aligned card image"})
-            continue
-
-        h_img, w_img      = img.shape[:2]
-        normalized_fields = normalize_fields_to_image_space(fields, w_img, h_img)
-        extracted         = ocr_with_custom_fields(temp_image_path, normalized_fields)
-
-        filename_fields = parse_card_filename(filename)
-        extracted.update(filename_fields)
+    def generate():
+        if not filenames or len(filenames) != 9:
+            yield sse("error", {"message": "Exactly 9 aligned card filenames are required"})
+            return
 
         try:
-            final_relative_image_path = move_temp_card_to_inventory(filename)
-            matched_product, record   = create_scan_record(
-                image_path=final_relative_image_path,
-                template_name=template_name,
-                extracted=extracted,
-                normalized_fields=normalized_fields,
-            )
-            results.append({
-                "filename":        filename,
-                "status":          "success",
-                "record_id":       record.id,
-                "image_url":       build_uploaded_file_url(record.image_path),
-                "extracted":       extracted,
-                "matched_product": matched_product.product_name if matched_product else "No match",
-            })
+            template = load_template(template_name)
         except Exception as e:
-            results.append({"filename": filename, "status": "error", "message": str(e)})
+            yield sse("error", {"message": f"Could not load template: {e}"})
+            return
 
-    success_count = sum(1 for r in results if r["status"] == "success")
+        fields  = template.get("fields", {})
+        results = []
 
-    return jsonify({
-        "status":  "success",
-        "message": f"OCR import completed for {success_count} of {len(filenames)} cards",
-        "results": results,
-    })
+        for idx, filename in enumerate(filenames, start=1):
+            temp_image_path = os.path.join(app.config["TEMP_CARD_FOLDER"], filename)
+
+            if not os.path.exists(temp_image_path):
+                result = {"filename": filename, "status": "error", "message": "Aligned card image not found"}
+                results.append(result)
+                yield sse("progress", {"slot": idx, "total": len(filenames), "result": result})
+                continue
+
+            img = cv2.imread(temp_image_path)
+            if img is None:
+                result = {"filename": filename, "status": "error", "message": "Could not read aligned card image"}
+                results.append(result)
+                yield sse("progress", {"slot": idx, "total": len(filenames), "result": result})
+                continue
+
+            h_img, w_img      = img.shape[:2]
+            normalized_fields = normalize_fields_to_image_space(fields, w_img, h_img)
+            extracted         = ocr_with_custom_fields(temp_image_path, normalized_fields)
+
+            filename_fields = parse_card_filename(filename)
+            extracted.update(filename_fields)
+
+            try:
+                final_relative_image_path = move_temp_card_to_inventory(filename)
+                matched_product, record   = create_scan_record(
+                    image_path=final_relative_image_path,
+                    template_name=template_name,
+                    extracted=extracted,
+                    normalized_fields=normalized_fields,
+                )
+                result = {
+                    "filename":        filename,
+                    "status":          "success",
+                    "record_id":       record.id,
+                    "image_url":       build_uploaded_file_url(record.image_path),
+                    "extracted":       extracted,
+                    "matched_product": matched_product.product_name if matched_product else "No match",
+                }
+            except Exception as e:
+                result = {"filename": filename, "status": "error", "message": str(e)}
+
+            results.append(result)
+            yield sse("progress", {"slot": idx, "total": len(filenames), "result": result})
+
+        success_count = sum(1 for r in results if r["status"] == "success")
+        yield sse("done", {
+            "status":  "success",
+            "message": f"OCR import completed for {success_count} of {len(filenames)} cards",
+            "results": results,
+        })
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control":     "no-cache",
+            "X-Accel-Buffering": "no",   # disable nginx buffering if behind a proxy
+        },
+    )
 
 
 # ====================== START ======================
