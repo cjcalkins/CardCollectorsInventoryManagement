@@ -1207,43 +1207,40 @@ def game_fields():
 def inventory_detail(record_id):
     record = ScanRecord.query.get_or_404(record_id)
 
-    # Determine prev/next IDs using the same ordering as the inventory list:
-    # scan_date DESC, id DESC (ties broken by id so the order is fully stable).
+    # Determine prev/next IDs scoped to the same game as the current record.
+    # Navigation wraps around: after the last entry of a game, loop back to the
+    # first; before the first, loop to the last.  This prevents jumping into a
+    # different game's records.
     #
-    # "Previous" = the immediately preceding row in that ordering
-    #              (scan_date > current OR same date with id > current)
-    # "Next"     = the immediately following row
-    #              (scan_date < current OR same date with id < current)
+    # Ordering follows the inventory list: scan_date DESC, id DESC.
 
-    prev_record = (
-        ScanRecord.query
-        .filter(
-            db.or_(
-                ScanRecord.scan_date > record.scan_date,
-                db.and_(
-                    ScanRecord.scan_date == record.scan_date,
-                    ScanRecord.id > record.id,
-                ),
-            )
-        )
-        .order_by(ScanRecord.scan_date.asc(), ScanRecord.id.asc())
-        .first()
-    )
+    current_game = (record.extracted_data or {}).get("game", "")
 
-    next_record = (
+    # Fetch all records that share the same game value, ordered DESC.
+    # We work in Python so we avoid JSON-in-SQL portability issues with SQLite.
+    game_records = (
         ScanRecord.query
-        .filter(
-            db.or_(
-                ScanRecord.scan_date < record.scan_date,
-                db.and_(
-                    ScanRecord.scan_date == record.scan_date,
-                    ScanRecord.id < record.id,
-                ),
-            )
-        )
         .order_by(ScanRecord.scan_date.desc(), ScanRecord.id.desc())
-        .first()
+        .all()
     )
+    game_records = [
+        r for r in game_records
+        if (r.extracted_data or {}).get("game", "") == current_game
+    ]
+
+    # Find the position of the current record in this ordered list
+    current_index = next(
+        (i for i, r in enumerate(game_records) if r.id == record.id), None
+    )
+
+    if current_index is not None and len(game_records) > 1:
+        # Previous = one step earlier in DESC order (index - 1), wrap to last
+        prev_record = game_records[(current_index - 1) % len(game_records)]
+        # Next = one step later in DESC order (index + 1), wrap to first
+        next_record = game_records[(current_index + 1) % len(game_records)]
+    else:
+        prev_record = None
+        next_record = None
 
     # ── Find all duplicate records that belong to the same stack ──
     # A stack is defined by matching: name, serial, edition, holographic, finalized==True.
