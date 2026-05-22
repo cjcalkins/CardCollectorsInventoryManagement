@@ -358,8 +358,8 @@
             </div>
         </div>
 
-        <!-- Column Visibility Controls (desktop only — hidden on mobile) -->
-        <div class="card table-card mb-3 d-none d-md-block" id="colControlsCard">
+        <!-- Column Visibility Controls -->
+        <div class="card table-card mb-3" id="colControlsCard">
             <div class="card-body py-2 px-3">
                 <div class="d-flex align-items-center gap-3 flex-wrap">
                     <span class="text-muted small fw-semibold" style="white-space:nowrap;">
@@ -501,6 +501,7 @@
                                         <span class="badge bg-secondary" style="opacity:0.55;">Standard</span>
                                     {% endif %}
                                 </td>
+                                </td>
                                 <td data-col-static="qty" class="text-center">
                                     {% if ginfo.count > 1 %}
                                     <span class="badge bg-primary">{{ ginfo.count }}</span>
@@ -509,22 +510,7 @@
                                     {% endif %}
                                 </td>
                                 {% for field in entry_fields %}
-                                {% set _tpl_f = template_fields_config.get(field, {}) %}
-                                {% set _ftype = _tpl_f.get('field_type', 'text') %}
-                                <td data-entry-field="{{ field | e }}"
-                                    data-field-type="{{ _ftype }}">
-                                    {%- if _ftype == 'boolean' -%}
-                                        {%- set _bval = (record.extracted_data.get(field, '') | string | lower) in ('true', '1', 'yes') -%}
-                                        <input type="checkbox"
-                                               class="form-check-input entry-bool-toggle"
-                                               data-record-id="{{ record.id }}"
-                                               data-field-key="{{ field | e }}"
-                                               {% if _bval %}checked{% endif %}
-                                               title="Toggle {{ field.replace('_', ' ').title() }}">
-                                    {%- else -%}
-                                        {{ record.extracted_data.get(field, '') | e }}
-                                    {%- endif -%}
-                                </td>
+                                <td data-entry-field="{{ field | e }}">{{ record.extracted_data.get(field, '') | e }}</td>
                                 {% endfor %}
                                 <td>
                                     <a href="{{ url_for('inventory_detail', record_id=record.id) }}" class="btn btn-sm btn-primary">
@@ -923,76 +909,6 @@
             }
         });
 
-        // ====================== COLUMN VISIBILITY & SORTING ======================
-
-        // Storage key bumped to v3 to drop old hidden-col state
-        // that referenced the removed matched_product column.
-        const COL_STORAGE_KEY  = 'inventory_hidden_cols_v9';
-        const COL_WIDTHS_KEY   = 'inventory_col_widths_v1';
-
-        // Entry fields discovered server-side and injected as JSON.
-        // Each item is a raw field key string (e.g. "name", "atk", "stars").
-        const ENTRY_FIELDS = {{ entry_fields | tojson }};
-
-        // Field-type config aggregated from all templates known to the server.
-        // Shape: { fieldKey: { field_type: "text"|"dropdown"|"boolean", dropdown_options: [...] } }
-        const TEMPLATE_FIELDS_CONFIG = {{ template_fields_config | tojson }};
-
-        // Static columns that can be toggled (key matches data-col on <th>)
-        const STATIC_TOGGLEABLE_COLS = [
-            { key: 'date',        label: 'Date' },
-            { key: 'image',       label: 'Image' },
-            { key: 'game',        label: 'Game' },
-            { key: 'album',       label: 'Album' },
-            { key: 'page',        label: 'Page' },
-            { key: 'slot',        label: 'Slot' },
-            { key: 'template',    label: 'Template' },
-            { key: 'tcg_url',      label: 'Price URL' },
-            { key: 'market_price', label: 'Market Price' },
-            { key: 'finalized',   label: 'Finalized' },
-            { key: 'edition',     label: 'Edition' },
-            { key: 'qty',         label: 'Qty' },
-        ];
-
-        // OCR metadata suffixes that must never appear as column chooser options.
-        const OCR_HIDDEN_SUFFIXES = ['__ocr_conf', '__ocr_variant'];
-        function isOcrMetaField(fieldKey) {
-            return OCR_HIDDEN_SUFFIXES.some(sfx => fieldKey.endsWith(sfx));
-        }
-
-        // Build the full toggleable-columns list, appending one entry per
-        // dynamic field.  Label converts underscores to spaces and title-cases.
-        // OCR conf/variant fields are filtered from the chooser.
-        function toLabel(fieldKey) {
-            return fieldKey.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-        }
-        // Only non-OCR-meta fields appear in the column chooser
-        const DYNAMIC_TOGGLEABLE_COLS = ENTRY_FIELDS
-            .filter(f => !isOcrMetaField(f))
-            .map(f => ({
-                key:      'entry_' + f,
-                label:    toLabel(f),
-                isDynamic: true,
-                fieldKey: f,
-            }));
-        // All dynamic cols (including OCR meta) for visibility-application logic;
-        // OCR meta ones are force-hidden regardless of the hiddenSet.
-        const ALL_DYNAMIC_COLS = ENTRY_FIELDS.map(f => ({
-            key:      'entry_' + f,
-            fieldKey: f,
-        }));
-        const TOGGLEABLE_COLS = [...STATIC_TOGGLEABLE_COLS, ...DYNAMIC_TOGGLEABLE_COLS];
-
-        // Static column key → 0-based cell index.
-        // Dynamic columns are NOT in this map; they are looked up by data-entry-field
-        // attribute on the <td> elements instead of by numeric index.
-        const STATIC_COL_INDEX = {
-            select: 0, date: 1, image: 2, game: 3,
-            album: 4, page: 5, slot: 6, template: 7,
-            // tcg_url is at index 8; looked up by data-col-static attribute
-            // actions column is always last; excluded from toggles
-        };
-
         // ====================== BULK EDIT SELECTED ======================
         (function () {
             const modal        = new bootstrap.Modal(document.getElementById('bulkEditModal'));
@@ -1012,29 +928,13 @@
                 finalized: FINALIZED_OPTIONS,
             };
 
-            // Merge in dropdown options from TEMPLATE_FIELDS_CONFIG for dynamic fields
-            Object.entries(TEMPLATE_FIELDS_CONFIG).forEach(([key, cfg]) => {
-                if (cfg.field_type === 'dropdown' && cfg.dropdown_options?.length) {
-                    ENUM_FIELDS[key] = cfg.dropdown_options;
-                }
-            });
-
             function switchValueControl(fieldKey) {
-                const cfg      = TEMPLATE_FIELDS_CONFIG[fieldKey] || {};
-                const ftype    = cfg.field_type || 'text';
-
                 if (ENUM_FIELDS[fieldKey]) {
-                    // dropdown / known enum — show <select>
                     valueInput.classList.add('d-none');
                     valueSel.classList.remove('d-none');
                     valueSel.innerHTML = ENUM_FIELDS[fieldKey]
                         .map(opt => `<option value="${opt}">${opt}</option>`)
                         .join('');
-                } else if (ftype === 'boolean') {
-                    // boolean — show <select> with True/False
-                    valueInput.classList.add('d-none');
-                    valueSel.classList.remove('d-none');
-                    valueSel.innerHTML = `<option value="True">True</option><option value="False">False</option>`;
                 } else {
                     valueSel.classList.add('d-none');
                     valueInput.classList.remove('d-none');
@@ -1082,11 +982,9 @@
             });
 
             document.getElementById('applyBulkEditBtn')?.addEventListener('click', async function () {
-                const field  = fieldSel.value.trim();
-                const cfg    = TEMPLATE_FIELDS_CONFIG[field] || {};
-                const ftype  = cfg.field_type || 'text';
-                const isEnum = !!(ENUM_FIELDS[field] || ftype === 'boolean');
-                const value  = isEnum ? valueSel.value : valueInput.value.trim();
+                const field = fieldSel.value.trim();
+                const isEnum = !!ENUM_FIELDS[field];
+                const value = isEnum ? valueSel.value : valueInput.value.trim();
 
                 if (!field) { alert('Please select a field to update.'); return; }
                 if (value === '') { alert('Please enter a value.'); return; }
@@ -1192,31 +1090,6 @@
             }
         });
 
-        // ====================== ENTRY BOOLEAN FIELD INLINE TOGGLE ======================
-        document.addEventListener('change', async function (e) {
-            const cb = e.target.closest('.entry-bool-toggle');
-            if (!cb) return;
-
-            const recordId = cb.dataset.recordId;
-            const fieldKey = cb.dataset.fieldKey;
-            const checked  = cb.checked;
-
-            try {
-                const res  = await fetch(`/update_scan/${recordId}`, {
-                    method:  'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body:    JSON.stringify({ extracted_data: { [fieldKey]: checked ? 'True' : 'False' } }),
-                });
-                const data = await res.json();
-                if (data.status !== 'success') {
-                    cb.checked = !checked;  // revert on failure
-                }
-            } catch (err) {
-                console.error('Failed to save field state:', err);
-                cb.checked = !checked;
-            }
-        });
-
         // ====================== EXPORT CSV ======================
         document.getElementById('exportCsvBtn')?.addEventListener('click', function () {
             // Collect the currently VISIBLE column keys from the table headers.
@@ -1316,6 +1189,72 @@
                 alert('An error occurred.');
             }
         });
+
+        // ====================== COLUMN VISIBILITY & SORTING ======================
+
+        // Storage key bumped to v3 to drop old hidden-col state
+        // that referenced the removed matched_product column.
+        const COL_STORAGE_KEY  = 'inventory_hidden_cols_v9';
+        const COL_WIDTHS_KEY   = 'inventory_col_widths_v1';
+
+        // Entry fields discovered server-side and injected as JSON.
+        // Each item is a raw field key string (e.g. "name", "atk", "stars").
+        const ENTRY_FIELDS = {{ entry_fields | tojson }};
+
+        // Static columns that can be toggled (key matches data-col on <th>)
+        const STATIC_TOGGLEABLE_COLS = [
+            { key: 'date',        label: 'Date' },
+            { key: 'image',       label: 'Image' },
+            { key: 'game',        label: 'Game' },
+            { key: 'album',       label: 'Album' },
+            { key: 'page',        label: 'Page' },
+            { key: 'slot',        label: 'Slot' },
+            { key: 'template',    label: 'Template' },
+            { key: 'tcg_url',      label: 'Price URL' },
+            { key: 'market_price', label: 'Market Price' },
+            { key: 'finalized',   label: 'Finalized' },
+            { key: 'edition',     label: 'Edition' },
+            { key: 'qty',         label: 'Qty' },
+        ];
+
+        // OCR metadata suffixes that must never appear as column chooser options.
+        const OCR_HIDDEN_SUFFIXES = ['__ocr_conf', '__ocr_variant'];
+        function isOcrMetaField(fieldKey) {
+            return OCR_HIDDEN_SUFFIXES.some(sfx => fieldKey.endsWith(sfx));
+        }
+
+        // Build the full toggleable-columns list, appending one entry per
+        // dynamic field.  Label converts underscores to spaces and title-cases.
+        // OCR conf/variant fields are filtered from the chooser.
+        function toLabel(fieldKey) {
+            return fieldKey.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+        }
+        // Only non-OCR-meta fields appear in the column chooser
+        const DYNAMIC_TOGGLEABLE_COLS = ENTRY_FIELDS
+            .filter(f => !isOcrMetaField(f))
+            .map(f => ({
+                key:      'entry_' + f,
+                label:    toLabel(f),
+                isDynamic: true,
+                fieldKey: f,
+            }));
+        // All dynamic cols (including OCR meta) for visibility-application logic;
+        // OCR meta ones are force-hidden regardless of the hiddenSet.
+        const ALL_DYNAMIC_COLS = ENTRY_FIELDS.map(f => ({
+            key:      'entry_' + f,
+            fieldKey: f,
+        }));
+        const TOGGLEABLE_COLS = [...STATIC_TOGGLEABLE_COLS, ...DYNAMIC_TOGGLEABLE_COLS];
+
+        // Static column key → 0-based cell index.
+        // Dynamic columns are NOT in this map; they are looked up by data-entry-field
+        // attribute on the <td> elements instead of by numeric index.
+        const STATIC_COL_INDEX = {
+            select: 0, date: 1, image: 2, game: 3,
+            album: 4, page: 5, slot: 6, template: 7,
+            // tcg_url is at index 8; looked up by data-col-static attribute
+            // actions column is always last; excluded from toggles
+        };
 
         function loadHiddenCols() {
             try {

@@ -7,6 +7,7 @@
     <title>Inventory Item - Card Collector Inventory Manager</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 
     <style>
         body { background-color: #f8f9fa; }
@@ -100,6 +101,43 @@
         .jtcg-fetch-btn:hover:not(:disabled) { background: #145f2e; }
         .jtcg-fetch-btn:disabled { opacity: 0.65; cursor: not-allowed; }
 
+        /* JustTCG result picker */
+        .jtcg-picker-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 14px;
+            padding: 12px 16px;
+            border-bottom: 1px solid #f0f0f0;
+            cursor: pointer;
+            transition: background 0.1s;
+        }
+        .jtcg-picker-item:last-child { border-bottom: none; }
+        .jtcg-picker-item:hover { background: #f0f8f2; }
+        .jtcg-picker-item.selected { background: #e6f4ea; }
+        .jtcg-picker-radio {
+            margin-top: 3px;
+            accent-color: #1a7a3c;
+            width: 16px;
+            height: 16px;
+            flex-shrink: 0;
+        }
+        .jtcg-picker-name { font-weight: 600; font-size: 0.9rem; color: #212529; }
+        .jtcg-picker-meta { font-size: 0.78rem; color: #6c757d; margin-top: 2px; }
+        .jtcg-picker-price {
+            margin-left: auto;
+            font-weight: 700;
+            font-size: 0.95rem;
+            color: #1a7a3c;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+        .jtcg-picker-list {
+            max-height: 360px;
+            overflow-y: auto;
+            border: 1px solid #dee2e6;
+            border-radius: 8px;
+        }
+
         .tcg-product-id {
             font-family: monospace;
             background: #e9ecef;
@@ -124,6 +162,94 @@
             .nav-tabs-minimal { margin-left: 0; margin-top: 12px; width: 100%; }
             .nav-tab { flex: 1; text-align: center; }
         }
+
+        /* ── Template Layout Editor ── */
+        .layout-mode-btn {
+            display: inline-flex; align-items: center; gap: 6px;
+            font-size: 0.8rem; font-weight: 600;
+            padding: 4px 10px; border-radius: 6px;
+            border: 1.5px solid #6c757d; color: #6c757d;
+            background: transparent; cursor: pointer;
+            transition: all 0.15s ease;
+        }
+        .layout-mode-btn:hover { border-color: #495057; color: #495057; background: #f8f9fa; }
+        .layout-mode-btn.active { border-color: #6f42c1; color: #6f42c1; background: #f3eeff; }
+
+        .layout-mode-banner {
+            display: none;
+            align-items: center; gap: 10px; flex-wrap: wrap;
+            background: linear-gradient(135deg, #f3eeff 0%, #ede9ff 100%);
+            border: 1.5px dashed #a78bfa;
+            border-radius: 10px;
+            padding: 10px 14px;
+            margin-bottom: 14px;
+            font-size: 0.82rem; color: #5b21b6;
+        }
+        .layout-mode-banner.visible { display: flex; }
+        .layout-mode-banner strong { font-weight: 700; }
+        .layout-save-btn {
+            margin-left: auto; padding: 4px 12px;
+            font-size: 0.8rem; font-weight: 700;
+            background: #6f42c1; color: #fff;
+            border: none; border-radius: 6px; cursor: pointer;
+            transition: background 0.15s;
+        }
+        .layout-save-btn:hover { background: #5a32a3; }
+        .layout-reset-btn {
+            padding: 4px 10px; font-size: 0.8rem; font-weight: 600;
+            background: transparent; color: #5b21b6;
+            border: 1.5px solid #a78bfa; border-radius: 6px;
+            cursor: pointer; transition: all 0.15s;
+        }
+        .layout-reset-btn:hover { background: #ede9ff; }
+
+        /* Fields become draggable tiles in layout mode */
+        #editFieldsGrid.layout-mode .col-md-6 {
+            cursor: grab !important;
+            user-select: none;
+        }
+        #editFieldsGrid.layout-mode .col-md-6:active { cursor: grabbing !important; }
+        #editFieldsGrid.layout-mode .col-md-6 .form-control,
+        #editFieldsGrid.layout-mode .col-md-6 .form-select {
+            pointer-events: none;
+        }
+        #editFieldsGrid.layout-mode .col-md-6 {
+            border: 1.5px dashed transparent;
+            border-radius: 8px;
+            padding: 6px;
+            transition: border-color 0.15s, background 0.15s;
+        }
+        #editFieldsGrid.layout-mode .col-md-6:hover {
+            border-color: #a78bfa;
+            background: #faf8ff;
+        }
+        #editFieldsGrid.layout-mode .col-md-6.dragging {
+            opacity: 0.4;
+            border-color: #6f42c1;
+        }
+        #editFieldsGrid.layout-mode .col-md-6.drag-over {
+            border-color: #6f42c1;
+            background: #ede9ff;
+        }
+        .drag-handle-icon {
+            display: none;
+            color: #a78bfa; font-size: 0.75rem;
+            margin-bottom: 2px;
+        }
+        #editFieldsGrid.layout-mode .drag-handle-icon { display: block; }
+
+        .layout-saved-toast {
+            position: fixed; bottom: 24px; right: 24px;
+            background: #5a32a3; color: #fff;
+            padding: 10px 18px; border-radius: 10px;
+            font-size: 0.85rem; font-weight: 600;
+            box-shadow: 0 4px 16px rgba(90,50,163,0.35);
+            opacity: 0; pointer-events: none;
+            transform: translateY(8px);
+            transition: opacity 0.25s ease, transform 0.25s ease;
+            z-index: 9999;
+        }
+        .layout-saved-toast.show { opacity: 1; transform: translateY(0); }
     </style>
 </head>
 <body>
@@ -268,10 +394,30 @@
 
                 <!-- Edit form -->
                 <div class="card detail-card">
-                    <div class="card-header bg-light"><strong>Edit Extracted Values</strong></div>
+                    <div class="card-header bg-light d-flex align-items-center justify-content-between">
+                        <strong>Edit Extracted Values</strong>
+                        {% set _edit_game = record.extracted_data.get('game', '') if record.extracted_data else '' %}
+                        {% if _edit_game %}
+                        <button type="button" class="layout-mode-btn" id="layoutModeBtn"
+                                title="Drag fields to reorder them for this game's template">
+                            <i class="fas fa-grip-vertical"></i>
+                            Layout for <em>{{ _edit_game }}</em>
+                        </button>
+                        {% endif %}
+                    </div>
                     <div class="card-body">
-                        <form id="editForm">
-                            <div class="row g-3">
+                        <div class="layout-mode-banner" id="layoutBanner">
+                            <i class="fas fa-arrows-alt"></i>
+                            <span><strong>Template Layout Mode</strong> — Drag fields to reorder. Layout saves per game.</span>
+                            <button type="button" class="layout-reset-btn" id="layoutResetBtn">
+                                <i class="fas fa-undo me-1"></i>Reset
+                            </button>
+                            <button type="button" class="layout-save-btn" id="layoutSaveBtn">
+                                <i class="fas fa-save me-1"></i>Save Layout
+                            </button>
+                        </div>
+                        <form id="editForm" data-game="{{ record.extracted_data.get('game', '') if record.extracted_data else '' }}">
+                            <div class="row g-3" id="editFieldsGrid">
                                 {% for key, value in record.extracted_data.items() %}
                                     {% if '__ocr_' not in key
                                        and key != '__roi_fields_used'
@@ -280,10 +426,48 @@
                                        and key != 'edition'
                                        and key != 'holographic'
                                        and key != 'finalized' %}
-                                    <div class="col-md-6">
+                                    {% set _tpl_field = template_fields_config.get(key, {}) %}
+                                    {% set _ftype = _tpl_field.get('field_type', 'text') %}
+                                    {% set _opts  = _tpl_field.get('dropdown_options', []) %}
+                                    <div class="col-md-6" data-field-key="{{ key }}" draggable="false">
+                                        <div class="drag-handle-icon"><i class="fas fa-grip-horizontal"></i> drag to reorder</div>
                                         <label class="form-label">{{ key.replace('_', ' ').title() }}</label>
-                                        <input type="text" class="form-control" name="{{ key }}"
-                                               value="{{ value if value is not none else '' }}">
+
+                                        {% if _ftype == 'boolean' %}
+                                            {%- set _bval = (value | string | lower) in ('true', '1', 'yes') -%}
+                                            {# hidden input carries the actual boolean string so the save form picks it up #}
+                                            <input type="hidden" name="{{ key }}" id="hidden_{{ key }}"
+                                                   value="{{ 'True' if _bval else 'False' }}">
+                                            <div class="d-flex align-items-center gap-3 mt-1">
+                                                <div class="form-check form-switch mb-0">
+                                                    <input class="form-check-input field-bool-toggle"
+                                                           type="checkbox" role="switch"
+                                                           data-target="hidden_{{ key }}"
+                                                           data-label="label_{{ key }}"
+                                                           {% if _bval %}checked{% endif %}
+                                                           style="width:3em;height:1.5em;cursor:pointer;">
+                                                </div>
+                                                <span id="label_{{ key }}" class="fw-semibold {% if _bval %}text-success{% else %}text-secondary{% endif %}">
+                                                    {% if _bval %}True{% else %}False{% endif %}
+                                                </span>
+                                            </div>
+
+                                        {% elif _ftype == 'dropdown' and _opts %}
+                                            <select class="form-select" name="{{ key }}">
+                                                {% for opt in _opts %}
+                                                <option value="{{ opt }}"
+                                                    {% if (value | string) == opt %}selected{% endif %}>{{ opt }}</option>
+                                                {% endfor %}
+                                                {# If the current value isn't in the list, add it as a fallback #}
+                                                {% if (value | string) not in _opts and value %}
+                                                <option value="{{ value }}" selected>{{ value }} (custom)</option>
+                                                {% endif %}
+                                            </select>
+
+                                        {% else %}
+                                            <input type="text" class="form-control" name="{{ key }}"
+                                                   value="{{ value if value is not none else '' }}">
+                                        {% endif %}
                                     </div>
                                     {% endif %}
                                 {% endfor %}
@@ -451,11 +635,7 @@
                             </div>
                             {% endif %}
 
-                            <div class="mt-3 d-flex align-items-center gap-3 flex-wrap">
-                                <a href="{{ tcg.url }}" target="_blank" rel="noopener"
-                                   class="btn btn-sm btn-outline-success">
-                                    <i class="fas fa-external-link-alt me-1"></i>View on JustTCG
-                                </a>
+                            <div class="mt-3">
                                 <span class="text-muted small">Fetched {{ tcg.get('saved_at', '')[:10] }}</span>
                             </div>
                         </div>
@@ -514,6 +694,20 @@
         }
 
         // ==================== EDIT FORM ====================
+
+        // ── Generic boolean field toggles (field_type = "boolean" in template) ──
+        document.querySelectorAll('.field-bool-toggle').forEach(function (chk) {
+            chk.addEventListener('change', function () {
+                const hiddenEl = document.getElementById(this.dataset.target);
+                const labelEl  = document.getElementById(this.dataset.label);
+                if (hiddenEl) hiddenEl.value = this.checked ? 'True' : 'False';
+                if (labelEl) {
+                    labelEl.textContent = this.checked ? 'True' : 'False';
+                    labelEl.className   = 'fw-semibold ' + (this.checked ? 'text-success' : 'text-secondary');
+                }
+            });
+        });
+
         document.getElementById('editForm').addEventListener('submit', async function (e) {
             e.preventDefault();
             const updated = {};
@@ -609,44 +803,6 @@
             } catch (err) {
                 console.error('Delete error:', err);
                 statusEl.innerHTML = `<div class="alert alert-danger mb-0">Delete failed: ${err.message}</div>`;
-            }
-        });
-
-        // ==================== JUSTTCG PRICE FETCH ====================
-        document.getElementById('jtcgFetchBtn')?.addEventListener('click', async function () {
-            const btn    = this;
-            const status = document.getElementById('jtcgStatus');
-
-            btn.disabled = true;
-            btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Fetching…';
-            status.innerHTML = '';
-
-            try {
-                const res  = await fetch(`/justtcg_fetch/${recordId}`, { method: 'POST' });
-                const data = await res.json();
-
-                if (data.status === 'success') {
-                    status.innerHTML = `<div class="alert alert-success mb-0">
-                        <i class="fas fa-check-circle me-1"></i>${data.message} Reloading…
-                    </div>`;
-                    setTimeout(() => window.location.reload(), 800);
-                } else if (data.status === 'not_found') {
-                    status.innerHTML = `<div class="alert alert-warning mb-0">
-                        <i class="fas fa-search me-1"></i>${data.message}
-                    </div>`;
-                    btn.disabled = false;
-                    btn.innerHTML = '<i class="fas fa-search-dollar me-1"></i>Fetch Price from JustTCG';
-                } else {
-                    status.innerHTML = `<div class="alert alert-danger mb-0">
-                        <i class="fas fa-exclamation-triangle me-1"></i>${data.message || 'Fetch failed.'}
-                    </div>`;
-                    btn.disabled = false;
-                    btn.innerHTML = '<i class="fas fa-search-dollar me-1"></i>Fetch Price from JustTCG';
-                }
-            } catch (err) {
-                status.innerHTML = `<div class="alert alert-danger mb-0">Network error: ${err.message}</div>`;
-                btn.disabled = false;
-                btn.innerHTML = '<i class="fas fa-search-dollar me-1"></i>Fetch Price from JustTCG';
             }
         });
 
@@ -869,6 +1025,330 @@
         function escHtml(s) {
             return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
         }
+    </script>
+
+    <!-- ==================== JUSTTCG PICKER MODAL ==================== -->
+    <div class="modal fade" id="jtcgPickerModal" tabindex="-1" aria-labelledby="jtcgPickerModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-lg modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="jtcgPickerModalLabel">
+                        <i class="fas fa-search-dollar me-2 text-success"></i>Choose a JustTCG Result
+                    </h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body p-0">
+                    <div class="px-3 pt-3 pb-2 border-bottom bg-light">
+                        <small class="text-muted" id="jtcgPickerSubtitle"></small>
+                    </div>
+                    <div class="jtcg-picker-list" id="jtcgPickerList">
+                        <!-- populated by JS -->
+                    </div>
+                </div>
+                <div class="modal-footer justify-content-between">
+                    <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-success" id="jtcgPickerConfirm" disabled>
+                        <i class="fas fa-check me-1"></i>Save Selected
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast for layout save feedback -->
+    <div class="layout-saved-toast" id="layoutToast">
+        <i class="fas fa-check-circle me-2"></i>Layout saved for this game!
+    </div>
+
+    <script>
+    // ==================== TEMPLATE LAYOUT EDITOR ====================
+    (function () {
+        const STORAGE_PREFIX = 'ccim_field_order_';
+
+        const layoutBtn    = document.getElementById('layoutModeBtn');
+        const layoutBanner = document.getElementById('layoutBanner');
+        const saveBtn      = document.getElementById('layoutSaveBtn');
+        const resetBtn     = document.getElementById('layoutResetBtn');
+        const grid         = document.getElementById('editFieldsGrid');
+        const toast        = document.getElementById('layoutToast');
+        const editForm     = document.getElementById('editForm');
+
+        if (!layoutBtn || !grid) return;  // no game on this record
+
+        const game = (editForm.dataset.game || '').trim();
+        const storageKey = STORAGE_PREFIX + game.toLowerCase().replace(/\s+/g, '_');
+
+        // ── Apply saved order on page load ──
+        function getSavedOrder() {
+            try { return JSON.parse(localStorage.getItem(storageKey)) || null; }
+            catch { return null; }
+        }
+
+        function applyOrder(order) {
+            if (!order || !order.length) return;
+            const items = Array.from(grid.querySelectorAll('.col-md-6[data-field-key]'));
+            const map = {};
+            items.forEach(el => { map[el.dataset.fieldKey] = el; });
+            order.forEach(key => {
+                if (map[key]) grid.appendChild(map[key]);
+            });
+            // Append any fields not in the saved order (new fields added after layout was saved)
+            items.forEach(el => {
+                if (!order.includes(el.dataset.fieldKey)) grid.appendChild(el);
+            });
+        }
+
+        applyOrder(getSavedOrder());
+
+        // ── Toggle layout mode ──
+        let layoutMode = false;
+
+        function setLayoutMode(on) {
+            layoutMode = on;
+            layoutBtn.classList.toggle('active', on);
+            layoutBanner.classList.toggle('visible', on);
+            grid.classList.toggle('layout-mode', on);
+
+            grid.querySelectorAll('.col-md-6[data-field-key]').forEach(el => {
+                el.setAttribute('draggable', on ? 'true' : 'false');
+            });
+        }
+
+        layoutBtn.addEventListener('click', () => setLayoutMode(!layoutMode));
+
+        // ── Drag-and-drop reordering ──
+        let dragSrc = null;
+
+        grid.addEventListener('dragstart', function (e) {
+            const item = e.target.closest('.col-md-6[data-field-key]');
+            if (!item || !layoutMode) { e.preventDefault(); return; }
+            dragSrc = item;
+            item.classList.add('dragging');
+            e.dataTransfer.effectAllowed = 'move';
+        });
+
+        grid.addEventListener('dragend', function () {
+            if (dragSrc) { dragSrc.classList.remove('dragging'); dragSrc = null; }
+            grid.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
+        });
+
+        grid.addEventListener('dragover', function (e) {
+            e.preventDefault();
+            if (!dragSrc || !layoutMode) return;
+            const target = e.target.closest('.col-md-6[data-field-key]');
+            if (!target || target === dragSrc) return;
+            grid.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
+            target.classList.add('drag-over');
+        });
+
+        grid.addEventListener('dragleave', function (e) {
+            const target = e.target.closest('.col-md-6[data-field-key]');
+            if (target) target.classList.remove('drag-over');
+        });
+
+        grid.addEventListener('drop', function (e) {
+            e.preventDefault();
+            if (!dragSrc || !layoutMode) return;
+            const target = e.target.closest('.col-md-6[data-field-key]');
+            if (!target || target === dragSrc) return;
+
+            // Insert dragSrc before or after target based on mouse position
+            const rect = target.getBoundingClientRect();
+            const midX = rect.left + rect.width / 2;
+            if (e.clientX < midX) {
+                grid.insertBefore(dragSrc, target);
+            } else {
+                target.after(dragSrc);
+            }
+            target.classList.remove('drag-over');
+        });
+
+        // ── Save layout ──
+        function currentOrder() {
+            return Array.from(grid.querySelectorAll('.col-md-6[data-field-key]'))
+                        .map(el => el.dataset.fieldKey);
+        }
+
+        function showToast(msg) {
+            if (msg) toast.innerHTML = `<i class="fas fa-check-circle me-2"></i>${msg}`;
+            toast.classList.add('show');
+            clearTimeout(toast._timer);
+            toast._timer = setTimeout(() => toast.classList.remove('show'), 2200);
+        }
+
+        saveBtn.addEventListener('click', function () {
+            const order = currentOrder();
+            localStorage.setItem(storageKey, JSON.stringify(order));
+            showToast(`Layout saved for <em>${game}</em>!`);
+            setLayoutMode(false);
+        });
+
+        resetBtn.addEventListener('click', function () {
+            if (!confirm(`Reset the field layout for "${game}" to default?`)) return;
+            localStorage.removeItem(storageKey);
+            showToast('Layout reset to default.');
+            setLayoutMode(false);
+            // Reload to restore original Jinja order
+            window.location.reload();
+        });
+    })();
+    </script>
+
+    <script>
+    (function () {
+        // ==================== JUSTTCG PICKER LOGIC ====================
+
+        function escHtml(s) {
+            return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+        }
+
+        // Lazy-init so bootstrap.Modal is only called when first needed
+        let pickerModal = null;
+        function getPickerModal() {
+            if (!pickerModal) {
+                pickerModal = new bootstrap.Modal(document.getElementById('jtcgPickerModal'));
+            }
+            return pickerModal;
+        }
+
+        const pickerList     = document.getElementById('jtcgPickerList');
+        const pickerSubtitle = document.getElementById('jtcgPickerSubtitle');
+        const confirmBtn     = document.getElementById('jtcgPickerConfirm');
+        let   selectedCardId = null;
+
+        // Clicking a row selects it
+        pickerList.addEventListener('click', function (e) {
+            const row = e.target.closest('.jtcg-picker-item');
+            if (!row) return;
+            pickerList.querySelectorAll('.jtcg-picker-item').forEach(r => {
+                r.classList.remove('selected');
+                r.querySelector('.jtcg-picker-radio').checked = false;
+            });
+            row.classList.add('selected');
+            row.querySelector('.jtcg-picker-radio').checked = true;
+            selectedCardId = row.dataset.cardId;
+            confirmBtn.disabled = false;
+        });
+
+        // "Save Selected" — POST with the chosen card_id
+        confirmBtn.addEventListener('click', async function () {
+            if (!selectedCardId) return;
+            const btn    = document.getElementById('jtcgFetchBtn');
+            const status = document.getElementById('jtcgStatus');
+
+            pickerModal = null;  // reset so it's re-initialised next open
+            getPickerModal().hide();
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Saving…';
+            status.innerHTML = '';
+
+            try {
+                const res  = await fetch(`/justtcg_fetch/${recordId}`, {
+                    method:  'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body:    JSON.stringify({ card_id: selectedCardId }),
+                });
+                const data = await res.json();
+
+                if (data.status === 'success') {
+                    status.innerHTML = `<div class="alert alert-success mb-0">
+                        <i class="fas fa-check-circle me-1"></i>${escHtml(data.message)} Reloading…
+                    </div>`;
+                    setTimeout(() => window.location.reload(), 800);
+                } else {
+                    status.innerHTML = `<div class="alert alert-danger mb-0">
+                        <i class="fas fa-exclamation-triangle me-1"></i>${escHtml(data.message || 'Save failed.')}
+                    </div>`;
+                    btn.disabled = false;
+                    btn.innerHTML = '<i class="fas fa-search-dollar me-1"></i>Fetch Price from JustTCG';
+                }
+            } catch (err) {
+                status.innerHTML = `<div class="alert alert-danger mb-0">Network error: ${escHtml(err.message)}</div>`;
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fas fa-search-dollar me-1"></i>Fetch Price from JustTCG';
+            }
+        });
+
+        // Fetch button — search first, then show picker
+        document.getElementById('jtcgFetchBtn')?.addEventListener('click', async function () {
+            const btn    = this;
+            const status = document.getElementById('jtcgStatus');
+
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Searching…';
+            status.innerHTML = '';
+            selectedCardId = null;
+            confirmBtn.disabled = true;
+
+            try {
+                const res  = await fetch(`/justtcg_search/${recordId}`);
+                const data = await res.json();
+
+                btn.disabled = false;
+                // Restore label based on whether pricing already exists
+                const hasPrice = document.querySelector('.jtcg-linked-panel') !== null;
+                btn.innerHTML = hasPrice
+                    ? '<i class="fas fa-sync-alt me-1"></i>Refresh Price'
+                    : '<i class="fas fa-search-dollar me-1"></i>Fetch Price from JustTCG';
+
+                if (data.status === 'not_found') {
+                    status.innerHTML = `<div class="alert alert-warning mb-0">
+                        <i class="fas fa-search me-1"></i>${escHtml(data.message)}
+                    </div>`;
+                    return;
+                }
+
+                if (data.status !== 'ok') {
+                    status.innerHTML = `<div class="alert alert-danger mb-0">
+                        <i class="fas fa-exclamation-triangle me-1"></i>${escHtml(data.message || 'Search failed.')}
+                    </div>`;
+                    return;
+                }
+
+                // Build picker rows
+                const candidates = data.candidates || [];
+                const searched   = data.searched   || {};
+                pickerSubtitle.textContent =
+                    `${candidates.length} result${candidates.length !== 1 ? 's' : ''} for "${searched.name || ''}"` +
+                    (searched.game ? ` · ${searched.game}` : '');
+
+                pickerList.innerHTML = candidates.map((c, i) => {
+                    const price = c.nm_price != null
+                        ? `$${parseFloat(c.nm_price).toFixed(2)}`
+                        : '—';
+                    const meta = [c.set_name, c.set_number, c.rarity, c.game]
+                        .filter(Boolean).join(' · ');
+                    return `
+                        <div class="jtcg-picker-item" data-card-id="${escHtml(c.card_id)}">
+                            <input type="radio" class="jtcg-picker-radio" name="jtcgPick" value="${escHtml(c.card_id)}">
+                            <div class="flex-grow-1 overflow-hidden">
+                                <div class="jtcg-picker-name">${escHtml(c.name)}</div>
+                                <div class="jtcg-picker-meta">${escHtml(meta)}</div>
+                            </div>
+                            <div class="jtcg-picker-price">${escHtml(price)}</div>
+                        </div>`;
+                }).join('');
+
+                // If there's only one result auto-select it for convenience
+                if (candidates.length === 1) {
+                    const only = pickerList.querySelector('.jtcg-picker-item');
+                    if (only) {
+                        only.classList.add('selected');
+                        only.querySelector('.jtcg-picker-radio').checked = true;
+                        selectedCardId = candidates[0].card_id;
+                        confirmBtn.disabled = false;
+                    }
+                }
+
+                getPickerModal().show();
+
+            } catch (err) {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fas fa-search-dollar me-1"></i>Fetch Price from JustTCG';
+                status.innerHTML = `<div class="alert alert-danger mb-0">Network error: ${escHtml(err.message)}</div>`;
+            }
+        });
+    })();
     </script>
 </body>
 </html>

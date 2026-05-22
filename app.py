@@ -995,6 +995,21 @@ def inventory():
     all_sample = all_records[:500]
     entry_fields = discover_entry_fields(all_sample)
 
+    # Aggregate field-type config from all known templates so the inventory
+    # list can render boolean toggles and respect dropdown options.
+    template_fields_config: dict = {}
+    for tpl_name in get_template_names():
+        try:
+            tpl = load_template(tpl_name)
+            for fk, fv in (tpl.get("fields") or {}).items():
+                if fk not in template_fields_config and isinstance(fv, dict):
+                    template_fields_config[fk] = {
+                        "field_type":       fv.get("field_type", "text"),
+                        "dropdown_options": fv.get("dropdown_options", []),
+                    }
+        except Exception:
+            pass
+
     return render_template(
         "inventory.html",
         records=pagination.items,
@@ -1008,6 +1023,7 @@ def inventory():
         group_info=group_info,
         sort_col=sort_col,
         sort_dir=sort_dir,
+        template_fields_config=template_fields_config,
     )
 
 
@@ -1296,12 +1312,21 @@ def inventory_detail(record_id):
                     "slot":  rdata.get("slot",  ""),
                 })
 
+    # Load the template that was used for this record so we can render
+    # fields with the correct input type (text / dropdown / boolean).
+    try:
+        tpl = load_template(record.template_used or "product_label")
+        template_fields_config = tpl.get("fields", {})
+    except Exception:
+        template_fields_config = {}
+
     return render_template(
         "inventory_detail.html",
         record=record,
         prev_id=prev_record.id if prev_record else None,
         next_id=next_record.id if next_record else None,
         stack_locations=stack_locations,
+        template_fields_config=template_fields_config,
     )
 
 
@@ -1698,13 +1723,30 @@ def template_save():
         except (ValueError, TypeError):
             return jsonify({"status": "error", "message": f"Invalid coordinates for field '{field_name}'"}), 400
 
-        cleaned_fields[field_key] = {
-            "x_pct":  round(max(0.0, min(100.0, x_pct)), 4),
-            "y_pct":  round(max(0.0, min(100.0, y_pct)), 4),
-            "w_pct":  round(max(0.1, min(100.0, w_pct)), 4),
-            "h_pct":  round(max(0.1, min(100.0, h_pct)), 4),
-            "config": coords.get("config", {}),
+        # ── field_type: "text" | "dropdown" | "boolean" ──
+        raw_field_type = str(coords.get("field_type", "text")).strip().lower()
+        if raw_field_type not in ("text", "dropdown", "boolean"):
+            raw_field_type = "text"
+
+        # dropdown_options: list of non-empty strings (only meaningful for dropdown)
+        raw_opts = coords.get("dropdown_options", [])
+        if isinstance(raw_opts, list):
+            dropdown_options = [str(o).strip() for o in raw_opts if str(o).strip()]
+        else:
+            dropdown_options = []
+
+        entry = {
+            "x_pct":      round(max(0.0, min(100.0, x_pct)), 4),
+            "y_pct":      round(max(0.0, min(100.0, y_pct)), 4),
+            "w_pct":      round(max(0.1, min(100.0, w_pct)), 4),
+            "h_pct":      round(max(0.1, min(100.0, h_pct)), 4),
+            "config":     coords.get("config", {}),
+            "field_type": raw_field_type,
         }
+        if raw_field_type == "dropdown":
+            entry["dropdown_options"] = dropdown_options
+
+        cleaned_fields[field_key] = entry
 
     if not cleaned_fields:
         return jsonify({"status": "error", "message": "No valid fields provided"}), 400
@@ -1795,6 +1837,34 @@ JUSTTCG_SEARCH_URL = "https://api.justtcg.com/v1/cards"
 JUSTTCG_TIMEOUT    = 10  # seconds
 JUSTTCG_API_KEY    = os.environ.get("JUSTTCG_API_KEY", "")
 
+# Maps human-readable / OCR'd game names to the slug values accepted by the
+# JustTCG API.  An unrecognised value causes HTTP 400, so anything not listed
+# here is dropped (empty string = no game filter, broader search).
+_JUSTTCG_GAME_MAP = {
+    "magic the gathering":    "magic-the-gathering",
+    "magic: the gathering":   "magic-the-gathering",
+    "magic":                  "magic-the-gathering",
+    "mtg":                    "magic-the-gathering",
+    "pokemon":                "pokemon",
+    "pokémon":                "pokemon",
+    "yugioh":                 "yugioh",
+    "yu-gi-oh":               "yugioh",
+    "yu-gi-oh!":              "yugioh",
+    "disney lorcana":         "disney-lorcana",
+    "lorcana":                "disney-lorcana",
+    "one piece":              "one-piece-card-game",
+    "one piece card game":    "one-piece-card-game",
+    "digimon":                "digimon-card-game",
+    "digimon card game":      "digimon-card-game",
+    "flesh and blood":        "flesh-and-blood-tcg",
+    "flesh and blood tcg":    "flesh-and-blood-tcg",
+    "union arena":            "union-arena",
+    "age of sigmar":          "age-of-sigmar",
+    "warhammer 40000":        "warhammer-40000",
+    "warhammer 40k":          "warhammer-40000",
+    "warhammer40000":         "warhammer-40000",
+}
+
 
 def _justtcg_search(name: str, number: str = "", game: str = "") -> dict:
     """
@@ -1861,23 +1931,11 @@ def justtcg_missing_ids():
     return jsonify({"ids": missing, "count": len(missing)})
 
 
-@app.route("/justtcg_fetch/<int:record_id>", methods=["POST"])
-def justtcg_fetch(record_id):
+def _resolve_card_name_and_game(ext: dict):
     """
-    Manually triggered endpoint: queries the JustTCG API for the card
-    associated with this inventory record, then persists the result.
-
-    The record's extracted_data is searched for the card name (product_name /
-    name / card_name) and optional set number (serial / set_number / number).
-
-    On success the pricing snapshot is stored under extracted_data['tcgplayer']
-    using the same schema as the old URL-save feature so the rest of the app
-    (copy-from, duplicate resolver, etc.) remains unchanged.
+    Shared helper used by both justtcg_search_candidates and justtcg_fetch.
+    Returns (card_name, set_number, game_slug).
     """
-    record = ScanRecord.query.get_or_404(record_id)
-    ext    = record.extracted_data or {}
-
-    # ── Resolve card name ─────────────────────────────────────────────────────
     card_name = (
         ext.get("product_name") or
         ext.get("name")         or
@@ -1886,13 +1944,6 @@ def justtcg_fetch(record_id):
         ""
     ).strip()
 
-    if not card_name:
-        return jsonify({
-            "status":  "error",
-            "message": "No card name found on this record (product_name / name / card_name).",
-        }), 400
-
-    # ── Resolve optional set number ───────────────────────────────────────────
     set_number = (
         ext.get("serial")     or
         ext.get("set_number") or
@@ -1900,9 +1951,76 @@ def justtcg_fetch(record_id):
         ""
     ).strip()
 
-    game = ext.get("game", "").strip()
+    raw_game = ext.get("game", "").strip()
+    game = _JUSTTCG_GAME_MAP.get(raw_game.lower(), "")
 
-    # ── Call JustTCG ──────────────────────────────────────────────────────────
+    return card_name, set_number, game
+
+
+def _build_entry_from_hit(hit: dict, card_name: str, set_number: str) -> dict:
+    """
+    Convert a single JustTCG Card object into the tcgplayer entry dict that
+    gets stored in extracted_data['tcgplayer'].
+    """
+    variants = hit.get("variants") or []
+    nm_normal = next(
+        (v for v in variants
+         if v.get("condition") in ("Near Mint", "NM") and v.get("printing") == "Normal"),
+        variants[0] if variants else {},
+    )
+    market = nm_normal.get("price")
+    low    = nm_normal.get("low_price")
+    mid    = nm_normal.get("mid_price")
+    high   = nm_normal.get("high_price")
+
+    card_id      = hit.get("id", "")
+    tcgplayer_id = hit.get("tcgplayerId", "")
+    product_url  = (
+        hit.get("url") or
+        (f"https://justtcg.com/cards/{card_id}" if card_id else "https://justtcg.com")
+    )
+
+    return {
+        "url":          product_url,
+        "full_url":     product_url,
+        "saved_at":     datetime.utcnow().isoformat(),
+        "source":       "justtcg",
+        "product_id":   str(card_id),
+        "tcgplayer_id": str(tcgplayer_id),
+        "product_name": hit.get("name", card_name),
+        "set_name":     hit.get("set_name") or hit.get("set") or "",
+        "set_number":   hit.get("number") or set_number,
+        "prices": {
+            "market": market,
+            "low":    low,
+            "mid":    mid,
+            "high":   high,
+        },
+    }
+
+
+@app.route("/justtcg_search/<int:record_id>", methods=["GET"])
+def justtcg_search_candidates(record_id):
+    """
+    Returns all JustTCG search results for the card on this record without
+    saving anything.  The UI uses this to present a picker so the user can
+    choose the correct printing/set before committing.
+
+    Response shape:
+      { status, candidates: [ { card_id, name, set_name, set_number, game,
+                                 rarity, nm_price, url } ] }
+    """
+    record = ScanRecord.query.get_or_404(record_id)
+    ext    = record.extracted_data or {}
+
+    card_name, set_number, game = _resolve_card_name_and_game(ext)
+
+    if not card_name:
+        return jsonify({
+            "status":  "error",
+            "message": "No card name found on this record (product_name / name / card_name).",
+        }), 400
+
     try:
         api_data = _justtcg_search(card_name, number=set_number, game=game)
     except urllib.error.HTTPError as exc:
@@ -1921,7 +2039,6 @@ def justtcg_fetch(record_id):
             "message": f"Unexpected response from JustTCG: {exc}",
         }), 502
 
-    # Real API returns {"data": [...]} — each item is a Card object with a `variants` array
     products = api_data.get("data") or []
 
     if not products:
@@ -1931,50 +2048,135 @@ def justtcg_fetch(record_id):
             "searched": {"name": card_name, "number": set_number, "game": game},
         })
 
-    # Use the first (best-ranked) result; narrow by set number if provided
-    hit = products[0]
-    if set_number:
-        for card in products:
-            if str(card.get("number", "")).strip().lower() == set_number.lower():
-                hit = card
-                break
+    candidates = []
+    for card in products:
+        variants = card.get("variants") or []
+        nm_normal = next(
+            (v for v in variants
+             if v.get("condition") in ("Near Mint", "NM") and v.get("printing") == "Normal"),
+            variants[0] if variants else {},
+        )
+        card_id = card.get("id", "")
+        candidates.append({
+            "card_id":    card_id,
+            "name":       card.get("name", ""),
+            "set_name":   card.get("set_name") or card.get("set") or "",
+            "set_number": card.get("number") or "",
+            "game":       card.get("game") or "",
+            "rarity":     card.get("rarity") or "",
+            "nm_price":   nm_normal.get("price"),
+            "url":        card.get("url") or
+                          (f"https://justtcg.com/cards/{card_id}" if card_id else ""),
+        })
 
-    # Prices live inside variants (condition/printing combos); pick the best Near Mint Normal price
-    variants = hit.get("variants") or []
-    nm_normal = next(
-        (v for v in variants if v.get("condition") in ("Near Mint", "NM") and v.get("printing") == "Normal"),
-        variants[0] if variants else {},
-    )
-    market = nm_normal.get("price")
-    low    = nm_normal.get("low_price")
-    mid    = nm_normal.get("mid_price")
-    high   = nm_normal.get("high_price")
+    return jsonify({
+        "status":     "ok",
+        "candidates": candidates,
+        "searched":   {"name": card_name, "number": set_number, "game": game},
+    })
 
-    card_id      = hit.get("id", "")
-    tcgplayer_id = hit.get("tcgplayerId", "")
-    product_url  = (
-        hit.get("url") or
-        (f"https://justtcg.com/cards/{card_id}" if card_id else "https://justtcg.com")
-    )
 
-    entry = {
-        # Keep the `url` key so copy-from and other existing code still works
-        "url":         product_url,
-        "full_url":    product_url,
-        "saved_at":    datetime.utcnow().isoformat(),
-        "source":      "justtcg",
-        "product_id":  str(card_id),
-        "tcgplayer_id": str(tcgplayer_id),
-        "product_name": hit.get("name", card_name),
-        "set_name":    hit.get("set_name") or hit.get("set") or "",
-        "set_number":  hit.get("number") or set_number,
-        "prices": {
-            "market": market,
-            "low":    low,
-            "mid":    mid,
-            "high":   high,
-        },
-    }
+@app.route("/justtcg_fetch/<int:record_id>", methods=["POST"])
+def justtcg_fetch(record_id):
+    """
+    Saves JustTCG pricing data for a specific card onto this record.
+
+    If the POST body contains a `card_id`, that exact card is looked up and
+    saved — this is the path taken after the user has chosen from the picker.
+
+    If no `card_id` is provided the first API result is used (legacy / bulk
+    fetch behaviour).
+
+    On success the pricing snapshot is stored under extracted_data['tcgplayer'].
+    """
+    record = ScanRecord.query.get_or_404(record_id)
+    ext    = record.extracted_data or {}
+
+    body      = request.get_json() or {}
+    chosen_id = body.get("card_id", "").strip()
+
+    card_name, set_number, game = _resolve_card_name_and_game(ext)
+
+    if not card_name and not chosen_id:
+        return jsonify({
+            "status":  "error",
+            "message": "No card name found on this record (product_name / name / card_name).",
+        }), 400
+
+    # ── If a specific card_id was supplied, fetch that card directly ──────────
+    if chosen_id:
+        # Build a direct lookup URL using cardId so we get full variant data
+        params = {"cardId": chosen_id, "include_price_history": "false"}
+        url = JUSTTCG_SEARCH_URL + "?" + urllib.parse.urlencode(params)
+        headers = {
+            "Accept":     "application/json",
+            "User-Agent": "CardCollectorInventoryManager/1.0",
+            "x-api-key":  JUSTTCG_API_KEY,
+        }
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=JUSTTCG_TIMEOUT) as resp:
+                api_data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            return jsonify({
+                "status":  "error",
+                "message": f"JustTCG API returned HTTP {exc.code}: {exc.reason}",
+            }), 502
+        except urllib.error.URLError as exc:
+            return jsonify({
+                "status":  "error",
+                "message": f"Could not reach JustTCG: {exc.reason}",
+            }), 502
+        except (json.JSONDecodeError, ValueError) as exc:
+            return jsonify({
+                "status":  "error",
+                "message": f"Unexpected response from JustTCG: {exc}",
+            }), 502
+
+        products = api_data.get("data") or []
+        if not products:
+            return jsonify({
+                "status":  "error",
+                "message": f"JustTCG returned no data for card ID '{chosen_id}'.",
+            }), 502
+        hit = products[0]
+
+    else:
+        # ── No card_id: fall back to name search and take the first result ────
+        try:
+            api_data = _justtcg_search(card_name, number=set_number, game=game)
+        except urllib.error.HTTPError as exc:
+            return jsonify({
+                "status":  "error",
+                "message": f"JustTCG API returned HTTP {exc.code}: {exc.reason}",
+            }), 502
+        except urllib.error.URLError as exc:
+            return jsonify({
+                "status":  "error",
+                "message": f"Could not reach JustTCG: {exc.reason}",
+            }), 502
+        except (json.JSONDecodeError, ValueError) as exc:
+            return jsonify({
+                "status":  "error",
+                "message": f"Unexpected response from JustTCG: {exc}",
+            }), 502
+
+        products = api_data.get("data") or []
+        if not products:
+            return jsonify({
+                "status":   "not_found",
+                "message":  f'No results found on JustTCG for "{card_name}".',
+                "searched": {"name": card_name, "number": set_number, "game": game},
+            })
+
+        hit = products[0]
+        if set_number:
+            for card in products:
+                if str(card.get("number", "")).strip().lower() == set_number.lower():
+                    hit = card
+                    break
+
+    entry = _build_entry_from_hit(hit, card_name, set_number)
 
     updated = dict(record.extracted_data or {})
     updated["tcgplayer"] = entry
@@ -1983,7 +2185,7 @@ def justtcg_fetch(record_id):
 
     return jsonify({
         "status":  "success",
-        "message": f'Price data fetched for "{hit.get("name", card_name)}".',
+        "message": f'Price data saved for "{entry["product_name"]}".',
         "entry":   entry,
     })
 
