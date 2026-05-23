@@ -1768,6 +1768,120 @@ def template_save():
     })
 
 
+# ====================== TEMPLATE CONFIG (live field types) ======================
+@app.route("/template_config/<template_name>")
+def template_config(template_name):
+    """
+    Return the live field config for a given template as JSON.
+    Used by the inventory detail page to detect field-type changes
+    made after the page was server-rendered.
+    Shape: { fieldKey: { field_type, dropdown_options? }, … }
+    """
+    try:
+        tpl = load_template(template_name or "product_label")
+        fields = tpl.get("fields", {})
+        # Return only field_type and dropdown_options — omit ROI coords
+        slim = {
+            k: {
+                "field_type":       v.get("field_type", "text"),
+                "dropdown_options": v.get("dropdown_options", []),
+            }
+            for k, v in fields.items()
+        }
+        return jsonify(slim)
+    except Exception as exc:
+        return jsonify({}), 200  # graceful fallback
+
+
+# ====================== UPDATE FIELD TYPE ======================
+@app.route("/update_field_type", methods=["POST"])
+def update_field_type():
+    """
+    Patch the field_type (and optionally dropdown_options) for a single field
+    across every template that contains that field key.
+
+    Request JSON:
+        {
+            "field_key":        "my_field",
+            "field_type":       "text" | "dropdown" | "boolean",
+            "dropdown_options": ["Opt A", "Opt B"]   // required when field_type == "dropdown"
+        }
+
+    Response JSON:
+        { "status": "success"|"error", "message": "...", "updated_templates": [...] }
+    """
+    data = request.get_json() or {}
+
+    field_key  = str(data.get("field_key",  "")).strip()
+    field_type = str(data.get("field_type", "")).strip().lower()
+    raw_opts   = data.get("dropdown_options", [])
+
+    # ── Validate inputs ──────────────────────────────────────────────────────
+    if not field_key:
+        return jsonify({"status": "error", "message": "field_key is required"}), 400
+
+    if field_type not in ("text", "dropdown", "boolean"):
+        return jsonify({"status": "error",
+                        "message": f"Invalid field_type '{field_type}'. Must be text, dropdown, or boolean."}), 400
+
+    if isinstance(raw_opts, list):
+        dropdown_options = [str(o).strip() for o in raw_opts if str(o).strip()]
+    else:
+        dropdown_options = []
+
+    if field_type == "dropdown" and not dropdown_options:
+        return jsonify({"status": "error",
+                        "message": "dropdown_options must contain at least one option for dropdown fields"}), 400
+
+    # ── Patch every template that contains this field key ────────────────────
+    updated_templates = []
+    errors            = []
+
+    for tpl_name in get_template_names():
+        tpl_path = os.path.join(app.config["ROI_TEMPLATE_FOLDER"], f"{tpl_name}.json")
+        try:
+            with open(tpl_path, "r", encoding="utf-8") as f:
+                tpl = json.load(f)
+
+            fields = tpl.get("fields", {})
+            if field_key not in fields:
+                continue  # this template doesn't have the field — skip
+
+            # Patch in-place, preserving all existing ROI coordinates / config
+            fields[field_key]["field_type"] = field_type
+            if field_type == "dropdown":
+                fields[field_key]["dropdown_options"] = dropdown_options
+            else:
+                # Remove stale dropdown_options for non-dropdown types
+                fields[field_key].pop("dropdown_options", None)
+
+            with open(tpl_path, "w", encoding="utf-8") as f:
+                json.dump(tpl, f, indent=2)
+
+            updated_templates.append(tpl_name)
+
+        except Exception as exc:
+            errors.append(f"{tpl_name}: {exc}")
+
+    if errors and not updated_templates:
+        return jsonify({"status": "error",
+                        "message": "Failed to update templates: " + "; ".join(errors)}), 500
+
+    if not updated_templates:
+        return jsonify({"status": "error",
+                        "message": f"Field '{field_key}' not found in any template"}), 404
+
+    msg = f"'{field_key}' updated to {field_type} in template(s): {', '.join(updated_templates)}"
+    if errors:
+        msg += f" (errors on: {'; '.join(errors)})"
+
+    return jsonify({
+        "status":            "success",
+        "message":           msg,
+        "updated_templates": updated_templates,
+    })
+
+
 # ====================== RECORDS SUMMARY ROUTE ======================
 @app.route("/records_summary")
 def records_summary():

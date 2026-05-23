@@ -631,7 +631,7 @@
 
     <!-- Bulk Edit Modal -->
     <div class="modal fade" id="bulkEditModal" tabindex="-1" aria-labelledby="bulkEditModalLabel" aria-hidden="true">
-        <div class="modal-dialog">
+        <div class="modal-dialog modal-lg">
             <div class="modal-content">
                 <div class="modal-header">
                     <h5 class="modal-title" id="bulkEditModalLabel">
@@ -657,13 +657,53 @@
                             </optgroup>
                         </select>
                     </div>
+
+                    <!-- ── VALUE section ── -->
                     <div class="mb-3" id="bulkEditValueWrap">
                         <label for="bulkEditValue" class="form-label fw-semibold">New Value</label>
                         <!-- swapped to a <select> for enum fields, <input> otherwise -->
                         <input type="text" id="bulkEditValue" class="form-control" placeholder="Enter new value…">
                         <select id="bulkEditValueSelect" class="form-select d-none"></select>
                     </div>
-                    <div class="alert alert-warning small py-2 mb-0" id="bulkEditWarning" style="display:none!important;">
+
+                    <!-- ── FIELD TYPE CHANGE section (only shown for custom fields) ── -->
+                    <div id="fieldTypeSection" class="d-none">
+                        <hr class="my-3">
+                        <p class="fw-semibold mb-2 small text-muted text-uppercase" style="letter-spacing:.05em;">
+                            <i class="fas fa-sliders me-1"></i>Change Input Type for This Field
+                        </p>
+                        <div class="d-flex gap-2 flex-wrap mb-2" id="fieldTypeBtns">
+                            <button type="button" class="btn btn-sm btn-outline-secondary field-type-btn" data-ftype="text">
+                                <i class="fas fa-font me-1"></i>Text
+                            </button>
+                            <button type="button" class="btn btn-sm btn-outline-primary field-type-btn" data-ftype="dropdown">
+                                <i class="fas fa-list me-1"></i>Dropdown
+                            </button>
+                            <button type="button" class="btn btn-sm btn-outline-success field-type-btn" data-ftype="boolean">
+                                <i class="fas fa-toggle-on me-1"></i>Checkbox
+                            </button>
+                        </div>
+
+                        <!-- Dropdown options builder (shown only when "Dropdown" type selected) -->
+                        <div id="dropdownOptionsSection" class="d-none border rounded-3 p-3 bg-light">
+                            <label class="form-label small fw-semibold mb-2">Dropdown Options</label>
+                            <div id="dropdownOptionsList" class="d-flex flex-column gap-2 mb-2">
+                                <!-- option rows injected by JS -->
+                            </div>
+                            <button type="button" class="btn btn-outline-secondary btn-sm" id="addDropdownOptionBtn">
+                                <i class="fas fa-plus me-1"></i>Add Option
+                            </button>
+                        </div>
+
+                        <div id="fieldTypeApplyWrap" class="mt-3 d-none">
+                            <button type="button" class="btn btn-outline-primary btn-sm" id="applyFieldTypeBtn">
+                                <i class="fas fa-check me-1"></i>Apply Type Change to Template
+                            </button>
+                            <span class="text-muted small ms-2" id="fieldTypeStatus"></span>
+                        </div>
+                    </div>
+
+                    <div class="alert alert-warning small py-2 mb-0 mt-3" id="bulkEditWarning" style="display:none!important;">
                         <i class="fas fa-triangle-exclamation me-1"></i>
                         This will overwrite the chosen field on <strong id="bulkEditWarningCount"></strong> records. This cannot be undone.
                     </div>
@@ -1004,24 +1044,203 @@
             const warningEl    = document.getElementById('bulkEditWarning');
             const warningCount = document.getElementById('bulkEditWarningCount');
 
+            // Field-type change elements
+            const fieldTypeSection     = document.getElementById('fieldTypeSection');
+            const fieldTypeBtns        = document.querySelectorAll('.field-type-btn');
+            const dropdownOptsSection  = document.getElementById('dropdownOptionsSection');
+            const dropdownOptionsList  = document.getElementById('dropdownOptionsList');
+            const addDropdownOptionBtn = document.getElementById('addDropdownOptionBtn');
+            const applyFieldTypeBtn    = document.getElementById('applyFieldTypeBtn');
+            const fieldTypeApplyWrap   = document.getElementById('fieldTypeApplyWrap');
+            const fieldTypeStatus      = document.getElementById('fieldTypeStatus');
+
+            // Currently selected field type in the type-change panel
+            let selectedFieldType = null;
+
             // Enum field definitions (mirror server-side constants)
             const EDITION_OPTIONS    = ['Standard Edition', 'First Edition', 'Limited Edition'];
             const FINALIZED_OPTIONS  = ['true', 'false'];
+            // Mutable local copy so we can reflect type changes within the session
             const ENUM_FIELDS = {
                 edition:   EDITION_OPTIONS,
                 finalized: FINALIZED_OPTIONS,
             };
+            // Mutable local copy of template field config (updated after type changes)
+            const localFieldConfig = Object.assign({}, TEMPLATE_FIELDS_CONFIG);
 
-            // Merge in dropdown options from TEMPLATE_FIELDS_CONFIG for dynamic fields
-            Object.entries(TEMPLATE_FIELDS_CONFIG).forEach(([key, cfg]) => {
+            // Merge in dropdown options from localFieldConfig for dynamic fields
+            Object.entries(localFieldConfig).forEach(([key, cfg]) => {
                 if (cfg.field_type === 'dropdown' && cfg.dropdown_options?.length) {
                     ENUM_FIELDS[key] = cfg.dropdown_options;
                 }
             });
 
+            // ── Dropdown option builder helpers ──
+            function addOptionRow(value = '') {
+                const row = document.createElement('div');
+                row.className = 'd-flex gap-2 align-items-center dropdown-option-row';
+                row.innerHTML = `
+                    <input type="text" class="form-control form-control-sm dropdown-option-input"
+                           placeholder="Option text…" value="${value.replace(/"/g, '&quot;')}">
+                    <button type="button" class="btn btn-outline-danger btn-sm remove-option-btn" title="Remove">
+                        <i class="fas fa-times"></i>
+                    </button>`;
+                row.querySelector('.remove-option-btn').addEventListener('click', function () {
+                    row.remove();
+                });
+                dropdownOptionsList.appendChild(row);
+                row.querySelector('input').focus();
+            }
+
+            function getDropdownOptions() {
+                return Array.from(dropdownOptionsList.querySelectorAll('.dropdown-option-input'))
+                    .map(inp => inp.value.trim())
+                    .filter(Boolean);
+            }
+
+            addDropdownOptionBtn.addEventListener('click', function () {
+                addOptionRow();
+            });
+
+            // ── Field type toggle buttons ──
+            fieldTypeBtns.forEach(btn => {
+                btn.addEventListener('click', function () {
+                    fieldTypeBtns.forEach(b => {
+                        b.classList.remove('btn-secondary', 'btn-primary', 'btn-success');
+                        b.classList.add('btn-outline-secondary', 'btn-outline-primary', 'btn-outline-success');
+                    });
+                    // Activate the clicked one
+                    const ftype = this.dataset.ftype;
+                    this.classList.remove('btn-outline-secondary', 'btn-outline-primary', 'btn-outline-success');
+                    if (ftype === 'text')     this.classList.add('btn-secondary');
+                    if (ftype === 'dropdown') this.classList.add('btn-primary');
+                    if (ftype === 'boolean')  this.classList.add('btn-success');
+
+                    selectedFieldType = ftype;
+                    fieldTypeStatus.textContent = '';
+
+                    if (ftype === 'dropdown') {
+                        dropdownOptsSection.classList.remove('d-none');
+                        // Seed with existing options if switching back to dropdown
+                        const existingOpts = getDropdownOptions();
+                        if (!existingOpts.length) {
+                            const fieldKey = fieldSel.value;
+                            const cfg = localFieldConfig[fieldKey] || {};
+                            const opts = cfg.dropdown_options || [];
+                            if (opts.length) {
+                                dropdownOptionsList.innerHTML = '';
+                                opts.forEach(o => addOptionRow(o));
+                            } else if (!dropdownOptionsList.children.length) {
+                                addOptionRow(); // start with one blank row
+                            }
+                        }
+                    } else {
+                        dropdownOptsSection.classList.add('d-none');
+                    }
+                    fieldTypeApplyWrap.classList.remove('d-none');
+                });
+            });
+
+            // ── Show/hide the field type section when a field is selected ──
+            function showFieldTypeSection(fieldKey) {
+                // Only show for custom (template) fields, not core fields
+                const CORE_FIELDS = ['album', 'page', 'slot', 'edition', 'finalized'];
+                if (CORE_FIELDS.includes(fieldKey) || !fieldKey) {
+                    fieldTypeSection.classList.add('d-none');
+                    return;
+                }
+                fieldTypeSection.classList.remove('d-none');
+
+                // Reset button states and reflect current type
+                selectedFieldType = null;
+                fieldTypeApplyWrap.classList.add('d-none');
+                fieldTypeStatus.textContent = '';
+                dropdownOptsSection.classList.add('d-none');
+                dropdownOptionsList.innerHTML = '';
+
+                const cfg = localFieldConfig[fieldKey] || {};
+                const currentType = cfg.field_type || 'text';
+
+                // Reflect current type with active button highlight (no pending changes yet)
+                fieldTypeBtns.forEach(b => {
+                    const ftype = b.dataset.ftype;
+                    b.classList.remove('btn-secondary', 'btn-primary', 'btn-success',
+                                       'btn-outline-secondary', 'btn-outline-primary', 'btn-outline-success');
+                    if (ftype === currentType) {
+                        if (ftype === 'text')     b.classList.add('btn-secondary');
+                        if (ftype === 'dropdown') b.classList.add('btn-primary');
+                        if (ftype === 'boolean')  b.classList.add('btn-success');
+                    } else {
+                        if (ftype === 'text')     b.classList.add('btn-outline-secondary');
+                        if (ftype === 'dropdown') b.classList.add('btn-outline-primary');
+                        if (ftype === 'boolean')  b.classList.add('btn-outline-success');
+                    }
+                });
+            }
+
+            // ── Apply field type change to template ──
+            applyFieldTypeBtn.addEventListener('click', async function () {
+                const fieldKey = fieldSel.value.trim();
+                if (!fieldKey || !selectedFieldType) return;
+
+                const opts = selectedFieldType === 'dropdown' ? getDropdownOptions() : [];
+                if (selectedFieldType === 'dropdown' && !opts.length) {
+                    alert('Please add at least one dropdown option.');
+                    return;
+                }
+
+                const label = fieldKey.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+                const confirmed = confirm(
+                    `Change "${label}" to ${selectedFieldType === 'boolean' ? 'Checkbox' : selectedFieldType === 'dropdown' ? 'Dropdown' : 'Text'} input type?` +
+                    (selectedFieldType === 'dropdown' ? `\nOptions: ${opts.join(', ')}` : '') +
+                    `\nThis updates the template and takes effect on the next page load.`
+                );
+                if (!confirmed) return;
+
+                const btn = this;
+                btn.disabled = true;
+                fieldTypeStatus.textContent = 'Saving…';
+
+                try {
+                    const res = await fetch('/update_field_type', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            field_key:        fieldKey,
+                            field_type:       selectedFieldType,
+                            dropdown_options: opts,
+                        }),
+                    });
+                    const data = await res.json();
+
+                    if (data.status === 'success') {
+                        fieldTypeStatus.textContent = '✅ ' + data.message;
+                        // Update local state so value control refreshes immediately
+                        localFieldConfig[fieldKey] = {
+                            field_type: selectedFieldType,
+                            dropdown_options: opts,
+                        };
+                        if (selectedFieldType === 'dropdown' && opts.length) {
+                            ENUM_FIELDS[fieldKey] = opts;
+                        } else {
+                            delete ENUM_FIELDS[fieldKey];
+                        }
+                        // Refresh the value control to match new type
+                        switchValueControl(fieldKey);
+                    } else {
+                        fieldTypeStatus.textContent = '⚠️ ' + (data.message || 'Update failed.');
+                    }
+                } catch (err) {
+                    fieldTypeStatus.textContent = '⚠️ Network error.';
+                    console.error(err);
+                } finally {
+                    btn.disabled = false;
+                }
+            });
+
             function switchValueControl(fieldKey) {
-                const cfg      = TEMPLATE_FIELDS_CONFIG[fieldKey] || {};
-                const ftype    = cfg.field_type || 'text';
+                const cfg   = localFieldConfig[fieldKey] || {};
+                const ftype = cfg.field_type || 'text';
 
                 if (ENUM_FIELDS[fieldKey]) {
                     // dropdown / known enum — show <select>
@@ -1045,6 +1264,7 @@
 
             fieldSel.addEventListener('change', function () {
                 switchValueControl(this.value);
+                showFieldTypeSection(this.value);
                 if (this.value) {
                     warningCount.textContent = selectedIds.size;
                     warningEl.style.setProperty('display', '', 'important');
@@ -1078,6 +1298,7 @@
                 valueInput.classList.remove('d-none');
                 valueSel.classList.add('d-none');
                 warningEl.style.setProperty('display', 'none', 'important');
+                fieldTypeSection.classList.add('d-none');
                 modal.show();
             });
 

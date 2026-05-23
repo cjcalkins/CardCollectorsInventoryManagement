@@ -685,7 +685,8 @@
     </div>
 
     <script>
-        const recordId = {{ record.id }};
+        const recordId    = {{ record.id }};
+        const templateUsed = {{ (record.template_used or 'product_label') | tojson }};
 
         // ==================== IMAGE ZOOM ====================
         const recordImage = document.getElementById('recordImage');
@@ -693,10 +694,13 @@
             recordImage.addEventListener('click', () => recordImage.classList.toggle('expanded'));
         }
 
-        // ==================== EDIT FORM ====================
+        // ==================== LIVE FIELD-TYPE SYNC ====================
+        // The edit form is server-rendered with the field types known at page-load time.
+        // If a field's type has since been changed (e.g. via the bulk-edit modal on the
+        // inventory page), we fetch the live template config and upgrade any field whose
+        // rendered widget type no longer matches.
 
-        // ── Generic boolean field toggles (field_type = "boolean" in template) ──
-        document.querySelectorAll('.field-bool-toggle').forEach(function (chk) {
+        function attachBoolToggle(chk) {
             chk.addEventListener('change', function () {
                 const hiddenEl = document.getElementById(this.dataset.target);
                 const labelEl  = document.getElementById(this.dataset.label);
@@ -706,6 +710,101 @@
                     labelEl.className   = 'fw-semibold ' + (this.checked ? 'text-success' : 'text-secondary');
                 }
             });
+        }
+
+        function upgradeFieldWidget(fieldKey, newType, dropdownOptions, currentValue) {
+            const wrapper = document.querySelector(`[data-field-key="${CSS.escape(fieldKey)}"]`);
+            if (!wrapper) return;
+
+            // Detect what's currently rendered
+            const existingInput  = wrapper.querySelector(`input[name="${CSS.escape(fieldKey)}"]`);
+            const existingSelect = wrapper.querySelector(`select[name="${CSS.escape(fieldKey)}"]`);
+            const existingHidden = wrapper.querySelector(`input[type="hidden"][name="${CSS.escape(fieldKey)}"]`);
+            const isBoolRendered = !!existingHidden && !!wrapper.querySelector('.field-bool-toggle');
+            const isDropRendered = !!existingSelect && !isBoolRendered;
+            const isTextRendered = !!existingInput && !isBoolRendered;
+
+            // Determine the rendered type
+            let renderedType = 'text';
+            if (isBoolRendered) renderedType = 'boolean';
+            else if (isDropRendered) renderedType = 'dropdown';
+
+            if (renderedType === newType) return; // nothing to do
+
+            // Read the current value from the existing widget
+            let val = currentValue ?? '';
+            if (isBoolRendered && existingHidden) val = existingHidden.value;
+            else if (isDropRendered && existingSelect) val = existingSelect.value;
+            else if (existingInput) val = existingInput.value;
+
+            // Remove old controls (keep the label and drag handle)
+            wrapper.querySelectorAll(
+                'input, select, .d-flex.align-items-center.gap-3'
+            ).forEach(el => el.remove());
+
+            const uid = `field_${fieldKey.replace(/[^a-z0-9]/gi, '_')}`;
+
+            if (newType === 'boolean') {
+                const isBool = String(val).toLowerCase() === 'true';
+                wrapper.insertAdjacentHTML('beforeend', `
+                    <input type="hidden" name="${fieldKey}" id="hidden_${uid}"
+                           value="${isBool ? 'True' : 'False'}">
+                    <div class="d-flex align-items-center gap-3 mt-1">
+                        <div class="form-check form-switch mb-0">
+                            <input class="form-check-input field-bool-toggle"
+                                   type="checkbox" role="switch"
+                                   data-target="hidden_${uid}"
+                                   data-label="label_${uid}"
+                                   ${isBool ? 'checked' : ''}
+                                   style="width:3em;height:1.5em;cursor:pointer;">
+                        </div>
+                        <span id="label_${uid}" class="fw-semibold ${isBool ? 'text-success' : 'text-secondary'}">
+                            ${isBool ? 'True' : 'False'}
+                        </span>
+                    </div>`);
+                const newToggle = wrapper.querySelector('.field-bool-toggle');
+                if (newToggle) attachBoolToggle(newToggle);
+
+            } else if (newType === 'dropdown' && dropdownOptions && dropdownOptions.length) {
+                const opts = dropdownOptions
+                    .map(o => `<option value="${o}"${o === val ? ' selected' : ''}>${o}</option>`)
+                    .join('');
+                // Add current value as fallback if not in list
+                const fallback = val && !dropdownOptions.includes(val)
+                    ? `<option value="${val}" selected>${val} (custom)</option>` : '';
+                wrapper.insertAdjacentHTML('beforeend',
+                    `<select class="form-select" name="${fieldKey}">${opts}${fallback}</select>`);
+
+            } else {
+                // text (or dropdown with no options — degrade to text)
+                wrapper.insertAdjacentHTML('beforeend',
+                    `<input type="text" class="form-control" name="${fieldKey}" value="${val}">`);
+            }
+        }
+
+        async function syncFieldTypesFromTemplate() {
+            try {
+                const res  = await fetch(`/template_config/${encodeURIComponent(templateUsed)}`);
+                const live = await res.json();
+                document.querySelectorAll('#editFieldsGrid [data-field-key]').forEach(wrapper => {
+                    const key = wrapper.dataset.fieldKey;
+                    if (!key || !live[key]) return;
+                    const { field_type, dropdown_options } = live[key];
+                    upgradeFieldWidget(key, field_type, dropdown_options || []);
+                });
+            } catch (e) {
+                // Non-fatal — silently ignore if template fetch fails
+            }
+        }
+
+        // Run once on load so any previously changed field types are reflected
+        syncFieldTypesFromTemplate();
+
+        // ==================== EDIT FORM ====================
+
+        // ── Generic boolean field toggles (field_type = "boolean" in template) ──
+        document.querySelectorAll('.field-bool-toggle').forEach(function (chk) {
+            attachBoolToggle(chk);
         });
 
         document.getElementById('editForm').addEventListener('submit', async function (e) {
