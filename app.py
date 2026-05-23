@@ -2803,6 +2803,183 @@ def import_run_ocr_batch():
     )
 
 
+# ====================== JUSTTCG MANUAL SEARCH ======================
+@app.route("/justtcg_search_manual", methods=["GET"])
+def justtcg_search_manual():
+    """
+    Perform a JustTCG search using a card name and optional game supplied
+    directly as query parameters — no inventory record required.
+
+    Query params:
+        name  (required)  — card name to search
+        game  (optional)  — human-readable game name, mapped to API slug
+
+    Response shape mirrors /justtcg_search/<record_id>:
+        { status, candidates: [...], searched: {name, game} }
+    """
+    card_name = request.args.get("name", "").strip()
+    raw_game  = request.args.get("game", "").strip()
+    game      = _JUSTTCG_GAME_MAP.get(raw_game.lower(), "")
+
+    if not card_name:
+        return jsonify({"status": "error", "message": "Card name is required."}), 400
+
+    try:
+        api_data = _justtcg_search(card_name, game=game)
+    except urllib.error.HTTPError as exc:
+        return jsonify({
+            "status":  "error",
+            "message": f"JustTCG API returned HTTP {exc.code}: {exc.reason}",
+        }), 502
+    except urllib.error.URLError as exc:
+        return jsonify({
+            "status":  "error",
+            "message": f"Could not reach JustTCG: {exc.reason}",
+        }), 502
+    except (json.JSONDecodeError, ValueError) as exc:
+        return jsonify({
+            "status":  "error",
+            "message": f"Unexpected response from JustTCG: {exc}",
+        }), 502
+
+    products = api_data.get("data") or []
+
+    if not products:
+        return jsonify({
+            "status":   "not_found",
+            "message":  f'No results found on JustTCG for "{card_name}".',
+            "searched": {"name": card_name, "game": raw_game},
+        })
+
+    candidates = []
+    for card in products:
+        variants  = card.get("variants") or []
+        nm_normal = next(
+            (v for v in variants
+             if v.get("condition") in ("Near Mint", "NM") and v.get("printing") == "Normal"),
+            variants[0] if variants else {},
+        )
+        card_id = card.get("id", "")
+        candidates.append({
+            "card_id":    card_id,
+            "name":       card.get("name", ""),
+            "set_name":   card.get("set_name") or card.get("set") or "",
+            "set_number": card.get("number") or "",
+            "game":       card.get("game") or "",
+            "rarity":     card.get("rarity") or "",
+            "nm_price":   nm_normal.get("price"),
+            "url":        card.get("url") or
+                          (f"https://justtcg.com/cards/{card_id}" if card_id else ""),
+        })
+
+    return jsonify({
+        "status":     "ok",
+        "candidates": candidates,
+        "searched":   {"name": card_name, "game": raw_game},
+    })
+
+
+# ====================== IMAGE SEARCH ======================
+def _orb_descriptors(img_bgr):
+    """Return ORB keypoint descriptors for an image (BGR numpy array), or None."""
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    orb  = cv2.ORB_create(nfeatures=500)
+    _, desc = orb.detectAndCompute(gray, None)
+    return desc
+
+
+def _match_score(desc_query, desc_ref):
+    """BFMatcher Hamming ratio-test score: 0.0–1.0 (higher = better match)."""
+    if desc_query is None or desc_ref is None:
+        return 0.0
+    if len(desc_query) < 2 or len(desc_ref) < 2:
+        return 0.0
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+    try:
+        matches = bf.knnMatch(desc_query, desc_ref, k=2)
+    except cv2.error:
+        return 0.0
+    good = [m for m, n in matches if m.distance < 0.75 * n.distance]
+    return len(good) / max(len(matches), 1)
+
+
+@app.route("/search_by_image_page")
+def search_by_image_page():
+    return render_template("search_by_image.html")
+
+
+@app.route("/search_by_image", methods=["POST"])
+def search_by_image():
+    """
+    Accept a photo of a card, run ORB feature matching against every inventory
+    image that has a file on disk, and return the top-N closest records.
+    """
+    TOP_N = 10
+
+    file = request.files.get("image")
+    if not file:
+        return jsonify({"status": "error", "message": "No image uploaded"}), 400
+
+    np_buf    = np.frombuffer(file.read(), np.uint8)
+    query_img = cv2.imdecode(np_buf, cv2.IMREAD_COLOR)
+    if query_img is None:
+        return jsonify({"status": "error", "message": "Could not decode image"}), 400
+
+    # Try to auto-align the card the same way the import pipeline does.
+    # Falls back to the raw image if alignment fails (e.g. card already cropped).
+    try:
+        query_img = process_card_image(query_img)
+    except Exception:
+        pass
+
+    query_desc = _orb_descriptors(query_img)
+
+    records = ScanRecord.query.all()
+    scored  = []
+
+    for record in records:
+        if not record.image_path or record.image_path == "__blank__":
+            continue
+        img_path = os.path.join(
+            app.config["UPLOAD_FOLDER"],
+            normalize_to_upload_relative(record.image_path),
+        )
+        if not os.path.exists(img_path):
+            continue
+        ref_img = cv2.imread(img_path)
+        if ref_img is None:
+            continue
+        score = _match_score(query_desc, _orb_descriptors(ref_img))
+        if score > 0:
+            scored.append((score, record))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    results = []
+    for score, record in scored[:TOP_N]:
+        data = record.extracted_data or {}
+        name = (
+            data.get("product_name")
+            or data.get("name")
+            or data.get("card_name")
+            or data.get("title")
+            or f"Record #{record.id}"
+        )
+        results.append({
+            "record_id":  record.id,
+            "name":       name,
+            "score":      round(score, 4),
+            "game":       data.get("game", ""),
+            "album":      data.get("album", ""),
+            "page":       data.get("page", ""),
+            "slot":       data.get("slot", ""),
+            "image_url":  build_uploaded_file_url(record.image_path),
+            "detail_url": url_for("inventory_detail", record_id=record.id),
+        })
+
+    return jsonify({"status": "success", "results": results})
+
+
 # ====================== START ======================
 if __name__ == "__main__":
     with app.app_context():
@@ -2818,6 +2995,9 @@ if __name__ == "__main__":
     print(" • /duplicates   — Duplicate image manager (name + serial + edition)")
     print(" • /migrate_clean_legacy_fields — POST: scrub first_edition, limited_edition, boolean holographic, empty")
     print(" • /albums       — Album grid view")
+    print(" • /search_by_image_page     — Photo search UI")
+    print(" • /search_by_image          — POST: ORB feature-match a card photo against inventory")
+    print(" • /justtcg_search_manual    — GET: search JustTCG by name/game without a record")
     print(" • /import       — 3x3 split, alignment, manual corner override, batch OCR")
     print(" • /records_summary — Copy-from dropdown API")
     print(" • /template_save   — Save new percentage-based ROI template")

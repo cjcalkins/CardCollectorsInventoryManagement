@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <link rel="icon" type="image/jpeg" href="{{ url_for('static', filename='favicon.jpg') }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Search by Photo - Card Collector Inventory Manager</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <style>
+        body { background: #f8f9fa; }
+
+        .nav-tabs-minimal { display: flex; gap: 10px; margin-left: auto; }
+        .nav-tab {
+            padding: 8px 14px; text-decoration: none; border-radius: 8px;
+            background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.85);
+            font-weight: 600; transition: 0.2s ease;
+        }
+        .nav-tab:hover { background: rgba(255,255,255,0.18); color: #fff; }
+        .nav-tab.active { background: #fff; color: #212529; }
+        @media (max-width: 768px) {
+            .nav-tabs-minimal { margin-left: 0; margin-top: 12px; width: 100%; }
+            .nav-tab { flex: 1; text-align: center; }
+        }
+
+        /* ── Section cards ── */
+        .search-card {
+            background: #fff;
+            border: 1px solid #dee2e6;
+            border-radius: 16px;
+            box-shadow: 0 4px 18px rgba(0,0,0,0.06);
+            overflow: hidden;
+        }
+        .search-card-header {
+            padding: 14px 20px;
+            background: #f8f9fa;
+            border-bottom: 1px solid #dee2e6;
+            font-weight: 700;
+            font-size: 0.95rem;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .search-card-body { padding: 20px; }
+
+        /* ── Drop zone ── */
+        #drop-zone {
+            border: 2px dashed #adb5bd;
+            border-radius: 12px;
+            padding: 2rem 1.5rem;
+            text-align: center;
+            cursor: pointer;
+            transition: border-color 0.2s, background 0.2s;
+            background: #f8f9fa;
+        }
+        #drop-zone.drag-over { border-color: #0d6efd; background: #e7f1ff; }
+        #drop-zone:hover { border-color: #6c757d; }
+        #preview-wrap { display: none; margin-top: 1rem; text-align: center; }
+        #preview-img {
+            max-height: 220px; max-width: 100%;
+            border-radius: 10px; border: 1px solid #dee2e6;
+            object-fit: contain; background: #f1f3f5;
+        }
+
+        /* ── Inventory match results ── */
+        .result-row {
+            display: flex; align-items: center; gap: 14px;
+            padding: 10px 14px;
+            background: #fff; border-radius: 10px;
+            border: 1px solid #dee2e6;
+            text-decoration: none; color: inherit;
+            transition: box-shadow 0.18s, border-color 0.18s;
+        }
+        .result-row:hover { box-shadow: 0 4px 14px rgba(0,0,0,0.09); border-color: #adb5bd; color: inherit; }
+        .result-thumb {
+            width: 48px; height: 62px;
+            object-fit: contain; border-radius: 6px;
+            background: #f1f3f5; border: 1px solid #dee2e6; flex-shrink: 0;
+        }
+        .result-thumb-ph {
+            width: 48px; height: 62px; border-radius: 6px;
+            background: #e9ecef; display: flex;
+            align-items: center; justify-content: center; flex-shrink: 0;
+        }
+        .match-bar-wrap { height: 4px; background: #e9ecef; border-radius: 2px; overflow: hidden; margin-top: 5px; }
+        .match-bar-fill { height: 100%; border-radius: 2px; background: linear-gradient(90deg, #0d6efd, #6610f2); }
+        .match-pct { font-size: 0.75rem; font-weight: 700; color: #6c757d; white-space: nowrap; flex-shrink: 0; min-width: 44px; text-align: right; }
+        .top-match { border-color: #b0caff; background: #f5f8ff; }
+        .top-match .match-pct { color: #0d6efd; }
+
+        /* ── JustTCG manual search ── */
+        .jtcg-section-header {
+            display: flex; align-items: center; gap: 10px;
+            padding: 14px 20px;
+            background: #f0f8f2;
+            border-bottom: 1px solid #c3e6cb;
+            font-weight: 700; font-size: 0.95rem;
+            color: #155724;
+        }
+        .jtcg-section-header i { color: #1a7a3c; }
+
+        /* Picker list — same style as inventory_detail.html */
+        .jtcg-picker-list {
+            border: 1px solid #dee2e6;
+            border-radius: 10px;
+            overflow: hidden;
+            margin-top: 12px;
+        }
+        .jtcg-picker-item {
+            display: flex; align-items: flex-start; gap: 14px;
+            padding: 11px 14px;
+            border-bottom: 1px solid #f0f0f0;
+            cursor: pointer;
+            transition: background 0.1s;
+        }
+        .jtcg-picker-item:last-child { border-bottom: none; }
+        .jtcg-picker-item:hover { background: #f0f8f2; }
+        .jtcg-picker-item.selected { background: #e6f4ea; }
+        .jtcg-picker-radio {
+            margin-top: 3px; accent-color: #1a7a3c;
+            width: 16px; height: 16px; flex-shrink: 0;
+        }
+        .jtcg-picker-name { font-weight: 600; font-size: 0.9rem; color: #212529; }
+        .jtcg-picker-meta { font-size: 0.78rem; color: #6c757d; margin-top: 2px; }
+        .jtcg-picker-price {
+            margin-left: auto; font-weight: 700;
+            font-size: 0.92rem; color: #1a7a3c;
+            white-space: nowrap; flex-shrink: 0;
+        }
+        .jtcg-fetch-btn {
+            display: inline-flex; align-items: center; gap: 8px;
+            background: #1a7a3c; color: #fff;
+            border: none; border-radius: 8px;
+            padding: 9px 18px; font-weight: 700; font-size: 0.9rem;
+            cursor: pointer; transition: background 0.15s;
+        }
+        .jtcg-fetch-btn:hover:not(:disabled) { background: #145f2e; }
+        .jtcg-fetch-btn:disabled { opacity: 0.65; cursor: not-allowed; }
+
+        /* result card for a chosen JustTCG entry */
+        .jtcg-result-panel {
+            background: #fff; border: 1px solid #b8ddb8;
+            border-radius: 12px; padding: 16px; margin-top: 14px;
+        }
+        .jtcg-logo-text { font-weight: 800; font-size: 1rem; color: #1a7a3c; letter-spacing: -0.5px; }
+        .jtcg-price-badge {
+            display: inline-block; background: #1a7a3c; color: #fff;
+            border-radius: 8px; padding: 3px 11px;
+            font-size: 1rem; font-weight: 700;
+        }
+        .jtcg-price-row { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 10px; }
+        .jtcg-price-item { text-align: center; min-width: 56px; }
+        .jtcg-price-item .label { font-size: 0.7rem; text-transform: uppercase; color: #6c757d; font-weight: 600; letter-spacing: .04em; }
+        .jtcg-price-item .value { font-size: 0.95rem; font-weight: 700; color: #212529; }
+
+        /* divider between the two panes */
+        .pane-divider {
+            display: flex; align-items: center; gap: 12px;
+            color: #adb5bd; font-size: 0.8rem; font-weight: 600;
+            text-transform: uppercase; letter-spacing: .06em;
+            margin: 6px 0;
+        }
+        .pane-divider::before, .pane-divider::after {
+            content: ''; flex: 1; height: 1px; background: #dee2e6;
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+        <div class="container d-flex flex-wrap align-items-center">
+            <a class="navbar-brand" href="{{ url_for('index') }}">
+                <img src="{{ url_for('static', filename='favicon.jpg') }}" alt="logo" width="24" height="24"
+                     style="object-fit:cover;border-radius:4px;margin-right:0.5rem;" class="me-2">Card Collector Inventory Manager
+            </a>
+            <div class="nav-tabs-minimal">
+                <a href="{{ url_for('import_page') }}"          class="nav-tab">Import</a>
+                <a href="{{ url_for('index') }}"                class="nav-tab">Scan</a>
+                <a href="{{ url_for('inventory') }}"            class="nav-tab">Inventory</a>
+                <a href="{{ url_for('albums_list') }}"          class="nav-tab">Album</a>
+                <a href="{{ url_for('search_by_image_page') }}" class="nav-tab active" title="Search by photo"><i class="fas fa-camera"></i></a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container py-5" style="max-width: 680px;">
+
+        <div class="mb-4">
+            <h2 class="mb-1"><i class="fas fa-camera-retro me-2"></i>Search by Photo</h2>
+            <p class="text-muted mb-0">Find a card in your inventory by photo, or look up pricing on JustTCG.</p>
+        </div>
+
+        <!-- ══════════════════════════════════════════
+             PANE 1 — Photo search
+        ═══════════════════════════════════════════ -->
+        <div class="search-card mb-3">
+            <div class="search-card-header">
+                <i class="fas fa-camera text-primary"></i>Search Inventory by Photo
+            </div>
+            <div class="search-card-body">
+                <div id="drop-zone" onclick="document.getElementById('photo-input').click()">
+                    <i class="fas fa-cloud-upload-alt fa-2x text-muted mb-3 d-block"></i>
+                    <div class="fw-semibold">Click to upload or take a photo</div>
+                    <div class="text-muted small mt-1">Or drag and drop an image here</div>
+                </div>
+                <input type="file" id="photo-input" accept="image/*" capture="environment" class="d-none">
+
+                <div id="preview-wrap">
+                    <img id="preview-img" src="" alt="Preview">
+                    <div class="text-muted small mt-1" id="preview-filename"></div>
+                </div>
+
+                <div class="d-grid mt-3">
+                    <button id="search-btn" class="btn btn-primary" disabled>
+                        <i class="fas fa-search me-2"></i>Search Inventory
+                    </button>
+                </div>
+
+                <div id="img-status" class="mt-2 text-center text-muted small" style="min-height:20px;"></div>
+                <div id="img-results" class="mt-2 d-flex flex-column gap-2"></div>
+            </div>
+        </div>
+
+        <div class="pane-divider">or</div>
+
+        <!-- ══════════════════════════════════════════
+             PANE 2 — JustTCG manual lookup
+        ═══════════════════════════════════════════ -->
+        <div class="search-card mb-4">
+            <div class="jtcg-section-header">
+                <i class="fas fa-tag"></i>Look Up Price on JustTCG
+            </div>
+            <div class="search-card-body">
+                <p class="text-muted small mb-3">
+                    Enter a card name and optionally a game to search
+                    <strong>JustTCG</strong> for pricing without needing an inventory record.
+                </p>
+
+                <div class="row g-2 mb-3">
+                    <div class="col-12 col-sm-7">
+                        <label class="form-label small fw-semibold mb-1" for="jtcg-name-input">Card Name</label>
+                        <input type="text" class="form-control" id="jtcg-name-input"
+                               placeholder="e.g. Charizard, Black Lotus…"
+                               autocomplete="off">
+                    </div>
+                    <div class="col-12 col-sm-5">
+                        <label class="form-label small fw-semibold mb-1" for="jtcg-game-input">Game <span class="text-muted fw-normal">(optional)</span></label>
+                        <input type="text" class="form-control" id="jtcg-game-input"
+                               list="jtcg-game-list"
+                               placeholder="e.g. Pokemon, MTG…"
+                               autocomplete="off">
+                        <datalist id="jtcg-game-list">
+                            <option value="Pokemon">
+                            <option value="Magic the Gathering">
+                            <option value="YuGiOh">
+                            <option value="Disney Lorcana">
+                            <option value="One Piece">
+                            <option value="Digimon">
+                            <option value="Flesh and Blood">
+                            <option value="Union Arena">
+                            <option value="Warhammer 40k">
+                        </datalist>
+                    </div>
+                </div>
+
+                <button class="jtcg-fetch-btn" id="jtcg-search-btn">
+                    <i class="fas fa-search-dollar me-1"></i>Search JustTCG
+                </button>
+
+                <div id="jtcg-status" class="mt-3" style="min-height: 20px;"></div>
+
+                <!-- picker list — hidden until results arrive -->
+                <div id="jtcg-picker-wrap" style="display:none;">
+                    <div class="d-flex align-items-center justify-content-between mt-3 mb-1 flex-wrap gap-2">
+                        <span class="small text-muted" id="jtcg-subtitle"></span>
+                        <button class="btn btn-sm btn-outline-secondary" id="jtcg-clear-btn">
+                            <i class="fas fa-times me-1"></i>Clear
+                        </button>
+                    </div>
+                    <div class="jtcg-picker-list" id="jtcg-picker-list"></div>
+                </div>
+
+                <!-- chosen card result panel — hidden until confirmed -->
+                <div id="jtcg-result-panel" class="jtcg-result-panel" style="display:none;">
+                    <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-2">
+                        <span class="jtcg-logo-text">JustTCG</span>
+                        <span class="jtcg-price-badge" id="jtcg-market-badge"></span>
+                    </div>
+                    <div class="text-muted small mb-1">
+                        <strong id="jtcg-result-name"></strong>
+                        <span id="jtcg-result-meta"></span>
+                    </div>
+                    <div class="jtcg-price-row" id="jtcg-price-row"></div>
+                    <div class="mt-3 d-flex gap-2 flex-wrap">
+                        <a id="jtcg-result-link" href="#" target="_blank" rel="noopener"
+                           class="btn btn-sm btn-outline-success">
+                            <i class="fas fa-external-link-alt me-1"></i>View on JustTCG
+                        </a>
+                        <button class="btn btn-sm btn-outline-secondary" id="jtcg-new-search-btn">
+                            <i class="fas fa-search me-1"></i>New Search
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    </div><!-- /container -->
+
+    <!-- ══════════════════════════════════════════
+         JustTCG picker modal (same markup as inventory_detail.html)
+    ═══════════════════════════════════════════ -->
+    <div class="modal fade" id="jtcgPickerModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-lg modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">
+                        <i class="fas fa-search-dollar me-2 text-success"></i>Choose a JustTCG Result
+                    </h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body p-0">
+                    <div class="px-3 pt-3 pb-2 border-bottom bg-light">
+                        <small class="text-muted" id="modal-subtitle"></small>
+                    </div>
+                    <div class="jtcg-picker-list border-0 rounded-0" id="modal-picker-list"></div>
+                </div>
+                <div class="modal-footer justify-content-between">
+                    <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-success" id="modal-confirm-btn" disabled>
+                        <i class="fas fa-check me-1"></i>View Pricing
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+    // ── shared util ──────────────────────────────────────────────────────────
+    function escHtml(s) {
+        return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+    function fmt(n) { return n != null ? '$' + parseFloat(n).toFixed(2) : null; }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  PANE 1 — Inventory photo search
+    // ════════════════════════════════════════════════════════════════════════
+    const photoInput  = document.getElementById('photo-input');
+    const dropZone    = document.getElementById('drop-zone');
+    const previewWrap = document.getElementById('preview-wrap');
+    const previewImg  = document.getElementById('preview-img');
+    const previewName = document.getElementById('preview-filename');
+    const searchBtn   = document.getElementById('search-btn');
+    const imgStatus   = document.getElementById('img-status');
+    const imgResults  = document.getElementById('img-results');
+    let   selectedFile = null;
+
+    photoInput.addEventListener('change', e => { if (e.target.files[0]) setFile(e.target.files[0]); });
+    dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+    dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+    dropZone.addEventListener('drop', e => {
+        e.preventDefault(); dropZone.classList.remove('drag-over');
+        if (e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]);
+    });
+
+    function setFile(file) {
+        selectedFile = file;
+        previewImg.src = URL.createObjectURL(file);
+        previewName.textContent = file.name;
+        previewWrap.style.display = 'block';
+        searchBtn.disabled = false;
+        imgResults.innerHTML = '';
+        imgStatus.textContent = '';
+    }
+
+    searchBtn.addEventListener('click', async () => {
+        if (!selectedFile) return;
+        searchBtn.disabled = true;
+        searchBtn.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>Searching…';
+        imgStatus.textContent = 'Comparing against inventory images…';
+        imgResults.innerHTML = '';
+
+        const fd = new FormData();
+        fd.append('image', selectedFile);
+        try {
+            const resp = await fetch('/search_by_image', { method: 'POST', body: fd });
+            const data = await resp.json();
+            renderImgResults(data);
+        } catch (err) {
+            imgStatus.innerHTML = `<span class="text-danger"><i class="fas fa-exclamation-circle me-1"></i>Search failed: ${err.message}</span>`;
+        }
+        searchBtn.disabled = false;
+        searchBtn.innerHTML = '<i class="fas fa-search me-2"></i>Search Inventory';
+    });
+
+    function renderImgResults(data) {
+        if (data.status !== 'success') {
+            imgStatus.innerHTML = `<span class="text-danger">${escHtml(data.message || 'Error')}</span>`;
+            return;
+        }
+        const results = data.results || [];
+        if (!results.length) {
+            imgStatus.innerHTML = '<span class="text-warning"><i class="fas fa-search me-1"></i>No matches found in inventory.</span>';
+            return;
+        }
+        imgStatus.textContent = `Found ${results.length} potential match${results.length !== 1 ? 'es' : ''}.`;
+        const topScore = results[0].score || 1;
+
+        results.forEach((r, idx) => {
+            const pct = topScore > 0 ? Math.round((r.score / topScore) * 100) : 0;
+            const thumb = r.image_url
+                ? `<img src="${escHtml(r.image_url)}" class="result-thumb" alt="${escHtml(r.name)}">`
+                : `<div class="result-thumb-ph"><i class="fas fa-image text-muted small"></i></div>`;
+            const meta = [r.game, r.album, r.page ? 'p.'+r.page : '', r.slot ? 's.'+r.slot : ''].filter(Boolean).join(' · ');
+
+            const a = document.createElement('a');
+            a.href = escHtml(r.detail_url);
+            a.className = 'result-row' + (idx === 0 ? ' top-match' : '');
+            a.innerHTML = `${thumb}
+                <div style="flex:1;min-width:0;">
+                    <div class="fw-semibold text-truncate" style="font-size:.9rem;">${escHtml(r.name)}</div>
+                    <div class="text-muted" style="font-size:.78rem;">${escHtml(meta)}</div>
+                    <div class="match-bar-wrap"><div class="match-bar-fill" style="width:${pct}%"></div></div>
+                </div>
+                <div class="match-pct">${pct}%</div>`;
+            imgResults.appendChild(a);
+        });
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  PANE 2 — JustTCG manual lookup
+    // ════════════════════════════════════════════════════════════════════════
+    const jtcgNameInput   = document.getElementById('jtcg-name-input');
+    const jtcgGameInput   = document.getElementById('jtcg-game-input');
+    const jtcgSearchBtn   = document.getElementById('jtcg-search-btn');
+    const jtcgStatus      = document.getElementById('jtcg-status');
+    const jtcgPickerWrap  = document.getElementById('jtcg-picker-wrap');
+    const jtcgSubtitle    = document.getElementById('jtcg-subtitle');
+    const jtcgPickerList  = document.getElementById('jtcg-picker-list');
+    const jtcgClearBtn    = document.getElementById('jtcg-clear-btn');
+    const jtcgResultPanel = document.getElementById('jtcg-result-panel');
+    const jtcgNewSearchBtn = document.getElementById('jtcg-new-search-btn');
+
+    // Modal elements
+    const modalSubtitle  = document.getElementById('modal-subtitle');
+    const modalPickerList = document.getElementById('modal-picker-list');
+    const modalConfirmBtn = document.getElementById('modal-confirm-btn');
+
+    let pickerModal     = null;
+    let jtcgCandidates  = [];
+    let selectedCardId  = null;
+
+    function getPickerModal() {
+        if (!pickerModal) pickerModal = new bootstrap.Modal(document.getElementById('jtcgPickerModal'));
+        return pickerModal;
+    }
+
+    // Allow Enter key in inputs to trigger search
+    [jtcgNameInput, jtcgGameInput].forEach(el => {
+        el.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); doJtcgSearch(); } });
+    });
+    jtcgSearchBtn.addEventListener('click', doJtcgSearch);
+
+    async function doJtcgSearch() {
+        const name = jtcgNameInput.value.trim();
+        const game = jtcgGameInput.value.trim();
+        if (!name) {
+            jtcgNameInput.focus();
+            jtcgNameInput.classList.add('is-invalid');
+            setTimeout(() => jtcgNameInput.classList.remove('is-invalid'), 1500);
+            return;
+        }
+
+        jtcgSearchBtn.disabled = true;
+        jtcgSearchBtn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Searching…';
+        jtcgStatus.innerHTML = '';
+        jtcgPickerWrap.style.display = 'none';
+        jtcgResultPanel.style.display = 'none';
+        selectedCardId = null;
+        modalConfirmBtn.disabled = true;
+
+        try {
+            const params = new URLSearchParams({ name });
+            if (game) params.append('game', game);
+            const resp = await fetch('/justtcg_search_manual?' + params.toString());
+            const data = await resp.json();
+
+            if (data.status === 'not_found') {
+                jtcgStatus.innerHTML = `<div class="alert alert-warning mb-0">
+                    <i class="fas fa-search me-1"></i>${escHtml(data.message)}
+                </div>`;
+                return;
+            }
+            if (data.status !== 'ok') {
+                jtcgStatus.innerHTML = `<div class="alert alert-danger mb-0">
+                    <i class="fas fa-exclamation-triangle me-1"></i>${escHtml(data.message || 'Search failed.')}
+                </div>`;
+                return;
+            }
+
+            jtcgCandidates = data.candidates || [];
+            const searched = data.searched || {};
+
+            // ── If only one result skip the modal and show it directly ──
+            if (jtcgCandidates.length === 1) {
+                showJtcgResult(jtcgCandidates[0]);
+                return;
+            }
+
+            // ── Multiple results → show modal picker ──
+            const subtitle = `${jtcgCandidates.length} result${jtcgCandidates.length !== 1 ? 's' : ''} for "${escHtml(searched.name || '')}"` +
+                (searched.game ? ` · ${escHtml(searched.game)}` : '');
+            modalSubtitle.innerHTML = subtitle;
+
+            modalPickerList.innerHTML = jtcgCandidates.map(c => {
+                const price = fmt(c.nm_price) || '—';
+                const meta  = [c.set_name, c.set_number, c.rarity, c.game].filter(Boolean).join(' · ');
+                return `<div class="jtcg-picker-item" data-card-id="${escHtml(c.card_id)}">
+                    <input type="radio" class="jtcg-picker-radio" name="jtcgModalPick" value="${escHtml(c.card_id)}">
+                    <div class="flex-grow-1 overflow-hidden">
+                        <div class="jtcg-picker-name">${escHtml(c.name)}</div>
+                        <div class="jtcg-picker-meta">${escHtml(meta)}</div>
+                    </div>
+                    <div class="jtcg-picker-price">${escHtml(price)}</div>
+                </div>`;
+            }).join('');
+
+            selectedCardId = null;
+            modalConfirmBtn.disabled = true;
+            getPickerModal().show();
+
+        } catch (err) {
+            jtcgStatus.innerHTML = `<div class="alert alert-danger mb-0">Network error: ${escHtml(err.message)}</div>`;
+        } finally {
+            jtcgSearchBtn.disabled = false;
+            jtcgSearchBtn.innerHTML = '<i class="fas fa-search-dollar me-1"></i>Search JustTCG';
+        }
+    }
+
+    // Row click inside modal
+    modalPickerList.addEventListener('click', function (e) {
+        const row = e.target.closest('.jtcg-picker-item');
+        if (!row) return;
+        modalPickerList.querySelectorAll('.jtcg-picker-item').forEach(r => {
+            r.classList.remove('selected');
+            r.querySelector('.jtcg-picker-radio').checked = false;
+        });
+        row.classList.add('selected');
+        row.querySelector('.jtcg-picker-radio').checked = true;
+        selectedCardId = row.dataset.cardId;
+        modalConfirmBtn.disabled = false;
+    });
+
+    // Confirm button in modal
+    modalConfirmBtn.addEventListener('click', function () {
+        const chosen = jtcgCandidates.find(c => String(c.card_id) === String(selectedCardId));
+        if (!chosen) return;
+        getPickerModal().hide();
+        showJtcgResult(chosen);
+    });
+
+    function showJtcgResult(card) {
+        // Populate the inline result panel
+        const market = fmt(card.nm_price);
+        document.getElementById('jtcg-market-badge').textContent = market || 'N/A';
+        document.getElementById('jtcg-result-name').textContent = card.name || '';
+
+        const metaParts = [card.set_name, card.set_number, card.rarity, card.game].filter(Boolean);
+        const metaEl = document.getElementById('jtcg-result-meta');
+        metaEl.textContent = metaParts.length ? ' · ' + metaParts.join(' · ') : '';
+
+        // Price breakdown row — only show items we have
+        const priceRow = document.getElementById('jtcg-price-row');
+        priceRow.innerHTML = '';
+        // nm_price is the NM market price from the variant; we don't have low/mid/high
+        // without fetching the full card, so just show Market for manual lookups.
+        if (card.nm_price != null) {
+            priceRow.innerHTML = `
+                <div class="jtcg-price-item">
+                    <div class="label">NM Market</div>
+                    <div class="value">${escHtml(fmt(card.nm_price))}</div>
+                </div>`;
+        }
+
+        const linkEl = document.getElementById('jtcg-result-link');
+        linkEl.href = card.url || 'https://justtcg.com';
+
+        jtcgResultPanel.style.display = 'block';
+        jtcgPickerWrap.style.display  = 'none';
+        jtcgStatus.innerHTML = '';
+    }
+
+    // Clear results and allow a new search
+    jtcgClearBtn.addEventListener('click', resetJtcg);
+    jtcgNewSearchBtn.addEventListener('click', resetJtcg);
+
+    function resetJtcg() {
+        jtcgPickerWrap.style.display  = 'none';
+        jtcgResultPanel.style.display = 'none';
+        jtcgStatus.innerHTML = '';
+        jtcgCandidates = [];
+        selectedCardId = null;
+    }
+    </script>
+</body>
+</html>
