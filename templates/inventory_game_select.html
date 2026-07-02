@@ -136,9 +136,10 @@
             </a>
             <div class="nav-tabs-minimal">
                 <a href="{{ url_for('import_page') }}" class="nav-tab">Import</a>
-                <a href="{{ url_for('index') }}"        class="nav-tab">Scan</a>
+                <a href="{{ url_for('index') }}"        class="nav-tab">Templates</a>
                 <a href="{{ url_for('inventory') }}"    class="nav-tab active">Inventory</a>
                 <a href="{{ url_for('albums_list') }}"  class="nav-tab">Album</a>
+                <a href="{{ url_for('shops_page') }}"   class="nav-tab">Shops</a>
                 <a href="{{ url_for('search_by_image_page') }}" class="nav-tab" title="Search by photo"><i class="fas fa-camera"></i></a>
 </div>
         </div>
@@ -150,7 +151,25 @@
                 <h2 class="mb-1"><i class="fas fa-boxes-stacked me-2"></i>Inventory</h2>
                 <div class="text-muted">Select a game to view its inventory</div>
             </div>
+            {% if catalog_count %}
+            <a href="{{ url_for('inventory', catalog=1) }}" class="btn btn-outline-warning" id="viewCatalogBtn">
+                <i class="fas fa-box-archive me-1"></i>View Imported Catalog
+                <span class="badge bg-warning text-dark ms-1">{{ catalog_count }}</span>
+            </a>
+            {% endif %}
         </div>
+
+        {% if catalog_count %}
+        <div class="alert alert-light border d-flex align-items-start gap-2 mb-4" style="font-size: 0.88rem;">
+            <i class="fas fa-circle-info mt-1 text-warning"></i>
+            <div>
+                <strong>{{ catalog_count }}</strong> row{{ 's' if catalog_count != 1 else '' }} from CSV imports
+                {{ 'are' if catalog_count != 1 else 'is' }} stored as a hidden reference catalog and
+                {{ 'don\'t' if catalog_count != 1 else "doesn't" }} appear below or anywhere else in Inventory.
+                Use <strong>View Imported Catalog</strong> above to find, edit, or delete them directly.
+            </div>
+        </div>
+        {% endif %}
 
         {% if games %}
         <div class="row g-4">

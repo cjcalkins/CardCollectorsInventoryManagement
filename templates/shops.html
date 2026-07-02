@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <link rel="icon" type="image/jpeg" href="{{ url_for('static', filename='favicon.jpg') }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shops - Card Collector Inventory Manager</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <style>
+        body { background: #f8f9fa; }
+
+        .nav-tabs-minimal { display: flex; gap: 10px; margin-left: auto; flex-wrap: wrap; }
+        .nav-tab {
+            padding: 8px 14px; text-decoration: none; border-radius: 8px;
+            background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.85);
+            font-weight: 600; transition: 0.2s ease;
+        }
+        .nav-tab:hover { background: rgba(255,255,255,0.18); color: #fff; }
+        .nav-tab.active { background: #fff; color: #212529; }
+
+        .summary-card { border: none; border-radius: 14px; box-shadow: 0 4px 18px rgba(0,0,0,0.06); }
+        .summary-num { font-size: 1.8rem; font-weight: 800; line-height: 1; }
+        .summary-label { font-size: 0.78rem; color: #6c757d; text-transform: uppercase; letter-spacing: 0.04em; }
+
+        .connector-card {
+            border: none; border-radius: 16px; overflow: hidden;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.07); height: 100%;
+        }
+        .connector-head {
+            display: flex; align-items: center; gap: 12px;
+            padding: 16px 18px; color: #fff;
+        }
+        .connector-head .brand-icon { font-size: 1.6rem; }
+        .connector-head h5 { margin: 0; font-weight: 700; }
+        .status-pill {
+            margin-left: auto; font-size: 0.72rem; font-weight: 700;
+            padding: 3px 10px; border-radius: 999px; background: rgba(255,255,255,0.25);
+            text-transform: uppercase; letter-spacing: 0.03em;
+        }
+        .connector-body { padding: 18px; }
+        .field-label { font-size: 0.78rem; font-weight: 600; color: #495057; margin-bottom: 3px; }
+        .closed-note {
+            font-size: 0.78rem; background: #fff4e5; border: 1px solid #ffe0b2;
+            color: #8a5a00; border-radius: 8px; padding: 8px 10px; margin-bottom: 12px;
+        }
+        .help-toggle { font-size: 0.78rem; color: #6c757d; cursor: pointer; }
+        .help-body { font-size: 0.78rem; color: #6c757d; margin-top: 8px; display: none; }
+        .help-body.show { display: block; }
+        .conn-status-line { font-size: 0.78rem; margin-top: 10px; min-height: 1.1em; }
+
+        .badge-status { font-size: 0.72rem; font-weight: 600; padding: 3px 8px; border-radius: 6px; }
+        .st-not_listed { background: #e9ecef; color: #6c757d; }
+        .st-active     { background: #d1e7dd; color: #0f5132; }
+        .st-draft      { background: #fff3cd; color: #664d03; }
+        .st-ended      { background: #e2e3e5; color: #41464b; }
+        .st-error      { background: #f8d7da; color: #842029; }
+
+        .listing-thumb { width: 34px; height: 46px; object-fit: cover; border-radius: 4px; background: #f1f3f5; }
+        .mk-cell { white-space: nowrap; }
+        .mini-btn { font-size: 0.72rem; padding: 2px 8px; }
+        #listingsTable td { vertical-align: middle; }
+
+        .bulk-bar {
+            position: sticky; bottom: 0; z-index: 20;
+            background: #212529; color: #fff; border-radius: 12px;
+            padding: 10px 16px; display: none; align-items: center; gap: 12px; flex-wrap: wrap;
+            box-shadow: 0 -4px 18px rgba(0,0,0,0.18);
+        }
+        .bulk-bar.show { display: flex; }
+
+        @media (max-width: 768px) {
+            .nav-tabs-minimal { margin-left: 0; margin-top: 12px; width: 100%; }
+            .nav-tab { flex: 1; text-align: center; }
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+        <div class="container d-flex flex-wrap align-items-center">
+            <a class="navbar-brand" href="{{ url_for('index') }}">
+                <img src="{{ url_for('static', filename='favicon.jpg') }}" alt="logo" width="24" height="24"
+                     style="object-fit:cover;border-radius:4px;margin-right:0.5rem;" class="me-2">Card Collector Inventory Manager
+            </a>
+            <div class="nav-tabs-minimal">
+                <a href="{{ url_for('import_page') }}" class="nav-tab">Import</a>
+                <a href="{{ url_for('index') }}"        class="nav-tab">Templates</a>
+                <a href="{{ url_for('inventory') }}"    class="nav-tab">Inventory</a>
+                <a href="{{ url_for('albums_list') }}"  class="nav-tab">Album</a>
+                <a href="{{ url_for('shops_page') }}"   class="nav-tab active">Shops</a>
+                <a href="{{ url_for('search_by_image_page') }}" class="nav-tab" title="Search by photo"><i class="fas fa-camera"></i></a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container py-4">
+        <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+            <div>
+                <h2 class="mb-1"><i class="fas fa-store me-2"></i>Shops</h2>
+                <div class="text-muted">Connect marketplaces and synchronize your inventory's online listings.</div>
+            </div>
+        </div>
+
+        <div id="ebayBanner"></div>
+
+        <!-- Summary -->
+        <div class="row g-3 mb-4">
+            <div class="col-6 col-md-3">
+                <div class="card summary-card"><div class="card-body">
+                    <div class="summary-num">{{ total_records }}</div>
+                    <div class="summary-label">Inventory items</div>
+                </div></div>
+            </div>
+            {% for mk, meta in marketplaces.items() %}
+            <div class="col-6 col-md-3">
+                <div class="card summary-card"><div class="card-body">
+                    <div class="summary-num" style="color: {{ meta.color }};">{{ active_counts[mk] }}</div>
+                    <div class="summary-label">{{ meta.label }} listed</div>
+                </div></div>
+            </div>
+            {% endfor %}
+        </div>
+
+        <!-- Connectors -->
+        <h5 class="mb-3"><i class="fas fa-plug me-2"></i>Connections</h5>
+        <div class="row g-4 mb-5">
+            {% for mk, meta in marketplaces.items() %}
+            {% set c = connections[mk] %}
+            <div class="col-12 col-lg-4">
+                <div class="card connector-card">
+                    <div class="connector-head" style="background: {{ meta.color }};">
+                        <i class="{{ meta.icon }} brand-icon"></i>
+                        <h5>{{ meta.label }}</h5>
+                        <span class="status-pill" id="pill-{{ mk }}">{{ c.status }}</span>
+                    </div>
+                    <div class="connector-body">
+                        {% if meta.closed_note %}
+                        <div class="closed-note"><i class="fas fa-triangle-exclamation me-1"></i>{{ meta.closed_note }}</div>
+                        {% endif %}
+                        <div class="text-muted mb-3" style="font-size:0.82rem;">{{ meta.blurb }}</div>
+
+                        <form class="connector-form" data-marketplace="{{ mk }}">
+                            {% for field in meta.fields %}
+                            <div class="mb-2">
+                                <div class="field-label">
+                                    {{ field.label }}
+                                    {% if field.optional %}<span class="text-muted">(optional)</span>{% endif %}
+                                </div>
+                                {% if field.type == 'select' %}
+                                <select class="form-select form-select-sm" name="{{ field.key }}">
+                                    {% for opt in field.options %}
+                                    <option value="{{ opt }}" {% if c.config.get(field.key) == opt %}selected{% endif %}>{{ opt }}</option>
+                                    {% endfor %}
+                                </select>
+                                {% elif field.secret %}
+                                <input type="password" class="form-control form-control-sm" name="{{ field.key }}"
+                                       autocomplete="new-password"
+                                       placeholder="{{ '•••••••• (saved — leave blank to keep)' if c.secrets_set.get(field.key) else (field.placeholder or '') }}">
+                                {% else %}
+                                <input type="text" class="form-control form-control-sm" name="{{ field.key }}"
+                                       value="{{ c.config.get(field.key, '') }}"
+                                       placeholder="{{ field.placeholder or '' }}">
+                                {% endif %}
+                            </div>
+                            {% endfor %}
+
+                            <div class="conn-status-line" id="status-{{ mk }}">
+                                {% if c.status_detail %}<span class="text-muted">{{ c.status_detail }}</span>{% endif %}
+                                {% if c.connected_at %}<span class="text-muted"> · since {{ c.connected_at }}</span>{% endif %}
+                            </div>
+
+                            <div class="d-flex gap-2 flex-wrap mt-2">
+                                <button type="button" class="btn btn-sm btn-dark btn-save">
+                                    <i class="fas fa-floppy-disk me-1"></i>Save
+                                </button>
+                                <button type="button" class="btn btn-sm btn-outline-secondary btn-test">
+                                    <i class="fas fa-vial me-1"></i>Test
+                                </button>
+
+                                {% if meta.oauth %}
+                                <a href="{{ url_for('shops_ebay_connect') }}"
+                                   class="btn btn-sm {{ 'btn-outline-success' if c.ebay_authorized else 'btn-primary' }}">
+                                    <i class="fas fa-link me-1"></i>{{ 'Reconnect' if c.ebay_authorized else 'Connect' }}
+                                </a>
+                                {% endif %}
+
+                                <button type="button" class="btn btn-sm btn-outline-danger ms-auto btn-disconnect">
+                                    Disconnect
+                                </button>
+                            </div>
+                        </form>
+
+                        <div class="mt-3">
+                            <span class="help-toggle" onclick="this.nextElementSibling.classList.toggle('show')">
+                                <i class="fas fa-circle-question me-1"></i>How to set this up
+                            </span>
+                            <div class="help-body">{{ meta.help }}</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+
+        <!-- Listings / sync -->
+        <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+            <h5 class="mb-0"><i class="fas fa-arrows-rotate me-2"></i>Inventory &amp; Listings</h5>
+            <div class="d-flex gap-2 flex-wrap align-items-center">
+                <div class="form-check form-switch mb-0">
+                    <input class="form-check-input" type="checkbox" id="unlistedOnly">
+                    <label class="form-check-label small" for="unlistedOnly">Unlisted only</label>
+                </div>
+                <select id="marketplaceFilter" class="form-select form-select-sm" style="width:auto;">
+                    {% for mk, meta in marketplaces.items() %}
+                    <option value="{{ mk }}">{{ meta.label }}</option>
+                    {% endfor %}
+                </select>
+                <button class="btn btn-sm btn-outline-primary" id="pullBtn">
+                    <i class="fas fa-cloud-arrow-down me-1"></i>Pull from selected shop
+                </button>
+            </div>
+        </div>
+
+        <div class="card summary-card mb-2">
+            <div class="table-responsive">
+                <table class="table table-hover align-middle mb-0" id="listingsTable">
+                    <thead class="table-light">
+                        <tr>
+                            <th style="width:32px;"><input type="checkbox" id="selectAllRows"></th>
+                            <th></th>
+                            <th>Item</th>
+                            <th class="text-end">Price</th>
+                            <th class="text-center">Qty</th>
+                            {% for mk, meta in marketplaces.items() %}
+                            <th class="mk-cell text-center">{{ meta.label }}</th>
+                            {% endfor %}
+                        </tr>
+                    </thead>
+                    <tbody id="listingsBody">
+                        <tr><td colspan="{{ 5 + marketplaces|length }}" class="text-center text-muted py-4">
+                            <i class="fas fa-spinner fa-spin me-2"></i>Loading inventory…
+                        </td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-2">
+            <div class="text-muted small" id="pageInfo"></div>
+            <div class="btn-group btn-group-sm">
+                <button class="btn btn-outline-secondary" id="prevPage" disabled>Prev</button>
+                <button class="btn btn-outline-secondary" id="nextPage" disabled>Next</button>
+            </div>
+        </div>
+
+        <!-- Bulk push bar -->
+        <div class="bulk-bar" id="bulkBar">
+            <span id="bulkCount" class="fw-semibold"></span>
+            <span>Push selected to</span>
+            <select id="bulkMarketplace" class="form-select form-select-sm" style="width:auto;">
+                {% for mk, meta in marketplaces.items() %}
+                <option value="{{ mk }}">{{ meta.label }}</option>
+                {% endfor %}
+            </select>
+            <button class="btn btn-sm btn-light fw-semibold" id="bulkPushBtn">
+                <i class="fas fa-cloud-arrow-up me-1"></i>Push
+            </button>
+            <button class="btn btn-sm btn-outline-light" id="bulkClear">Clear</button>
+            <span id="bulkProgress" class="ms-2 small"></span>
+        </div>
+    </div>
+
+    <div class="toast-container position-fixed bottom-0 end-0 p-3" id="toastArea" style="z-index:1080;"></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // Server-provided connection state (which marketplaces are usable).
+        const CONNECTED = {
+            {% for mk in marketplaces %}"{{ mk }}": {{ 'true' if connections[mk].enabled else 'false' }},{% endfor %}
+        };
+        const MK_LABELS = {
+            {% for mk, meta in marketplaces.items() %}"{{ mk }}": "{{ meta.label }}",{% endfor %}
+        };
+        const MK_KEYS = Object.keys(MK_LABELS);
+
+        function toast(msg, ok = true) {
+            const el = document.createElement('div');
+            el.className = `toast align-items-center text-bg-${ok ? 'success' : 'danger'} border-0 show`;
+            el.innerHTML = `<div class="d-flex"><div class="toast-body">${msg}</div>
+                <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button></div>`;
+            document.getElementById('toastArea').appendChild(el);
+            setTimeout(() => el.remove(), 5000);
+        }
+
+        // eBay OAuth return banner
+        (function () {
+            const p = new URLSearchParams(location.search);
+            const banner = document.getElementById('ebayBanner');
+            if (p.get('ebay_ok')) {
+                banner.innerHTML = `<div class="alert alert-success alert-dismissible">eBay account connected.
+                    <button class="btn-close" data-bs-dismiss="alert"></button></div>`;
+            } else if (p.get('ebay_error')) {
+                banner.innerHTML = `<div class="alert alert-danger alert-dismissible">eBay: ${p.get('ebay_error')}
+                    <button class="btn-close" data-bs-dismiss="alert"></button></div>`;
+            }
+        })();
+
+        // ── Connector form actions (save / test / disconnect) ──
+        function setPill(mk, status) {
+            const pill = document.getElementById('pill-' + mk);
+            if (!pill) return;
+            pill.textContent = status;
+            const colors = { connected: 'rgba(255,255,255,0.35)', error: 'rgba(220,53,69,0.55)', disconnected: 'rgba(255,255,255,0.2)' };
+            pill.style.background = colors[status] || 'rgba(255,255,255,0.2)';
+        }
+
+        document.querySelectorAll('.connector-form').forEach(form => {
+            const mk = form.dataset.marketplace;
+
+            form.querySelector('.btn-save').addEventListener('click', async () => {
+                const fd = new FormData(form);
+                const res = await fetch(`/shops/save/${mk}`, { method: 'POST', body: fd });
+                const data = await res.json();
+                toast(data.message, data.status === 'success');
+            });
+
+            form.querySelector('.btn-test').addEventListener('click', async (e) => {
+                const btn = e.currentTarget;
+                const orig = btn.innerHTML;
+                btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Testing…';
+                // Save first so freshly typed values are used.
+                await fetch(`/shops/save/${mk}`, { method: 'POST', body: new FormData(form) });
+                const res = await fetch(`/shops/test/${mk}`, { method: 'POST' });
+                const data = await res.json();
+                document.getElementById('status-' + mk).innerHTML =
+                    `<span class="${data.connected ? 'text-success' : 'text-danger'}">${data.message}</span>`;
+                setPill(mk, data.connected ? 'connected' : 'error');
+                CONNECTED[mk] = !!data.connected;
+                toast(data.message, data.connected);
+                btn.disabled = false; btn.innerHTML = orig;
+            });
+
+            form.querySelector('.btn-disconnect').addEventListener('click', async () => {
+                if (!confirm(`Disconnect ${MK_LABELS[mk]}? Cached tokens are cleared (your app credentials stay saved).`)) return;
+                const res = await fetch(`/shops/disconnect/${mk}`, { method: 'POST' });
+                const data = await res.json();
+                setPill(mk, 'disconnected');
+                CONNECTED[mk] = false;
+                document.getElementById('status-' + mk).innerHTML = '<span class="text-muted">Disconnected.</span>';
+                toast(data.message, true);
+            });
+        });
+
+        // ── Listings table ──
+        const state = { page: 1, per_page: 25, pages: 1 };
+        const selected = new Set();
+
+        function statusBadge(mk, info) {
+            const s = info.status;
+            let inner = `<span class="badge-status st-${s}">${s.replace('_',' ')}</span>`;
+            const connected = CONNECTED[mk];
+            let btns = '';
+            if (s === 'not_listed' || s === 'error' || s === 'ended') {
+                btns = `<button class="btn btn-outline-dark mini-btn ms-1 row-push" data-mk="${mk}"
+                          ${connected ? '' : 'disabled title="Connect this shop first"'}>Push</button>`;
+            } else if ((s === 'active' || s === 'draft') && info.listing_id) {
+                const link = info.url ? `<a href="${info.url}" target="_blank" class="btn btn-outline-secondary mini-btn ms-1"><i class="fas fa-arrow-up-right-from-square"></i></a>` : '';
+                btns = `${link}<button class="btn btn-outline-danger mini-btn ms-1 row-unlist" data-listing="${info.listing_id}">End</button>`;
+            }
+            return `<div class="d-inline-flex align-items-center">${inner}${btns}</div>`;
+        }
+
+        function renderRows(rows) {
+            const body = document.getElementById('listingsBody');
+            if (!rows.length) {
+                body.innerHTML = `<tr><td colspan="${5 + MK_KEYS.length}" class="text-center text-muted py-4">No inventory items match.</td></tr>`;
+                return;
+            }
+            body.innerHTML = rows.map(r => {
+                const mkCells = MK_KEYS.map(mk => `<td class="mk-cell text-center" data-mk="${mk}" data-record="${r.record_id}">${statusBadge(mk, r.listings[mk])}</td>`).join('');
+                const img = r.image_url ? `<img src="${r.image_url}" class="listing-thumb">` : `<div class="listing-thumb"></div>`;
+                return `<tr data-record="${r.record_id}">
+                    <td><input type="checkbox" class="row-check" value="${r.record_id}" ${selected.has(r.record_id) ? 'checked' : ''}></td>
+                    <td>${img}</td>
+                    <td><a href="${r.detail_url}" class="text-decoration-none fw-semibold">${r.name}</a>
+                        <div class="text-muted small">${[r.game, r.set].filter(Boolean).join(' · ')}</div></td>
+                    <td class="text-end">$${(r.price || 0).toFixed(2)}</td>
+                    <td class="text-center">${r.quantity}</td>
+                    ${mkCells}
+                </tr>`;
+            }).join('');
+        }
+
+        async function loadListings() {
+            const mk = document.getElementById('marketplaceFilter').value;
+            const unlisted = document.getElementById('unlistedOnly').checked ? '1' : '';
+            const params = new URLSearchParams({ page: state.page, per_page: state.per_page, marketplace: mk, unlisted });
+            const res = await fetch('/shops/listings?' + params.toString());
+            const data = await res.json();
+            state.pages = data.pages;
+            renderRows(data.rows);
+            document.getElementById('pageInfo').textContent =
+                `Page ${data.page} of ${data.pages} · ${data.total} item(s)`;
+            document.getElementById('prevPage').disabled = data.page <= 1;
+            document.getElementById('nextPage').disabled = data.page >= data.pages;
+            updateBulkBar();
+        }
+
+        document.getElementById('marketplaceFilter').addEventListener('change', () => { state.page = 1; loadListings(); });
+        document.getElementById('unlistedOnly').addEventListener('change', () => { state.page = 1; loadListings(); });
+        document.getElementById('prevPage').addEventListener('click', () => { if (state.page > 1) { state.page--; loadListings(); } });
+        document.getElementById('nextPage').addEventListener('click', () => { if (state.page < state.pages) { state.page++; loadListings(); } });
+
+        // Row-level push / unlist and selection (delegated)
+        document.getElementById('listingsBody').addEventListener('click', async (e) => {
+            const pushBtn = e.target.closest('.row-push');
+            const unlistBtn = e.target.closest('.row-unlist');
+            if (pushBtn) {
+                const mk = pushBtn.dataset.mk;
+                const rid = parseInt(pushBtn.closest('td').dataset.record, 10);
+                pushBtn.disabled = true; pushBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+                await pushRecords(mk, [rid]);
+                loadListings();
+            } else if (unlistBtn) {
+                if (!confirm('End this listing on the marketplace?')) return;
+                unlistBtn.disabled = true; unlistBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+                const res = await fetch('/shops/unlist', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ listing_id: parseInt(unlistBtn.dataset.listing, 10) }),
+                });
+                const data = await res.json();
+                toast(data.message, data.status === 'success');
+                loadListings();
+            }
+        });
+
+        document.getElementById('listingsBody').addEventListener('change', (e) => {
+            const cb = e.target.closest('.row-check');
+            if (!cb) return;
+            const id = parseInt(cb.value, 10);
+            if (cb.checked) selected.add(id); else selected.delete(id);
+            updateBulkBar();
+        });
+
+        document.getElementById('selectAllRows').addEventListener('change', (e) => {
+            document.querySelectorAll('.row-check').forEach(cb => {
+                cb.checked = e.target.checked;
+                const id = parseInt(cb.value, 10);
+                if (e.target.checked) selected.add(id); else selected.delete(id);
+            });
+            updateBulkBar();
+        });
+
+        function updateBulkBar() {
+            const bar = document.getElementById('bulkBar');
+            document.getElementById('bulkCount').textContent = `${selected.size} selected`;
+            bar.classList.toggle('show', selected.size > 0);
+        }
+        document.getElementById('bulkClear').addEventListener('click', () => {
+            selected.clear();
+            document.querySelectorAll('.row-check').forEach(cb => cb.checked = false);
+            document.getElementById('selectAllRows').checked = false;
+            updateBulkBar();
+        });
+
+        async function pushRecords(marketplace, ids) {
+            if (!CONNECTED[marketplace]) { toast(`${MK_LABELS[marketplace]} isn't connected.`, false); return null; }
+            const res = await fetch('/shops/push', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ marketplace, record_ids: ids }),
+            });
+            const data = await res.json();
+            if (data.status !== 'success') { toast(data.message || 'Push failed.', false); return null; }
+            const failures = (data.results || []).filter(r => !r.ok);
+            if (failures.length) toast(`${failures.length} failed: ${failures[0].message}`, false);
+            return data;
+        }
+
+        document.getElementById('bulkPushBtn').addEventListener('click', async () => {
+            const mk = document.getElementById('bulkMarketplace').value;
+            const ids = [...selected];
+            if (!ids.length) return;
+            const btn = document.getElementById('bulkPushBtn');
+            const prog = document.getElementById('bulkProgress');
+            btn.disabled = true;
+            let ok = 0, fail = 0;
+            // Push one at a time so progress is visible and one failure can't sink the batch.
+            for (let i = 0; i < ids.length; i++) {
+                prog.textContent = `Pushing ${i + 1}/${ids.length}…`;
+                const data = await pushRecords(mk, [ids[i]]);
+                if (data && data.ok_count) ok += data.ok_count; else fail++;
+            }
+            prog.textContent = `Done — ${ok} ok, ${fail} failed.`;
+            btn.disabled = false;
+            toast(`Pushed ${ok} to ${MK_LABELS[mk]}${fail ? `, ${fail} failed` : ''}.`, fail === 0);
+            loadListings();
+        });
+
+        document.getElementById('pullBtn').addEventListener('click', async (e) => {
+            const mk = document.getElementById('marketplaceFilter').value;
+            if (!CONNECTED[mk]) { toast(`${MK_LABELS[mk]} isn't connected.`, false); return; }
+            const btn = e.currentTarget; const orig = btn.innerHTML;
+            btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Pulling…';
+            const res = await fetch(`/shops/pull/${mk}`, { method: 'POST' });
+            const data = await res.json();
+            toast(data.message || 'Pull complete.', data.status === 'success');
+            btn.disabled = false; btn.innerHTML = orig;
+            loadListings();
+        });
+
+        loadListings();
+    </script>
+</body>
+</html>

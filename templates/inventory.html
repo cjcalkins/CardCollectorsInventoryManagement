@@ -92,6 +92,80 @@
             white-space: nowrap;
         }
 
+        /* ── Hidden-field toggle & indicators ── */
+        .hidden-fields-switch-wrap {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 10px;
+            border-radius: 20px;
+            background: #fef3c7;
+            border: 1px solid #fde68a;
+            white-space: nowrap;
+        }
+        .hidden-fields-switch-wrap label {
+            font-size: 0.82rem;
+            font-weight: 700;
+            color: #92400e;
+            margin: 0;
+            cursor: pointer;
+        }
+        .hidden-fields-switch-wrap .form-check-input {
+            cursor: pointer;
+        }
+        .hidden-field-badge {
+            display: inline-block;
+            font-size: 9px;
+            line-height: 1;
+            font-weight: 700;
+            color: #92400e;
+            background: #fde68a;
+            border-radius: 3px;
+            padding: 2px 4px;
+            vertical-align: middle;
+        }
+        #inventoryTable thead th.hidden-field-th {
+            background-color: #78450f;
+        }
+        td.hidden-field-cell {
+            background-color: #fffbeb;
+        }
+        .hf-cell-inline {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .hf-cell-inline .hf-value {
+            cursor: text;
+            min-width: 10px;
+        }
+        .hf-cell-inline .hf-value:empty::before {
+            content: '—';
+            color: #adb5bd;
+        }
+        .hf-icon-btn {
+            border: none;
+            background: none;
+            padding: 0 2px;
+            font-size: 0.78rem;
+            color: #92400e;
+            opacity: 0;
+            transition: opacity 0.15s ease;
+            cursor: pointer;
+            line-height: 1;
+        }
+        td.hidden-field-cell:hover .hf-icon-btn {
+            opacity: 0.85;
+        }
+        .hf-icon-btn:hover { opacity: 1 !important; }
+        .hf-cell-inline input.hf-edit-input {
+            font-size: 0.85rem;
+            padding: 2px 4px;
+            border: 1px solid #d1a954;
+            border-radius: 4px;
+            width: 100%;
+        }
+
         /* ── Sortable headers ── */
         #inventoryTable thead th.sortable {
             cursor: pointer;
@@ -271,41 +345,61 @@
 
             <div class="nav-tabs-minimal">
                 <a href="{{ url_for('import_page') }}" class="nav-tab">Import</a>
-                <a href="{{ url_for('index') }}"        class="nav-tab">Scan</a>
+                <a href="{{ url_for('index') }}"        class="nav-tab">Templates</a>
                 <a href="{{ url_for('inventory') }}"    class="nav-tab active">Inventory</a>
                 <a href="{{ url_for('albums_list') }}"  class="nav-tab">Album</a>
+                <a href="{{ url_for('shops_page') }}"   class="nav-tab">Shops</a>
                 <a href="{{ url_for('search_by_image_page') }}" class="nav-tab" title="Search by photo"><i class="fas fa-camera"></i></a>
 </div>
         </div>
     </nav>
 
     <div class="container py-5">
+        {% if catalog_view %}
+        <div class="alert alert-warning d-flex align-items-start gap-2 mb-3">
+            <i class="fas fa-box-archive mt-1"></i>
+            <div>
+                <strong>Imported Catalog — Hidden Entries.</strong>
+                These rows came from a CSV import and are reference-only: they never appear in the normal
+                Inventory list, Albums, or CSV export. Edit or delete them here, or use
+                <strong>Copy from Entry</strong> on a real Inventory Detail page to pull one in.
+            </div>
+        </div>
+        {% endif %}
         <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-3">
             <div>
                 <a href="{{ url_for('inventory') }}" class="text-muted small text-decoration-none d-inline-flex align-items-center mb-2">
-                    <i class="fas fa-chevron-left me-1" style="font-size:0.7rem;"></i>All Games
+                    <i class="fas fa-chevron-left me-1" style="font-size:0.7rem;"></i>{{ 'Back to Inventory' if catalog_view else 'All Games' }}
                 </a>
                 <h2 class="mb-0">
-                    <i class="fas fa-boxes-stacked me-2"></i>
-                    {% if f_game %}{{ f_game }}{% else %}Inventory Records{% endif %}
+                    <i class="fas {{ 'fa-box-archive' if catalog_view else 'fa-boxes-stacked' }} me-2"></i>
+                    {% if catalog_view %}Imported Catalog{% elif f_game %}{{ f_game }}{% else %}Inventory Records{% endif %}
                 </h2>
             </div>
 
             <div class="d-flex gap-2 flex-wrap">
+                {% if not catalog_view %}
                 <a href="{{ url_for('duplicates') }}" class="btn btn-outline-warning">
                     <i class="fas fa-clone me-1"></i>Find Duplicates
                 </a>
+                {% endif %}
                 <button class="btn btn-outline-success" id="exportCsvBtn" type="button">
                     <i class="fas fa-file-csv me-1"></i>Export CSV
                 </button>
+                {% if not catalog_view %}
                 <button class="btn btn-outline-info" id="fetchMissingPricesBtn" type="button">
                     <i class="fas fa-tags me-1"></i>Fetch Missing Prices
                 </button>
+                {% endif %}
                 <button class="btn btn-success" id="addCustomFieldBtn" type="button">
                     <i class="fas fa-plus me-1"></i>Add Field to Game
                 </button>
                 <button class="btn btn-warning" id="editSelectedBtn" type="button">
                     <i class="fas fa-pen-to-square me-1"></i>Edit Selected
+                </button>
+                <button class="btn btn-dark" id="gradeSelectedBtn" type="button"
+                        title="Send front & back images of the selected cards to Ximilar for a condition check">
+                    <i class="fas fa-award me-1"></i>Grade Condition
                 </button>
                 <button class="btn btn-danger" id="deleteSelectedBtn" type="button">
                     <i class="fas fa-trash me-1"></i>Delete Selected
@@ -368,6 +462,12 @@
                     </span>
                     <div class="col-toggle-bar" id="colToggleBar">
                         <!-- populated by JS -->
+                    </div>
+                    <div class="hidden-fields-switch-wrap" id="hiddenFieldsSwitchWrap" title="Reveal hidden template fields for this game so their values can be edited or cleared">
+                        <div class="form-check form-switch mb-0">
+                            <input class="form-check-input" type="checkbox" role="switch" id="showHiddenFieldsToggle">
+                        </div>
+                        <label for="showHiddenFieldsToggle"><i class="fas fa-eye-slash me-1"></i>Show Hidden Fields</label>
                     </div>
                     <button class="btn btn-outline-secondary btn-sm ms-auto" id="resetColsBtn" type="button">
                         <i class="fas fa-undo me-1"></i>Reset
@@ -432,7 +532,10 @@
                                 <th data-col="edition" class="sortable" data-sort-type="enum">Edition <span class="sort-icon">⇅</span></th>
                                 <th data-col="qty" class="sortable" data-sort-type="num">Qty <span class="sort-icon">⇅</span></th>
                                 {% for field in entry_fields %}
-                                <th data-col="entry_{{ field | e }}" data-entry-field="{{ field | e }}" class="sortable" data-sort-type="text">{{ field | replace('_', ' ') | title }} <span class="sort-icon">⇅</span></th>
+                                {% set _th_hidden = template_fields_config.get(field, {}).get('hidden', False) %}
+                                <th data-col="entry_{{ field | e }}" data-entry-field="{{ field | e }}"
+                                    {% if _th_hidden %}data-field-hidden="1"{% endif %}
+                                    class="sortable{% if _th_hidden %} hidden-field-th{% endif %}" data-sort-type="text">{{ field | replace('_', ' ') | title }}{% if _th_hidden %} <span class="hidden-field-badge" title="Hidden field">H</span>{% endif %} <span class="sort-icon">⇅</span></th>
                                 {% endfor %}
                                 <th data-col="actions">Actions</th>
                             </tr>
@@ -448,15 +551,16 @@
                                 </td>
                                 <td>{{ record.scan_date.strftime('%Y-%m-%d %H:%M') }}</td>
                                 <td>
-                                    {% if record.image_path == '__blank__' %}
+                                    {% set thumb_path = record.display_image_path or record.image_path %}
+                                    {% if thumb_path == '__blank__' %}
                                     <img
                                         src="{{ url_for('static', filename='blank.jpg') }}"
                                         class="thumbnail"
                                         alt="Empty slot"
                                     >
-                                    {% elif record.image_path %}
+                                    {% elif thumb_path %}
                                     <img
-                                        src="{{ url_for('uploaded_file', filename=record.image_path.replace('\\', '/')) }}"
+                                        src="{{ url_for('uploaded_file', filename=thumb_path.replace('\\', '/')) }}"
                                         class="thumbnail"
                                         alt="Record image"
                                     >
@@ -512,8 +616,11 @@
                                 {% for field in entry_fields %}
                                 {% set _tpl_f = template_fields_config.get(field, {}) %}
                                 {% set _ftype = _tpl_f.get('field_type', 'text') %}
+                                {% set _fhidden = _tpl_f.get('hidden', False) %}
                                 <td data-entry-field="{{ field | e }}"
-                                    data-field-type="{{ _ftype }}">
+                                    data-field-type="{{ _ftype }}"
+                                    {% if _fhidden %}data-field-hidden="1" data-record-id="{{ record.id }}"{% endif %}
+                                    class="{% if _fhidden %}hidden-field-cell{% endif %}">
                                     {%- if _ftype == 'boolean' -%}
                                         {%- set _bval = (record.extracted_data.get(field, '') | string | lower) in ('true', '1', 'yes') -%}
                                         <input type="checkbox"
@@ -522,6 +629,12 @@
                                                data-field-key="{{ field | e }}"
                                                {% if _bval %}checked{% endif %}
                                                title="Toggle {{ field.replace('_', ' ').title() }}">
+                                    {%- elif _fhidden -%}
+                                        <div class="hf-cell-inline">
+                                            <span class="hf-value" title="Click to edit">{{ record.extracted_data.get(field, '') | e }}</span>
+                                            <button type="button" class="hf-icon-btn hf-edit-btn" data-field-key="{{ field | e }}" title="Edit value"><i class="fas fa-pen"></i></button>
+                                            <button type="button" class="hf-icon-btn hf-clear-btn text-danger" data-field-key="{{ field | e }}" title="Clear (delete) value"><i class="fas fa-eraser"></i></button>
+                                        </div>
                                     {%- else -%}
                                         {{ record.extracted_data.get(field, '') | e }}
                                     {%- endif -%}
@@ -543,7 +656,7 @@
 
                 {% if not records %}
                 <div class="text-center text-muted py-4">
-                    No inventory records found.
+                    {% if catalog_view %}No imported catalog entries found.{% else %}No inventory records found.{% endif %}
                 </div>
                 {% endif %}
 
@@ -781,15 +894,95 @@
         </div>
     </div>
 
+    <!-- Grade Condition Modal -->
+    <div class="modal fade" id="gradeModal" tabindex="-1" aria-labelledby="gradeModalLabel" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
+        <div class="modal-dialog modal-dialog-centered modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="gradeModalLabel">
+                        <i class="fas fa-award me-2"></i>Grade Condition
+                    </h5>
+                </div>
+                <div class="modal-body">
+                    <!-- Pre-run state -->
+                    <div id="gradeIdle">
+                        <p class="mb-3 text-muted small" id="gradeIdleMsg">Loading…</p>
+                        <label for="gradeModeSelect" class="form-label small fw-semibold mb-1">Grading scale</label>
+                        <select id="gradeModeSelect" class="form-select form-select-sm" style="max-width:220px;">
+                            <option value="ebay">eBay</option>
+                            <option value="tcgplayer" selected>TCGplayer</option>
+                            <option value="cardmarket">Cardmarket</option>
+                            <option value="ximilar">Ximilar</option>
+                        </select>
+                        <p class="text-muted small mt-3 mb-0">
+                            <i class="fas fa-circle-info me-1"></i>Each card's front &amp; back images are sent to the
+                            Ximilar Card Grading <strong>condition</strong> endpoint. Grading runs one card at a time and
+                            can take ~10–20&nbsp;seconds per image, so larger selections take a while.
+                        </p>
+                    </div>
+                    <!-- Running state -->
+                    <div id="gradeRunning" style="display:none;">
+                        <div class="mb-2 d-flex justify-content-between align-items-center">
+                            <span class="small fw-semibold text-muted">Progress</span>
+                            <span class="small text-muted" id="gradeCounter">0 / 0</span>
+                        </div>
+                        <div class="progress mb-3" style="height:10px;">
+                            <div id="gradeBar" class="progress-bar progress-bar-striped progress-bar-animated bg-dark"
+                                 role="progressbar" style="width:0%"></div>
+                        </div>
+                        <div class="border rounded px-3 py-2 bg-light mb-3" style="min-height:48px;">
+                            <div class="small text-muted mb-1">Current card</div>
+                            <div id="gradeCurrentCard" class="fw-semibold text-truncate">—</div>
+                        </div>
+                        <div class="d-flex gap-3 justify-content-center small mb-3">
+                            <span class="text-success"><i class="fas fa-check-circle me-1"></i><span id="gradeCountOk">0</span> graded</span>
+                            <span class="text-danger"><i class="fas fa-times-circle me-1"></i><span id="gradeCountErr">0</span> errors</span>
+                        </div>
+                        <div class="table-responsive" style="max-height:260px;overflow:auto;">
+                            <table class="table table-sm align-middle mb-0">
+                                <thead class="table-light">
+                                    <tr>
+                                        <th style="width:70px;">Record</th>
+                                        <th>Front</th>
+                                        <th>Back</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="gradeResultsBody"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <!-- Done state -->
+                    <div id="gradeDone" style="display:none;">
+                        <div class="alert alert-success mb-0" id="gradeDoneMsg"></div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" id="gradeCancelBtn">Cancel</button>
+                    <button type="button" class="btn btn-dark" id="gradeStartBtn" disabled>
+                        <i class="fas fa-play me-1"></i>Start
+                    </button>
+                    <button type="button" class="btn btn-warning" id="gradeStopBtn" style="display:none;">
+                        <i class="fas fa-stop me-1"></i>Stop
+                    </button>
+                    <button type="button" class="btn btn-primary" id="gradeCloseBtn" style="display:none;" data-bs-dismiss="modal">
+                        <i class="fas fa-check me-1"></i>Done
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         // ====================== ACTIVE FILTER STATE (injected from server) ======================
+        const CATALOG_VIEW = {{ catalog_view | tojson }};
         const activeFilters = {
             search:   {{ search     | tojson }},
             game:     {{ f_game     | tojson }},
             album:    {{ f_album    | tojson }},
             template: {{ f_template | tojson }},
             per_page: {{ per_page   | tojson }},
+            catalog:  CATALOG_VIEW ? '1' : '',
         };
 
         // Current sort state injected from server so header indicators survive page loads
@@ -801,7 +994,7 @@
         // ====================== LOAD DROPDOWN OPTIONS FROM SERVER ======================
         async function loadFilterOptions() {
             try {
-                const res  = await fetch('/inventory/filter_options');
+                const res  = await fetch('/inventory/filter_options' + (CATALOG_VIEW ? '?catalog=1' : ''));
                 const data = await res.json();
 
                 const mapping = [
@@ -833,6 +1026,7 @@
                 template: document.getElementById('filterTemplate').value,
                 per_page: activeFilters.per_page,
                 page:     '1',
+                catalog:  activeFilters.catalog,
             });
             // Strip blank params for cleaner URLs
             for (const [k, v] of [...params.entries()]) {
@@ -851,7 +1045,7 @@
         document.getElementById('filterTemplate').addEventListener('change', submitFilters);
 
         document.getElementById('clearFiltersBtn').addEventListener('click', function () {
-            window.location.href = '/inventory';
+            window.location.href = CATALOG_VIEW ? '/inventory?catalog=1' : '/inventory';
         });
 
         // Per-page selector — preserves current filters, resets to page 1
@@ -865,6 +1059,7 @@
                     template: activeFilters.template,
                     per_page: this.value,
                     page:     '1',
+                    catalog:  activeFilters.catalog,
                 });
                 for (const [k, v] of [...params.entries()]) {
                     if (!v) params.delete(k);
@@ -941,6 +1136,7 @@
                     game:     activeFilters.game     || '',
                     album:    activeFilters.album    || '',
                     template: activeFilters.template || '',
+                    catalog:  activeFilters.catalog  || '',
                 });
                 for (const [k, v] of [...params.entries()]) { if (!v) params.delete(k); }
 
@@ -1001,28 +1197,50 @@
             return OCR_HIDDEN_SUFFIXES.some(sfx => fieldKey.endsWith(sfx));
         }
 
+        // Fields the current game's template marks as "hidden" — stored on every
+        // record, but left off the Inventory Detail page. They're also kept out
+        // of the normal Inventory table/column-chooser unless the person flips
+        // the dedicated "Show Hidden Fields" switch above the table.
+        function isHiddenTemplateField(fieldKey) {
+            return !!(TEMPLATE_FIELDS_CONFIG[fieldKey] && TEMPLATE_FIELDS_CONFIG[fieldKey].hidden);
+        }
+        const HIDDEN_TEMPLATE_FIELD_KEYS = ENTRY_FIELDS.filter(isHiddenTemplateField);
+
+        const SHOW_HIDDEN_STORAGE_KEY = 'inventory_show_hidden_fields_v1';
+        function loadShowHiddenFields() {
+            return localStorage.getItem(SHOW_HIDDEN_STORAGE_KEY) === '1';
+        }
+        function saveShowHiddenFields(val) {
+            localStorage.setItem(SHOW_HIDDEN_STORAGE_KEY, val ? '1' : '0');
+        }
+        let showHiddenFields = loadShowHiddenFields();
+
         // Build the full toggleable-columns list, appending one entry per
         // dynamic field.  Label converts underscores to spaces and title-cases.
-        // OCR conf/variant fields are filtered from the chooser.
+        // OCR conf/variant fields are filtered from the chooser. Hidden
+        // template fields are only included once "Show Hidden Fields" is on.
         function toLabel(fieldKey) {
             return fieldKey.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
         }
-        // Only non-OCR-meta fields appear in the column chooser
-        const DYNAMIC_TOGGLEABLE_COLS = ENTRY_FIELDS
-            .filter(f => !isOcrMetaField(f))
-            .map(f => ({
-                key:      'entry_' + f,
-                label:    toLabel(f),
-                isDynamic: true,
-                fieldKey: f,
-            }));
+        function buildDynamicToggleableCols() {
+            return ENTRY_FIELDS
+                .filter(f => !isOcrMetaField(f))
+                .filter(f => showHiddenFields || !isHiddenTemplateField(f))
+                .map(f => ({
+                    key:      'entry_' + f,
+                    label:    toLabel(f) + (isHiddenTemplateField(f) ? ' (hidden field)' : ''),
+                    isDynamic: true,
+                    fieldKey: f,
+                }));
+        }
+        let DYNAMIC_TOGGLEABLE_COLS = buildDynamicToggleableCols();
         // All dynamic cols (including OCR meta) for visibility-application logic;
         // OCR meta ones are force-hidden regardless of the hiddenSet.
         const ALL_DYNAMIC_COLS = ENTRY_FIELDS.map(f => ({
             key:      'entry_' + f,
             fieldKey: f,
         }));
-        const TOGGLEABLE_COLS = [...STATIC_TOGGLEABLE_COLS, ...DYNAMIC_TOGGLEABLE_COLS];
+        let TOGGLEABLE_COLS = [...STATIC_TOGGLEABLE_COLS, ...DYNAMIC_TOGGLEABLE_COLS];
 
         // Static column key → 0-based cell index.
         // Dynamic columns are NOT in this map; they are looked up by data-entry-field
@@ -1390,6 +1608,169 @@
             }
         });
 
+        // ====================== GRADE CONDITION (Ximilar, batch) ======================
+        (function () {
+            const startBtn   = document.getElementById('gradeSelectedBtn');
+            if (!startBtn) return;
+
+            const modalEl    = document.getElementById('gradeModal');
+            const modal      = new bootstrap.Modal(modalEl);
+
+            const idleBox    = document.getElementById('gradeIdle');
+            const idleMsg    = document.getElementById('gradeIdleMsg');
+            const runningBox = document.getElementById('gradeRunning');
+            const doneBox    = document.getElementById('gradeDone');
+            const doneMsg    = document.getElementById('gradeDoneMsg');
+
+            const modeSel    = document.getElementById('gradeModeSelect');
+            const counterEl  = document.getElementById('gradeCounter');
+            const barEl      = document.getElementById('gradeBar');
+            const currentEl  = document.getElementById('gradeCurrentCard');
+            const okCountEl  = document.getElementById('gradeCountOk');
+            const errCountEl = document.getElementById('gradeCountErr');
+            const bodyEl     = document.getElementById('gradeResultsBody');
+
+            const modalStartBtn = document.getElementById('gradeStartBtn');
+            const stopBtn       = document.getElementById('gradeStopBtn');
+            const closeBtn      = document.getElementById('gradeCloseBtn');
+            const cancelBtn     = document.getElementById('gradeCancelBtn');
+
+            let queue    = [];
+            let stopFlag = false;
+
+            function tier(label) {
+                const l = (label || '').toLowerCase();
+                if (['gem mint', 'mint', 'near mint'].includes(l)) return '#1a7a3c';
+                if (['excellent', 'very good', 'lightly played', 'light played'].includes(l)) return '#2b8a9e';
+                if (['good', 'fair', 'moderately played', 'heavily played', 'played'].includes(l)) return '#d1811a';
+                if (['poor', 'damaged'].includes(l)) return '#b0322b';
+                return '#495057';
+            }
+            function badge(side) {
+                if (!side) return '<span class="text-muted small">—</span>';
+                if (!side.label) return `<span class="text-muted small">${side.error || 'No result'}</span>`;
+                const bg = tier(side.label);
+                const score = (side.value !== null && side.value !== undefined)
+                    ? ` <span class="text-muted">(${Number(side.value).toFixed(1)})</span>` : '';
+                return `<span style="display:inline-block;padding:2px 10px;border-radius:999px;`
+                     + `background:${bg};color:#fff;font-weight:600;font-size:0.8rem;">${side.label}</span>${score}`;
+            }
+
+            function collectIds() {
+                if (selectedIds.size > 0) return [...selectedIds];
+                const s = new Set();
+                document.querySelectorAll('.record-checkbox:checked').forEach(cb => {
+                    (cb.dataset.allIds || cb.value).split(',').forEach(v => {
+                        const n = parseInt(v.trim(), 10);
+                        if (!isNaN(n)) s.add(n);
+                    });
+                });
+                return [...s];
+            }
+
+            // Open the modal (idle state)
+            startBtn.addEventListener('click', function () {
+                const ids = collectIds();
+                if (!ids.length) { alert('Please select at least one record.'); return; }
+                queue = ids;
+                stopFlag = false;
+
+                idleBox.style.display    = '';
+                runningBox.style.display = 'none';
+                doneBox.style.display    = 'none';
+                bodyEl.innerHTML = '';
+                idleMsg.innerHTML = `<strong>${ids.length}</strong> card${ids.length !== 1 ? 's' : ''} selected for condition grading.`;
+
+                modalStartBtn.style.display = '';
+                modalStartBtn.disabled = false;
+                stopBtn.style.display  = 'none';
+                closeBtn.style.display = 'none';
+                cancelBtn.style.display = '';
+
+                modal.show();
+            });
+
+            cancelBtn.addEventListener('click', function () { modal.hide(); });
+            stopBtn.addEventListener('click', function () {
+                stopFlag = true;
+                stopBtn.disabled = true;
+                stopBtn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Stopping…';
+            });
+
+            modalStartBtn.addEventListener('click', async function () {
+                const mode  = modeSel.value;
+                const total = queue.length;
+                let done = 0, ok = 0, err = 0;
+
+                idleBox.style.display       = 'none';
+                runningBox.style.display    = '';
+                modalStartBtn.style.display = 'none';
+                cancelBtn.style.display     = 'none';
+                stopBtn.style.display       = '';
+                stopBtn.disabled = false;
+                stopBtn.innerHTML = '<i class="fas fa-stop me-1"></i>Stop';
+
+                counterEl.textContent = `0 / ${total}`;
+                okCountEl.textContent = '0';
+                errCountEl.textContent = '0';
+                barEl.style.width = '0%';
+
+                for (const id of queue) {
+                    if (stopFlag) break;
+                    currentEl.textContent = `Record #${id}`;
+
+                    const row = document.createElement('tr');
+                    row.innerHTML = `<td class="fw-semibold">#${id}</td>`
+                                  + `<td colspan="2" class="text-muted small">`
+                                  + `<i class="fas fa-spinner fa-spin me-1"></i>Grading…</td>`;
+                    bodyEl.prepend(row);
+
+                    try {
+                        const res  = await fetch(`/grade_condition/${id}`, {
+                            method:  'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body:    JSON.stringify({ mode }),
+                        });
+                        const data = await res.json();
+                        if (data.status === 'success') {
+                            ok++;
+                            const g = data.grading || {};
+                            row.innerHTML = `<td class="fw-semibold">#${id}</td>`
+                                          + `<td>${badge(g.front)}</td>`
+                                          + `<td>${badge(g.back)}</td>`;
+                        } else {
+                            err++;
+                            row.innerHTML = `<td class="fw-semibold">#${id}</td>`
+                                          + `<td colspan="2" class="text-danger small">`
+                                          + `<i class="fas fa-times-circle me-1"></i>${data.message || 'Failed'}</td>`;
+                        }
+                    } catch (e) {
+                        err++;
+                        row.innerHTML = `<td class="fw-semibold">#${id}</td>`
+                                      + `<td colspan="2" class="text-danger small">`
+                                      + `<i class="fas fa-times-circle me-1"></i>${e.message}</td>`;
+                    }
+
+                    done++;
+                    counterEl.textContent  = `${done} / ${total}`;
+                    okCountEl.textContent  = ok;
+                    errCountEl.textContent = err;
+                    barEl.style.width      = `${Math.round((done / total) * 100)}%`;
+                }
+
+                // Finished (or stopped)
+                runningBox.style.display = 'none';
+                doneBox.style.display    = '';
+                const stoppedNote = stopFlag ? ' (stopped early)' : '';
+                doneMsg.innerHTML = `<i class="fas fa-check-circle me-1"></i>`
+                                  + `Graded <strong>${ok}</strong> card${ok !== 1 ? 's' : ''}`
+                                  + (err ? `, <strong>${err}</strong> error${err !== 1 ? 's' : ''}` : '')
+                                  + `${stoppedNote}. Open a card's detail page to see its saved condition.`;
+                stopBtn.style.display  = 'none';
+                closeBtn.style.display = '';
+            });
+        })();
+
         // ====================== FINALIZED INLINE TOGGLE ======================
         document.addEventListener('change', async function (e) {
             const cb = e.target.closest('.finalized-toggle');
@@ -1439,6 +1820,93 @@
             }
         });
 
+        // ====================== HIDDEN FIELD INLINE EDIT / CLEAR ======================
+        // Only reachable when "Show Hidden Fields" is on (the cells are display:none
+        // otherwise), letting a hidden field's value be corrected or wiped without
+        // opening the record — the value itself is never removed from storage, just
+        // set back to blank, so the field stays available for later reference.
+        function startHiddenFieldEdit(cell) {
+            if (cell.querySelector('input.hf-edit-input')) return; // already editing
+            const wrap    = cell.querySelector('.hf-cell-inline');
+            const valSpan = cell.querySelector('.hf-value');
+            const recordId = cell.dataset.recordId;
+            const fieldKey = cell.dataset.entryField;
+            const original  = valSpan.textContent;
+
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.className = 'hf-edit-input';
+            input.value = original;
+            wrap.insertBefore(input, valSpan);
+            valSpan.style.display = 'none';
+            input.focus();
+            input.select();
+
+            let settled = false;
+            async function commit(newValue) {
+                if (settled) return;
+                settled = true;
+                if (newValue === original) { cancel(); return; }
+                try {
+                    const res = await fetch(`/update_scan/${recordId}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ extracted_data: { [fieldKey]: newValue } }),
+                    });
+                    const data = await res.json();
+                    if (data.status === 'success') {
+                        valSpan.textContent = newValue;
+                    }
+                } catch (err) {
+                    console.error('Failed to save hidden field value:', err);
+                }
+                cleanup();
+            }
+            function cancel() {
+                settled = true;
+                cleanup();
+            }
+            function cleanup() {
+                input.remove();
+                valSpan.style.display = '';
+            }
+
+            input.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter') { e.preventDefault(); commit(input.value.trim()); }
+                if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+            });
+            input.addEventListener('blur', function () { commit(input.value.trim()); });
+        }
+
+        document.addEventListener('click', function (e) {
+            const editTrigger = e.target.closest('.hf-value, .hf-edit-btn');
+            if (editTrigger) {
+                const cell = editTrigger.closest('td.hidden-field-cell');
+                if (cell) startHiddenFieldEdit(cell);
+                return;
+            }
+
+            const clearBtn = e.target.closest('.hf-clear-btn');
+            if (clearBtn) {
+                const cell = clearBtn.closest('td.hidden-field-cell');
+                if (!cell) return;
+                const fieldKey  = cell.dataset.entryField;
+                const recordId  = cell.dataset.recordId;
+                const valSpan   = cell.querySelector('.hf-value');
+                if (!confirm(`Clear the value of "${toLabel(fieldKey)}" for this entry? The field stays on the record, just emptied.`)) return;
+                fetch(`/update_scan/${recordId}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ extracted_data: { [fieldKey]: '' } }),
+                })
+                    .then(res => res.json())
+                    .then(data => {
+                        if (data.status === 'success' && valSpan) valSpan.textContent = '';
+                    })
+                    .catch(err => console.error('Failed to clear hidden field value:', err));
+            }
+        });
+
         // ====================== EXPORT CSV ======================
         document.getElementById('exportCsvBtn')?.addEventListener('click', function () {
             // Collect the currently VISIBLE column keys from the table headers.
@@ -1466,6 +1934,7 @@
                 album:    activeFilters.album    || '',
                 template: activeFilters.template || '',
                 columns:  visibleCols.join(','),
+                catalog:  activeFilters.catalog  || '',
             });
             // Strip blank params for cleaner URLs
             for (const [k, v] of [...params.entries()]) {
@@ -1484,7 +1953,7 @@
         // Uses filter_options so it shows ALL games, not just the current page
         async function populateGameSelect() {
             try {
-                const res  = await fetch('/inventory/filter_options');
+                const res  = await fetch('/inventory/filter_options' + (CATALOG_VIEW ? '?catalog=1' : ''));
                 const data = await res.json();
                 gameSelect.innerHTML = '<option value="">Select a Game...</option>';
                 data.games.forEach(game => {
@@ -1512,7 +1981,9 @@
             if (!selectedGame) { alert('Please select a Game.'); return; }
             if (!key || !value) { alert('Please fill in both Field Name and Value.'); return; }
 
-            const confirmed = confirm(`Add "${key}: ${value}" to ALL records with Game "${selectedGame}"?`);
+            const confirmed = confirm(
+                `Add "${key}: ${value}" to ALL ${CATALOG_VIEW ? 'imported catalog' : 'inventory'} records with Game "${selectedGame}"?`
+            );
             if (!confirmed) return;
 
             try {
@@ -1521,7 +1992,9 @@
                     headers: { 'Content-Type': 'application/json' },
                     // Sends game name so the server finds all matching records itself —
                     // avoids the old bug where only the current page's IDs were collected.
-                    body: JSON.stringify({ game: selectedGame, key, value })
+                    // catalog_only keeps the match scoped to this same view (hidden catalog
+                    // rows vs. real inventory rows) so it can't spill across the two.
+                    body: JSON.stringify({ game: selectedGame, key, value, catalog_only: CATALOG_VIEW })
                 });
 
                 const data = await response.json();
@@ -1575,8 +2048,12 @@
 
             // Apply visibility for ALL dynamic entry columns (by data-col / data-entry-field).
             // OCR meta fields (e.g. name__ocr_conf) are always force-hidden.
+            // Hidden template fields are force-hidden unless the "Show Hidden
+            // Fields" switch is on, regardless of any per-column preference.
             ALL_DYNAMIC_COLS.forEach(({ key, fieldKey }) => {
-                const hide = hiddenSet.has(key) || isOcrMetaField(fieldKey);
+                const hide = hiddenSet.has(key)
+                    || isOcrMetaField(fieldKey)
+                    || (isHiddenTemplateField(fieldKey) && !showHiddenFields);
                 const th = table.querySelector(`thead th[data-col="${CSS.escape(key)}"]`);
                 if (th) th.style.display = hide ? 'none' : '';
                 table.querySelectorAll(`tbody td[data-entry-field="${CSS.escape(fieldKey)}"]`).forEach(td => {
@@ -1589,6 +2066,10 @@
             const bar = document.getElementById('colToggleBar');
             if (!bar) return;
             bar.innerHTML = '';
+
+            // Recompute in case showHiddenFields changed since the last build.
+            DYNAMIC_TOGGLEABLE_COLS = buildDynamicToggleableCols();
+            TOGGLEABLE_COLS = [...STATIC_TOGGLEABLE_COLS, ...DYNAMIC_TOGGLEABLE_COLS];
 
             // TOGGLEABLE_COLS already excludes OCR meta fields
             TOGGLEABLE_COLS.forEach(({ key, label }) => {
@@ -1654,6 +2135,7 @@
                 page:     '1',   // always reset to page 1 on sort change
                 sort:     colKey,
                 sort_dir: newDir,
+                catalog:  activeFilters.catalog  || '',
             });
             for (const [k, v] of [...params.entries()]) {
                 if (!v) params.delete(k);
@@ -1899,6 +2381,7 @@
                     page:     '1',
                     sort:     col,
                     sort_dir: dir,
+                    catalog:  activeFilters.catalog  || '',
                 });
                 for (const [k, v] of [...params.entries()]) { if (!v) params.delete(k); }
                 window.location.href = '/inventory?' + params.toString();
@@ -2009,6 +2492,29 @@
                 });
             });
         }
+
+        // ── Show Hidden Fields switch ──────────────────────────────────────────
+        (function initHiddenFieldsSwitch() {
+            const wrap   = document.getElementById('hiddenFieldsSwitchWrap');
+            const toggle = document.getElementById('showHiddenFieldsToggle');
+            if (!wrap || !toggle) return;
+
+            // Nothing to show for this game — don't clutter the toolbar.
+            if (!HIDDEN_TEMPLATE_FIELD_KEYS.length) {
+                wrap.style.display = 'none';
+                return;
+            }
+
+            toggle.checked = showHiddenFields;
+
+            toggle.addEventListener('change', function () {
+                showHiddenFields = this.checked;
+                saveShowHiddenFields(showHiddenFields);
+                const hidden = loadHiddenCols();
+                buildColToggles(hidden);
+                applyColVisibility(hidden);
+            });
+        })();
 
         // ── Init column visibility + resize ─────────────────────────────────────
         (function initCols() {

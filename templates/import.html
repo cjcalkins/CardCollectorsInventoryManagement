@@ -150,6 +150,97 @@
       gap: 12px;
     }
 
+    .hidden { display: none !important; }
+    .mt-1 { margin-top: 6px; }
+
+    .mode-toggle {
+      display: flex;
+      gap: 8px;
+    }
+    .mode-toggle label {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      background: white;
+    }
+    .mode-toggle input { margin: 0; }
+    .mode-toggle label.active {
+      background: #111827;
+      color: #fff;
+      border-color: #111827;
+    }
+
+    .new-field-row {
+      display: grid;
+      grid-template-columns: 1fr 130px 1fr auto auto;
+      gap: 8px;
+      align-items: center;
+      padding: 8px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .mapping-row {
+      display: grid;
+      grid-template-columns: 1fr 130px 1fr auto;
+      gap: 8px;
+      align-items: center;
+      padding: 8px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .new-field-row:last-child,
+    .mapping-row:last-child { border-bottom: none; }
+    .new-field-row .field-opts,
+    .mapping-row .field-opts { display: none; }
+    .new-field-row.type-dropdown .field-opts { display: block; }
+
+    .field-hidden-toggle {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--muted);
+      white-space: nowrap;
+      cursor: pointer;
+      user-select: none;
+    }
+    .field-hidden-toggle input { margin: 0; cursor: pointer; }
+
+    .mapping-row .mapping-field-label {
+      font-size: 14px;
+      font-weight: 700;
+    }
+    .mapping-row .mapping-field-type {
+      font-size: 11px;
+      text-transform: uppercase;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .mapping-row .hidden-field-badge {
+      display: inline-block;
+      margin-left: 6px;
+      font-size: 10px;
+      text-transform: uppercase;
+      font-weight: 700;
+      color: #92400e;
+      background: #fef3c7;
+      border-radius: 4px;
+      padding: 1px 5px;
+    }
+
+    @media (max-width: 640px) {
+      .new-field-row, .mapping-row {
+        grid-template-columns: 1fr;
+      }
+    }
+
     .slider-group {
       display: grid;
       gap: 10px;
@@ -260,6 +351,64 @@
       background: #fee2e2;
       color: #991b1b;
       border: 1px solid #fecaca;
+    }
+
+    .pdf-batch-bar {
+      display: none;
+      grid-template-columns: 1fr auto auto;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      background: #eef2ff;
+      border: 1px solid #c7d2fe;
+      margin-top: 4px;
+    }
+
+    .pdf-batch-bar.show {
+      display: grid;
+    }
+
+    .pdf-batch-info {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .pdf-batch-title {
+      font-size: 13px;
+      font-weight: 700;
+      color: #3730a3;
+    }
+
+    .pdf-batch-sub {
+      font-size: 12px;
+      color: #4338ca;
+    }
+
+    .pdf-side-pill {
+      font-size: 12px;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: #4338ca;
+      color: white;
+      white-space: nowrap;
+    }
+
+    .pdf-side-pill.back {
+      background: #7c3aed;
+    }
+
+    .btn-pdf-exit {
+      background: #e0e7ff;
+      color: #3730a3;
+      padding: 8px 12px;
+      font-size: 12px;
+    }
+
+    .btn-pdf-exit:hover:not(:disabled) {
+      background: #c7d2fe;
     }
 
     .preview-wrap {
@@ -571,29 +720,118 @@
           </a>
           <div class="nav-tabs-minimal">
               <a href="{{ url_for('import_page') }}" class="nav-tab active">Import</a>
-              <a href="{{ url_for('index') }}"        class="nav-tab">Scan</a>
+              <a href="{{ url_for('index') }}"        class="nav-tab">Templates</a>
               <a href="{{ url_for('inventory') }}"    class="nav-tab">Inventory</a>
               <a href="{{ url_for('albums_list') }}"  class="nav-tab">Album</a>
+              <a href="{{ url_for('shops_page') }}"   class="nav-tab">Shops</a>
               <a href="{{ url_for('search_by_image_page') }}" class="nav-tab" title="Search by photo"><i class="fas fa-camera"></i></a>
 </div>
       </div>
   </nav>
 
   <main class="page">
+    <section class="panel" style="margin-bottom: 24px;">
+      <div class="panel-header">Import CSV Catalog</div>
+      <div class="panel-body">
+        <form id="csvImportForm" class="stack">
+          <div class="field">
+            <label for="csvFile">CSV file</label>
+            <input type="file" id="csvFile" name="csv_file" accept=".csv,text/csv" required>
+            <div class="hint">
+              These rows are added as a <strong>hidden card catalog</strong> for one Game — they
+              will <strong>not</strong> appear in Inventory, Albums, or CSV export. Instead, open
+              any inventory entry and use its <strong>Copy from Entry</strong> box to search this
+              catalog and pull in its fields with one click. If your CSV covers more than one
+              game, filter it down first or run the import once per game.
+            </div>
+          </div>
+
+          <div class="field">
+            <label>Template</label>
+            <div class="mode-toggle">
+              <label id="modeExistingLabel" class="active">
+                <input type="radio" name="template_mode" value="existing" checked>Use existing game
+              </label>
+              <label id="modeNewLabel">
+                <input type="radio" name="template_mode" value="new">Create new game
+              </label>
+            </div>
+          </div>
+
+          <!-- ── Existing game picker ── -->
+          <div class="field" id="existingGameField">
+            <label for="csvTemplateSelect">Game</label>
+            <select id="csvTemplateSelect">
+              <option value="" disabled {% if not templates %}selected{% endif %}>Select a game…</option>
+              {% for t in templates %}
+              <option value="{{ t }}">{{ t.replace('_', ' ')|title }}</option>
+              {% endfor %}
+            </select>
+            {% if not templates %}
+            <div class="hint">No games defined yet — create one below, or on the <a href="{{ url_for('index') }}">Templates</a> page.</div>
+            {% endif %}
+          </div>
+
+          <!-- ── New game builder (hidden unless "Create new game" is picked) ── -->
+          <div class="field hidden" id="newGameField">
+            <label for="newGameName">New game name</label>
+            <input type="text" id="newGameName" placeholder="e.g. Pokemon">
+            <div id="newFieldsContainer" class="mt-1"></div>
+            <button type="button" class="btn-secondary" id="addNewFieldBtn" style="justify-self: start;">+ Add Field</button>
+          </div>
+
+          <!-- ── Column mapping ── -->
+          <div class="field hidden" id="mappingField">
+            <label>Map CSV columns to fields</label>
+            <div class="hint" id="mappingHint">Choose a game and a CSV file to map columns.</div>
+            <div id="mappingContainer"></div>
+          </div>
+
+          <div class="actions">
+            <button type="submit" class="btn-primary" id="csvImportBtn">Import CSV</button>
+            <a href="{{ url_for('inventory') }}" class="btn-secondary" style="text-decoration:none; display:inline-flex; align-items:center;">View Inventory</a>
+          </div>
+          <div id="csvStatusBox" class="status info"></div>
+        </form>
+      </div>
+    </section>
+
     <div class="layout">
       <section class="panel">
         <div class="panel-header">Import Settings</div>
         <div class="panel-body">
           <form id="importForm" class="stack">
             <div class="field">
-              <label for="image">Image</label>
-              <input type="file" id="image" name="image" accept="image/*" required>
+              <label for="image">Image or PDF</label>
+              <input type="file" id="image" name="image" accept="image/*,.pdf,application/pdf" required>
+              <div class="hint">You can select a single 9-pocket page image, or a multi-page PDF. For a PDF, page 1 is treated as the front of the page, page 2 as its back, page 3 as the next page's front, page 4 its back, and so on — each pair is loaded here one after another.</div>
+            </div>
+
+            <!-- Hidden side field, driven automatically by the PDF batch queue.
+                 Defaults to "front" for ordinary single-image uploads. -->
+            <input type="hidden" id="side" name="side" value="front">
+
+            <div id="pdfBatchBar" class="pdf-batch-bar">
+              <div class="pdf-batch-info">
+                <div class="pdf-batch-title" id="pdfBatchTitle">PDF batch: pair 1 of 1</div>
+                <div class="pdf-batch-sub" id="pdfBatchSub">Page 1</div>
+              </div>
+              <span class="pdf-side-pill" id="pdfSidePill">Front</span>
+              <button type="button" class="btn-pdf-exit" id="pdfExitBtn">Exit PDF Batch</button>
             </div>
 
             <div class="grid-2">
               <div class="field">
                 <label for="game">Game</label>
-                <input type="text" id="game" name="game" placeholder="pokemon" required>
+                <select id="game" name="game" required>
+                  <option value="" disabled {% if not templates %}selected{% endif %}>Select a game…</option>
+                  {% for t in templates %}
+                  <option value="{{ t }}">{{ t.replace('_', ' ')|title }}</option>
+                  {% endfor %}
+                </select>
+                {% if not templates %}
+                <div class="hint">No games defined yet — <a href="{{ url_for('index') }}">create one</a> first.</div>
+                {% endif %}
               </div>
               <div class="field">
                 <label for="album">Album</label>
@@ -605,14 +843,6 @@
               <div class="field">
                 <label for="page">Page</label>
                 <input type="number" id="page" name="page" min="1" step="1" placeholder="1" required>
-              </div>
-              <div class="field">
-                <label for="template">OCR Template</label>
-                <select id="template" name="template">
-                  {% for t in templates %}
-                  <option value="{{ t }}">{{ t.replace('_', ' ')|title }}</option>
-                  {% endfor %}
-                </select>
               </div>
             </div>
 
@@ -635,27 +865,8 @@
               </div>
             </div>
 
-            <div class="slider-group">
-              <div class="field">
-                <label for="cannylow">Canny Low</label>
-                <input type="number" id="cannylow" name="cannylow" value="50" min="1" max="500">
-              </div>
-              <div class="field">
-                <label for="cannyhigh">Canny High</label>
-                <input type="number" id="cannyhigh" name="cannyhigh" value="200" min="1" max="500">
-              </div>
-              <div class="field">
-                <label for="approxeps">Approx EPS</label>
-                <input type="number" id="approxeps" name="approxeps" value="0.021" min="0.001" max="1" step="0.005">
-              </div>
-              <div class="field">
-                <label for="minareapct">Min Area %</label>
-                <input type="number" id="minareapct" name="minareapct" value="0.051" min="0.001" max="1" step="0.005">
-              </div>
-            </div>
-
             <div class="hint">
-              Upload one 9-pocket page image, adjust the red cut lines, auto-align the detected cards, review any of the 9 results, manually correct corners when needed, and then send all 9 aligned cards through the selected OCR ROI template into inventory.
+              Upload one 9-pocket page image, adjust the red cut lines, straighten the 9 split images, review any of the results, manually correct corners when needed, and then send all 9 aligned cards into inventory as blank entries for the selected Game.
             </div>
 
             <div class="actions">
@@ -691,11 +902,11 @@
 
         <div class="ocr-panel">
           <div class="ocr-head">
-            <div class="ocr-title">Batch OCR Import</div>
-            <button type="button" class="btn-ocr" id="runBatchOcrBtn" disabled>Send 9 aligned cards to OCR import</button>
+            <div class="ocr-title">Batch Import</div>
+            <button type="button" class="btn-ocr" id="runBatchOcrBtn" disabled>Send 9 aligned cards to inventory</button>
           </div>
           <div class="hint">
-            This button stays disabled until all 9 card tiles are aligned. When clicked, it sends the 9 processed filenames plus the selected template to the batch OCR route, which creates one inventory record per card.
+            This button stays disabled until all 9 card tiles are aligned. When clicked, it sends the 9 processed filenames plus the selected Game to the batch import route, which creates one blank inventory record per card, ready to fill in by hand.
           </div>
           <div id="ocrResults" class="ocr-results"></div>
         </div>
@@ -703,11 +914,11 @@
     </div>
   </main>
 
-  <!-- OCR Progress Overlay -->
+  <!-- Import Progress Overlay -->
   <div id="ocrProgressOverlay">
     <div class="ocr-progress-dialog">
-      <div class="ocr-progress-icon">🔍</div>
-      <div class="ocr-progress-title">Running OCR Import</div>
+      <div class="ocr-progress-icon">📥</div>
+      <div class="ocr-progress-title">Adding Cards to Inventory</div>
       <div id="ocrProgressSub" class="ocr-progress-sub">Preparing cards…</div>
       <div class="ocr-progress-track">
         <div id="ocrProgressFill" class="ocr-progress-fill"></div>
@@ -743,8 +954,354 @@
   </div>
 
   <script>
+    // ====================== CSV IMPORT ======================
+    const csvImportForm     = document.getElementById('csvImportForm');
+    const csvFileInput      = document.getElementById('csvFile');
+    const csvStatusBox      = document.getElementById('csvStatusBox');
+    const csvImportBtn      = document.getElementById('csvImportBtn');
+
+    const modeExistingLabel = document.getElementById('modeExistingLabel');
+    const modeNewLabel      = document.getElementById('modeNewLabel');
+    const existingGameField = document.getElementById('existingGameField');
+    const newGameField      = document.getElementById('newGameField');
+    const csvTemplateSelect = document.getElementById('csvTemplateSelect');
+    const newGameName       = document.getElementById('newGameName');
+    const newFieldsContainer = document.getElementById('newFieldsContainer');
+    const addNewFieldBtn    = document.getElementById('addNewFieldBtn');
+    const mappingField      = document.getElementById('mappingField');
+    const mappingHint       = document.getElementById('mappingHint');
+    const mappingContainer  = document.getElementById('mappingContainer');
+
+    let csvHeaders = [];              // headers from the uploaded CSV
+    let existingTemplateFields = {};  // cache: { gameName: [ {key, field_type, dropdown_options}, ... ] }
+    let existingTemplateMapping = {}; // cache: { gameName: { fieldKey: "Saved Column Name" } }
+
+    function setCsvStatus(message, type = 'info') {
+      csvStatusBox.textContent = message;
+      csvStatusBox.className = `status show ${type}`;
+    }
+
+    // ── Mode toggle (existing game vs. create new game) ─────────────────
+    function currentTemplateMode() {
+      const checked = csvImportForm.querySelector('input[name="template_mode"]:checked');
+      return checked ? checked.value : 'existing';
+    }
+
+    function updateModeUI() {
+      const mode = currentTemplateMode();
+      modeExistingLabel.classList.toggle('active', mode === 'existing');
+      modeNewLabel.classList.toggle('active', mode === 'new');
+      existingGameField.classList.toggle('hidden', mode !== 'existing');
+      newGameField.classList.toggle('hidden', mode !== 'new');
+      updateMappingUI();
+    }
+
+    csvImportForm.querySelectorAll('input[name="template_mode"]').forEach(input => {
+      input.addEventListener('change', updateModeUI);
+    });
+
+    // ── New-game inline field builder (mirrors the Templates page) ──────
+    function addNewFieldRow(name = '', fieldType = 'text', dropdownOptions = [], hidden = false) {
+      const row = document.createElement('div');
+      row.className = 'new-field-row' + (fieldType === 'dropdown' ? ' type-dropdown' : '');
+      row.innerHTML = `
+        <input type="text" class="new-field-name" placeholder="Field name (e.g. set_number)" value="${name.replace(/"/g, '&quot;')}">
+        <select class="new-field-type">
+          <option value="text"     ${fieldType === 'text' ? 'selected' : ''}>Text</option>
+          <option value="dropdown" ${fieldType === 'dropdown' ? 'selected' : ''}>Dropdown</option>
+          <option value="boolean"  ${fieldType === 'boolean' ? 'selected' : ''}>Yes / No</option>
+        </select>
+        <input type="text" class="field-opts" placeholder="Options, comma separated" value="${dropdownOptions.join(', ').replace(/"/g, '&quot;')}">
+        <label class="field-hidden-toggle" title="Stored on every record, but left off the Inventory Detail page">
+          <input type="checkbox" class="new-field-hidden" ${hidden ? 'checked' : ''}>
+          Hidden
+        </label>
+        <button type="button" class="btn-danger remove-new-field-btn" title="Remove field">✕</button>
+      `;
+      row.querySelector('.new-field-type').addEventListener('change', function () {
+        row.classList.toggle('type-dropdown', this.value === 'dropdown');
+        updateMappingUI();
+      });
+      row.querySelector('.remove-new-field-btn').addEventListener('click', function () {
+        row.remove();
+        updateMappingUI();
+      });
+      row.querySelector('.new-field-name').addEventListener('input', updateMappingUI);
+      row.querySelector('.new-field-hidden').addEventListener('change', updateMappingUI);
+      newFieldsContainer.appendChild(row);
+    }
+
+    addNewFieldBtn.addEventListener('click', () => { addNewFieldRow(); updateMappingUI(); });
+    newGameName.addEventListener('input', updateMappingUI);
+    addNewFieldRow(); // start with one blank row
+
+    function slugifyFieldName(name) {
+      return name.trim().toLowerCase().replace(/ /g, '_').replace(/[^a-z0-9_]/g, '');
+    }
+
+    function collectNewFields() {
+      const fields = [];
+      const rawFields = {};
+      newFieldsContainer.querySelectorAll('.new-field-row').forEach(row => {
+        const rawName = row.querySelector('.new-field-name').value.trim();
+        const key = slugifyFieldName(rawName);
+        if (!key) return;
+        const fieldType = row.querySelector('.new-field-type').value;
+        const isHidden = row.querySelector('.new-field-hidden').checked;
+        const entry = { field_type: fieldType, hidden: isHidden };
+        if (fieldType === 'dropdown') {
+          entry.dropdown_options = row.querySelector('.field-opts').value
+            .split(',').map(o => o.trim()).filter(Boolean);
+        }
+        fields.push({ key, field_type: fieldType, dropdown_options: entry.dropdown_options || [], hidden: isHidden });
+        rawFields[key] = entry;
+      });
+      return { fields, rawFields };
+    }
+
+    // ── Existing-game fields, fetched from the server on selection ──────
+    // Also called once on page load below: browsers auto-select the first
+    // non-disabled <option> in a <select> when nothing has the `selected`
+    // attribute, so a game can already be "selected" on load without the
+    // person ever touching the dropdown — and thus without a `change`
+    // event ever firing. Without this, that pre-selected game's fields
+    // never get fetched and the mapping list silently stays empty.
+    async function loadExistingGameFields(name) {
+      if (!name) { updateMappingUI(); return; }
+      if (!existingTemplateFields[name]) {
+        mappingHint.textContent = 'Loading fields…';
+        mappingField.classList.remove('hidden');
+        try {
+          const res = await fetch(`/template_config/${encodeURIComponent(name)}`);
+          const data = await res.json();
+          existingTemplateFields[name] = Object.entries(data).map(([key, cfg]) => ({
+            key,
+            field_type: cfg.field_type || 'text',
+            dropdown_options: cfg.dropdown_options || [],
+            hidden: !!cfg.hidden,
+          }));
+        } catch (err) {
+          console.error(err);
+          existingTemplateFields[name] = [];
+        }
+      }
+      if (!existingTemplateMapping[name]) {
+        try {
+          const res = await fetch(`/template_csv_mapping/${encodeURIComponent(name)}`);
+          const data = await res.json();
+          existingTemplateMapping[name] = data.mapping || {};
+        } catch (err) {
+          console.error(err);
+          existingTemplateMapping[name] = {};
+        }
+      }
+      updateMappingUI();
+    }
+
+    csvTemplateSelect.addEventListener('change', function () {
+      loadExistingGameFields(this.value);
+    });
+
+    // ── CSV header detection ─────────────────────────────────────────────
+    csvFileInput.addEventListener('change', async function () {
+      const file = this.files && this.files[0];
+      csvHeaders = [];
+      if (!file) { updateMappingUI(); return; }
+
+      mappingHint.textContent = 'Reading CSV headers…';
+      mappingField.classList.remove('hidden');
+
+      const fd = new FormData();
+      fd.append('csv_file', file);
+      try {
+        const res = await fetch('/csv_headers', { method: 'POST', body: fd });
+        const data = await res.json();
+        if (res.ok && data.status === 'success') {
+          csvHeaders = data.headers || [];
+        } else {
+          setCsvStatus(data.message || 'Could not read CSV headers.', 'error');
+        }
+      } catch (err) {
+        console.error(err);
+        setCsvStatus('Could not read CSV headers.', 'error');
+      }
+      updateMappingUI();
+    });
+
+    // ── Best-effort auto-match of a field key to a CSV header ────────────
+    function normalizeForMatch(s) {
+      return s.toLowerCase().replace(/[^a-z0-9]/g, '');
+    }
+    function guessHeaderForField(fieldKey, headers) {
+      const target = normalizeForMatch(fieldKey);
+      return headers.find(h => normalizeForMatch(h) === target) || '';
+    }
+
+    function currentFields() {
+      return currentTemplateMode() === 'new'
+        ? collectNewFields().fields
+        : (existingTemplateFields[csvTemplateSelect.value] || []);
+    }
+
+    function updateMappingUI() {
+      const fields = currentFields();
+
+      if (!fields.length || !csvHeaders.length) {
+        mappingContainer.innerHTML = '';
+        mappingHint.textContent = !csvHeaders.length
+          ? 'Choose a CSV file to map columns.'
+          : 'Choose (or create) a game with at least one field to map columns.';
+        mappingField.classList.toggle('hidden', !(fields.length || csvHeaders.length));
+        return;
+      }
+
+      mappingField.classList.remove('hidden');
+
+      const savedMapping = currentTemplateMode() === 'existing'
+        ? (existingTemplateMapping[csvTemplateSelect.value] || {})
+        : {};
+      const hasSavedMapping = Object.keys(savedMapping).length > 0;
+      mappingHint.textContent = hasSavedMapping
+        ? 'Columns were auto-filled from the last CSV imported into this game — adjust anything that doesn\'t match.'
+        : 'Pick which CSV column fills each field. Leave a field unmapped to skip it.';
+
+      // Preserve any selections the person already made where possible.
+      const previous = {};
+      mappingContainer.querySelectorAll('.mapping-row').forEach(row => {
+        previous[row.dataset.fieldKey] = row.querySelector('select').value;
+      });
+
+      mappingContainer.innerHTML = '';
+      fields.forEach(f => {
+        const row = document.createElement('div');
+        row.className = 'mapping-row';
+        row.dataset.fieldKey = f.key;
+
+        let preselected;
+        if (previous[f.key] !== undefined) {
+          preselected = previous[f.key];
+        } else if (savedMapping[f.key] && csvHeaders.includes(savedMapping[f.key])) {
+          preselected = savedMapping[f.key];
+        } else {
+          preselected = guessHeaderForField(f.key, csvHeaders);
+        }
+
+        const options = ['<option value="">— Leave unmapped —</option>']
+          .concat(csvHeaders.map(h => `<option value="${h.replace(/"/g, '&quot;')}" ${h === preselected ? 'selected' : ''}>${h}</option>`));
+
+        row.innerHTML = `
+          <span class="mapping-field-label">${f.key}${f.hidden ? '<span class="hidden-field-badge">Hidden</span>' : ''}</span>
+          <span class="mapping-field-type">${f.field_type}</span>
+          <select>${options.join('')}</select>
+        `;
+        mappingContainer.appendChild(row);
+      });
+    }
+
+    function collectMapping() {
+      const mapping = {};
+      mappingContainer.querySelectorAll('.mapping-row').forEach(row => {
+        mapping[row.dataset.fieldKey] = row.querySelector('select').value;
+      });
+      return mapping;
+    }
+
+    function resetCsvForm() {
+      csvImportForm.reset();
+      csvHeaders = [];
+      newFieldsContainer.innerHTML = '';
+      addNewFieldRow();
+      mappingContainer.innerHTML = '';
+      updateModeUI();
+    }
+
+    if (csvImportForm) {
+      csvImportForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const file = csvFileInput.files[0];
+        if (!file) return;
+
+        const mode = currentTemplateMode();
+        const mapping = collectMapping();
+        const mappedCount = Object.values(mapping).filter(Boolean).length;
+        if (mappedCount === 0) {
+          setCsvStatus('Map at least one field to a CSV column.', 'error');
+          return;
+        }
+
+        const formData = new FormData();
+        formData.append('csv_file', file);
+        formData.append('template_mode', mode);
+        formData.append('mapping', JSON.stringify(mapping));
+
+        if (mode === 'new') {
+          const name = newGameName.value.trim();
+          if (!name) { setCsvStatus('New game name is required.', 'error'); return; }
+          const { rawFields } = collectNewFields();
+          if (Object.keys(rawFields).length === 0) { setCsvStatus('Add at least one field to the new game.', 'error'); return; }
+          formData.append('new_template_name', name);
+          formData.append('new_template_fields', JSON.stringify(rawFields));
+        } else {
+          if (!csvTemplateSelect.value) { setCsvStatus('Select a game to import into.', 'error'); return; }
+          formData.append('template_name', csvTemplateSelect.value);
+        }
+
+        csvImportBtn.disabled = true;
+        setCsvStatus('Importing CSV…', 'info');
+
+        try {
+          const res = await fetch('/import_csv', { method: 'POST', body: formData });
+          const data = await res.json();
+
+          if (!res.ok || data.status !== 'success') {
+            setCsvStatus('Import failed: ' + (data.message || 'Unknown error'), 'error');
+            return;
+          }
+
+          const gamesList = data.games && data.games.length ? data.games.join(', ') : '—';
+          let msg = `Added ${data.records_created} card(s) to the hidden catalog from ${data.rows_seen} row(s).`;
+          if (data.rows_skipped > 0) {
+            msg += ` Skipped ${data.rows_skipped} row(s) with no mapped data.`;
+          }
+          msg += `\nGame: ${gamesList}`;
+          msg += `\nThe column mapping used here has been saved to this game, so it'll auto-fill next time.`;
+          msg += `\nThese won't show in Inventory — use "Copy from Entry" on any inventory entry to pull fields from them.`;
+          setCsvStatus(msg, 'success');
+
+          // Drop cached fields/mapping for this game so they're re-fetched
+          // fresh (they may have just changed as a result of this import).
+          (data.games || []).forEach(g => {
+            delete existingTemplateFields[g];
+            delete existingTemplateMapping[g];
+          });
+
+          if (mode === 'new') {
+            // The new game needs to appear in the "existing game" dropdowns
+            // on this page (and the Templates page) — reload to pick it up.
+            setTimeout(() => window.location.reload(), 600);
+          } else {
+            resetCsvForm();
+          }
+        } catch (err) {
+          console.error('CSV import error:', err);
+          setCsvStatus('Import failed. Please try again.', 'error');
+        } finally {
+          csvImportBtn.disabled = false;
+        }
+      });
+    }
+
+    updateModeUI();
+
+    // Prime the mapping list for whichever game the browser auto-selected
+    // on load (see comment on loadExistingGameFields above) — otherwise the
+    // mapping UI can stay empty even though a real game is already chosen.
+    if (currentTemplateMode() === 'existing' && csvTemplateSelect.value) {
+      loadExistingGameFields(csvTemplateSelect.value);
+    }
+
     const imageInput = document.getElementById('image');
-    const templateSelect = document.getElementById('template');
+    const templateSelect = document.getElementById('game');
     const form = document.getElementById('importForm');
     const statusBox = document.getElementById('statusBox');
     const resultsGrid = document.getElementById('resultsGrid');
@@ -777,6 +1334,152 @@
     let manualFilename = null;
     let manualPoints = [];
     let manualScale = 1;
+
+    // ── PDF batch state ─────────────────────────────────────────────────
+    const sideField = document.getElementById('side');
+    const pageInput = document.getElementById('page');
+    const pdfBatchBar = document.getElementById('pdfBatchBar');
+    const pdfBatchTitle = document.getElementById('pdfBatchTitle');
+    const pdfBatchSub = document.getElementById('pdfBatchSub');
+    const pdfSidePill = document.getElementById('pdfSidePill');
+    const pdfExitBtn = document.getElementById('pdfExitBtn');
+
+    let pdfPairs = [];       // [{front: {index,filename,url}, back: {...}|null}]
+    let pdfPairIndex = 0;    // which pair we're on
+    let pdfSide = 'front';   // 'front' or 'back' — which half of the pair is loaded
+    let pdfBasePage = 1;     // page number assigned to pair 0
+    let pdfActive = false;
+
+    function isPdfFile(file) {
+      if (!file) return false;
+      if (file.type === 'application/pdf') return true;
+      return /\.pdf$/i.test(file.name || '');
+    }
+
+    function setImageInputFile(file) {
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      imageInput.files = dt.files;
+    }
+
+    async function urlToFile(url, filename, mimeType) {
+      const res = await fetch(url);
+      const blob = await res.blob();
+      return new File([blob], filename, { type: mimeType || blob.type || 'image/png' });
+    }
+
+    function resetPdfBatchState() {
+      pdfPairs = [];
+      pdfPairIndex = 0;
+      pdfSide = 'front';
+      pdfBasePage = 1;
+      pdfActive = false;
+      sideField.value = 'front';
+      pdfBatchBar.classList.remove('show');
+    }
+
+    function updatePdfBatchBar() {
+      if (!pdfActive) {
+        pdfBatchBar.classList.remove('show');
+        return;
+      }
+      pdfBatchBar.classList.add('show');
+      pdfBatchTitle.textContent = `PDF batch: pair ${pdfPairIndex + 1} of ${pdfPairs.length}`;
+      pdfBatchSub.textContent = `Page ${pdfBasePage + pdfPairIndex}`;
+      pdfSidePill.textContent = pdfSide === 'back' ? 'Back' : 'Front';
+      pdfSidePill.classList.toggle('back', pdfSide === 'back');
+    }
+
+    async function handlePdfSelected(file) {
+      resultsGrid.innerHTML = '';
+      ocrResults.innerHTML = '';
+      runBatchOcrBtn.disabled = true;
+      setStatus('Extracting pages from PDF…', 'info');
+
+      const fd = new FormData();
+      fd.append('pdf', file);
+
+      try {
+        const res = await fetch('/pdf_extract_pages', { method: 'POST', body: fd });
+        const data = await res.json();
+        if (!res.ok || data.status !== 'success') {
+          throw new Error(data.message || 'Could not extract PDF pages.');
+        }
+
+        const pages = data.pages || [];
+        if (!pages.length) throw new Error('PDF had no pages.');
+
+        pdfPairs = [];
+        for (let i = 0; i < pages.length; i += 2) {
+          pdfPairs.push({ front: pages[i], back: pages[i + 1] || null });
+        }
+        pdfPairIndex = 0;
+        pdfSide = 'front';
+        pdfBasePage = parseInt(pageInput.value, 10) || 1;
+        pdfActive = true;
+
+        setStatus(`Loaded ${pages.length} page(s) as ${pdfPairs.length} pair(s). Starting with pair 1, front.`, 'success');
+        await loadPdfCurrentImage();
+      } catch (err) {
+        console.error(err);
+        setStatus(err.message || 'PDF extraction failed.', 'error');
+        resetPdfBatchState();
+      }
+    }
+
+    async function loadPdfCurrentImage() {
+      if (!pdfActive) return;
+
+      if (pdfPairIndex >= pdfPairs.length) {
+        setStatus('PDF batch complete — all pairs processed.', 'success');
+        resetPdfBatchState();
+        window.location.reload();
+        return;
+      }
+
+      const pair = pdfPairs[pdfPairIndex];
+      const pageObj = pdfSide === 'back' ? pair.back : pair.front;
+
+      if (!pageObj) {
+        // Odd page count — this pair has no back page, move on to the next pair.
+        pdfPairIndex += 1;
+        pdfSide = 'front';
+        await loadPdfCurrentImage();
+        return;
+      }
+
+      updatePdfBatchBar();
+      pageInput.value = pdfBasePage + pdfPairIndex;
+      sideField.value = pdfSide;
+
+      resultsGrid.innerHTML = '';
+      ocrResults.innerHTML = '';
+      runBatchOcrBtn.disabled = true;
+      document.querySelector('.canvas-panel').style.display = '';
+
+      setStatus(`Loading pair ${pdfPairIndex + 1} of ${pdfPairs.length} — ${pdfSide} (PDF page ${pageObj.index})…`, 'info');
+
+      try {
+        const file = await urlToFile(pageObj.url, pageObj.filename, 'image/png');
+        setImageInputFile(file);
+        loadSelectedImage();
+      } catch (err) {
+        console.error(err);
+        setStatus('Could not load page image from PDF.', 'error');
+      }
+    }
+
+    function advancePdfBatch() {
+      if (!pdfActive) return;
+      if (pdfSide === 'front') {
+        pdfSide = 'back';
+      } else {
+        pdfSide = 'front';
+        pdfPairIndex += 1;
+      }
+      loadPdfCurrentImage();
+    }
+    // ─────────────────────────────────────────────────────────────────────
 
     function setStatus(message, type = 'info') {
       statusBox.textContent = message;
@@ -1087,7 +1790,7 @@
     function renderOcrResults(results) {
       ocrResults.innerHTML = '';
       if (!results || !results.length) {
-        ocrResults.innerHTML = '<div class="hint">No OCR results returned.</div>';
+        ocrResults.innerHTML = '<div class="hint">No import results returned.</div>';
         return;
       }
 
@@ -1095,9 +1798,6 @@
         const div = document.createElement('div');
         div.className = 'ocr-item';
         let topLine = `${item.filename} — ${item.status}`;
-        if (item.matched_product) {
-          topLine = `Match: ${item.matched_product}`;
-        }
         div.innerHTML = `
           <strong>${topLine}</strong>
           <div class="hint">${JSON.stringify(item.extracted, null, 2)}</div>
@@ -1142,21 +1842,25 @@
       const templateName = templateSelect.value;
 
       if (filenames.length !== 9) {
-        setStatus('All 9 cards must be aligned before OCR import can run.', 'error');
+        setStatus('All 9 cards must be aligned before import can run.', 'error');
+        return;
+      }
+      if (!templateName) {
+        setStatus('Select a Game before importing.', 'error');
         return;
       }
 
       runBatchOcrBtn.disabled = true;
-      runBatchOcrBtn.textContent = 'Running OCR...';
+      runBatchOcrBtn.textContent = 'Importing...';
       showOcrProgress();
-      setStatus('Running OCR import on all 9 aligned cards...', 'info');
+      setStatus('Adding all 9 aligned cards to inventory...', 'info');
 
       try {
-        // POST the filenames/template via fetch first so the server knows what
+        // POST the filenames/game via fetch first so the server knows what
         // to process, then open the SSE stream to receive per-card events.
         // Because EventSource only supports GET, we instead POST and stream
         // the response body directly as a ReadableStream.
-        const response = await fetch('/import_run_ocr_batch', {
+        const response = await fetch('/import_finalize_batch', {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
           body:    JSON.stringify({ template_name: templateName, filenames }),
@@ -1205,7 +1909,7 @@
               doneData = payload;
               break outer;
             } else if (eventType === 'error') {
-              throw new Error(payload.message || 'Batch OCR import failed.');
+              throw new Error(payload.message || 'Batch import failed.');
             }
           }
         }
@@ -1213,23 +1917,41 @@
         if (!doneData) throw new Error('Stream ended without a completion event.');
 
         renderOcrResults(doneData.results || allResults);
-        setStatus(doneData.message || 'Batch OCR import completed.', 'success');
+        setStatus(doneData.message || 'Batch import completed.', 'success');
 
         await hideOcrProgress();
-        window.location.reload();
+
+        if (pdfActive) {
+          // Move on to the back of this pair, or the front of the next pair.
+          advancePdfBatch();
+        } else {
+          window.location.reload();
+        }
 
       } catch (err) {
         console.error(err);
         await hideOcrProgress();
-        setStatus(err.message || 'Batch OCR import failed.', 'error');
+        setStatus(err.message || 'Batch import failed.', 'error');
       } finally {
         updateBatchOcrButton();
-        runBatchOcrBtn.textContent = 'Send 9 aligned cards to OCR import';
+        runBatchOcrBtn.textContent = 'Send 9 aligned cards to inventory';
       }
     }
 
     [vCut1, vCut2, hCut1, hCut2].forEach(input => input.addEventListener('input', drawPreview));
-    imageInput.addEventListener('change', loadSelectedImage);
+    imageInput.addEventListener('change', function () {
+      const file = imageInput.files && imageInput.files[0];
+      if (file && isPdfFile(file)) {
+        handlePdfSelected(file);
+      } else {
+        if (pdfActive) resetPdfBatchState();
+        loadSelectedImage();
+      }
+    });
+    pdfExitBtn.addEventListener('click', function () {
+      resetPdfBatchState();
+      setStatus('Exited PDF batch mode.', 'info');
+    });
     refreshPreviewBtn.addEventListener('click', drawPreview);
     closeManualBtn.addEventListener('click', closeManualModal);
     clearManualBtn.addEventListener('click', clearManualPoints);

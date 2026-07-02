@@ -4,1062 +4,404 @@
     <meta charset="UTF-8">
     <link rel="icon" type="image/jpeg" href="{{ url_for('static', filename='favicon.jpg') }}">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Card Collector Inventory Manager</title>
+    <title>Templates - Card Collector Inventory Manager</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
-
     <style>
         body { background: #f8f9fa; }
+        .hidden { display: none !important; }
 
-        .navbar-brand { font-weight: 700; }
-
-        .upload-card, .preview-card, .roi-card, .results-card, .builder-card {
-            border: none;
-            border-radius: 14px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.08);
-        }
-
-        /* ── Shared preview wrapper style (scan + builder both use it) ── */
-        .preview-wrapper {
-            position: relative;
-            display: inline-block;
-            max-width: 100%;
-            border: 1px solid #dee2e6;
-            border-radius: 12px;
-            overflow: hidden;
-            background: #fff;
-            cursor: crosshair;
-        }
-        .preview-wrapper img { max-width: 100%; display: block; user-select: none; }
-
-        /* ── ROI boxes (scan) — green ── */
-        .roi-box {
-            position: absolute;
-            border: 2px solid #28a745;
-            background: rgba(40,167,69,0.12);
-            cursor: move;
-            box-sizing: border-box;
-        }
-        .roi-label {
-            position: absolute;
-            top: -24px; left: 0;
-            background: #28a745;
-            color: #fff;
-            font-size: 11px;
-            padding: 2px 6px;
-            border-radius: 6px;
-            white-space: nowrap;
-            pointer-events: none;
-        }
-        .roi-handle {
-            position: absolute;
-            width: 12px; height: 12px;
-            right: -6px; bottom: -6px;
-            background: #28a745;
-            border-radius: 50%;
-            cursor: nwse-resize;
-        }
-
-        /* ── Builder ROI boxes — blue ── */
-        .builder-box {
-            position: absolute;
-            border: 2px solid #0d6efd;
-            background: rgba(13,110,253,0.10);
-            cursor: move;
-            box-sizing: border-box;
-        }
-        .builder-label {
-            position: absolute;
-            top: -22px; left: 0;
-            background: #0d6efd;
-            color: #fff;
-            font-size: 11px;
-            padding: 2px 6px;
-            border-radius: 6px;
-            white-space: nowrap;
-            pointer-events: none;
-        }
-        .builder-handle {
-            position: absolute;
-            width: 12px; height: 12px;
-            right: -6px; bottom: -6px;
-            background: #0d6efd;
-            border-radius: 50%;
-            cursor: nwse-resize;
-        }
-        /* Draw-new-box rubber band */
-        .builder-draw {
-            position: absolute;
-            border: 2px dashed #0d6efd;
-            background: rgba(13,110,253,0.08);
-            box-sizing: border-box;
-            pointer-events: none;
-        }
-
-        .hidden { display: none; }
-
-        .result-pre {
-            white-space: pre-wrap;
-            word-break: break-word;
-            background: #f8f9fa;
-            border-radius: 10px;
-            padding: 12px;
-            border: 1px solid #dee2e6;
-        }
-
+        /* ── Nav ── */
         .nav-tabs-minimal { display: flex; gap: 10px; margin-left: auto; }
         .nav-tab {
             padding: 8px 14px; text-decoration: none; border-radius: 8px;
-            background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.85);
+            background: rgba(255, 255, 255, 0.08); color: rgba(255, 255, 255, 0.85);
             font-weight: 600; transition: 0.2s ease;
         }
-        .nav-tab:hover { background: rgba(255,255,255,0.18); color: #fff; }
+        .nav-tab:hover { background: rgba(255, 255, 255, 0.18); color: #fff; }
         .nav-tab.active { background: #fff; color: #212529; }
-
-        .field-row {
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            background: #f8f9fa;
-            border: 1px solid #dee2e6;
-            border-radius: 8px;
-            padding: 6px 10px;
-            margin-bottom: 6px;
-        }
-        .field-row .field-swatch {
-            width: 12px; height: 12px;
-            border-radius: 3px;
-            background: #0d6efd;
-            flex-shrink: 0;
-        }
-        .field-row .field-name { font-weight: 600; font-size: 0.85rem; flex: 1; }
-        .field-row .field-coords { font-size: 0.75rem; color: #6c757d; }
-        .field-row .btn-del { padding: 0 4px; font-size: 0.75rem; }
-
-        /* ── OCR Progress Overlay ── */
-        #ocrProgressOverlay {
-            display: none;
-            position: fixed;
-            inset: 0;
-            background: rgba(15, 23, 42, 0.72);
-            z-index: 10000;
-            align-items: center;
-            justify-content: center;
-        }
-        #ocrProgressOverlay.visible {
-            display: flex;
-        }
-        .ocr-progress-dialog {
-            background: white;
-            border-radius: 20px;
-            padding: 36px 40px;
-            width: min(480px, 90vw);
-            box-shadow: 0 24px 64px rgba(0,0,0,0.35);
-            display: flex;
-            flex-direction: column;
-            gap: 20px;
-            align-items: center;
-            text-align: center;
-        }
-        .ocr-progress-icon {
-            width: 54px;
-            height: 54px;
-            border-radius: 50%;
-            background: #dbeafe;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 26px;
-        }
-        .ocr-progress-title {
-            font-size: 20px;
-            font-weight: 700;
-            color: #1e293b;
-        }
-        .ocr-progress-sub {
-            font-size: 14px;
-            color: #64748b;
-            min-height: 20px;
-        }
-        .ocr-progress-track {
-            width: 100%;
-            height: 12px;
-            background: #e2e8f0;
-            border-radius: 999px;
-            overflow: hidden;
-        }
-        .ocr-progress-fill {
-            height: 100%;
-            width: 0%;
-            background: linear-gradient(90deg, #1d4ed8, #2563eb);
-            border-radius: 999px;
-            transition: width 0.45s cubic-bezier(0.4, 0, 0.2, 1);
-        }
-        .ocr-progress-count {
-            font-size: 13px;
-            font-weight: 700;
-            color: #64748b;
-        }
-
         @media (max-width: 768px) {
             .nav-tabs-minimal { margin-left: 0; margin-top: 12px; width: 100%; }
             .nav-tab { flex: 1; text-align: center; }
         }
+
+        .panel-card {
+            border: none;
+            border-radius: 14px;
+            box-shadow: 0 4px 18px rgba(0,0,0,0.08);
+        }
+
+        .field-row {
+            display: grid;
+            grid-template-columns: 1fr 160px 1fr auto auto;
+            gap: 10px;
+            align-items: center;
+            padding: 10px 0;
+            border-bottom: 1px solid #eee;
+        }
+        .field-row:last-child { border-bottom: none; }
+        .field-row .dropdown-opts { display: none; }
+        .field-row.type-dropdown .dropdown-opts { display: block; }
+        .field-hidden-toggle {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 12px;
+            font-weight: 600;
+            color: #6c757d;
+            white-space: nowrap;
+            cursor: pointer;
+            user-select: none;
+        }
+        .field-hidden-toggle input { margin: 0; cursor: pointer; }
+        .type-badge-hidden {
+            display: inline-block;
+            margin-left: 4px;
+            font-size: 9px;
+            text-transform: uppercase;
+            font-weight: 700;
+            color: #92400e;
+            background: #fef3c7;
+            border-radius: 4px;
+            padding: 1px 5px;
+        }
+
+        @media (max-width: 767px) {
+            .field-row {
+                grid-template-columns: 1fr;
+                gap: 6px;
+                padding-bottom: 16px;
+                margin-bottom: 8px;
+                border-bottom: 1px solid #ddd;
+            }
+        }
+
+        .game-card {
+            border: none;
+            border-radius: 14px;
+            box-shadow: 0 4px 18px rgba(0,0,0,0.08);
+            transition: box-shadow 0.18s ease, transform 0.18s ease;
+        }
+        .game-card:hover { box-shadow: 0 8px 24px rgba(0,0,0,0.14); transform: translateY(-2px); }
+        .game-card .card-header {
+            background: #212529;
+            color: #fff;
+            font-weight: 700;
+            border-radius: 14px 14px 0 0;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .field-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 0.78rem;
+            background: #e9ecef;
+            color: #495057;
+            border-radius: 20px;
+            padding: 3px 10px;
+            font-weight: 500;
+            margin: 3px 4px 0 0;
+        }
+        .field-pill .type-badge {
+            font-size: 0.65rem;
+            text-transform: uppercase;
+            color: #868e96;
+        }
+        .empty-state {
+            text-align: center;
+            padding: 4rem 1rem;
+            color: #6c757d;
+        }
+        .empty-state i { font-size: 3rem; margin-bottom: 1rem; opacity: 0.35; }
     </style>
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
         <div class="container d-flex flex-wrap align-items-center">
             <a class="navbar-brand" href="{{ url_for('index') }}">
-                <img src="{{ url_for('static', filename='favicon.jpg') }}" alt="logo" width="24" height="24" style="object-fit:cover;border-radius:4px;margin-right:0.5rem;" class="me-2">Card Collector Inventory Manager
+                <img src="{{ url_for('static', filename='favicon.jpg') }}" alt="logo" width="24" height="24"
+                     style="object-fit:cover;border-radius:4px;margin-right:0.5rem;" class="me-2">Card Collector Inventory Manager
             </a>
             <div class="nav-tabs-minimal">
                 <a href="{{ url_for('import_page') }}" class="nav-tab">Import</a>
-                <a href="{{ url_for('index') }}"        class="nav-tab active">Scan</a>
+                <a href="{{ url_for('index') }}"        class="nav-tab active">Templates</a>
                 <a href="{{ url_for('inventory') }}"    class="nav-tab">Inventory</a>
                 <a href="{{ url_for('albums_list') }}"  class="nav-tab">Album</a>
+                <a href="{{ url_for('shops_page') }}"   class="nav-tab">Shops</a>
                 <a href="{{ url_for('search_by_image_page') }}" class="nav-tab" title="Search by photo"><i class="fas fa-camera"></i></a>
-</div>
+            </div>
         </div>
     </nav>
 
-    <div class="container-fluid px-4 py-5">
+    <div class="container py-5">
+        <div class="mb-4">
+            <h2 class="mb-1"><i class="fas fa-layer-group me-2"></i>Templates</h2>
+            <div class="text-muted">
+                A template defines a <strong>Game</strong> and the fields every entry for that game should have.
+                When you import a page of cards, pick a Game and each of the 9 cards is added to Inventory with
+                these fields present but blank, ready to fill in by hand.
+            </div>
+        </div>
+
         <div class="row g-4">
+            <!-- ── Builder form ── -->
+            <div class="col-lg-5">
+                <div class="card panel-card sticky-lg-top" style="top: 20px;">
+                    <div class="card-body p-4">
+                        <h5 class="mb-3" id="formTitle"><i class="fas fa-plus me-2"></i>New Game</h5>
 
-            <!-- ============================================================
-                 LEFT COLUMN — scan controls (unchanged behaviour)
-            ============================================================ -->
-            <div class="col-xl-3 col-lg-4">
-                <div class="card upload-card">
-                    <div class="card-header bg-light">
-                        <strong>Upload Image &amp; Choose Template</strong>
-                    </div>
-                    <div class="card-body">
-                        <form id="uploadForm">
-                            <div class="mb-3">
-                                <label class="form-label">Select Image(s)</label>
-                                <input type="file" class="form-control" id="images"
-                                       name="images" accept="image/*" multiple required>
-                            </div>
-                            <div class="mb-3">
-                                <label class="form-label">Template</label>
-                                <select class="form-select" id="template" name="template">
-                                    {% for t in templates %}
-                                    <option value="{{ t }}">{{ t|replace('_',' ')|title }}</option>
-                                    {% endfor %}
-                                </select>
-                            </div>
-                            <button type="submit" class="btn btn-primary w-100">
-                                <i class="fas fa-upload me-1"></i>Upload &amp; Show Preview
-                            </button>
-                        </form>
-                    </div>
-                </div>
-
-                <!-- Hidden elements kept so existing JS references don't break -->
-                <div class="hidden">
-                    <div id="fieldsEditor"></div>
-                    <button id="resetTemplateBtn"></button>
-                </div>
-
-                <!-- Entry Details — shown after image preview loads -->
-                <div class="card mt-4 hidden" id="entryMetaCard"
-                     style="border:none;border-radius:14px;box-shadow:0 4px 20px rgba(0,0,0,0.08);">
-                    <div class="card-header bg-light">
-                        <strong><i class="fas fa-tags me-2"></i>Entry Details</strong>
-                    </div>
-                    <div class="card-body d-flex flex-column gap-3">
-
-                        <!-- Game -->
-                        <div>
-                            <label class="form-label fw-semibold small mb-1">
-                                Game <span class="text-danger">*</span>
-                            </label>
-                            <select class="form-select form-select-sm" id="entryGame">
-                                <option value="">— select game —</option>
-                            </select>
+                        <div class="mb-3">
+                            <label class="form-label fw-semibold" for="gameName">Game name</label>
+                            <input type="text" class="form-control" id="gameName" placeholder="e.g. Pokemon">
                         </div>
 
-                        <!-- Album — filtered by game -->
-                        <div>
-                            <label class="form-label fw-semibold small mb-1">
-                                Album <span class="text-danger">*</span>
-                            </label>
-                            <select class="form-select form-select-sm" id="entryAlbum" disabled>
-                                <option value="">— select game first —</option>
-                            </select>
-                        </div>
+                        <label class="form-label fw-semibold">Fields</label>
+                        <div id="fieldsContainer" class="mb-2"></div>
 
-                        <!-- Page -->
-                        <div>
-                            <label class="form-label fw-semibold small mb-1">
-                                Page <span class="text-danger">*</span>
-                            </label>
-                            <input type="number" class="form-control form-control-sm"
-                                   id="entryPage" min="1" placeholder="e.g. 1">
-                        </div>
-
-                        <!-- Slot -->
-                        <div>
-                            <label class="form-label fw-semibold small mb-1">
-                                Slot <span class="text-danger">*</span>
-                            </label>
-                            <input type="number" class="form-control form-control-sm"
-                                   id="entrySlot" min="1" placeholder="e.g. 3">
-                        </div>
-
-                        <div id="entryMetaStatus"></div>
-
-                        <button class="btn btn-success w-100" id="runOcrBtn">
-                            <i class="fas fa-play me-1"></i>Run OCR
+                        <button type="button" class="btn btn-outline-secondary btn-sm mb-3" id="addFieldBtn">
+                            <i class="fas fa-plus me-1"></i>Add Field
                         </button>
 
-                    </div>
-                </div>
-            </div>
+                        <div id="saveStatus" class="mb-2"></div>
 
-            <!-- ============================================================
-                 MIDDLE COLUMN — scan preview + results
-            ============================================================ -->
-            <div class="col-xl-5 col-lg-8">
-                <div class="card preview-card hidden" id="previewCard">
-                    <div class="card-header bg-light">
-                        <strong>Scan Preview – Drag &amp; Resize Boxes</strong>
-                    </div>
-                    <div class="card-body text-center">
-                        <div class="preview-wrapper" id="previewWrapper" style="cursor:default;">
-                            <img id="previewImage" src="" alt="Preview image">
+                        <div class="d-flex gap-2">
+                            <button type="button" class="btn btn-dark flex-grow-1" id="saveGameBtn">
+                                <i class="fas fa-save me-1"></i>Save Game
+                            </button>
+                            <button type="button" class="btn btn-outline-secondary hidden" id="cancelEditBtn">
+                                Cancel
+                            </button>
                         </div>
                     </div>
                 </div>
-
-
             </div>
 
-            <!-- ============================================================
-                 RIGHT COLUMN — template builder
-            ============================================================ -->
-            <div class="col-xl-4 col-lg-12">
-                <div class="card builder-card h-100">
-                    <div class="card-header bg-dark text-white d-flex justify-content-between align-items-center">
-                        <strong><i class="fas fa-drafting-compass me-2"></i>Template Builder</strong>
-                        <span class="badge bg-secondary" id="builderFieldCount">0 fields</span>
-                    </div>
-                    <div class="card-body d-flex flex-column gap-3">
-
-                        <!-- Step 1: upload reference image -->
-                        <div>
-                            <label class="form-label fw-semibold small">
-                                <span class="badge bg-dark me-1">1</span>
-                                Upload a reference card image
-                            </label>
-                            <input type="file" class="form-control form-control-sm"
-                                   id="builderImageInput" accept="image/*">
-                        </div>
-
-                        <!-- Builder canvas -->
-                        <div id="builderCanvasWrap" class="hidden">
-                            <div class="text-muted small mb-1">
-                                <i class="fas fa-draw-polygon me-1 text-primary"></i>
-                                <strong>Draw a box</strong> by clicking and dragging on the image.
-                                Drag existing boxes to reposition, drag the corner handle to resize.
-                            </div>
-                            <div class="preview-wrapper w-100" id="builderWrapper">
-                                <img id="builderImage" src="" alt="Template reference image"
-                                     style="width:100%; display:block; user-select:none;">
-                            </div>
-                        </div>
-
-                        <!-- Step 2: name + add field -->
-                        <div id="builderAddWrap" class="hidden">
-                            <label class="form-label fw-semibold small">
-                                <span class="badge bg-dark me-1">2</span>
-                                Name the drawn region, then add it
-                            </label>
-                            <div class="input-group input-group-sm">
-                                <input type="text" class="form-control" id="builderFieldName"
-                                       placeholder="e.g. card_name, set_number, hp …"
-                                       list="commonFieldNames">
-                                <button class="btn btn-primary" id="builderAddFieldBtn">
-                                    <i class="fas fa-plus me-1"></i>Add Field
-                                </button>
-                            </div>
-                            <datalist id="commonFieldNames">
-                                <option value="card_name">
-                                <option value="set_number">
-                                <option value="collector_number">
-                                <option value="hp">
-                                <option value="rarity">
-                                <option value="edition">
-                                <option value="artist">
-                                <option value="description">
-                                <option value="attack">
-                                <option value="type">
-                            </datalist>
-                            <div id="builderDrawHint" class="text-muted small mt-1 hidden">
-                                <i class="fas fa-info-circle text-primary me-1"></i>
-                                Draw a region on the image first, then name it here.
-                            </div>
-                        </div>
-
-                        <!-- Step 3: field list -->
-                        <div id="builderFieldListWrap" class="hidden">
-                            <label class="form-label fw-semibold small">
-                                <span class="badge bg-dark me-1">3</span>
-                                Defined fields
-                            </label>
-                            <div id="builderFieldList"></div>
-                        </div>
-
-                        <!-- Step 4: save -->
-                        <div id="builderSaveWrap" class="hidden mt-auto">
-                            <label class="form-label fw-semibold small">
-                                <span class="badge bg-dark me-1">4</span>
-                                Save as new template
-                            </label>
-                            <div class="input-group input-group-sm mb-2">
-                                <input type="text" class="form-control" id="builderTemplateName"
-                                       placeholder="e.g. pokemon_base, mtg_standard …">
-                                <button class="btn btn-success" id="builderSaveBtn">
-                                    <i class="fas fa-save me-1"></i>Save Template
-                                </button>
-                            </div>
-                            <div class="text-muted small">
-                                Saved templates appear immediately in the Template dropdown above.
-                            </div>
-                            <div id="builderSaveStatus" class="mt-2"></div>
-                        </div>
-
-                    </div>
+            <!-- ── Existing games ── -->
+            <div class="col-lg-7">
+                <h5 class="mb-3">Existing Games</h5>
+                <div id="gamesList" class="row g-3"></div>
+                <div id="gamesEmptyState" class="empty-state hidden">
+                    <i class="fas fa-inbox d-block"></i>
+                    <h5>No games defined yet</h5>
+                    <p>Create your first game on the left, then use it on the Import page.</p>
                 </div>
             </div>
-
-        </div><!-- /row -->
-    </div><!-- /container -->
-
-    <!-- OCR Progress Overlay -->
-    <div id="ocrProgressOverlay">
-        <div class="ocr-progress-dialog">
-            <div class="ocr-progress-icon">🔍</div>
-            <div class="ocr-progress-title">Running OCR</div>
-            <div id="ocrProgressSub" class="ocr-progress-sub">Processing image…</div>
-            <div class="ocr-progress-track">
-                <div id="ocrProgressFill" class="ocr-progress-fill"></div>
-            </div>
-            <div id="ocrProgressCount" class="ocr-progress-count">Scanning…</div>
         </div>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-    // ===========================================================================
-    // SECTION A — SCAN (existing functionality, percentage-based)
-    // ===========================================================================
-    const uploadForm      = document.getElementById('uploadForm');
-    const previewCard     = document.getElementById('previewCard');
-    const entryMetaCard   = document.getElementById('entryMetaCard');
-    const previewImage    = document.getElementById('previewImage');
-    const previewWrapper  = document.getElementById('previewWrapper');
-    const fieldsEditor    = document.getElementById('fieldsEditor');
-    const runOcrBtn       = document.getElementById('runOcrBtn');
-    const resetTemplateBtn = document.getElementById('resetTemplateBtn');
+        // Server-rendered starting data: [{ name, fields: [{key, field_type, dropdown_options}] }]
+        let games = {{ games | tojson }};
 
-    const entryGame       = document.getElementById('entryGame');
-    const entryAlbum      = document.getElementById('entryAlbum');
-    const entryPage       = document.getElementById('entryPage');
-    const entrySlot       = document.getElementById('entrySlot');
-    const entryMetaStatus = document.getElementById('entryMetaStatus');
+        const fieldsContainer = document.getElementById('fieldsContainer');
+        const addFieldBtn     = document.getElementById('addFieldBtn');
+        const gameNameInput   = document.getElementById('gameName');
+        const saveGameBtn     = document.getElementById('saveGameBtn');
+        const cancelEditBtn   = document.getElementById('cancelEditBtn');
+        const saveStatus      = document.getElementById('saveStatus');
+        const formTitle       = document.getElementById('formTitle');
+        const gamesList       = document.getElementById('gamesList');
+        const gamesEmptyState = document.getElementById('gamesEmptyState');
 
-    let currentFilename     = null;
-    let currentTemplateName = null;
-    let templateFields      = {};
-    let currentFields       = {};
+        let editingOriginalName = null; // set when editing an existing game
 
-    function toPercent(fields) {
-        const pw = previewImage.clientWidth;
-        const ph = previewImage.clientHeight;
-        const result = {};
-        for (const [key, box] of Object.entries(fields)) {
-            if ('x_pct' in box) {
-                result[key] = { x_pct: +box.x_pct, y_pct: +box.y_pct,
-                                w_pct: +box.w_pct, h_pct: +box.h_pct,
-                                config: box.config || {} };
-            } else {
-                result[key] = {
-                    x_pct: pw > 0 ? +box.x / pw * 100 : 0,
-                    y_pct: ph > 0 ? +box.y / ph * 100 : 0,
-                    w_pct: pw > 0 ? +box.w / pw * 100 : 10,
-                    h_pct: ph > 0 ? +box.h / ph * 100 : 10,
-                    config: box.config || {},
-                };
+        function addFieldRow(name = '', fieldType = 'text', dropdownOptions = [], hidden = false) {
+            const row = document.createElement('div');
+            row.className = 'field-row' + (fieldType === 'dropdown' ? ' type-dropdown' : '');
+
+            row.innerHTML = `
+                <input type="text" class="form-control form-control-sm field-name" placeholder="Field name (e.g. set_number)" value="${name.replace(/"/g, '&quot;')}">
+                <select class="form-select form-select-sm field-type">
+                    <option value="text"     ${fieldType === 'text' ? 'selected' : ''}>Text</option>
+                    <option value="dropdown" ${fieldType === 'dropdown' ? 'selected' : ''}>Dropdown</option>
+                    <option value="boolean"  ${fieldType === 'boolean' ? 'selected' : ''}>Yes / No</option>
+                </select>
+                <input type="text" class="form-control form-control-sm dropdown-opts" placeholder="Options, comma separated" value="${dropdownOptions.join(', ').replace(/"/g, '&quot;')}">
+                <label class="field-hidden-toggle" title="Stored on every record, but left off the Inventory Detail page">
+                    <input type="checkbox" class="field-hidden" ${hidden ? 'checked' : ''}>
+                    Hidden
+                </label>
+                <button type="button" class="btn btn-sm btn-outline-danger remove-field-btn" title="Remove field">
+                    <i class="fas fa-trash"></i>
+                </button>
+            `;
+
+            row.querySelector('.field-type').addEventListener('change', function () {
+                row.classList.toggle('type-dropdown', this.value === 'dropdown');
+            });
+            row.querySelector('.remove-field-btn').addEventListener('click', function () {
+                row.remove();
+            });
+
+            fieldsContainer.appendChild(row);
+        }
+
+        function resetForm() {
+            fieldsContainer.innerHTML = '';
+            gameNameInput.value = '';
+            editingOriginalName = null;
+            formTitle.innerHTML = '<i class="fas fa-plus me-2"></i>New Game';
+            cancelEditBtn.classList.add('hidden');
+            addFieldRow();
+            saveStatus.innerHTML = '';
+        }
+
+        addFieldBtn.addEventListener('click', () => addFieldRow());
+        cancelEditBtn.addEventListener('click', resetForm);
+
+        function setStatus(message, type) {
+            const cls = type === 'error' ? 'text-danger' : 'text-success';
+            saveStatus.innerHTML = `<div class="${cls} small">${message}</div>`;
+        }
+
+        function collectFieldsFromForm() {
+            const fields = {};
+            fieldsContainer.querySelectorAll('.field-row').forEach(row => {
+                const name = row.querySelector('.field-name').value.trim();
+                if (!name) return;
+                const fieldType = row.querySelector('.field-type').value;
+                const entry = { field_type: fieldType, hidden: row.querySelector('.field-hidden').checked };
+                if (fieldType === 'dropdown') {
+                    const opts = row.querySelector('.dropdown-opts').value
+                        .split(',').map(o => o.trim()).filter(Boolean);
+                    entry.dropdown_options = opts;
+                }
+                fields[name] = entry;
+            });
+            return fields;
+        }
+
+        saveGameBtn.addEventListener('click', async function () {
+            const name = gameNameInput.value.trim();
+            if (!name) {
+                setStatus('Game name is required.', 'error');
+                return;
             }
-        }
-        return result;
-    }
-
-    function pctToPx(box, img) {
-        const pw = img.clientWidth;
-        const ph = img.clientHeight;
-        return { x: box.x_pct / 100 * pw, y: box.y_pct / 100 * ph,
-                 w: box.w_pct / 100 * pw, h: box.h_pct / 100 * ph };
-    }
-
-    function rnd(n) { return Math.round(n * 10) / 10; }
-
-    uploadForm.addEventListener('submit', async function (e) {
-        e.preventDefault();
-        const res  = await fetch('/preview', { method: 'POST', body: new FormData(uploadForm) });
-        const data = await res.json();
-        if (data.error) { alert(data.error); return; }
-
-        currentFilename     = data.filename;
-        currentTemplateName = document.getElementById('template').value;
-        templateFields      = data.template.fields || {};
-
-        previewImage.onload = function () {
-            currentFields = toPercent(JSON.parse(JSON.stringify(templateFields)));
-            previewCard.classList.remove('hidden');
-            entryMetaCard.classList.remove('hidden');
-            renderScanBoxes();
-            renderFieldEditor();
-        };
-        previewImage.src = data.image_url + '?t=' + Date.now();
-
-        // Populate the game dropdown from existing inventory
-        populateGames();
-    });
-
-    resetTemplateBtn.addEventListener('click', function () {
-        currentFields = toPercent(JSON.parse(JSON.stringify(templateFields)));
-        renderScanBoxes();
-        renderFieldEditor();
-    });
-
-    // ── Entry metadata helpers ────────────────────────────────────────────────
-
-    async function populateGames() {
-        try {
-            const res  = await fetch('/inventory/filter_options');
-            const data = await res.json();
-            entryGame.innerHTML = '<option value="">— select game —</option>';
-            (data.games || []).forEach(g => {
-                const o = document.createElement('option');
-                o.value = o.textContent = g;
-                entryGame.appendChild(o);
-            });
-        } catch (e) {
-            console.error('Could not load games:', e);
-        }
-    }
-
-    entryGame.addEventListener('change', async function () {
-        const game = this.value;
-        entryAlbum.innerHTML = '<option value="">— loading… —</option>';
-        entryAlbum.disabled = true;
-
-        if (!game) {
-            entryAlbum.innerHTML = '<option value="">— select game first —</option>';
-            return;
-        }
-
-        try {
-            const res  = await fetch(`/game_fields?game=${encodeURIComponent(game)}`);
-            const data = await res.json();
-            entryAlbum.innerHTML = '<option value="">— select album —</option>';
-            (data.albums || []).forEach(a => {
-                const o = document.createElement('option');
-                o.value = o.textContent = a;
-                entryAlbum.appendChild(o);
-            });
-            entryAlbum.disabled = false;
-        } catch (e) {
-            entryAlbum.innerHTML = '<option value="">— error loading albums —</option>';
-        }
-    });
-
-    // ── OCR Progress Overlay helpers ─────────────────────────────────────────
-    const ocrProgressOverlay = document.getElementById('ocrProgressOverlay');
-    const ocrProgressFill    = document.getElementById('ocrProgressFill');
-    const ocrProgressSub     = document.getElementById('ocrProgressSub');
-    const ocrProgressCount   = document.getElementById('ocrProgressCount');
-
-    function showOcrProgress() {
-        ocrProgressFill.style.width  = '0%';
-        ocrProgressSub.textContent   = 'Processing image…';
-        ocrProgressCount.textContent = 'Scanning…';
-        ocrProgressOverlay.classList.add('visible');
-    }
-
-    function advanceOcrProgress(pct, subText) {
-        ocrProgressFill.style.width  = pct + '%';
-        ocrProgressSub.textContent   = subText || '';
-    }
-
-    function finishOcrProgress() {
-        ocrProgressFill.style.width  = '100%';
-        ocrProgressSub.textContent   = 'Done!';
-        ocrProgressCount.textContent = '✓ Saved';
-        return new Promise(resolve => setTimeout(() => {
-            ocrProgressOverlay.classList.remove('visible');
-            resolve();
-        }, 520));
-    }
-    // ─────────────────────────────────────────────────────────────────────────
-
-    runOcrBtn.addEventListener('click', async function () {
-        if (!currentFilename) return;
-
-        // Validate all required entry fields
-        const missing = [];
-        if (!entryGame.value)  missing.push('Game');
-        if (!entryAlbum.value) missing.push('Album');
-        if (!entryPage.value)  missing.push('Page');
-        if (!entrySlot.value)  missing.push('Slot');
-
-        if (missing.length) {
-            entryMetaStatus.innerHTML = `<div class="alert alert-warning py-2 mb-0">
-                Please fill in: <strong>${missing.join(', ')}</strong></div>`;
-            return;
-        }
-        entryMetaStatus.innerHTML = '';
-
-        runOcrBtn.disabled = true;
-        showOcrProgress();
-        advanceOcrProgress(20, 'Sending to OCR engine…');
-
-        try {
-            const res = await fetch('/run_custom_ocr', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    image_path:    currentFilename,
-                    template_name: currentTemplateName,
-                    fields:        currentFields,
-                    preview_meta:  { width: previewImage.clientWidth, height: previewImage.clientHeight },
-                    game:  entryGame.value,
-                    album: entryAlbum.value,
-                    page:  entryPage.value,
-                    slot:  entrySlot.value,
-                })
-            });
-
-            advanceOcrProgress(75, 'Extracting fields…');
-            const data = await res.json();
-
-            if (data.error) {
-                await finishOcrProgress();
-                entryMetaStatus.innerHTML = `<div class="alert alert-danger py-2 mb-0">${data.error}</div>`;
-                runOcrBtn.disabled = false;
+            const fields = collectFieldsFromForm();
+            if (Object.keys(fields).length === 0) {
+                setStatus('Add at least one field.', 'error');
                 return;
             }
 
-            advanceOcrProgress(95, 'Saving entry…');
-            await finishOcrProgress();
-            window.location.reload();
+            saveGameBtn.disabled = true;
+            setStatus('Saving…');
 
-        } catch (err) {
-            await finishOcrProgress();
-            entryMetaStatus.innerHTML = `<div class="alert alert-danger py-2 mb-0">Error: ${err.message}</div>`;
-            runOcrBtn.disabled = false;
-        }
-    });
+            try {
+                const res = await fetch('/template_save', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name, fields }),
+                });
+                const data = await res.json();
 
-    function renderScanBoxes() {
-        previewWrapper.querySelectorAll('.roi-box').forEach(el => el.remove());
-        Object.entries(currentFields).forEach(([key, box]) => {
-            const px  = pctToPx(box, previewImage);
-            const div = document.createElement('div');
-            div.className  = 'roi-box';
-            div.style.left = px.x + 'px'; div.style.top    = px.y + 'px';
-            div.style.width = px.w + 'px'; div.style.height = px.h + 'px';
-            div.dataset.key = key;
-            const lbl = document.createElement('div');
-            lbl.className = 'roi-label'; lbl.textContent = key;
-            const hdl = document.createElement('div');
-            hdl.className = 'roi-handle';
-            div.appendChild(lbl); div.appendChild(hdl);
-            previewWrapper.appendChild(div);
-            makeScanBoxInteractive(div, key);
-        });
-    }
-
-    function renderFieldEditor() {
-        let html = '<div class="row g-3">';
-        Object.entries(currentFields).forEach(([key, box]) => {
-            html += `<div class="col-md-6">
-                <label class="form-label fw-semibold">${key}</label>
-                <div class="row g-2">
-                    <div class="col-6"><div class="input-group input-group-sm">
-                        <span class="input-group-text">X</span>
-                        <input class="form-control" type="number" step="0.1" min="0" max="100"
-                               value="${rnd(box.x_pct)}"
-                               onchange="updateFieldPct('${key}','x_pct',this.value)">
-                        <span class="input-group-text">%</span>
-                    </div></div>
-                    <div class="col-6"><div class="input-group input-group-sm">
-                        <span class="input-group-text">Y</span>
-                        <input class="form-control" type="number" step="0.1" min="0" max="100"
-                               value="${rnd(box.y_pct)}"
-                               onchange="updateFieldPct('${key}','y_pct',this.value)">
-                        <span class="input-group-text">%</span>
-                    </div></div>
-                    <div class="col-6"><div class="input-group input-group-sm">
-                        <span class="input-group-text">W</span>
-                        <input class="form-control" type="number" step="0.1" min="0.1" max="100"
-                               value="${rnd(box.w_pct)}"
-                               onchange="updateFieldPct('${key}','w_pct',this.value)">
-                        <span class="input-group-text">%</span>
-                    </div></div>
-                    <div class="col-6"><div class="input-group input-group-sm">
-                        <span class="input-group-text">H</span>
-                        <input class="form-control" type="number" step="0.1" min="0.1" max="100"
-                               value="${rnd(box.h_pct)}"
-                               onchange="updateFieldPct('${key}','h_pct',this.value)">
-                        <span class="input-group-text">%</span>
-                    </div></div>
-                </div>
-            </div>`;
-        });
-        html += '</div>';
-        fieldsEditor.innerHTML = html;
-    }
-
-    function updateFieldPct(key, prop, value) {
-        currentFields[key][prop] = Math.max(0, Math.min(100, parseFloat(value) || 0));
-        renderScanBoxes();
-    }
-
-    function makeScanBoxInteractive(boxEl, key) {
-        const handle = boxEl.querySelector('.roi-handle');
-        let startX, startY, sXp, sYp, sWp, sHp, mode;
-
-        boxEl.addEventListener('mousedown', function (e) {
-            mode = (e.target === handle) ? 'resize' : 'drag';
-            startX = e.clientX; startY = e.clientY;
-            sXp = currentFields[key].x_pct; sYp = currentFields[key].y_pct;
-            sWp = currentFields[key].w_pct; sHp = currentFields[key].h_pct;
-            document.addEventListener('mousemove', onMove);
-            document.addEventListener('mouseup', onUp);
-            e.preventDefault(); e.stopPropagation();
-        });
-
-        function onMove(e) {
-            const pw = previewImage.clientWidth, ph = previewImage.clientHeight;
-            const dpx = pw > 0 ? (e.clientX - startX) / pw * 100 : 0;
-            const dpy = ph > 0 ? (e.clientY - startY) / ph * 100 : 0;
-            if (mode === 'drag') {
-                currentFields[key].x_pct = Math.max(0, Math.min(100, sXp + dpx));
-                currentFields[key].y_pct = Math.max(0, Math.min(100, sYp + dpy));
-            } else {
-                currentFields[key].w_pct = Math.max(0.5, Math.min(100, sWp + dpx));
-                currentFields[key].h_pct = Math.max(0.5, Math.min(100, sHp + dpy));
-            }
-            renderScanBoxes(); renderFieldEditor();
-        }
-
-        function onUp() {
-            document.removeEventListener('mousemove', onMove);
-            document.removeEventListener('mouseup', onUp);
-        }
-    }
-
-
-    // ===========================================================================
-    // SECTION B — TEMPLATE BUILDER
-    // ===========================================================================
-    const builderImageInput   = document.getElementById('builderImageInput');
-    const builderCanvasWrap   = document.getElementById('builderCanvasWrap');
-    const builderWrapper      = document.getElementById('builderWrapper');
-    const builderImage        = document.getElementById('builderImage');
-    const builderAddWrap      = document.getElementById('builderAddWrap');
-    const builderFieldName    = document.getElementById('builderFieldName');
-    const builderAddFieldBtn  = document.getElementById('builderAddFieldBtn');
-    const builderDrawHint     = document.getElementById('builderDrawHint');
-    const builderFieldListWrap = document.getElementById('builderFieldListWrap');
-    const builderFieldList    = document.getElementById('builderFieldList');
-    const builderSaveWrap     = document.getElementById('builderSaveWrap');
-    const builderTemplateName = document.getElementById('builderTemplateName');
-    const builderSaveBtn      = document.getElementById('builderSaveBtn');
-    const builderSaveStatus   = document.getElementById('builderSaveStatus');
-    const builderFieldCount   = document.getElementById('builderFieldCount');
-
-    // State
-    let builderFields   = {};       // { fieldName: { x_pct, y_pct, w_pct, h_pct } }
-    let pendingBox      = null;     // pct coords of the region currently drawn but not yet named
-    let drawState       = null;     // { startX, startY } during rubber-band draw
-
-    // ── Load reference image ──────────────────────────────────────────────────
-    builderImageInput.addEventListener('change', function () {
-        const file = this.files[0];
-        if (!file) return;
-        const url = URL.createObjectURL(file);
-        builderImage.onload = function () {
-            builderCanvasWrap.classList.remove('hidden');
-            builderAddWrap.classList.remove('hidden');
-            builderSaveWrap.classList.remove('hidden');
-            renderBuilderBoxes();
-        };
-        builderImage.src = url;
-    });
-
-    // ── Draw new region by click-drag on the image ────────────────────────────
-    builderWrapper.addEventListener('mousedown', function (e) {
-        // Only start a draw if clicking directly on the image (not on an existing box)
-        if (e.target !== builderImage) return;
-        e.preventDefault();
-
-        const rect   = builderImage.getBoundingClientRect();
-        drawState    = { startX: e.clientX - rect.left, startY: e.clientY - rect.top };
-        pendingBox   = null;
-
-        // Create rubber-band div
-        const band = document.createElement('div');
-        band.className = 'builder-draw';
-        band.id = '__drawBand';
-        band.style.left = drawState.startX + 'px';
-        band.style.top  = drawState.startY + 'px';
-        band.style.width = '0'; band.style.height = '0';
-        builderWrapper.appendChild(band);
-
-        function onMove(e) {
-            const rect = builderImage.getBoundingClientRect();
-            const cx   = Math.max(0, Math.min(builderImage.clientWidth,  e.clientX - rect.left));
-            const cy   = Math.max(0, Math.min(builderImage.clientHeight, e.clientY - rect.top));
-            const x    = Math.min(drawState.startX, cx);
-            const y    = Math.min(drawState.startY, cy);
-            const w    = Math.abs(cx - drawState.startX);
-            const h    = Math.abs(cy - drawState.startY);
-            band.style.left   = x + 'px'; band.style.top    = y + 'px';
-            band.style.width  = w + 'px'; band.style.height = h + 'px';
-        }
-
-        function onUp(e) {
-            document.removeEventListener('mousemove', onMove);
-            document.removeEventListener('mouseup', onUp);
-            band.remove();
-
-            const rect = builderImage.getBoundingClientRect();
-            const cx   = Math.max(0, Math.min(builderImage.clientWidth,  e.clientX - rect.left));
-            const cy   = Math.max(0, Math.min(builderImage.clientHeight, e.clientY - rect.top));
-            const pw   = builderImage.clientWidth;
-            const ph   = builderImage.clientHeight;
-
-            const x_px = Math.min(drawState.startX, cx);
-            const y_px = Math.min(drawState.startY, cy);
-            const w_px = Math.abs(cx - drawState.startX);
-            const h_px = Math.abs(cy - drawState.startY);
-
-            // Ignore tiny accidental clicks
-            if (w_px < 5 || h_px < 5) { drawState = null; return; }
-
-            pendingBox = {
-                x_pct: x_px / pw * 100,
-                y_pct: y_px / ph * 100,
-                w_pct: w_px / pw * 100,
-                h_pct: h_px / ph * 100,
-            };
-            drawState = null;
-
-            builderDrawHint.classList.add('hidden');
-            builderFieldName.focus();
-            renderBuilderBoxes(); // show the pending (dashed) preview
-        }
-
-        document.addEventListener('mousemove', onMove);
-        document.addEventListener('mouseup', onUp);
-    });
-
-    // ── Add field button ──────────────────────────────────────────────────────
-    builderAddFieldBtn.addEventListener('click', addBuilderField);
-    builderFieldName.addEventListener('keydown', function (e) {
-        if (e.key === 'Enter') { e.preventDefault(); addBuilderField(); }
-    });
-
-    function addBuilderField() {
-        const name = builderFieldName.value.trim().toLowerCase().replace(/\s+/g, '_');
-        if (!name) {
-            builderFieldName.classList.add('is-invalid');
-            setTimeout(() => builderFieldName.classList.remove('is-invalid'), 1500);
-            return;
-        }
-        if (!pendingBox) {
-            builderDrawHint.classList.remove('hidden');
-            return;
-        }
-        builderFields[name] = { ...pendingBox };
-        pendingBox = null;
-        builderFieldName.value = '';
-        refreshBuilderUI();
-    }
-
-    function refreshBuilderUI() {
-        renderBuilderBoxes();
-        renderBuilderFieldList();
-        const count = Object.keys(builderFields).length;
-        builderFieldCount.textContent = count + ' field' + (count !== 1 ? 's' : '');
-        if (count > 0) builderFieldListWrap.classList.remove('hidden');
-    }
-
-    // ── Render all saved builder boxes ───────────────────────────────────────
-    function renderBuilderBoxes() {
-        builderWrapper.querySelectorAll('.builder-box').forEach(el => el.remove());
-        const pw = builderImage.clientWidth;
-        const ph = builderImage.clientHeight;
-
-        Object.entries(builderFields).forEach(([key, box]) => {
-            const div  = document.createElement('div');
-            div.className = 'builder-box';
-            div.style.left   = (box.x_pct / 100 * pw) + 'px';
-            div.style.top    = (box.y_pct / 100 * ph) + 'px';
-            div.style.width  = (box.w_pct / 100 * pw) + 'px';
-            div.style.height = (box.h_pct / 100 * ph) + 'px';
-            div.dataset.key  = key;
-
-            const lbl = document.createElement('div');
-            lbl.className = 'builder-label'; lbl.textContent = key;
-            const hdl = document.createElement('div');
-            hdl.className = 'builder-handle';
-            div.appendChild(lbl); div.appendChild(hdl);
-            builderWrapper.appendChild(div);
-            makeBuilderBoxInteractive(div, key);
-        });
-
-        // Show pending box with dashed outline if a region is drawn but not yet named
-        if (pendingBox) {
-            const prev = document.createElement('div');
-            prev.className  = 'builder-draw';
-            prev.style.left   = (pendingBox.x_pct / 100 * pw) + 'px';
-            prev.style.top    = (pendingBox.y_pct / 100 * ph) + 'px';
-            prev.style.width  = (pendingBox.w_pct / 100 * pw) + 'px';
-            prev.style.height = (pendingBox.h_pct / 100 * ph) + 'px';
-            prev.style.pointerEvents = 'none';
-            builderWrapper.appendChild(prev);
-        }
-    }
-
-    // ── Make saved builder boxes draggable / resizable ───────────────────────
-    function makeBuilderBoxInteractive(boxEl, key) {
-        const handle = boxEl.querySelector('.builder-handle');
-        let startX, startY, sXp, sYp, sWp, sHp, mode;
-
-        boxEl.addEventListener('mousedown', function (e) {
-            mode = (e.target === handle) ? 'resize' : 'drag';
-            startX = e.clientX; startY = e.clientY;
-            sXp = builderFields[key].x_pct; sYp = builderFields[key].y_pct;
-            sWp = builderFields[key].w_pct; sHp = builderFields[key].h_pct;
-            document.addEventListener('mousemove', onMove);
-            document.addEventListener('mouseup', onUp);
-            e.preventDefault(); e.stopPropagation();
-        });
-
-        function onMove(e) {
-            const pw = builderImage.clientWidth, ph = builderImage.clientHeight;
-            const dpx = pw > 0 ? (e.clientX - startX) / pw * 100 : 0;
-            const dpy = ph > 0 ? (e.clientY - startY) / ph * 100 : 0;
-            if (mode === 'drag') {
-                builderFields[key].x_pct = Math.max(0, Math.min(100, sXp + dpx));
-                builderFields[key].y_pct = Math.max(0, Math.min(100, sYp + dpy));
-            } else {
-                builderFields[key].w_pct = Math.max(0.5, Math.min(100, sWp + dpx));
-                builderFields[key].h_pct = Math.max(0.5, Math.min(100, sHp + dpy));
-            }
-            renderBuilderBoxes();
-            renderBuilderFieldList();
-        }
-
-        function onUp() {
-            document.removeEventListener('mousemove', onMove);
-            document.removeEventListener('mouseup', onUp);
-        }
-    }
-
-    // ── Render field list with coords + delete ───────────────────────────────
-    function renderBuilderFieldList() {
-        builderFieldList.innerHTML = '';
-        Object.entries(builderFields).forEach(([key, box]) => {
-            const row = document.createElement('div');
-            row.className = 'field-row';
-            row.innerHTML = `
-                <div class="field-swatch"></div>
-                <div class="field-name">${key}</div>
-                <div class="field-coords">
-                    x:${rnd(box.x_pct)}% y:${rnd(box.y_pct)}%
-                    w:${rnd(box.w_pct)}% h:${rnd(box.h_pct)}%
-                </div>
-                <button class="btn btn-sm btn-outline-danger btn-del"
-                        onclick="deleteBuilderField('${key}')">
-                    <i class="fas fa-times"></i>
-                </button>`;
-            builderFieldList.appendChild(row);
-        });
-    }
-
-    function deleteBuilderField(key) {
-        delete builderFields[key];
-        refreshBuilderUI();
-        if (Object.keys(builderFields).length === 0) {
-            builderFieldListWrap.classList.add('hidden');
-        }
-    }
-
-    // ── Save template ─────────────────────────────────────────────────────────
-    builderSaveBtn.addEventListener('click', async function () {
-        const name = builderTemplateName.value.trim()
-                        .toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
-        const status = builderSaveStatus;
-
-        if (!name) {
-            status.innerHTML = `<div class="alert alert-warning py-1 mb-0">Enter a template name.</div>`;
-            return;
-        }
-        if (Object.keys(builderFields).length === 0) {
-            status.innerHTML = `<div class="alert alert-warning py-1 mb-0">Add at least one field first.</div>`;
-            return;
-        }
-
-        const payload = { name, fields: builderFields };
-
-        try {
-            const res  = await fetch('/template_save', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload),
-            });
-            const data = await res.json();
-
-            if (data.status === 'success') {
-                status.innerHTML = `<div class="alert alert-success py-1 mb-0">
-                    Template <strong>${name}</strong> saved! Refreshing template list…</div>`;
-
-                // Add to the scan template dropdown without full reload
-                const sel = document.getElementById('template');
-                const exists = Array.from(sel.options).some(o => o.value === name);
-                if (!exists) {
-                    const opt = document.createElement('option');
-                    opt.value = opt.textContent = name;
-                    sel.appendChild(opt);
+                if (!res.ok || data.status !== 'success') {
+                    setStatus(data.message || 'Save failed.', 'error');
+                    return;
                 }
-                sel.value = name;
 
-                // Reset builder for next template
-                setTimeout(() => {
-                    builderFields  = {};
-                    pendingBox     = null;
-                    builderTemplateName.value = '';
-                    builderFieldName.value    = '';
-                    builderFieldList.innerHTML = '';
-                    builderFieldListWrap.classList.add('hidden');
-                    builderFieldCount.textContent = '0 fields';
-                    builderWrapper.querySelectorAll('.builder-box').forEach(el => el.remove());
-                    status.innerHTML = '';
-                }, 2500);
-            } else {
-                status.innerHTML = `<div class="alert alert-danger py-1 mb-0">${data.message || 'Save failed.'}</div>`;
+                setStatus(data.message, 'success');
+
+                // If the slugified name changed (e.g. editing) and it's different
+                // from the game we started editing, remove the old file so we
+                // don't leave a stale duplicate template behind.
+                if (editingOriginalName && editingOriginalName !== data.name) {
+                    try {
+                        await fetch('/template_delete', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ name: editingOriginalName }),
+                        });
+                    } catch (e) { /* best effort */ }
+                }
+
+                setTimeout(() => window.location.reload(), 500);
+            } catch (err) {
+                console.error(err);
+                setStatus('Save failed. Please try again.', 'error');
+            } finally {
+                saveGameBtn.disabled = false;
             }
-        } catch (err) {
-            status.innerHTML = `<div class="alert alert-danger py-1 mb-0">Error: ${err.message}</div>`;
-        }
-    });
+        });
 
+        function loadGameIntoForm(game) {
+            fieldsContainer.innerHTML = '';
+            gameNameInput.value = game.name;
+            editingOriginalName = game.name;
+            formTitle.innerHTML = `<i class="fas fa-pen me-2"></i>Edit "${game.name}"`;
+            cancelEditBtn.classList.remove('hidden');
+
+            if (game.fields && game.fields.length) {
+                game.fields.forEach(f => addFieldRow(f.key, f.field_type, f.dropdown_options || [], !!f.hidden));
+            } else {
+                addFieldRow();
+            }
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+        }
+
+        async function deleteGame(name) {
+            if (!confirm(`Delete the "${name}" game template? Existing inventory records won't be affected.`)) return;
+            try {
+                const res = await fetch('/template_delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name }),
+                });
+                const data = await res.json();
+                if (!res.ok || data.status !== 'success') {
+                    alert(data.message || 'Delete failed.');
+                    return;
+                }
+                window.location.reload();
+            } catch (err) {
+                console.error(err);
+                alert('Delete failed. Please try again.');
+            }
+        }
+
+        function renderGamesList() {
+            gamesList.innerHTML = '';
+            if (!games.length) {
+                gamesEmptyState.classList.remove('hidden');
+                return;
+            }
+            gamesEmptyState.classList.add('hidden');
+
+            games.forEach((game, idx) => {
+                const col = document.createElement('div');
+                col.className = 'col-12 col-md-6';
+
+                const pills = (game.fields || []).map(f => {
+                    return `<span class="field-pill">${f.key} <span class="type-badge">${f.field_type}</span>${f.hidden ? '<span class="type-badge-hidden">Hidden</span>' : ''}</span>`;
+                }).join('');
+
+                col.innerHTML = `
+                    <div class="card game-card h-100">
+                        <div class="card-header px-3 py-2">
+                            <span><i class="fas fa-gamepad me-2"></i>${game.name.replace(/_/g, ' ')}</span>
+                            <div>
+                                <button class="btn btn-sm btn-outline-light edit-game-btn" title="Edit"><i class="fas fa-pen"></i></button>
+                                <button class="btn btn-sm btn-outline-light delete-game-btn" title="Delete"><i class="fas fa-trash"></i></button>
+                            </div>
+                        </div>
+                        <div class="card-body">
+                            <div class="text-muted small mb-2">${(game.fields || []).length} field${(game.fields || []).length !== 1 ? 's' : ''}</div>
+                            <div>${pills || '<span class="text-muted small">No fields</span>'}</div>
+                        </div>
+                    </div>
+                `;
+
+                col.querySelector('.edit-game-btn').addEventListener('click', () => loadGameIntoForm(game));
+                col.querySelector('.delete-game-btn').addEventListener('click', () => deleteGame(game.name));
+
+                gamesList.appendChild(col);
+            });
+        }
+
+        resetForm();
+        renderGamesList();
     </script>
 </body>
 </html>

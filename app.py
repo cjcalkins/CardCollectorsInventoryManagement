@@ -2,16 +2,24 @@ from flask import Flask, request, jsonify, render_template, send_from_directory,
 import os
 import re as _re
 import cv2
-import pytesseract
 import json
 import shutil
 import numpy as np
 from datetime import datetime
 from PIL import Image
 from werkzeug.utils import secure_filename
-from models import db, Product, ScanRecord
+from models import db, Product, ScanRecord, ShopConnection, Listing
 from dotenv import load_dotenv
 load_dotenv()
+
+# PyMuPDF is used to rasterize uploaded PDF pages (see /pdf_extract_pages).
+# Import is optional at module load time so the rest of the app keeps working
+# even on installs that haven't run `pip install PyMuPDF` yet — the PDF
+# import route will just report a clear error instead of crashing the app.
+try:
+    import fitz  # PyMuPDF
+except ImportError:
+    fitz = None
 
 app = Flask(__name__, template_folder="templates")
 
@@ -24,6 +32,7 @@ app.config["TEMP_IMPORT_FOLDER"] = os.path.join(app.config["UPLOAD_FOLDER"], "im
 app.config["TEMP_SPLIT_FOLDER"] = os.path.join(app.config["UPLOAD_FOLDER"], "temp_split")
 app.config["TEMP_CARD_FOLDER"] = os.path.join(app.config["UPLOAD_FOLDER"], "temp_cards")
 app.config["INVENTORY_IMAGE_FOLDER"] = os.path.join(app.config["UPLOAD_FOLDER"], "inventory_cards")
+app.config["TEMP_PDF_FOLDER"] = os.path.join(app.config["UPLOAD_FOLDER"], "temp_pdf_pages")
 
 db.init_app(app)
 
@@ -37,6 +46,7 @@ def ensure_dirs():
     os.makedirs(app.config["TEMP_SPLIT_FOLDER"], exist_ok=True)
     os.makedirs(app.config["TEMP_CARD_FOLDER"], exist_ok=True)
     os.makedirs(app.config["INVENTORY_IMAGE_FOLDER"], exist_ok=True)
+    os.makedirs(app.config["TEMP_PDF_FOLDER"], exist_ok=True)
 
 
 # ====================== PATH HELPERS ======================
@@ -45,6 +55,13 @@ def normalize_to_upload_relative(path_value):
         return ""
 
     normalized = str(path_value).replace("\\", "/")
+
+    # External URLs (e.g. Photo URL column from a CSV import) are stored and
+    # returned as-is — they don't live under UPLOAD_FOLDER and shouldn't be
+    # mangled by the prefix-stripping below.
+    if normalized.startswith("http://") or normalized.startswith("https://"):
+        return normalized
+
     upload_prefix = app.config["UPLOAD_FOLDER"].replace("\\", "/").rstrip("/") + "/"
 
     if normalized.startswith(upload_prefix):
@@ -57,6 +74,10 @@ def build_uploaded_file_url(path_value):
     relative_path = normalize_to_upload_relative(path_value)
     if not relative_path:
         return None
+    if relative_path == "__blank__":
+        return url_for("static", filename="blank.jpg")
+    if relative_path.startswith("http://") or relative_path.startswith("https://"):
+        return relative_path
     return url_for("uploaded_file", filename=relative_path)
 
 
@@ -90,11 +111,27 @@ def parse_card_filename(filename):
     if len(parts) < 4:
         return {}
 
+    # Current format embeds the page side as the final segment:
+    #   game-album-page-slot-side.png
+    # Older imports (from before front/back support) omit it:
+    #   game-album-page-slot.png
+    if len(parts) >= 5 and parts[-1] in ("front", "back"):
+        side  = parts[-1]
+        slot  = parts[-2]
+        page  = parts[-3]
+        album = "-".join(parts[1:-3])
+    else:
+        side  = "front"
+        slot  = parts[-1]
+        page  = parts[-2]
+        album = "-".join(parts[1:-2])
+
     return {
-        "game": parts[0].replace("_", " "),
-        "album": "-".join(parts[1:-2]).replace("_", " "),
-        "page": parts[-2],
-        "slot": parts[-1],
+        "game":  parts[0].replace("_", " "),
+        "album": album.replace("_", " "),
+        "page":  page,
+        "slot":  slot,
+        "side":  side,
     }
 
 
@@ -127,6 +164,10 @@ def build_album_index():
     album_map = {}
 
     for record in records:
+        data = record.extracted_data or {}
+        if _is_catalog_only(data):
+            continue
+
         album_name = get_record_value(record, "album")
         if not album_name:
             continue
@@ -171,164 +212,12 @@ def build_album_index():
     )
 
 
-# ====================== OCR PREPROCESSING ======================
-def window_levels(gray, low, high):
-    gray_f = gray.astype(np.float32)
-    stretched = (gray_f - low) * (255.0 / max(1, high - low))
-    stretched = np.clip(stretched, 0, 255).astype(np.uint8)
-    return stretched
-
-
-def upscale_for_ocr(img, scale=3):
-    return cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-
-
-def clean_binary(img):
-    kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    cleaned = cv2.morphologyEx(img, cv2.MORPH_OPEN, kernel_open, iterations=1)
-    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel_close, iterations=1)
-    return cleaned
-
-
-def preprocess_roi_for_ocr_candidates(roi):
-    """
-    Build a prioritised list of preprocessed image candidates for OCR.
-    Candidates are ordered from most-likely-to-succeed to least, so that
-    the early-exit threshold in preprocess_and_ocr_best fires as soon as
-    possible and avoids running all 30+ variants on every field.
-
-    Priority order:
-      1. CLAHE on raw gray         — fast, effective on clean prints
-      2. Otsu threshold variants   — sharp binary, good for high-contrast text
-      3. Windowed + CLAHE          — handles uneven lighting
-      4. Adaptive threshold        — fallback for low-contrast regions
-      5. Raw windowed              — rarely needed, kept for robustness
-    """
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    gray = cv2.bilateralFilter(gray, d=5, sigmaColor=50, sigmaSpace=50)
-
-    candidates = []
-
-    # ── Tier 1: CLAHE on raw gray (fastest, most reliable on clean card text) ──
-    clahe_base = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
-    candidates.append(("gray_clahe", clahe_base))
-
-    windows = [(100, 110), (95, 115), (90, 120), (105, 118)]
-    for low, high in windows:
-        leveled       = window_levels(gray, low, high)
-        leveled_clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(leveled)
-        blackhat      = cv2.morphologyEx(
-            leveled_clahe,
-            cv2.MORPH_BLACKHAT,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9)),
-        )
-        enhanced = cv2.addWeighted(leveled_clahe, 0.80, blackhat, 0.35, 0)
-
-        # ── Tier 2: Otsu — sharp binary, prioritised before adaptive ──
-        _, otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        _, otsu_inv = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        otsu     = clean_binary(otsu)
-        otsu_inv = clean_binary(otsu_inv)
-        candidates.append((f"lvl_{low}_{high}_otsu",     otsu))
-        candidates.append((f"lvl_{low}_{high}_otsu_inv", otsu_inv))
-
-        # ── Tier 3: windowed + CLAHE enhanced ──
-        candidates.append((f"lvl_{low}_{high}_clahe", leveled_clahe))
-        candidates.append((f"lvl_{low}_{high}_enh",   enhanced))
-
-        # ── Tier 4: adaptive threshold ──
-        th = cv2.adaptiveThreshold(
-            enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 2
-        )
-        th_inv = cv2.adaptiveThreshold(
-            enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 2
-        )
-        th     = clean_binary(th)
-        th_inv = clean_binary(th_inv)
-        candidates.append((f"lvl_{low}_{high}_th",  th))
-        candidates.append((f"lvl_{low}_{high}_inv", th_inv))
-
-        # ── Tier 5: raw windowed — rarely needed ──
-        candidates.append((f"lvl_{low}_{high}", leveled))
-
-    return candidates
-
-
-def run_tesseract_on_candidate(candidate_img, psm=7, oem=3, whitelist=""):
-    up = upscale_for_ocr(candidate_img, scale=3)
-    config_str = f"--oem {oem} --psm {psm}"
-    if whitelist:
-        config_str += f" -c tessedit_char_whitelist={whitelist}"
-
-    text = pytesseract.image_to_string(up, config=config_str).strip()
-    text = " ".join(text.split())
-
-    data = pytesseract.image_to_data(up, config=config_str, output_type=pytesseract.Output.DICT)
-    confs = [
-        float(c)
-        for c in data.get("conf", [])
-        if str(c).replace(".", "", 1).isdigit() and float(c) >= 0
-    ]
-
-    mean_conf = sum(confs) / len(confs) if confs else -1.0
-    return text, mean_conf, up
-
-
-# Confidence threshold (0–100) at which OCR is considered good enough to stop
-# trying further preprocessing candidates. Saves 60–80% of Tesseract calls on
-# clean card images. Lower this if accuracy drops on difficult scans.
-OCR_CONFIDENCE_THRESHOLD = 75.0
-
-# Maximum number of preprocessing candidates to try per field before giving up.
-# Full candidate set is ~30. Capping at 12 covers the most effective variants
-# without exhausting all permutations on every field.
-OCR_MAX_CANDIDATES = 12
-
-
-def preprocess_and_ocr_best(roi, field_name="field", psm=7, oem=3, whitelist=""):
-    candidates = preprocess_roi_for_ocr_candidates(roi)
-    best = {"text": "", "conf": -1.0, "variant": "none", "image": None}
-
-    debug_dir = os.path.join(app.config["UPLOAD_FOLDER"], "debug")
-    os.makedirs(debug_dir, exist_ok=True)
-
-    for variant_name, candidate_img in candidates[:OCR_MAX_CANDIDATES]:
-        text, conf, up = run_tesseract_on_candidate(
-            candidate_img, psm=psm, oem=oem, whitelist=whitelist
-        )
-
-        debug_path = os.path.join(debug_dir, f"{field_name}_{variant_name}.jpg")
-        cv2.imwrite(debug_path, up)
-
-        if text.strip() and conf > best["conf"]:
-            best["text"]    = text
-            best["conf"]    = conf
-            best["variant"] = variant_name
-            best["image"]   = up
-
-        # Early exit — confidence is good enough, no need to try more variants
-        if best["conf"] >= OCR_CONFIDENCE_THRESHOLD:
-            break
-
-    # Fallback: if no candidate produced text at all, run the first one regardless
-    if best["image"] is None and candidates:
-        variant_name, candidate_img = candidates[0]
-        text, conf, up = run_tesseract_on_candidate(
-            candidate_img, psm=psm, oem=oem, whitelist=whitelist
-        )
-        best["text"]    = text
-        best["conf"]    = conf
-        best["variant"] = variant_name
-        best["image"]   = up
-
-    if best["image"] is not None:
-        best_path = os.path.join(debug_dir, f"{field_name}_BEST_{best['variant']}.jpg")
-        cv2.imwrite(best_path, best["image"])
-
-    return best
-
-
+# ====================== GAME TEMPLATES ======================
+# A "template" file (templates/roi/<name>.json) now represents a Game
+# definition: just a name plus a flat list of fields that belong to every
+# entry for that game. There are no OCR zones / ROI coordinates anymore —
+# imported cards are simply created with these fields blank, ready to be
+# filled in by hand from the Inventory / Inventory Detail pages.
 def load_template(template_name="product_label"):
     template_path = os.path.join(app.config["ROI_TEMPLATE_FOLDER"], f"{template_name}.json")
     if not os.path.exists(template_path):
@@ -336,95 +225,6 @@ def load_template(template_name="product_label"):
 
     with open(template_path, "r", encoding="utf-8") as f:
         return json.load(f)
-
-
-def normalize_fields_to_image_space(fields_dict, original_w, original_h, preview_w=None, preview_h=None):
-    """
-    Convert ROI field coordinates to absolute pixel values against the actual image.
-
-    Percentage format (preferred):
-      x_pct, y_pct, w_pct, h_pct — floats 0.0–100.0
-      Converted directly using original_w / original_h. preview dimensions ignored.
-
-    Legacy pixel format (backwards-compatible):
-      x, y, w, h — pixel values relative to preview display size.
-      Scaled to image space using preview_w / preview_h ratio.
-    """
-    if not isinstance(fields_dict, dict):
-        return {}
-
-    normalized = {}
-    for field, coords in fields_dict.items():
-        if not isinstance(coords, dict):
-            continue
-
-        if "x_pct" in coords:
-            try:
-                x_pct = max(0.0, min(100.0, float(coords.get("x_pct", 0))))
-                y_pct = max(0.0, min(100.0, float(coords.get("y_pct", 0))))
-                w_pct = max(0.1, min(100.0, float(coords.get("w_pct", 10))))
-                h_pct = max(0.1, min(100.0, float(coords.get("h_pct", 10))))
-
-                x = int(round(x_pct / 100.0 * original_w))
-                y = int(round(y_pct / 100.0 * original_h))
-                w = max(1, int(round(w_pct / 100.0 * original_w)))
-                h = max(1, int(round(h_pct / 100.0 * original_h)))
-            except Exception:
-                continue
-        else:
-            sx = sy = 1.0
-            if preview_w and preview_h:
-                try:
-                    pw = float(preview_w)
-                    ph = float(preview_h)
-                    if pw > 0 and ph > 0:
-                        sx = float(original_w) / pw
-                        sy = float(original_h) / ph
-                except Exception:
-                    pass
-
-            x = max(0, int(round(float(coords.get("x", 0)) * sx)))
-            y = max(0, int(round(float(coords.get("y", 0)) * sy)))
-            w = max(1, int(round(float(coords.get("w", 100)) * sx)))
-            h = max(1, int(round(float(coords.get("h", 50)) * sy)))
-
-        normalized[field] = {
-            "x": x, "y": y, "w": w, "h": h,
-            "config": coords.get("config", {}),
-        }
-
-    return normalized
-
-
-def ocr_with_custom_fields(image_path, fields_dict):
-    img = cv2.imread(image_path)
-    if img is None:
-        return {"error": f"Could not read image: {image_path}"}
-
-    h_img, w_img = img.shape[:2]
-    results = {}
-
-    for field, coords in fields_dict.items():
-        x, y, w, h = coords["x"], coords["y"], coords["w"], coords["h"]
-        x2 = min(x + w, w_img)
-        y2 = min(y + h, h_img)
-
-        if x2 - x <= 10 or y2 - y <= 10:
-            results[field] = ""
-            continue
-
-        roi = img[y:y2, x:x2]
-        field_config = coords.get("config", {})
-        psm = field_config.get("psm", 7)
-        oem = field_config.get("oem", 3)
-        whitelist = field_config.get("whitelist", "")
-
-        best = preprocess_and_ocr_best(roi, field_name=field, psm=psm, oem=oem, whitelist=whitelist)
-        results[field] = best["text"]
-        results[f"{field}__ocr_conf"] = round(best["conf"], 2) if best["conf"] >= 0 else -1
-        results[f"{field}__ocr_variant"] = best["variant"]
-
-    return results
 
 
 # ====================== CARD ALIGNMENT HELPERS ======================
@@ -516,6 +316,55 @@ def process_card_image(image, canny_low=50, canny_high=200, approx_eps=0.02, min
     return warped
 
 
+def straighten_split_image(image, max_angle=15.0):
+    """Slightly rotate a single split-page tile so the card sits upright.
+
+    This intentionally does NOT try to locate the four corners of the card
+    or run a perspective ("four point") warp — the 3x3 split already frames
+    each card closely enough. All this does is estimate how far the card is
+    tilted inside its tile and apply a small corrective rotation so it reads
+    as upright. The crop/framing from the split is otherwise left alone.
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Separate the card from whatever background is visible in this tile.
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return image
+
+    largest = max(contours, key=cv2.contourArea)
+    image_area = image.shape[0] * image.shape[1]
+    if cv2.contourArea(largest) < 0.05 * image_area:
+        # Nothing large enough found — leave the tile as-is rather than guessing.
+        return image
+
+    angle = cv2.minAreaRect(largest)[-1]
+
+    # cv2.minAreaRect reports an angle in [-90, 0); convert that into a small
+    # +/- rotation relative to upright instead of a raw box angle.
+    if angle < -45:
+        angle = 90 + angle
+    elif angle > 45:
+        angle = angle - 90
+
+    # Ignore tiny noise and anything implausibly large for a "slight" fix.
+    if abs(angle) < 0.3 or abs(angle) > max_angle:
+        return image
+
+    h, w = image.shape[:2]
+    center = (w / 2.0, h / 2.0)
+    rotation_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    straightened = cv2.warpAffine(
+        image, rotation_matrix, (w, h),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    return straightened
+
+
 def split_image_3x3(pil_image, v1_pct, v2_pct, h1_pct, h2_pct):
     w, h = pil_image.size
 
@@ -529,6 +378,28 @@ def split_image_3x3(pil_image, v1_pct, v2_pct, h1_pct, h2_pct):
             pieces.append(pil_image.crop(box))
 
     return pieces
+
+
+# Maps a piece's position in the photographed image (1-9, left-to-right /
+# top-to-bottom, i.e. the order returned by split_image_3x3) to the physical
+# pocket number it should be filed under when that photo is of the BACK of a
+# 9-pocket page. Flipping a page over left-to-right (as when turning it to
+# photograph the back) mirrors the pocket order horizontally within each row,
+# so a back photo's leftmost pocket in a row is actually the row's rightmost
+# physical pocket, and vice versa. This keeps a card's front and back slot
+# numbers pointing at the same physical pocket. Front photos need no
+# remapping since they're numbered directly as photographed.
+BACK_SLOT_MAP = {1: 3, 2: 2, 3: 1, 4: 6, 5: 5, 6: 4, 7: 9, 8: 8, 9: 7}
+
+
+def resolve_slot_number(photographed_index, side):
+    """
+    Given a piece's 1-9 index in photographed (crop) order, return the slot
+    number it should be filed under for the given page side ("front"/"back").
+    """
+    if side == "back":
+        return BACK_SLOT_MAP[photographed_index]
+    return photographed_index
 
 
 def get_template_names():
@@ -559,13 +430,35 @@ def match_product_from_extracted(extracted):
     return matched_product
 
 
-def create_scan_record(image_path, template_name, extracted, normalized_fields):
+def find_existing_record_for_key(game, album, page, slot):
+    """
+    Look up a ScanRecord already occupying the same (game, album, page, slot)
+    identity. Used to merge a front and back photo of the same physical
+    pocket into a single record instead of creating two.
+    """
+    if not (game and album and page and slot):
+        return None
+
+    for record in ScanRecord.query.all():
+        data = record.extracted_data or {}
+        if (
+            str(data.get("game",  "")).strip() == game  and
+            str(data.get("album", "")).strip() == album and
+            str(data.get("page",  "")).strip() == page  and
+            str(data.get("slot",  "")).strip() == slot
+        ):
+            return record
+    return None
+
+
+def create_scan_record(image_path, template_name, extracted, image_path_back=None):
     matched_product = match_product_from_extracted(extracted)
 
     record = ScanRecord(
         image_path=normalize_to_upload_relative(image_path),
+        image_path_back=normalize_to_upload_relative(image_path_back) if image_path_back else None,
         template_used=template_name,
-        extracted_data={**extracted, "__roi_fields_used": normalized_fields},
+        extracted_data=dict(extracted),
         matched_product_id=matched_product.id if matched_product else None,
     )
     db.session.add(record)
@@ -736,6 +629,7 @@ def utility_functions():
             per_page=request.args.get("per_page", 50),
             sort=request.args.get("sort", ""),
             sort_dir=request.args.get("sort_dir", "asc"),
+            catalog=request.args.get("catalog", ""),
         )
     return dict(
         build_inventory_url=build_inventory_url,
@@ -746,7 +640,28 @@ def utility_functions():
 # ====================== PAGE ROUTES ======================
 @app.route("/")
 def index():
-    return render_template("index.html", templates=get_template_names())
+    ensure_dirs()
+    games = []
+    for name in get_template_names():
+        try:
+            tpl = load_template(name)
+        except Exception:
+            continue
+        fields = tpl.get("fields", {}) or {}
+        games.append({
+            "name": name,
+            "fields": [
+                {
+                    "key": field_key,
+                    "field_type": (field_cfg or {}).get("field_type", "text"),
+                    "dropdown_options": (field_cfg or {}).get("dropdown_options", []),
+                    "hidden": bool((field_cfg or {}).get("hidden", False)),
+                }
+                for field_key, field_cfg in fields.items()
+            ],
+        })
+    games.sort(key=lambda g: g["name"])
+    return render_template("index.html", games=games)
 
 
 # Keys that are rendered as dedicated static columns or are internal/OCR metadata.
@@ -756,12 +671,24 @@ _STATIC_ENTRY_KEYS = frozenset({
     "__roi_fields_used",
     # Dedicated static columns and legacy/superseded keys that must never
     # surface as dynamic ad-hoc text columns.
-    "edition", "holographic", "finalized", "tcgplayer",
+    "edition", "holographic", "finalized", "tcgplayer", "grading",
     "first_edition", "limited_edition",
-    "empty",
+    "empty", "catalog_only",
 })
 _INTERNAL_KEY_PREFIXES = ("__ocr_", "__")
 _INTERNAL_KEY_SUFFIXES = ("__ocr_conf", "__ocr_variant")
+
+
+def _is_catalog_only(data: dict) -> bool:
+    """
+    Catalog-only records (created by CSV import) are reference/lookup rows —
+    not owned inventory. They exist so their fields (name, set, rarity,
+    TCGplayer URL/price, etc.) can be pulled into a real inventory entry via
+    "Copy from Entry", but they must never appear in the Inventory list,
+    Album view, CSV export, or duplicate-resolution tools themselves.
+    """
+    val = (data or {}).get("catalog_only", False)
+    return val is True or str(val).strip().lower() == "true"
 
 
 def _is_entry_field(key: str) -> bool:
@@ -853,6 +780,7 @@ def _inventory_game_select():
     )
 
     game_map = {}
+    catalog_count = 0
     for (extracted_data,) in rows:
         if isinstance(extracted_data, dict):
             data = extracted_data
@@ -861,6 +789,10 @@ def _inventory_game_select():
                 data = json.loads(extracted_data or "{}")
             except (ValueError, TypeError):
                 data = {}
+
+        if _is_catalog_only(data):
+            catalog_count += 1
+            continue
 
         game_name = str(data.get("game", "")).strip()
         if not game_name:
@@ -889,7 +821,7 @@ def _inventory_game_select():
     games.sort(key=lambda g: g["name"].lower())
     for game in games:
         game["image_url"] = find_saved_image("game_icons", game["name"])
-    return render_template("inventory_game_select.html", games=games)
+    return render_template("inventory_game_select.html", games=games, catalog_count=catalog_count)
 
 
 @app.route("/inventory")
@@ -902,9 +834,14 @@ def inventory():
     f_template = request.args.get("template", "").strip()
     sort_col   = request.args.get("sort", "").strip()
     sort_dir   = request.args.get("sort_dir", "asc").strip()
+    # "Imported Catalog" view: CSV imports create hidden catalog_only
+    # records (reference rows, not owned inventory) that never show up in
+    # the normal Inventory list. ?catalog=1 flips this page to show ONLY
+    # those hidden rows instead, so they can be found, edited, and deleted.
+    view_catalog = request.args.get("catalog", "").strip() in ("1", "true", "yes")
 
     # If no filter is active, show the game selection landing page.
-    if not f_game and not f_album and not f_template and not search:
+    if not f_game and not f_album and not f_template and not search and not view_catalog:
         return _inventory_game_select()
 
     if sort_dir not in ("asc", "desc"):
@@ -922,6 +859,20 @@ def inventory():
         query = query.filter(ScanRecord.extracted_data.cast(db.Text).ilike(f"%{search}%"))
 
     all_records_raw = query.all()
+
+    # Catalog-only records (from CSV import) are lookup/reference rows, not
+    # owned inventory. Normally they're excluded from the Inventory list;
+    # in catalog view, the filter is flipped so ONLY they show.
+    if view_catalog:
+        all_records_raw = [
+            r for r in all_records_raw
+            if _is_catalog_only(r.extracted_data or {})
+        ]
+    else:
+        all_records_raw = [
+            r for r in all_records_raw
+            if not _is_catalog_only(r.extracted_data or {})
+        ]
 
     # Python-side filtering for game / album (SQLite-safe)
     all_records = all_records_raw
@@ -996,7 +947,9 @@ def inventory():
     entry_fields = discover_entry_fields(all_sample)
 
     # Aggregate field-type config from all known templates so the inventory
-    # list can render boolean toggles and respect dropdown options.
+    # list can render boolean toggles, respect dropdown options, and know
+    # which fields are marked "hidden" (kept off the table/detail page by
+    # default, revealed only via the "Show Hidden Fields" switch).
     template_fields_config: dict = {}
     for tpl_name in get_template_names():
         try:
@@ -1006,6 +959,7 @@ def inventory():
                     template_fields_config[fk] = {
                         "field_type":       fv.get("field_type", "text"),
                         "dropdown_options": fv.get("dropdown_options", []),
+                        "hidden":           bool(fv.get("hidden", False)),
                     }
         except Exception:
             pass
@@ -1024,6 +978,7 @@ def inventory():
         sort_col=sort_col,
         sort_dir=sort_dir,
         template_fields_config=template_fields_config,
+        catalog_view=view_catalog,
     )
 
 
@@ -1046,6 +1001,7 @@ def inventory_export_csv():
     f_album    = request.args.get("album", "").strip()
     f_template = request.args.get("template", "").strip()
     columns_param = request.args.get("columns", "").strip()
+    view_catalog = request.args.get("catalog", "").strip() in ("1", "true", "yes")
 
     # Build query — same logic as /inventory, but no pagination
     # Python-side filtering for game/album for SQLite compatibility (.astext is PostgreSQL-only)
@@ -1056,6 +1012,7 @@ def inventory_export_csv():
         query = query.filter(ScanRecord.extracted_data.cast(db.Text).ilike(f"%{search}%"))
 
     records = query.all()
+    records = [r for r in records if _is_catalog_only(r.extracted_data or {}) == view_catalog]
     if f_game:
         records = [
             r for r in records
@@ -1136,7 +1093,11 @@ def inventory_filter_options():
     Returns distinct Game, Album, and Template values for the inventory
     filter dropdowns. Uses with_entities for efficiency at large scale.
     Works whether extracted_data is db.JSON or db.Text.
+    Pass catalog=1 to scope the values to hidden catalog-only rows (used by
+    the Imported Catalog view) instead of normal owned-inventory rows.
     """
+    view_catalog = request.args.get("catalog", "").strip() in ("1", "true", "yes")
+
     rows = (
         ScanRecord.query
         .with_entities(ScanRecord.extracted_data, ScanRecord.template_used)
@@ -1155,6 +1116,9 @@ def inventory_filter_options():
                 data = json.loads(extracted_data or "{}")
             except (ValueError, TypeError):
                 data = {}
+
+        if _is_catalog_only(data) != view_catalog:
+            continue
 
         if data.get("game"):
             games.add(str(data["game"]).strip())
@@ -1176,11 +1140,16 @@ def inventory_all_ids():
     Return all ScanRecord IDs that match the current filter params
     (search, game, album, template).  Used by the "Select All in Filter"
     button to collect IDs across every page before a bulk operation.
+    Respects the same catalog=1 flag as /inventory so "Select All" on the
+    Imported Catalog view only ever selects catalog rows, and — just as
+    important — "Select All" on the normal Inventory view can never quietly
+    pull in hidden catalog rows that were never shown on the page.
     """
-    search     = request.args.get("search",   "").strip()
-    f_game     = request.args.get("game",     "").strip()
-    f_album    = request.args.get("album",    "").strip()
-    f_template = request.args.get("template", "").strip()
+    search       = request.args.get("search",   "").strip()
+    f_game       = request.args.get("game",     "").strip()
+    f_album      = request.args.get("album",    "").strip()
+    f_template   = request.args.get("template", "").strip()
+    view_catalog = request.args.get("catalog", "").strip() in ("1", "true", "yes")
 
     query = ScanRecord.query.with_entities(ScanRecord.id, ScanRecord.extracted_data)
 
@@ -1201,6 +1170,8 @@ def inventory_all_ids():
                 data = json.loads(extracted_data or "{}")
             except (ValueError, TypeError):
                 data = {}
+        if _is_catalog_only(data) != view_catalog:
+            continue
         if f_game and str(data.get("game", "")).strip() != f_game:
             continue
         if f_album and str(data.get("album", "")).strip() != f_album:
@@ -1458,6 +1429,323 @@ def import_page():
     return render_template("import.html", templates=get_template_names())
 
 
+# ====================== CSV IMPORT ======================
+# CSV import is now template-driven rather than tied to a fixed TCGplayer
+# column layout: the person picks (or creates) a Game template, then maps
+# whichever CSV columns they want onto that template's fields. Rows become
+# hidden "catalog" ScanRecords (extracted_data['catalog_only'] = True) —
+# reference/lookup entries pullable into a real inventory entry later via
+# "Copy from Entry" — using exactly the field keys of the chosen Game, so a
+# copy lines up cleanly with entries created through the photo import flow.
+#
+# A handful of field KEYS get optional bonus handling if the person happens
+# to map them (this is best-effort convenience, not a requirement):
+#   product_id   + set + name  -> extrapolated TCGplayer product URL
+#   market_price               -> stored alongside the TCGplayer URL data
+#   printing                   -> best-effort mapped into an 'edition' value
+#                                  (Standard/First/Limited) if no explicit
+#                                  'edition' field was mapped
+#   quantity                   -> parsed into 'csv_quantity' (informational)
+#   photo_url / photo          -> used as the record's image instead of blank
+
+
+def _csv_map_printing_to_edition(printing_value: str) -> str:
+    """
+    The app's 'edition' field is a strict 3-option dropdown
+    (Standard Edition / First Edition / Limited Edition), but TCGplayer's
+    'Printing' column commonly contains values like 'Normal', 'Unlimited',
+    'Holofoil', 'Reverse Holofoil', '1st Edition', etc.
+
+    Best-effort mapping into the dropdown's vocabulary, used only when the
+    person mapped a 'printing' column but no explicit 'edition' field.
+    """
+    v = (printing_value or "").strip().lower()
+    if not v:
+        return EDITION_DEFAULT
+    if "unlimited" in v:
+        return EDITION_DEFAULT
+    if "1st" in v or "first" in v:
+        return "First Edition"
+    if "limited" in v:
+        return "Limited Edition"
+    return EDITION_DEFAULT
+
+
+def _csv_parse_int(value, default=1, minimum=1):
+    try:
+        n = int(float(str(value).strip()))
+    except (ValueError, TypeError):
+        return default
+    return n if n >= minimum else default
+
+
+def _csv_parse_float(value):
+    try:
+        s = str(value).strip()
+        if not s:
+            return None
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def _slugify_tcg_component(text):
+    """Lowercase, alnum-only, hyphen-joined slug component for a TCGplayer URL."""
+    text = (text or "").strip().lower()
+    text = _re.sub(r"[^a-z0-9]+", "-", text)
+    text = _re.sub(r"-{2,}", "-", text)
+    return text.strip("-")
+
+
+def build_tcgplayer_url(product_id, game, set_name, product_name):
+    """
+    Extrapolate a TCGplayer.com product PAGE url (not the image CDN url) from
+    CSV columns, e.g.:
+      Product ID=42545, Game=Pokemon, Set=Base Set 2, Name=Starmie
+      -> https://www.tcgplayer.com/product/42545/pokemon-base-set-2-starmie?Language=English
+
+    TCGplayer routes on the numeric product ID — the slug text is cosmetic/SEO
+    only — so this is safe even where our best-effort slug doesn't exactly
+    match TCGplayer's own generated slug.
+    """
+    product_id = str(product_id or "").strip()
+    if not product_id:
+        return ""
+    slug_parts = [
+        _slugify_tcg_component(game),
+        _slugify_tcg_component(set_name),
+        _slugify_tcg_component(product_name),
+    ]
+    slug = "-".join(p for p in slug_parts if p) or "card"
+    return f"https://www.tcgplayer.com/product/{product_id}/{slug}?Language=English"
+
+
+@app.route("/csv_headers", methods=["POST"])
+def csv_headers():
+    """
+    Read just the header row of an uploaded CSV so the front-end can render
+    a column-mapping UI without guessing. Does not import anything.
+    """
+    import csv
+    import io
+
+    upload = request.files.get("csv_file")
+    if not upload or not upload.filename:
+        return jsonify({"status": "error", "message": "No CSV file was uploaded."}), 400
+
+    try:
+        raw_bytes = upload.stream.read()
+        text = raw_bytes.decode("utf-8-sig")
+        reader = csv.reader(io.StringIO(text))
+        headers = next(reader, [])
+        headers = [h.strip() for h in headers if h.strip()]
+    except Exception as exc:
+        return jsonify({"status": "error", "message": f"Could not read CSV headers: {exc}"}), 400
+
+    if not headers:
+        return jsonify({"status": "error", "message": "CSV file has no header row."}), 400
+
+    return jsonify({"status": "success", "headers": headers})
+
+
+@app.route("/import_csv", methods=["POST"])
+def import_csv():
+    """
+    Bulk-import a card catalog from any CSV, mapped onto a Game template's
+    fields.
+
+    Form fields:
+      csv_file            — the CSV file
+      template_mode        — "existing" | "new"
+      template_name         — existing Game name (when template_mode == "existing")
+      new_template_name     — new Game name (when template_mode == "new")
+      new_template_fields    — JSON {field_name: {field_type, dropdown_options}}
+                                (when template_mode == "new")
+      mapping               — JSON {field_key: csv_column_name} — csv_column_name
+                                may be "" to leave a field unmapped/blank
+
+    Each valid row becomes exactly ONE hidden "catalog" ScanRecord
+    (extracted_data['catalog_only'] = True) — a reference/lookup entry, not
+    an owned inventory item. Catalog records are filtered out of the
+    Inventory list, Album view, CSV export, and duplicate-resolution tools,
+    but remain fully searchable via the "Copy from Entry" box on the
+    Inventory Detail page.
+    """
+    import csv
+    import io
+
+    upload = request.files.get("csv_file")
+    if not upload or not upload.filename:
+        return jsonify({"status": "error", "message": "No CSV file was uploaded."}), 400
+
+    if not upload.filename.lower().endswith(".csv"):
+        return jsonify({"status": "error", "message": "Please upload a .csv file."}), 400
+
+    template_mode = (request.form.get("template_mode") or "existing").strip().lower()
+
+    # ── Resolve (or create) the Game template this import will use ──────────
+    if template_mode == "new":
+        new_name = (request.form.get("new_template_name") or "").strip()
+        if not new_name:
+            return jsonify({"status": "error", "message": "New game name is required."}), 400
+
+        clean_name = _slugify_template_name(new_name)
+        if not clean_name:
+            return jsonify({"status": "error", "message": "Game name contains no valid characters."}), 400
+
+        try:
+            raw_fields = json.loads(request.form.get("new_template_fields") or "{}")
+        except (ValueError, TypeError):
+            return jsonify({"status": "error", "message": "Invalid field definition."}), 400
+
+        cleaned_fields = _clean_template_fields(raw_fields)
+        if not cleaned_fields:
+            return jsonify({"status": "error", "message": "Add at least one field to the new game."}), 400
+
+        try:
+            _write_template_file(clean_name, cleaned_fields)
+        except OSError as exc:
+            return jsonify({"status": "error", "message": f"Could not save new game: {exc}"}), 500
+
+        template_fields = cleaned_fields
+    else:
+        template_name = (request.form.get("template_name") or "").strip()
+        clean_name = _slugify_template_name(template_name)
+        if not clean_name:
+            return jsonify({"status": "error", "message": "Select a game to import into."}), 400
+        try:
+            tpl = load_template(clean_name)
+        except Exception:
+            return jsonify({"status": "error", "message": f"Game '{clean_name}' not found."}), 404
+        template_fields = tpl.get("fields", {}) or {}
+
+    # ── Resolve the column mapping ───────────────────────────────────────────
+    try:
+        mapping = json.loads(request.form.get("mapping") or "{}")
+    except (ValueError, TypeError):
+        return jsonify({"status": "error", "message": "Invalid column mapping."}), 400
+
+    if not isinstance(mapping, dict):
+        mapping = {}
+    # Normalize keys the same way field names are slugified when a template
+    # is saved (_clean_template_fields) — the mapping the front-end sends may
+    # use a field's raw display name (e.g. "Set Number") rather than its
+    # slugified key ("set_number"), especially right after creating a new
+    # game inline, so this keeps the two in sync.
+    mapping = {
+        _slugify_template_name(field_key): str(col or "").strip()
+        for field_key, col in mapping.items()
+    }
+    mapping = {
+        field_key: col
+        for field_key, col in mapping.items()
+        if field_key in template_fields
+    }
+    mapped_pairs = {k: v for k, v in mapping.items() if v}
+    if not mapped_pairs:
+        return jsonify({"status": "error", "message": "Map at least one field to a CSV column."}), 400
+
+    try:
+        raw_bytes = upload.stream.read()
+        text = raw_bytes.decode("utf-8-sig")
+        text_stream = io.StringIO(text)
+        reader = csv.DictReader(text_stream)
+
+        if not reader.fieldnames:
+            return jsonify({"status": "error", "message": "CSV file has no header row."}), 400
+
+        missing_cols = sorted({col for col in mapped_pairs.values() if col not in reader.fieldnames})
+        if missing_cols:
+            return jsonify({
+                "status": "error",
+                "message": "CSV is missing mapped column(s): " + ", ".join(missing_cols),
+            }), 400
+
+        # Remember this mapping on the template itself so importing another
+        # CSV shaped like this one into the same game auto-fills the mapping.
+        try:
+            _write_template_file(clean_name, template_fields, csv_column_mapping=mapped_pairs)
+        except OSError:
+            pass  # non-fatal — the import can still proceed without saving it
+
+        rows_seen = 0
+        rows_skipped = 0
+        records_created = 0
+        new_records = []
+
+        for row in reader:
+            rows_seen += 1
+
+            extracted_data = {}
+            for field_key, column_name in mapped_pairs.items():
+                extracted_data[field_key] = (row.get(column_name) or "").strip()
+
+            if not any(extracted_data.values()):
+                rows_skipped += 1
+                continue
+
+            extracted_data["game"] = clean_name
+            extracted_data["catalog_only"] = True
+
+            # ── Optional bonus handling for recognizable field keys ──────────
+            if "printing" in extracted_data and not extracted_data.get("edition"):
+                extracted_data["edition"] = _csv_map_printing_to_edition(extracted_data["printing"])
+
+            if "quantity" in extracted_data:
+                extracted_data["csv_quantity"] = _csv_parse_int(extracted_data.get("quantity"), default=1)
+
+            image_path = "__blank__"
+            for photo_key in ("photo_url", "photo"):
+                if extracted_data.get(photo_key):
+                    image_path = extracted_data[photo_key]
+                    break
+
+            product_id = extracted_data.get("product_id", "")
+            if product_id:
+                tcg_url = build_tcgplayer_url(
+                    product_id, clean_name,
+                    extracted_data.get("set", ""), extracted_data.get("name", ""),
+                )
+                if tcg_url:
+                    extracted_data["tcgplayer"] = {
+                        "url":          tcg_url,
+                        "full_url":     tcg_url,
+                        "saved_at":     datetime.utcnow().isoformat(),
+                        "source":       "csv_import",
+                        "product_id":   product_id,
+                        "product_name": extracted_data.get("name", ""),
+                        "set_name":     extracted_data.get("set", ""),
+                        "set_number":   extracted_data.get("set_number", ""),
+                        "prices": {
+                            "market": _csv_parse_float(extracted_data.get("market_price")),
+                        },
+                    }
+
+            new_records.append(ScanRecord(
+                image_path=image_path,
+                template_used=clean_name,
+                extracted_data=extracted_data,
+            ))
+            records_created += 1
+
+        if new_records:
+            db.session.bulk_save_objects(new_records)
+            db.session.commit()
+
+        return jsonify({
+            "status":           "success",
+            "rows_seen":        rows_seen,
+            "rows_skipped":     rows_skipped,
+            "records_created":  records_created,
+            "games":            [clean_name],
+        })
+
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({"status": "error", "message": f"Import failed: {exc}"}), 500
+
+
+
 # ====================== FILE ROUTES ======================
 @app.route("/uploads/<path:filename>")
 def uploaded_file(filename):
@@ -1472,6 +1760,11 @@ def temp_split_file(filename):
 @app.route("/temp_cards/<path:filename>")
 def temp_card_file(filename):
     return send_from_directory(app.config["TEMP_CARD_FOLDER"], filename)
+
+
+@app.route("/temp_pdf/<path:filename>")
+def temp_pdf_file(filename):
+    return send_from_directory(app.config["TEMP_PDF_FOLDER"], filename)
 
 
 # ====================== INVENTORY UPDATE ROUTES ======================
@@ -1492,6 +1785,9 @@ def update_scan(record_id):
 def update_scan_image(record_id):
     record = ScanRecord.query.get_or_404(record_id)
     file = request.files.get("image")
+    side = request.form.get("side", "front").strip().lower()
+    if side not in ("front", "back"):
+        side = "front"
 
     if not file or not file.filename:
         return jsonify({"status": "error", "message": "No image uploaded"}), 400
@@ -1503,32 +1799,40 @@ def update_scan_image(record_id):
     if not ext:
         ext = ".png"
 
-    final_name = f"record_{record_id}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}{ext}"
+    suffix = "back" if side == "back" else "front"
+    final_name = f"record_{record_id}_{suffix}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}{ext}"
     relative_path = normalize_to_upload_relative(os.path.join("inventory_cards", final_name))
     absolute_path = os.path.join(app.config["UPLOAD_FOLDER"], relative_path)
     file.save(absolute_path)
 
-    old_path = record.image_path
-    record.image_path = relative_path
+    if side == "back":
+        old_path = record.image_path_back
+        record.image_path_back = relative_path
+    else:
+        old_path = record.image_path
+        record.image_path = relative_path
     db.session.commit()
 
-    if old_path and normalize_to_upload_relative(old_path) != relative_path:
+    if old_path and old_path != "__blank__" and normalize_to_upload_relative(old_path) != relative_path:
         remove_file_if_exists(old_path)
 
     return jsonify({
         "status":    "success",
         "message":   "Image updated successfully",
-        "image_url": build_uploaded_file_url(record.image_path),
+        "side":      side,
+        "image_url": build_uploaded_file_url(record.image_path_back if side == "back" else record.image_path),
     })
 
 
 @app.route("/delete_scan/<int:record_id>", methods=["POST"])
 def delete_scan(record_id):
     record = ScanRecord.query.get_or_404(record_id)
-    image_path = record.image_path
+    image_path      = record.image_path
+    image_path_back = record.image_path_back
     db.session.delete(record)
     db.session.commit()
     remove_file_if_exists(image_path)
+    remove_file_if_exists(image_path_back)
     return jsonify({"status": "success", "message": "Inventory item deleted"})
 
 
@@ -1544,7 +1848,7 @@ def delete_scans():
     if not records:
         return jsonify({"status": "error", "message": "No matching records found"}), 404
 
-    image_paths = [r.image_path for r in records]
+    image_paths = [r.image_path for r in records] + [r.image_path_back for r in records]
     for record in records:
         db.session.delete(record)
     db.session.commit()
@@ -1625,6 +1929,11 @@ def add_custom_field():
     Accepts either:
       { game, key, value }        — applies to ALL records matching the game name
       { record_ids, key, value }  — applies to explicit list of record IDs
+    When matching by game name, an optional { catalog_only: true|false } keeps
+    the match scoped to the same kind of row the person was looking at (hidden
+    CSV-catalog rows vs. normal owned-inventory rows) so applying a field from
+    the Imported Catalog view can never spill onto real inventory for the same
+    game, and vice versa.
     """
     data  = request.get_json() or {}
     key   = data.get("key",   "").strip()
@@ -1633,8 +1942,10 @@ def add_custom_field():
     if not key or not value:
         return jsonify({"status": "error", "message": "Key and value are required"}), 400
 
-    game       = data.get("game", "").strip()
-    record_ids = data.get("record_ids", [])
+    game         = data.get("game", "").strip()
+    record_ids   = data.get("record_ids", [])
+    scope_passed = "catalog_only" in data
+    want_catalog = bool(data.get("catalog_only", False))
 
     if game:
         all_rows = (
@@ -1645,14 +1956,17 @@ def add_custom_field():
         matching_ids = []
         for row_id, extracted_data in all_rows:
             if isinstance(extracted_data, dict):
-                row_game = extracted_data.get("game", "")
+                row_data = extracted_data
             else:
                 try:
-                    row_game = json.loads(extracted_data or "{}").get("game", "")
+                    row_data = json.loads(extracted_data or "{}")
                 except (ValueError, TypeError):
-                    row_game = ""
-            if str(row_game).strip() == game:
-                matching_ids.append(row_id)
+                    row_data = {}
+            if str(row_data.get("game", "")).strip() != game:
+                continue
+            if scope_passed and _is_catalog_only(row_data) != want_catalog:
+                continue
+            matching_ids.append(row_id)
 
         if not matching_ids:
             return jsonify({"status": "error", "message": f"No records found for game '{game}'"}), 404
@@ -1679,112 +1993,196 @@ def add_custom_field():
     })
 
 
-# ====================== TEMPLATE SAVE ROUTE ======================
+# ====================== TEMPLATE (GAME) SAVE ROUTE ======================
+def _slugify_template_name(name):
+    return _re.sub(r"[^a-z0-9_]", "", str(name or "").strip().lower().replace(" ", "_"))
+
+
+def _clean_template_fields(fields):
+    """
+    Normalize a raw {field_name: {field_type, dropdown_options}} payload into
+    the on-disk template shape. Returns {} if nothing valid was provided.
+    Shared by /template_save and the CSV import's "create new template" path.
+    """
+    if not isinstance(fields, dict):
+        return {}
+
+    cleaned_fields = {}
+    for field_name, cfg in fields.items():
+        if not isinstance(cfg, dict):
+            continue
+
+        field_key = _slugify_template_name(field_name)
+        if not field_key:
+            continue
+
+        raw_field_type = str(cfg.get("field_type", "text")).strip().lower()
+        if raw_field_type not in ("text", "dropdown", "boolean"):
+            raw_field_type = "text"
+
+        raw_opts = cfg.get("dropdown_options", [])
+        if isinstance(raw_opts, list):
+            dropdown_options = [str(o).strip() for o in raw_opts if str(o).strip()]
+        else:
+            dropdown_options = []
+
+        if raw_field_type == "dropdown" and not dropdown_options:
+            # Fall back to a plain text field rather than reject the whole
+            # save — an empty-options dropdown isn't useful anyway.
+            raw_field_type = "text"
+
+        # A hidden field is still stored on every record (CSV import, manual
+        # entry, etc.) and remains referenceable — e.g. via "Copy from Entry"
+        # or a future export — but is left out of the editable field grid on
+        # the Inventory Detail page.
+        is_hidden = bool(cfg.get("hidden", False))
+
+        entry = {"field_type": raw_field_type}
+        if raw_field_type == "dropdown":
+            entry["dropdown_options"] = dropdown_options
+        if is_hidden:
+            entry["hidden"] = True
+
+        cleaned_fields[field_key] = entry
+
+    return cleaned_fields
+
+
+def _write_template_file(clean_name, cleaned_fields, csv_column_mapping=None):
+    """
+    Write a template's JSON file. Field definitions are always replaced with
+    `cleaned_fields`. The saved CSV column mapping (see /import_csv) is
+    preserved across ordinary field edits — pass `csv_column_mapping` to
+    explicitly set/merge it (e.g. right after a CSV import), or leave it
+    None to just carry forward whatever was already saved. Mapping entries
+    for fields that no longer exist are dropped automatically.
+    """
+    ensure_dirs()
+    template_path = os.path.join(app.config["ROI_TEMPLATE_FOLDER"], f"{clean_name}.json")
+
+    existing_mapping = {}
+    if os.path.exists(template_path):
+        try:
+            with open(template_path, "r", encoding="utf-8") as f:
+                existing_mapping = (json.load(f) or {}).get("csv_column_mapping", {}) or {}
+        except Exception:
+            existing_mapping = {}
+
+    if csv_column_mapping is not None:
+        merged_mapping = {**existing_mapping, **csv_column_mapping}
+    else:
+        merged_mapping = existing_mapping
+
+    # Drop stale entries for fields that no longer exist on this template.
+    merged_mapping = {k: v for k, v in merged_mapping.items() if k in cleaned_fields and v}
+
+    payload = {"name": clean_name, "fields": cleaned_fields}
+    if merged_mapping:
+        payload["csv_column_mapping"] = merged_mapping
+
+    with open(template_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+
 @app.route("/template_save", methods=["POST"])
 def template_save():
     """
-    Save a new percentage-based ROI template JSON file from the template builder.
-    Fields must use x_pct, y_pct, w_pct, h_pct (0.0–100.0).
+    Save a Game definition: a name plus a flat list of fields that every
+    entry for that game should have. Each field just needs a key and a
+    field_type ("text" | "dropdown" | "boolean"); dropdown fields also carry
+    a list of options. There are no image zones / ROI coordinates involved —
+    imported cards for this game are simply created with these fields blank.
     """
     data   = request.get_json() or {}
     name   = data.get("name", "").strip()
     fields = data.get("fields", {})
 
     if not name:
-        return jsonify({"status": "error", "message": "Template name is required"}), 400
+        return jsonify({"status": "error", "message": "Game name is required"}), 400
 
-    clean_name = _re.sub(r"[^a-z0-9_]", "", name.lower().replace(" ", "_"))
+    clean_name = _slugify_template_name(name)
     if not clean_name:
-        return jsonify({"status": "error", "message": "Template name contains no valid characters"}), 400
+        return jsonify({"status": "error", "message": "Game name contains no valid characters"}), 400
 
     if not isinstance(fields, dict) or not fields:
         return jsonify({"status": "error", "message": "At least one field is required"}), 400
 
-    cleaned_fields = {}
-    for field_name, coords in fields.items():
-        if not isinstance(coords, dict):
-            continue
-
-        field_key = _re.sub(r"[^a-z0-9_]", "", str(field_name).lower().replace(" ", "_"))
-        if not field_key:
-            continue
-
-        if "x_pct" not in coords:
-            return jsonify({
-                "status":  "error",
-                "message": f"Field '{field_name}' missing percentage coordinates (x_pct, y_pct, w_pct, h_pct).",
-            }), 400
-
-        try:
-            x_pct = float(coords["x_pct"])
-            y_pct = float(coords["y_pct"])
-            w_pct = float(coords["w_pct"])
-            h_pct = float(coords["h_pct"])
-        except (ValueError, TypeError):
-            return jsonify({"status": "error", "message": f"Invalid coordinates for field '{field_name}'"}), 400
-
-        # ── field_type: "text" | "dropdown" | "boolean" ──
-        raw_field_type = str(coords.get("field_type", "text")).strip().lower()
-        if raw_field_type not in ("text", "dropdown", "boolean"):
-            raw_field_type = "text"
-
-        # dropdown_options: list of non-empty strings (only meaningful for dropdown)
-        raw_opts = coords.get("dropdown_options", [])
-        if isinstance(raw_opts, list):
-            dropdown_options = [str(o).strip() for o in raw_opts if str(o).strip()]
-        else:
-            dropdown_options = []
-
-        entry = {
-            "x_pct":      round(max(0.0, min(100.0, x_pct)), 4),
-            "y_pct":      round(max(0.0, min(100.0, y_pct)), 4),
-            "w_pct":      round(max(0.1, min(100.0, w_pct)), 4),
-            "h_pct":      round(max(0.1, min(100.0, h_pct)), 4),
-            "config":     coords.get("config", {}),
-            "field_type": raw_field_type,
-        }
-        if raw_field_type == "dropdown":
-            entry["dropdown_options"] = dropdown_options
-
-        cleaned_fields[field_key] = entry
-
+    cleaned_fields = _clean_template_fields(fields)
     if not cleaned_fields:
         return jsonify({"status": "error", "message": "No valid fields provided"}), 400
 
-    ensure_dirs()
-    template_path = os.path.join(app.config["ROI_TEMPLATE_FOLDER"], f"{clean_name}.json")
-
     try:
-        with open(template_path, "w", encoding="utf-8") as f:
-            json.dump({"name": clean_name, "fields": cleaned_fields}, f, indent=2)
+        _write_template_file(clean_name, cleaned_fields)
     except OSError as exc:
         return jsonify({"status": "error", "message": f"Could not write template file: {exc}"}), 500
 
     return jsonify({
         "status":  "success",
-        "message": f"Template '{clean_name}' saved with {len(cleaned_fields)} field(s)",
+        "message": f"Game '{clean_name}' saved with {len(cleaned_fields)} field(s)",
         "name":    clean_name,
         "fields":  cleaned_fields,
     })
 
 
+@app.route("/template_delete", methods=["POST"])
+def template_delete():
+    """Delete a Game definition file. Existing inventory records that used
+    this game/template are left untouched — only the field definition goes
+    away, so imports can no longer use it as a source of blank fields."""
+    data = request.get_json() or {}
+    name = str(data.get("name", "")).strip()
+
+    clean_name = _slugify_template_name(name)
+    if not clean_name:
+        return jsonify({"status": "error", "message": "Game name is required"}), 400
+
+    template_path = os.path.join(app.config["ROI_TEMPLATE_FOLDER"], f"{clean_name}.json")
+    if not os.path.exists(template_path):
+        return jsonify({"status": "error", "message": f"Game '{clean_name}' not found"}), 404
+
+    try:
+        os.remove(template_path)
+    except OSError as exc:
+        return jsonify({"status": "error", "message": f"Could not delete game: {exc}"}), 500
+
+    return jsonify({"status": "success", "message": f"Game '{clean_name}' deleted"})
+
+
 # ====================== TEMPLATE CONFIG (live field types) ======================
+@app.route("/template_csv_mapping/<template_name>")
+def template_csv_mapping(template_name):
+    """
+    Return the saved CSV column mapping for a template, if any — i.e. the
+    field->column pairing used the last time a CSV was successfully imported
+    into this game. The CSV import UI uses this to auto-fill the mapping
+    when the same game is selected again.
+    Shape: { "mapping": { fieldKey: "CSV Column Name", ... } }
+    """
+    try:
+        tpl = load_template(template_name)
+        mapping = tpl.get("csv_column_mapping", {}) or {}
+        return jsonify({"mapping": mapping})
+    except Exception:
+        return jsonify({"mapping": {}}), 200
+
+
 @app.route("/template_config/<template_name>")
 def template_config(template_name):
     """
     Return the live field config for a given template as JSON.
     Used by the inventory detail page to detect field-type changes
     made after the page was server-rendered.
-    Shape: { fieldKey: { field_type, dropdown_options? }, … }
+    Shape: { fieldKey: { field_type, dropdown_options?, hidden? }, … }
     """
     try:
         tpl = load_template(template_name or "product_label")
         fields = tpl.get("fields", {})
-        # Return only field_type and dropdown_options — omit ROI coords
+        # Return only field_type / dropdown_options / hidden — omit ROI coords
         slim = {
             k: {
                 "field_type":       v.get("field_type", "text"),
                 "dropdown_options": v.get("dropdown_options", []),
+                "hidden":           bool(v.get("hidden", False)),
             }
             for k, v in fields.items()
         }
@@ -1882,6 +2280,89 @@ def update_field_type():
     })
 
 
+@app.route("/update_field_hidden", methods=["POST"])
+def update_field_hidden():
+    """
+    Toggle the `hidden` flag for a single field key across every template that
+    contains it (same cross-template scope as /update_field_type).
+
+    Hidden fields are still stored on every record, but are kept off the
+    Inventory table and the Inventory Detail edit form. They can be revealed and
+    toggled back via the detail page's Layout editor, or shown in the Inventory
+    table via its "Show Hidden Fields" switch.
+
+    Request JSON:
+        { "field_key": "my_field", "hidden": true | false }
+
+    Response JSON:
+        { "status": ..., "message": ..., "updated_templates": [...], "hidden": bool }
+    """
+    data = request.get_json() or {}
+
+    field_key = str(data.get("field_key", "")).strip()
+    hidden    = bool(data.get("hidden", False))
+
+    if not field_key:
+        return jsonify({"status": "error", "message": "field_key is required"}), 400
+
+    # 'game' drives per-game grouping / navigation, so it must always stay visible.
+    if field_key == "game":
+        return jsonify({
+            "status":  "error",
+            "message": "The 'game' field is required for navigation and can't be hidden.",
+        }), 400
+
+    updated_templates = []
+    errors            = []
+
+    for tpl_name in get_template_names():
+        tpl_path = os.path.join(app.config["ROI_TEMPLATE_FOLDER"], f"{tpl_name}.json")
+        try:
+            with open(tpl_path, "r", encoding="utf-8") as f:
+                tpl = json.load(f)
+
+            fields = tpl.get("fields", {})
+            if field_key not in fields:
+                continue  # this template doesn't have the field — skip
+
+            if hidden:
+                fields[field_key]["hidden"] = True
+            else:
+                # Clearing the flag entirely keeps template files tidy.
+                fields[field_key].pop("hidden", None)
+
+            with open(tpl_path, "w", encoding="utf-8") as f:
+                json.dump(tpl, f, indent=2)
+
+            updated_templates.append(tpl_name)
+
+        except Exception as exc:
+            errors.append(f"{tpl_name}: {exc}")
+
+    if errors and not updated_templates:
+        return jsonify({"status": "error",
+                        "message": "Failed to update templates: " + "; ".join(errors)}), 500
+
+    if not updated_templates:
+        return jsonify({
+            "status":  "error",
+            "message": f"Field '{field_key}' isn't part of any saved template, so its "
+                       f"hidden state can't be stored.",
+        }), 404
+
+    state = "hidden" if hidden else "visible"
+    msg = f"'{field_key}' set to {state} in template(s): {', '.join(updated_templates)}"
+    if errors:
+        msg += f" (errors on: {'; '.join(errors)})"
+
+    return jsonify({
+        "status":            "success",
+        "message":           msg,
+        "updated_templates": updated_templates,
+        "hidden":            hidden,
+    })
+
+
 # ====================== RECORDS SUMMARY ROUTE ======================
 @app.route("/records_summary")
 def records_summary():
@@ -1913,6 +2394,7 @@ def records_summary():
         )
 
         parts = [p for p in [
+            "Catalog" if _is_catalog_only(data) else "",
             data.get("game", ""),
             data.get("album", ""),
             f"p{data.get('page','')}" if data.get("page") else "",
@@ -2026,6 +2508,10 @@ def justtcg_missing_ids():
                 data = json.loads(extracted_data or "{}")
             except (ValueError, TypeError):
                 data = {}
+
+        # Catalog-only records (CSV import) aren't owned inventory — skip them
+        if _is_catalog_only(data):
+            continue
 
         # Must have a usable card name or the fetch will fail immediately
         card_name = (
@@ -2365,6 +2851,8 @@ def duplicates():
     groups_map = {}
     for record in records:
         data     = record.extracted_data or {}
+        if _is_catalog_only(data):
+            continue
         name     = _get_name(data)
         serial   = _get_serial(data)
         if not name or not serial:
@@ -2378,8 +2866,12 @@ def duplicates():
     for (name, serial, edition), recs in groups_map.items():
         if len(recs) < 2:
             continue
-        # Skip groups where all image paths are already identical (already resolved)
-        if len(set(r.image_path for r in recs)) <= 1:
+        # Skip groups where all *effective display* images are already
+        # identical (already resolved). We check display_image_path first
+        # since that's what the Inventory page actually shows for the
+        # group's representative; falling back to image_path covers
+        # groups that were never run through the duplicate resolver.
+        if len(set((r.display_image_path or r.image_path) for r in recs)) <= 1:
             continue
 
         display_name = (
@@ -2412,10 +2904,17 @@ def duplicates_resolve():
 
     Payload: { "canonical_id": int, "record_ids": [int, ...] }
 
-    All non-canonical records are repointed to the canonical image_path.
-    Orphaned image files are deleted from disk after a successful commit.
-    After resolution all records share one image_path, so the group is
-    filtered out on the next /duplicates load.
+    This ONLY sets display_image_path on every record in the group to the
+    canonical record's image_path. That field is purely a display override
+    used when a record is chosen as a duplicate group's representative on
+    the Inventory page (see build_group_info / inventory.html) — it does
+    NOT touch image_path, so each record's own inventory_detail page keeps
+    showing the photo it was actually scanned with, and no image files are
+    deleted from disk.
+
+    After resolution all records in the group share the same effective
+    display image (display_image_path), so the group is filtered out on
+    the next /duplicates load.
     """
     data         = request.get_json() or {}
     canonical_id = data.get("canonical_id")
@@ -2437,19 +2936,11 @@ def duplicates_resolve():
     if not records:
         return jsonify({"status": "error", "message": "No matching records found"}), 404
 
-    to_delete = []
-    updated   = 0
-
+    updated = 0
     for record in records:
-        if record.id == canonical_id:
-            continue
-        old_path = record.image_path
-        if old_path and old_path != canonical_path:
-            to_delete.append(
-                os.path.join(app.config["UPLOAD_FOLDER"], normalize_to_upload_relative(old_path))
-            )
-        record.image_path = canonical_path
-        updated += 1
+        if record.display_image_path != canonical_path:
+            record.display_image_path = canonical_path
+            updated += 1
 
     try:
         db.session.commit()
@@ -2457,125 +2948,86 @@ def duplicates_resolve():
         db.session.rollback()
         return jsonify({"status": "error", "message": f"Database error: {exc}"}), 500
 
-    deleted_files = 0
-    for path in to_delete:
+    return jsonify({
+        "status":  "success",
+        "message": (
+            f"Image from Record #{canonical_id} will now represent {updated} record(s) "
+            f"on the Inventory page. Each record's own detail page is unchanged."
+        ),
+    })
+
+
+# ====================== IMPORT SPLIT / ALIGN ROUTES ======================
+@app.route("/pdf_extract_pages", methods=["POST"])
+def pdf_extract_pages():
+    """
+    Rasterizes every page of an uploaded PDF into a PNG image so the existing
+    single-image 9-pocket splitter can process it. Pages come back in order;
+    the front-end pairs them up two at a time (page 1 = front, page 2 = back,
+    page 3 = front, page 4 = back, ...) and feeds them into /run_import_split
+    one after another.
+    """
+    ensure_dirs()
+
+    if fitz is None:
+        return jsonify({
+            "status": "error",
+            "message": "PDF support isn't installed on the server. Run: pip install PyMuPDF"
+        }), 500
+
+    file = request.files.get("pdf")
+    if not file or not file.filename:
+        return jsonify({"status": "error", "message": "No PDF provided"}), 400
+
+    _, ext = os.path.splitext(file.filename)
+    if ext.lower() != ".pdf":
+        return jsonify({"status": "error", "message": "File must be a .pdf"}), 400
+
+    batch_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    pdf_path = os.path.join(app.config["TEMP_PDF_FOLDER"], f"upload_{batch_id}.pdf")
+    file.save(pdf_path)
+
+    try:
+        doc = fitz.open(pdf_path)
         try:
-            if os.path.isfile(path):
-                os.remove(path)
-                deleted_files += 1
+            if doc.page_count < 1:
+                return jsonify({"status": "error", "message": "PDF has no pages"}), 400
+
+            # Zoom of 2.0 ≈ 144 DPI, plenty of resolution for the 3x3 splitter
+            # while keeping file sizes and processing time reasonable.
+            zoom = 2.0
+            matrix = fitz.Matrix(zoom, zoom)
+
+            pages = []
+            for page_index in range(doc.page_count):
+                page = doc.load_page(page_index)
+                pix = page.get_pixmap(matrix=matrix)
+                page_filename = f"pdfpage_{batch_id}_{page_index + 1:03d}.png"
+                page_path = os.path.join(app.config["TEMP_PDF_FOLDER"], page_filename)
+                pix.save(page_path)
+
+                pages.append({
+                    "index":    page_index + 1,
+                    "filename": page_filename,
+                    "url":      url_for("temp_pdf_file", filename=page_filename),
+                })
+        finally:
+            doc.close()
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Could not read PDF: {e}"}), 500
+    finally:
+        try:
+            os.remove(pdf_path)
         except OSError:
             pass
 
     return jsonify({
         "status":  "success",
-        "message": (
-            f"Image from Record #{canonical_id} applied to {updated} record(s). "
-            f"{deleted_files} orphaned file(s) deleted."
-        ),
+        "message": f"Extracted {len(pages)} page(s) from PDF.",
+        "pages":   pages,
     })
 
 
-# ====================== MAIN OCR ROUTES ======================
-@app.route("/preview", methods=["POST"])
-def preview():
-    ensure_dirs()
-
-    files = request.files.getlist("images")
-    if not files or not files[0].filename:
-        return jsonify({"error": "No image selected"}), 400
-
-    template_name = request.form.get("template", "product_label")
-    template      = load_template(template_name)
-
-    file      = files[0]
-    filename  = secure_filename(file.filename)
-    image_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-    file.save(image_path)
-
-    return jsonify({
-        "image_url": url_for("uploaded_file", filename=filename),
-        "filename":  filename,
-        "template":  template,
-    })
-
-
-@app.route("/run_custom_ocr", methods=["POST"])
-def run_custom_ocr():
-    data            = request.get_json() or {}
-    filename        = data.get("image_path")
-    adjusted_fields = data.get("fields", {})
-
-    if not filename:
-        return jsonify({"error": "Missing image_path"}), 400
-
-    image_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-    img = cv2.imread(image_path)
-    if img is None:
-        return jsonify({"error": f"Could not read image: {filename}"}), 400
-
-    h_img, w_img = img.shape[:2]
-    preview_meta = data.get("preview_meta", {})
-
-    normalized_fields = normalize_fields_to_image_space(
-        adjusted_fields, w_img, h_img,
-        preview_meta.get("width"), preview_meta.get("height"),
-    )
-
-    extracted = ocr_with_custom_fields(image_path, normalized_fields)
-
-    # Merge in the manually supplied location/game metadata
-    for key in ("game", "album", "page", "slot"):
-        val = str(data.get(key, "")).strip()
-        if val:
-            extracted[key] = val
-
-    # Delete any existing record(s) occupying the same game/album/page/slot
-    # so the new scan cleanly replaces whatever was there before.
-    game  = extracted.get("game",  "")
-    album = extracted.get("album", "")
-    page  = extracted.get("page",  "")
-    slot  = extracted.get("slot",  "")
-
-    if game and album and page and slot:
-        existing = [
-            r for r in ScanRecord.query.all()
-            if (
-                str((r.extracted_data or {}).get("game",  "")).strip() == game  and
-                str((r.extracted_data or {}).get("album", "")).strip() == album and
-                str((r.extracted_data or {}).get("page",  "")).strip() == page  and
-                str((r.extracted_data or {}).get("slot",  "")).strip() == slot
-            )
-        ]
-        old_image_paths = [r.image_path for r in existing]
-        for old in existing:
-            db.session.delete(old)
-        db.session.commit()
-        for old_image in old_image_paths:
-            if old_image and old_image != "__blank__":
-                remove_file_if_exists(old_image)
-
-    matched_product, record = create_scan_record(
-        image_path=filename,
-        template_name=data.get("template_name", "custom"),
-        extracted=extracted,
-        normalized_fields=normalized_fields,
-    )
-
-    brand        = extracted.get("brand", "").lower().strip()
-    product_name = extracted.get("product_name", "").lower().strip()
-    display_key  = f"{brand.title()} {product_name.title()}".strip() or "Unknown Item"
-
-    return jsonify({
-        "status":          "success",
-        "key":             display_key,
-        "record_id":       record.id,
-        "image_url":       build_uploaded_file_url(record.image_path),
-        "extracted":       extracted,
-        "matched_product": matched_product.product_name if matched_product else "No match",
-    })
-
-
-# ====================== IMPORT SPLIT / ALIGN ROUTES ======================
 @app.route("/run_import_split", methods=["POST"])
 def run_import_split():
     ensure_dirs()
@@ -2587,19 +3039,19 @@ def run_import_split():
     game  = request.form.get("game",  "").strip()
     album = request.form.get("album", "").strip()
     page  = request.form.get("page",  "").strip()
+    side  = request.form.get("side",  "front").strip().lower()
+
+    if side not in ("front", "back"):
+        side = "front"
 
     if not game or not album or not page:
         return jsonify({"status": "error", "message": "Game, album, and page are required"}), 400
 
     try:
-        v_cut1       = float(request.form.get("vcut1",      33))
-        v_cut2       = float(request.form.get("vcut2",      66))
-        h_cut1       = float(request.form.get("hcut1",      33))
-        h_cut2       = float(request.form.get("hcut2",      66))
-        canny_low    = int(request.form.get("cannylow",     50))
-        canny_high   = int(request.form.get("cannyhigh",   200))
-        approx_eps   = float(request.form.get("approxeps",   0.02))
-        min_area_pct = float(request.form.get("minareapct",  0.05))
+        v_cut1 = float(request.form.get("vcut1", 33))
+        v_cut2 = float(request.form.get("vcut2", 66))
+        h_cut1 = float(request.form.get("hcut1", 33))
+        h_cut2 = float(request.form.get("hcut2", 66))
     except ValueError:
         return jsonify({"status": "error", "message": "Invalid numeric form values"}), 400
 
@@ -2620,8 +3072,9 @@ def run_import_split():
         pieces    = split_image_3x3(pil_image, v_cut1, v_cut2, h_cut1, h_cut2)
 
         results = []
-        for idx, piece in enumerate(pieces, start=1):
-            slot_filename = f"{safe_game}-{safe_album}-{safe_page}-{idx}.png"
+        for photographed_idx, piece in enumerate(pieces, start=1):
+            slot_num      = resolve_slot_number(photographed_idx, side)
+            slot_filename = f"{safe_game}-{safe_album}-{safe_page}-{slot_num}-{side}.png"
             split_path    = os.path.join(app.config["TEMP_SPLIT_FOLDER"], slot_filename)
             piece.save(split_path)
 
@@ -2630,23 +3083,19 @@ def run_import_split():
                 if split_cv is None:
                     raise ValueError("Could not read split image")
 
-                processed = process_card_image(
-                    split_cv,
-                    canny_low=canny_low, canny_high=canny_high,
-                    approx_eps=approx_eps, min_area_pct=min_area_pct,
-                )
+                processed = straighten_split_image(split_cv)
 
                 card_path = os.path.join(app.config["TEMP_CARD_FOLDER"], slot_filename)
                 cv2.imwrite(card_path, processed)
 
                 results.append({
-                    "slot": idx, "filename": slot_filename,
+                    "slot": slot_num, "filename": slot_filename,
                     "status": "processed",
                     "url": url_for("temp_card_file", filename=slot_filename),
                 })
             except Exception:
                 results.append({
-                    "slot": idx, "filename": slot_filename,
+                    "slot": slot_num, "filename": slot_filename,
                     "status": "fallback",
                     "url": url_for("temp_split_file", filename=slot_filename),
                 })
@@ -2706,11 +3155,16 @@ def manual_process_card():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# ====================== BATCH OCR IMPORT ROUTE (SSE streaming) ======================
-@app.route("/import_run_ocr_batch", methods=["POST"])
-def import_run_ocr_batch():
+# ====================== BATCH IMPORT ROUTE (SSE streaming) ======================
+@app.route("/import_finalize_batch", methods=["POST"])
+def import_finalize_batch():
     """
     Streams Server-Sent Events so the browser can show real per-card progress.
+
+    Takes the 9 already-cropped/aligned card image filenames plus the chosen
+    Game (template) name, and creates one inventory record per card with all
+    of that Game's fields present but blank — ready to be filled in by hand.
+    There is no OCR step anymore; this just files the photos away.
 
     Event types
     -----------
@@ -2735,10 +3189,11 @@ def import_run_ocr_batch():
         try:
             template = load_template(template_name)
         except Exception as e:
-            yield sse("error", {"message": f"Could not load template: {e}"})
+            yield sse("error", {"message": f"Could not load game '{template_name}': {e}"})
             return
 
-        fields  = template.get("fields", {})
+        # Blank starting values for every field this Game defines.
+        blank_fields = {field_key: "" for field_key in (template.get("fields", {}) or {}).keys()}
         results = []
 
         for idx, filename in enumerate(filenames, start=1):
@@ -2750,33 +3205,66 @@ def import_run_ocr_batch():
                 yield sse("progress", {"slot": idx, "total": len(filenames), "result": result})
                 continue
 
-            img = cv2.imread(temp_image_path)
-            if img is None:
-                result = {"filename": filename, "status": "error", "message": "Could not read aligned card image"}
-                results.append(result)
-                yield sse("progress", {"slot": idx, "total": len(filenames), "result": result})
-                continue
-
-            h_img, w_img      = img.shape[:2]
-            normalized_fields = normalize_fields_to_image_space(fields, w_img, h_img)
-            extracted         = ocr_with_custom_fields(temp_image_path, normalized_fields)
-
             filename_fields = parse_card_filename(filename)
-            extracted.update(filename_fields)
+            extracted = {**blank_fields, **filename_fields}
+            side = filename_fields.get("side", "front")
+
+            game  = extracted.get("game",  "")
+            album = extracted.get("album", "")
+            page  = extracted.get("page",  "")
+            slot  = extracted.get("slot",  "")
 
             try:
                 final_relative_image_path = move_temp_card_to_inventory(filename)
-                matched_product, record   = create_scan_record(
-                    image_path=final_relative_image_path,
-                    template_name=template_name,
-                    extracted=extracted,
-                    normalized_fields=normalized_fields,
-                )
+                existing = find_existing_record_for_key(game, album, page, slot)
+
+                if existing:
+                    # Same physical pocket already has a record (from the other
+                    # side, or a re-import) — attach this image to it instead of
+                    # creating a duplicate row. Any fields the person has
+                    # already filled in by hand are left alone.
+                    old_image = existing.image_path_back if side == "back" else existing.image_path
+                    if side == "back":
+                        existing.image_path_back = final_relative_image_path
+                    else:
+                        existing.image_path = final_relative_image_path
+
+                    merged = dict(existing.extracted_data or {})
+                    for key, val in extracted.items():
+                        if not merged.get(key) and val:
+                            merged[key] = val
+                    existing.extracted_data = merged
+
+                    db.session.commit()
+
+                    if old_image and old_image != "__blank__":
+                        remove_file_if_exists(old_image)
+
+                    record          = existing
+                    matched_product = existing.matched_product
+                else:
+                    create_kwargs = dict(
+                        template_name=template_name,
+                        extracted=extracted,
+                    )
+                    if side == "back":
+                        # No front photo yet — hold its place with the blank
+                        # sentinel so the back image still has a record to
+                        # live on; the front slot fills in once it's imported.
+                        create_kwargs["image_path"]      = "__blank__"
+                        create_kwargs["image_path_back"] = final_relative_image_path
+                    else:
+                        create_kwargs["image_path"] = final_relative_image_path
+
+                    matched_product, record = create_scan_record(**create_kwargs)
+
                 result = {
                     "filename":        filename,
                     "status":          "success",
                     "record_id":       record.id,
+                    "side":            side,
                     "image_url":       build_uploaded_file_url(record.image_path),
+                    "image_url_back":  build_uploaded_file_url(record.image_path_back) if record.image_path_back else None,
                     "extracted":       extracted,
                     "matched_product": matched_product.product_name if matched_product else "No match",
                 }
@@ -2789,7 +3277,7 @@ def import_run_ocr_batch():
         success_count = sum(1 for r in results if r["status"] == "success")
         yield sse("done", {
             "status":  "success",
-            "message": f"OCR import completed for {success_count} of {len(filenames)} cards",
+            "message": f"Import completed for {success_count} of {len(filenames)} cards",
             "results": results,
         })
 
@@ -2980,15 +3468,862 @@ def search_by_image():
     return jsonify({"status": "success", "results": results})
 
 
+# ====================== XIMILAR CARD GRADING (fast "condition" endpoint) ======================
+#
+# Ximilar's Card Grading service is asynchronous-only: you POST a job to
+#   https://api.ximilar.com/account/v2/request/
+# then poll
+#   https://api.ximilar.com/account/v2/request/<id>
+# until status == "DONE" and read response.records.
+#
+# Our card images live on local disk (served from /uploads/...), which Ximilar's
+# workers can't reach over the network, so local files are sent as `_base64`.
+# Images that were imported as external URLs are passed straight through as `_url`.
+import base64
+import time
+
+XIMILAR_API_TOKEN       = os.environ.get("XIMILAR_API_TOKEN", "")
+XIMILAR_REQUEST_URL     = "https://api.ximilar.com/account/v2/request/"
+XIMILAR_CONNECT_TIMEOUT = 40      # seconds per individual HTTP call
+XIMILAR_POLL_INTERVAL   = 2.0     # seconds between status polls
+XIMILAR_POLL_MAX_WAIT   = 120     # seconds to wait for a single job to finish
+
+# Naming schemes accepted by the /condition endpoint's `mode` field.
+XIMILAR_CONDITION_MODES = {"ebay", "tcgplayer", "cardmarket", "ximilar"}
+
+
+def _image_source_for_grading(path_value):
+    """
+    Turn a stored image_path into a Ximilar record source dict.
+
+    Returns:
+      {"_url": "https://..."}  for images stored as external URLs (Ximilar fetches them)
+      {"_base64": "..."}       for local files (encoded from disk)
+      None                     when there is no usable image on this side
+    """
+    relative = normalize_to_upload_relative(path_value)
+    if not relative or relative == "__blank__":
+        return None
+
+    if relative.startswith("http://") or relative.startswith("https://"):
+        return {"_url": relative}
+
+    abs_path = os.path.join(app.config["UPLOAD_FOLDER"], relative)
+    if not os.path.exists(abs_path):
+        return None
+    try:
+        with open(abs_path, "rb") as fh:
+            encoded = base64.b64encode(fh.read()).decode("ascii")
+    except OSError:
+        return None
+    return {"_base64": encoded}
+
+
+def _ximilar_http(method, url, payload=None):
+    """Small JSON HTTP helper for the Ximilar async request API."""
+    data = None
+    headers = {
+        "Authorization": f"Token {XIMILAR_API_TOKEN}",
+        "Accept":        "application/json",
+        "User-Agent":    "CardCollectorInventoryManager/1.0",
+    }
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=XIMILAR_CONNECT_TIMEOUT) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _ximilar_condition_records(records, mode="ebay"):
+    """
+    Submit a batch of image records to the Card Grading *condition* endpoint and
+    block until the async job finishes.
+
+    `records` — list of dicts, each already carrying a source (`_url` / `_base64`)
+    plus an `_id` marker used to map results back. Max 10 per Ximilar request.
+
+    Returns response.records (order + `_id` preserved). Raises RuntimeError with a
+    human-readable message on any failure.
+    """
+    if not XIMILAR_API_TOKEN:
+        raise RuntimeError(
+            "XIMILAR_API_TOKEN is not set. Add it to your environment (or .env file) "
+            "to enable card condition grading."
+        )
+    if not records:
+        raise RuntimeError("No usable card images to grade.")
+
+    submit_body = {
+        "type":     "card-grader",
+        "endpoint": "condition",
+        "mode":     mode if mode in XIMILAR_CONDITION_MODES else "ebay",
+        "records":  records,
+    }
+
+    # 1) Submit the job
+    try:
+        submitted = _ximilar_http("POST", XIMILAR_REQUEST_URL, submit_body)
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8")[:300]
+        except Exception:
+            pass
+        raise RuntimeError(f"Ximilar submit failed (HTTP {exc.code} {exc.reason}). {detail}".strip())
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Could not reach Ximilar: {exc.reason}")
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError(f"Unexpected response from Ximilar on submit: {exc}")
+
+    job_id = submitted.get("id")
+    if not job_id:
+        raise RuntimeError("Ximilar did not return a job id for the request.")
+
+    # 2) Poll the details endpoint until DONE / timeout
+    poll_url = XIMILAR_REQUEST_URL.rstrip("/") + "/" + job_id
+    deadline = time.time() + XIMILAR_POLL_MAX_WAIT
+    job = {}
+    while True:
+        try:
+            job = _ximilar_http("GET", poll_url)
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"Ximilar poll failed (HTTP {exc.code} {exc.reason}).")
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Could not reach Ximilar while polling: {exc.reason}")
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError(f"Unexpected response from Ximilar while polling: {exc}")
+
+        status = (job.get("status") or "").upper()
+        if status == "DONE":
+            break
+        if status in ("FAILED", "ERROR"):
+            raise RuntimeError(f"Ximilar reported job status {status}.")
+        if time.time() >= deadline:
+            raise RuntimeError("Ximilar grading timed out. Please try again.")
+        time.sleep(XIMILAR_POLL_INTERVAL)
+
+    return (job.get("response") or {}).get("records") or []
+
+
+def _parse_condition_record(rec):
+    """
+    Pull the useful bits out of one condition response record.
+
+    Returns a compact dict, or {"error": "..."} if that image failed.
+    """
+    if not isinstance(rec, dict):
+        return {"error": "Malformed response record."}
+
+    rstatus = rec.get("_status") or {}
+    code = rstatus.get("code")
+    if code is not None and code != 200:
+        return {"error": rstatus.get("text") or f"Image failed (code {code})."}
+
+    objects = rec.get("_objects") or []
+    if not objects:
+        return {"error": "No card detected in this image."}
+
+    obj = objects[0]
+
+    # Best category name (e.g. "Card/Sport Card" or "Card/Trading Card Game")
+    category = ""
+    cats = obj.get("Category") or []
+    if cats:
+        category = cats[0].get("name", "")
+
+    cond_list = obj.get("Condition") or []
+    if not cond_list:
+        return {"error": "No condition returned for this image.", "category": category}
+
+    cond = cond_list[0]
+    return {
+        "label":           cond.get("label", ""),
+        "value":           cond.get("value"),
+        "mode":            cond.get("mode", ""),
+        "scale":           cond.get("scale") or [],
+        "scale_value":     cond.get("scale_value"),
+        "max_scale_value": cond.get("max_scale_value"),
+        "category":        category,
+    }
+
+
+def _grade_condition_single(record, mode="ebay"):
+    """
+    Grade one ScanRecord's front (and back, if present) via the condition
+    endpoint, persist the result onto record.extracted_data['grading'], and
+    return the grading dict. Raises RuntimeError on failure.
+    """
+    records = []
+    front_src = _image_source_for_grading(record.image_path)
+    back_src  = _image_source_for_grading(record.image_path_back)
+
+    if front_src:
+        front_src["_id"] = "front"
+        records.append(front_src)
+    if back_src:
+        back_src["_id"] = "back"
+        records.append(back_src)
+
+    if not records:
+        raise RuntimeError("This record has no front or back image to grade.")
+
+    resp_records = _ximilar_condition_records(records, mode=mode)
+
+    # Map results back by the `_id` marker we submitted (fall back to order).
+    by_id = {}
+    for i, rec in enumerate(resp_records):
+        marker = rec.get("_id")
+        if marker not in ("front", "back"):
+            marker = "front" if i == 0 else "back"
+        by_id[marker] = _parse_condition_record(rec)
+
+    grading = {
+        "mode":      mode if mode in XIMILAR_CONDITION_MODES else "ebay",
+        "graded_at": datetime.utcnow().isoformat() + "Z",
+        "front":     by_id.get("front"),
+        "back":      by_id.get("back"),
+    }
+
+    updated = dict(record.extracted_data or {})
+    updated["grading"] = grading
+    record.extracted_data = updated
+    db.session.commit()
+
+    return grading
+
+
+@app.route("/grade_condition/<int:record_id>", methods=["POST"])
+def grade_condition(record_id):
+    """
+    Send this record's front & back images to the Ximilar Card Grading
+    *condition* endpoint and save the returned condition label(s).
+
+    Optional JSON body: { "mode": "ebay" | "tcgplayer" | "cardmarket" | "ximilar" }
+    """
+    record = ScanRecord.query.get_or_404(record_id)
+    body = request.get_json(silent=True) or {}
+    mode = (body.get("mode") or "ebay").strip().lower()
+    if mode not in XIMILAR_CONDITION_MODES:
+        mode = "ebay"
+
+    try:
+        grading = _grade_condition_single(record, mode=mode)
+    except RuntimeError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 502
+
+    # Build a short human summary for toasts / inline badges.
+    parts = []
+    if grading.get("front") and grading["front"].get("label"):
+        parts.append(f"Front: {grading['front']['label']}")
+    if grading.get("back") and grading["back"].get("label"):
+        parts.append(f"Back: {grading['back']['label']}")
+    summary = " · ".join(parts) if parts else "Graded"
+
+    return jsonify({
+        "status":    "success",
+        "message":   f"Condition checked ({summary}).",
+        "record_id": record_id,
+        "grading":   grading,
+    })
+
+
+# ====================== SHOPS (marketplace sync) ======================
+import shop_providers
+from shop_providers import MARKETPLACES, SECRET_FIELDS, get_provider
+
+SHOP_SKU_PREFIX = "CCIM-"
+
+
+def _shop_persist():
+    db.session.commit()
+
+
+def _get_connection(marketplace, create=False):
+    conn = ShopConnection.query.filter_by(marketplace=marketplace).first()
+    if conn is None and create:
+        conn = ShopConnection(marketplace=marketplace, enabled=False, config={},
+                              status="disconnected")
+        db.session.add(conn)
+        db.session.commit()
+    return conn
+
+
+def _record_display_name(record):
+    data = record.extracted_data or {}
+    return (data.get("product_name") or data.get("name") or data.get("card_name")
+            or data.get("title") or f"Record #{record.id}")
+
+
+def _record_market_price(record):
+    data = record.extracted_data or {}
+    try:
+        mp = (data.get("tcgplayer") or {}).get("prices", {}).get("market")
+        if mp:
+            return round(float(mp), 2)
+    except (TypeError, ValueError):
+        pass
+    for k in ("price", "market_price", "sell_price"):
+        v = data.get(k)
+        try:
+            if v not in (None, ""):
+                return round(float(v), 2)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def _record_quantity(record):
+    data = record.extracted_data or {}
+    for k in ("qty", "quantity", "stock", "count"):
+        v = data.get(k)
+        try:
+            if v not in (None, ""):
+                return max(int(float(v)), 0)
+        except (TypeError, ValueError):
+            continue
+    return 1
+
+
+def _record_image_sources(record):
+    """Return (public_image_urls, base64_image_strings) for a record's front/back."""
+    urls, b64s = [], []
+    data = record.extracted_data or {}
+
+    # Any URL-typed fields the record already carries (e.g. CSV "Photo URL").
+    for key in ("photo_url", "image_url", "photo url", "picture_url", "img_url"):
+        val = str(data.get(key, "")).strip()
+        if val.startswith("http"):
+            urls.append(val)
+
+    for path in (record.image_path, record.image_path_back):
+        rel = normalize_to_upload_relative(path)
+        if not rel or rel == "__blank__":
+            continue
+        if rel.startswith("http://") or rel.startswith("https://"):
+            urls.append(rel)
+            continue
+        abs_path = os.path.join(app.config["UPLOAD_FOLDER"], rel)
+        if os.path.exists(abs_path):
+            try:
+                with open(abs_path, "rb") as fh:
+                    b64s.append(base64.b64encode(fh.read()).decode("ascii"))
+            except OSError:
+                pass
+    # De-dupe URLs while preserving order.
+    seen, uniq = set(), []
+    for u in urls:
+        if u not in seen:
+            seen.add(u); uniq.append(u)
+    return uniq, b64s
+
+
+def _condition_to_ebay(record):
+    """Map the saved Ximilar condition (if any) to an eBay condition enum."""
+    data = record.extracted_data or {}
+    label = ((data.get("grading") or {}).get("front") or {}).get("label", "")
+    m = {
+        "gem mint": "LIKE_NEW", "mint": "LIKE_NEW", "near mint": "USED_LIKE_NEW",
+        "excellent": "USED_EXCELLENT", "very good": "USED_VERY_GOOD",
+        "lightly played": "USED_VERY_GOOD", "good": "USED_GOOD",
+        "moderately played": "USED_GOOD", "heavily played": "USED_ACCEPTABLE",
+        "played": "USED_ACCEPTABLE", "poor": "USED_ACCEPTABLE", "damaged": "USED_ACCEPTABLE",
+    }
+    return m.get(str(label).lower(), "USED_VERY_GOOD")
+
+
+def _build_payload(record, marketplace, price=None, quantity=None):
+    data = record.extracted_data or {}
+    name = _record_display_name(record)
+    game = data.get("game", "")
+    serial = _get_serial(data)
+    title = name
+    if game:
+        title = f"{name} - {game}"
+    if serial:
+        title = f"{title} #{serial}"
+
+    urls, b64s = _record_image_sources(record)
+
+    desc_bits = []
+    for k in ("game", "set", "edition", "rarity", "holographic"):
+        v = data.get(k)
+        if v:
+            desc_bits.append(f"{k.title()}: {v}")
+    grade = ((data.get("grading") or {}).get("front") or {}).get("label")
+    if grade:
+        desc_bits.append(f"Condition (AI): {grade}")
+    description = "<br>".join(desc_bits) or name
+
+    # Map the AI condition label into each marketplace's condition vocabulary.
+    grade_label = str(grade or "").lower()
+    manapool_cond_map = {
+        "gem mint": "NM", "mint": "NM", "near mint": "NM", "excellent": "LP",
+        "very good": "LP", "lightly played": "LP", "good": "MP",
+        "moderately played": "MP", "played": "HP", "heavily played": "HP",
+        "poor": "DMG", "damaged": "DMG",
+    }
+    foil = str(data.get("holographic", "")).strip().lower() in (
+        "true", "1", "yes", "foil", "holo", "holographic")
+
+    return {
+        "sku": f"{SHOP_SKU_PREFIX}{record.id}",
+        "title": title,
+        "description": description,
+        "price": price if price is not None else _record_market_price(record),
+        "currency": "USD",
+        "quantity": quantity if quantity is not None else _record_quantity(record),
+        "brand": game or "Trading Card",
+        "category": data.get("set") or "Trading Card",
+        "tags": ", ".join([t for t in (game, data.get("set"), data.get("rarity")) if t]),
+        "image_urls": urls,
+        "image_b64": b64s,
+        "foil": foil,
+        "language": data.get("language") or "English",
+        # eBay
+        "ebay_condition": _condition_to_ebay(record),
+        # TCGplayer
+        "tcgplayer_sku_id": data.get("tcgplayer_sku_id") or (data.get("tcgplayer") or {}).get("sku_id"),
+        # Mana Pool (MTG-only)
+        "manapool_product_id": data.get("manapool_product_id") or (data.get("manapool") or {}).get("product_id"),
+        "manapool_condition": manapool_cond_map.get(grade_label, "NM"),
+        # Cardmarket
+        "cardmarket_product_id": (data.get("cardmarket_product_id")
+                                  or (data.get("cardmarket") or {}).get("product_id")
+                                  or (data.get("cardmarket") or {}).get("idProduct")),
+        "cardmarket_condition": shop_providers.CardmarketProvider.CONDITION_MAP.get(grade_label, "NM"),
+        # CardTrader
+        "cardtrader_blueprint_id": (data.get("cardtrader_blueprint_id")
+                                    or (data.get("cardtrader") or {}).get("blueprint_id")),
+        "cardtrader_condition": shop_providers.CardTraderProvider.CONDITION_MAP.get(grade_label, "Near Mint"),
+    }
+
+
+def _listing_for(record_id, marketplace):
+    return Listing.query.filter_by(record_id=record_id, marketplace=marketplace).first()
+
+
+def _connection_public_view(conn, marketplace):
+    """Config safe to send to the browser: secrets replaced with a set/unset flag."""
+    meta = MARKETPLACES[marketplace]
+    cfg = (conn.config if conn else {}) or {}
+    public = {}
+    secrets_set = {}
+    for field in meta["fields"]:
+        k = field["key"]
+        if field.get("secret") or k in SECRET_FIELDS.get(marketplace, set()):
+            secrets_set[k] = bool(str(cfg.get(k, "")).strip())
+        else:
+            public[k] = cfg.get(k, "")
+    return {
+        "enabled": bool(conn.enabled) if conn else False,
+        "status": conn.status if conn else "disconnected",
+        "status_detail": conn.status_detail if conn else "",
+        "connected_at": conn.connected_at.strftime("%Y-%m-%d %H:%M") if (conn and conn.connected_at) else "",
+        "config": public,
+        "secrets_set": secrets_set,
+        "ebay_authorized": bool((cfg.get("refresh_token") or cfg.get("access_token"))) if marketplace == "ebay" else None,
+    }
+
+
+def _sellable_records_query():
+    """Owned inventory only — exclude catalog-only reference rows and blank slots."""
+    records = ScanRecord.query.order_by(ScanRecord.scan_date.desc(), ScanRecord.id.desc()).all()
+    out = []
+    for r in records:
+        data = r.extracted_data or {}
+        if _is_catalog_only(data):
+            continue
+        if str(data.get("empty", "")).strip().lower() == "true":
+            continue
+        out.append(r)
+    return out
+
+
+@app.route("/shops")
+def shops_page():
+    connections = {}
+    for mk in MARKETPLACES:
+        conn = _get_connection(mk)
+        connections[mk] = _connection_public_view(conn, mk)
+
+    # Summary counts
+    records = _sellable_records_query()
+    total = len(records)
+    active_counts = {mk: 0 for mk in MARKETPLACES}
+    for lst in Listing.query.filter(Listing.status.in_(["active", "draft"])).all():
+        if lst.marketplace in active_counts:
+            active_counts[lst.marketplace] += 1
+
+    return render_template(
+        "shops.html",
+        marketplaces=MARKETPLACES,
+        connections=connections,
+        total_records=total,
+        active_counts=active_counts,
+    )
+
+
+@app.route("/shops/save/<marketplace>", methods=["POST"])
+def shops_save(marketplace):
+    if marketplace not in MARKETPLACES:
+        return jsonify({"status": "error", "message": "Unknown marketplace"}), 404
+    conn = _get_connection(marketplace, create=True)
+    cfg = dict(conn.config or {})
+
+    for field in MARKETPLACES[marketplace]["fields"]:
+        k = field["key"]
+        submitted = request.form.get(k, None)
+        if submitted is None:
+            continue
+        submitted = submitted.strip()
+        is_secret = field.get("secret") or k in SECRET_FIELDS.get(marketplace, set())
+        # For secret fields, an empty submission means "keep what's stored".
+        if is_secret and submitted == "":
+            continue
+        cfg[k] = submitted
+
+    conn.config = cfg
+    conn.updated_at = datetime.utcnow()
+    db.session.commit()
+    return jsonify({"status": "success", "message": f"{MARKETPLACES[marketplace]['label']} settings saved."})
+
+
+@app.route("/shops/test/<marketplace>", methods=["POST"])
+def shops_test(marketplace):
+    if marketplace not in MARKETPLACES:
+        return jsonify({"status": "error", "message": "Unknown marketplace"}), 404
+    conn = _get_connection(marketplace, create=True)
+    provider = get_provider(marketplace, conn, persist=_shop_persist)
+    result = provider.test_connection()
+
+    conn.status = "connected" if result.get("ok") else "error"
+    conn.status_detail = result.get("message", "")
+    if result.get("ok"):
+        conn.enabled = True
+        conn.connected_at = conn.connected_at or datetime.utcnow()
+    conn.updated_at = datetime.utcnow()
+    db.session.commit()
+
+    return jsonify({
+        "status": "success" if result.get("ok") else "error",
+        "message": result.get("message", ""),
+        "connected": bool(result.get("ok")),
+    })
+
+
+@app.route("/shops/disconnect/<marketplace>", methods=["POST"])
+def shops_disconnect(marketplace):
+    if marketplace not in MARKETPLACES:
+        return jsonify({"status": "error", "message": "Unknown marketplace"}), 404
+    conn = _get_connection(marketplace)
+    if conn:
+        cfg = dict(conn.config or {})
+        # Drop cached tokens but keep the app credentials the user typed in.
+        for tok in ("access_token", "refresh_token", "access_expires_at",
+                    "refresh_expires_at", "bearer_token", "bearer_expires_at"):
+            cfg.pop(tok, None)
+        conn.config = cfg
+        conn.enabled = False
+        conn.status = "disconnected"
+        conn.status_detail = "Disconnected."
+        conn.connected_at = None
+        db.session.commit()
+    return jsonify({"status": "success", "message": "Disconnected."})
+
+
+@app.route("/shops/ebay/connect")
+def shops_ebay_connect():
+    conn = _get_connection("ebay", create=True)
+    provider = get_provider("ebay", conn, persist=_shop_persist)
+    if provider._need("client_id", "ru_name"):
+        return redirect(url_for("shops_page") + "?ebay_error=Set+App+ID+and+RuName+first")
+    return redirect(provider.authorize_url(state="ebay"))
+
+
+@app.route("/shops/ebay/callback")
+def shops_ebay_callback():
+    code = request.args.get("code", "")
+    err = request.args.get("error_description") or request.args.get("error")
+    if err:
+        return redirect(url_for("shops_page") + "?ebay_error=" + urllib.parse.quote(err))
+    if not code:
+        return redirect(url_for("shops_page") + "?ebay_error=No+authorization+code+returned")
+
+    conn = _get_connection("ebay", create=True)
+    provider = get_provider("ebay", conn, persist=_shop_persist)
+    result = provider.exchange_code(code)
+    if result.get("ok"):
+        conn.status = "connected"
+        conn.enabled = True
+        conn.connected_at = datetime.utcnow()
+        conn.status_detail = "Account connected."
+        db.session.commit()
+        return redirect(url_for("shops_page") + "?ebay_ok=1")
+    return redirect(url_for("shops_page") + "?ebay_error=" + urllib.parse.quote(result.get("message", "Failed")))
+
+
+@app.route("/shops/listings")
+def shops_listings():
+    """Paginated inventory with per-marketplace listing status (JSON for the table)."""
+    page = max(int(request.args.get("page", 1) or 1), 1)
+    per_page = min(max(int(request.args.get("per_page", 25) or 25), 1), 100)
+    only_marketplace = request.args.get("marketplace", "")
+    unlisted_only = request.args.get("unlisted", "") == "1"
+
+    records = _sellable_records_query()
+
+    # Pre-index listings by (record_id, marketplace)
+    all_listings = Listing.query.all()
+    idx = {}
+    for lst in all_listings:
+        idx[(lst.record_id, lst.marketplace)] = lst
+
+    def record_row(r):
+        data = r.extracted_data or {}
+        row_listings = {}
+        for mk in MARKETPLACES:
+            lst = idx.get((r.id, mk))
+            row_listings[mk] = {
+                "status": lst.status if lst else "not_listed",
+                "listing_id": lst.id if lst else None,
+                "url": lst.external_url if lst else "",
+                "price": lst.price if lst else None,
+            } if True else None
+        return {
+            "record_id": r.id,
+            "name": _record_display_name(r),
+            "game": data.get("game", ""),
+            "set": data.get("set", ""),
+            "price": _record_market_price(r),
+            "quantity": _record_quantity(r),
+            "image_url": build_uploaded_file_url(r.image_path),
+            "detail_url": url_for("inventory_detail", record_id=r.id),
+            "listings": row_listings,
+        }
+
+    rows = [record_row(r) for r in records]
+
+    if unlisted_only and only_marketplace in MARKETPLACES:
+        rows = [row for row in rows if row["listings"][only_marketplace]["status"] == "not_listed"]
+
+    total = len(rows)
+    start = (page - 1) * per_page
+    page_rows = rows[start:start + per_page]
+
+    return jsonify({
+        "status": "success",
+        "rows": page_rows,
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+        "pages": max((total + per_page - 1) // per_page, 1),
+    })
+
+
+@app.route("/shops/push", methods=["POST"])
+def shops_push():
+    body = request.get_json(silent=True) or {}
+    marketplace = body.get("marketplace", "")
+    record_ids = body.get("record_ids", []) or []
+    price_override = body.get("price", None)
+    qty_override = body.get("quantity", None)
+
+    if marketplace not in MARKETPLACES:
+        return jsonify({"status": "error", "message": "Unknown marketplace"}), 400
+    conn = _get_connection(marketplace)
+    if not conn or not conn.enabled:
+        return jsonify({"status": "error", "message": f"{MARKETPLACES[marketplace]['label']} isn't connected."}), 400
+
+    provider = get_provider(marketplace, conn, persist=_shop_persist)
+    results = []
+
+    for rid in record_ids:
+        record = ScanRecord.query.get(rid)
+        if not record:
+            results.append({"record_id": rid, "ok": False, "message": "Record not found."})
+            continue
+
+        payload = _build_payload(record, marketplace,
+                                 price=price_override, quantity=qty_override)
+
+        listing = _listing_for(rid, marketplace)
+        if listing and listing.external_id:
+            payload["external_id"] = listing.external_id
+            payload["extra"] = listing.extra or {}
+
+        result = provider.push(payload)
+
+        if listing is None:
+            listing = Listing(record_id=rid, marketplace=marketplace)
+            db.session.add(listing)
+        listing.sku = payload["sku"]
+        listing.title = payload["title"]
+        listing.price = payload["price"]
+        listing.quantity = payload["quantity"]
+        listing.last_synced = datetime.utcnow()
+        if result.get("ok"):
+            listing.external_id = result.get("external_id") or listing.external_id
+            listing.external_url = result.get("external_url") or listing.external_url
+            listing.status = result.get("status", "active")
+            listing.last_error = None
+            if result.get("extra"):
+                merged = dict(listing.extra or {}); merged.update(result["extra"])
+                listing.extra = merged
+        else:
+            listing.status = result.get("status", "error")
+            listing.last_error = result.get("message", "")
+            if result.get("external_id"):
+                listing.external_id = result["external_id"]
+            if result.get("extra"):
+                merged = dict(listing.extra or {}); merged.update(result["extra"])
+                listing.extra = merged
+        db.session.commit()
+
+        results.append({
+            "record_id": rid,
+            "ok": bool(result.get("ok")),
+            "status": listing.status,
+            "url": listing.external_url,
+            "message": result.get("message", ""),
+        })
+
+    ok_count = sum(1 for r in results if r["ok"])
+    return jsonify({
+        "status": "success",
+        "ok_count": ok_count,
+        "fail_count": len(results) - ok_count,
+        "results": results,
+    })
+
+
+@app.route("/shops/unlist", methods=["POST"])
+def shops_unlist():
+    body = request.get_json(silent=True) or {}
+    listing_id = body.get("listing_id")
+    listing = Listing.query.get(listing_id) if listing_id else None
+    if not listing:
+        return jsonify({"status": "error", "message": "Listing not found."}), 404
+    conn = _get_connection(listing.marketplace)
+    if not conn:
+        return jsonify({"status": "error", "message": "Marketplace not connected."}), 400
+    provider = get_provider(listing.marketplace, conn, persist=_shop_persist)
+    result = provider.end_listing(listing)
+    if result.get("ok"):
+        listing.status = result.get("status", "ended")
+        listing.last_error = None
+        listing.last_synced = datetime.utcnow()
+    else:
+        listing.last_error = result.get("message", "")
+    db.session.commit()
+    return jsonify({
+        "status": "success" if result.get("ok") else "error",
+        "message": result.get("message", ""),
+    })
+
+
+@app.route("/shops/pull/<marketplace>", methods=["POST"])
+def shops_pull(marketplace):
+    if marketplace not in MARKETPLACES:
+        return jsonify({"status": "error", "message": "Unknown marketplace"}), 404
+    conn = _get_connection(marketplace)
+    if not conn or not conn.enabled:
+        return jsonify({"status": "error", "message": f"{MARKETPLACES[marketplace]['label']} isn't connected."}), 400
+
+    provider = get_provider(marketplace, conn, persist=_shop_persist)
+    result = provider.pull()
+    if not result.get("ok"):
+        return jsonify({"status": "error", "message": result.get("message", "Pull failed.")}), 502
+
+    matched = 0
+    for item in result.get("items", []):
+        sku = str(item.get("sku", ""))
+        if not sku.startswith(SHOP_SKU_PREFIX):
+            continue
+        try:
+            rid = int(sku[len(SHOP_SKU_PREFIX):])
+        except ValueError:
+            continue
+        record = ScanRecord.query.get(rid)
+        if not record:
+            continue
+        listing = _listing_for(rid, marketplace)
+        if listing is None:
+            listing = Listing(record_id=rid, marketplace=marketplace)
+            db.session.add(listing)
+        listing.sku = sku
+        listing.external_id = item.get("external_id") or listing.external_id
+        listing.external_url = item.get("external_url") or listing.external_url
+        listing.title = item.get("title") or listing.title
+        listing.price = item.get("price", listing.price)
+        listing.quantity = item.get("quantity", listing.quantity)
+        listing.status = item.get("status") or "active"
+        listing.last_synced = datetime.utcnow()
+        if item.get("extra"):
+            merged = dict(listing.extra or {}); merged.update(item["extra"])
+            listing.extra = merged
+        matched += 1
+    db.session.commit()
+
+    return jsonify({
+        "status": "success",
+        "message": f"{result.get('message','')} Matched {matched} to inventory by SKU.",
+        "fetched": len(result.get("items", [])),
+        "matched": matched,
+    })
+
+
 # ====================== START ======================
+def migrate_add_image_path_back_column():
+    """
+    db.create_all() only creates missing tables — it never alters existing
+    ones. Since image_path_back is new, existing installs with an already-
+    created scan_records table need the column added by hand. This runs a
+    plain ALTER TABLE the first time (SQLite supports adding a nullable
+    column live) and is a no-op on every run after that.
+    """
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(db.engine)
+    if "scan_records" not in inspector.get_table_names():
+        return  # fresh DB — db.create_all() already created it with the column
+
+    columns = {col["name"] for col in inspector.get_columns("scan_records")}
+    if "image_path_back" not in columns:
+        with db.engine.begin() as conn:
+            conn.execute(text("ALTER TABLE scan_records ADD COLUMN image_path_back VARCHAR(255)"))
+
+
+def migrate_add_display_image_path_column():
+    """
+    Same rationale as migrate_add_image_path_back_column(), for the new
+    display_image_path column used by the duplicate-image resolver to
+    override only the Inventory page's stacked thumbnail without touching
+    each record's own image_path.
+    """
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(db.engine)
+    if "scan_records" not in inspector.get_table_names():
+        return  # fresh DB — db.create_all() already created it with the column
+
+    columns = {col["name"] for col in inspector.get_columns("scan_records")}
+    if "display_image_path" not in columns:
+        with db.engine.begin() as conn:
+            conn.execute(text("ALTER TABLE scan_records ADD COLUMN display_image_path VARCHAR(255)"))
+
+
 if __name__ == "__main__":
     with app.app_context():
         db.create_all()
+        migrate_add_image_path_back_column()
+        migrate_add_display_image_path_column()
 
     ensure_dirs()
 
-    print("OCR Inventory Scanner")
-    print(" • /             — Scan page with template builder")
+    print("Card Collector Inventory Manager")
+    print(" • /             — Create/edit Game templates (name + blank field list)")
     print(" • /inventory    — Inventory list with server-side pagination and filters")
     print(" • /inventory/<id> — Record detail with edit, TCGPlayer link, copy-from, edition")
     print(" • /inventory/filter_options — Dropdown options API")
@@ -2998,9 +4333,9 @@ if __name__ == "__main__":
     print(" • /search_by_image_page     — Photo search UI")
     print(" • /search_by_image          — POST: ORB feature-match a card photo against inventory")
     print(" • /justtcg_search_manual    — GET: search JustTCG by name/game without a record")
-    print(" • /import       — 3x3 split, alignment, manual corner override, batch OCR")
+    print(" • /import       — 3x3 split, alignment, manual corner override, blank batch import")
     print(" • /records_summary — Copy-from dropdown API")
-    print(" • /template_save   — Save new percentage-based ROI template")
+    print(" • /template_save   — Save a Game definition (name + fields)")
     print(" • /justtcg_fetch/<id>              — Fetch live price from JustTCG API (POST, manual trigger)")
     print(" • /tcg_save_url/<id>, /tcg_clear_url/<id> — Legacy URL save / pricing data clear")
     print(" • Visit: http://127.0.0.1:5000")
