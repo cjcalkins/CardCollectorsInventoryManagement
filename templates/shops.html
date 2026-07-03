@@ -202,6 +202,113 @@
             {% endfor %}
         </div>
 
+        <!-- Sale email monitor -->
+        {% set em = email_monitor %}
+        <h5 class="mb-3"><i class="fas fa-envelope-open-text me-2"></i>Sale email monitor</h5>
+        <div class="card connector-card mb-5">
+            <div class="connector-head" style="background:#495057;">
+                <i class="fas fa-inbox brand-icon"></i>
+                <h5>IMAP mailbox</h5>
+                <span class="status-pill" id="pill-email">{{ em.status }}</span>
+            </div>
+            <div class="connector-body">
+                <div class="text-muted mb-3" style="font-size:0.82rem;">
+                    Watch a mailbox for marketplace sale emails (e.g. TCGplayer "you made a sale"). Matched
+                    sales decrement inventory and delist the item on every other connected shop automatically.
+                    Point a dedicated address or a filtered label at this and use an app password.
+                </div>
+
+                <form id="emailForm">
+                    <div class="row g-2">
+                        <div class="col-md-6">
+                            <div class="field-label">IMAP host</div>
+                            <input type="text" class="form-control form-control-sm" name="host"
+                                   value="{{ em.host }}" placeholder="imap.gmail.com">
+                        </div>
+                        <div class="col-md-3">
+                            <div class="field-label">Port</div>
+                            <input type="number" class="form-control form-control-sm" name="port" value="{{ em.port }}">
+                        </div>
+                        <div class="col-md-3 d-flex align-items-end">
+                            <div class="form-check form-switch mb-1">
+                                <input class="form-check-input" type="checkbox" id="emUseSsl" {% if em.use_ssl %}checked{% endif %}>
+                                <label class="form-check-label small" for="emUseSsl">Use SSL</label>
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="field-label">Username</div>
+                            <input type="text" class="form-control form-control-sm" name="username"
+                                   value="{{ em.username }}" placeholder="you@example.com" autocomplete="username">
+                        </div>
+                        <div class="col-md-6">
+                            <div class="field-label">Password / app password</div>
+                            <input type="password" class="form-control form-control-sm" name="password"
+                                   autocomplete="new-password"
+                                   placeholder="{{ '•••••••• (saved — leave blank to keep)' if em.password_set else 'app password' }}">
+                        </div>
+                        <div class="col-md-3">
+                            <div class="field-label">Folder</div>
+                            <input type="text" class="form-control form-control-sm" name="folder" value="{{ em.folder }}">
+                        </div>
+                        <div class="col-md-5">
+                            <div class="field-label">From filter</div>
+                            <input type="text" class="form-control form-control-sm" name="sender_filter"
+                                   value="{{ em.sender_filter }}" placeholder="tcgplayer.com">
+                        </div>
+                        <div class="col-md-4">
+                            <div class="field-label">Subject filter</div>
+                            <input type="text" class="form-control form-control-sm" name="subject_filter"
+                                   value="{{ em.subject_filter }}" placeholder="sold">
+                        </div>
+                        <div class="col-md-4">
+                            <div class="field-label">Sale source</div>
+                            <select class="form-select form-select-sm" name="source">
+                                {% for mk, meta in marketplaces.items() %}
+                                <option value="{{ mk }}" {% if em.source == mk %}selected{% endif %}>{{ meta.label }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="field-label">Auto-poll every (seconds, 0 = manual)</div>
+                            <input type="number" min="0" class="form-control form-control-sm" name="poll_interval" value="{{ em.poll_interval }}">
+                        </div>
+                        <div class="col-md-4 d-flex align-items-end">
+                            <div class="form-check form-switch mb-1">
+                                <input class="form-check-input" type="checkbox" id="emMarkSeen" {% if em.mark_seen %}checked{% endif %}>
+                                <label class="form-check-label small" for="emMarkSeen">Mark processed emails as read</label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="conn-status-line" id="status-email">
+                        {% if em.status_detail %}<span class="text-muted">{{ em.status_detail }}</span>{% endif %}
+                        {% if em.last_checked %}<span class="text-muted"> · last checked {{ em.last_checked }}</span>{% endif %}
+                    </div>
+
+                    <div class="d-flex gap-2 flex-wrap mt-2">
+                        <button type="button" class="btn btn-sm btn-dark" id="emSaveBtn"><i class="fas fa-floppy-disk me-1"></i>Save</button>
+                        <button type="button" class="btn btn-sm btn-outline-secondary" id="emTestBtn"><i class="fas fa-vial me-1"></i>Test</button>
+                        <button type="button" class="btn btn-sm btn-success" id="emCheckBtn"><i class="fas fa-envelope-circle-check me-1"></i>Check now</button>
+                        <button type="button" class="btn btn-sm btn-outline-danger ms-auto" id="emDisconnectBtn">Disconnect</button>
+                    </div>
+                </form>
+
+                <div id="emResult" class="mt-3"></div>
+
+                <div class="mt-3">
+                    <span class="help-toggle" onclick="this.nextElementSibling.classList.toggle('show')">
+                        <i class="fas fa-circle-question me-1"></i>Notes &amp; safety
+                    </span>
+                    <div class="help-body">
+                        Auto-poll runs only when the app is started with EMAIL_MONITOR_BACKGROUND=1; otherwise use
+                        "Check now". Parsing sale emails is best-effort — unmatched or unparsed sales are logged for
+                        review and never guess at a delist. The mailbox password is stored in inventory.db, so treat
+                        that file as a secret; a dedicated address or app password is strongly recommended.
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <!-- Listings / sync -->
         <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
             <h5 class="mb-0"><i class="fas fa-arrows-rotate me-2"></i>Inventory &amp; Listings</h5>
@@ -217,6 +324,13 @@
                 </select>
                 <button class="btn btn-sm btn-outline-primary" id="pullBtn">
                     <i class="fas fa-cloud-arrow-down me-1"></i>Pull from selected shop
+                </button>
+                <button class="btn btn-sm btn-dark" id="tcgCsvBtn" style="background:#F8991D;border-color:#F8991D;">
+                    <i class="fas fa-file-csv me-1"></i>TCGplayer import CSV
+                </button>
+                <button class="btn btn-sm btn-outline-dark" id="tcgImportBtn"
+                        style="border-color:#F8991D;color:#b26a00;">
+                    <i class="fas fa-file-import me-1"></i>Backfill IDs from export
                 </button>
             </div>
         </div>
@@ -267,6 +381,126 @@
             </button>
             <button class="btn btn-sm btn-outline-light" id="bulkClear">Clear</button>
             <span id="bulkProgress" class="ms-2 small"></span>
+        </div>
+    </div>
+
+    <!-- TCGplayer import CSV modal -->
+    <div class="modal fade" id="tcgCsvModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-lg modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header text-white" style="background:#F8991D;">
+                    <h5 class="modal-title"><i class="fas fa-file-csv me-2"></i>Generate TCGplayer import CSV</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="text-muted small mb-3">
+                        TCGplayer's API is closed, so listing is done by importing a CSV in the Seller Portal.
+                        This builds that file and records each row's <strong>TCGplayer Id</strong> back onto the
+                        item, so future sales match exactly. Upload it via
+                        <em>Seller Portal → Pricing → Import to Staged</em>, review, then <em>Move to Live</em>
+                        (requires a Level&nbsp;4 seller account).
+                    </p>
+
+                    <div class="row g-3 mb-3">
+                        <div class="col-sm-6">
+                            <label class="field-label d-block mb-1">Which items?</label>
+                            <div class="form-check">
+                                <input class="form-check-input" type="radio" name="tcgScope" id="tcgScopeSel" value="selected" checked>
+                                <label class="form-check-label" for="tcgScopeSel">Selected rows (<span id="tcgSelCount">0</span>)</label>
+                            </div>
+                            <div class="form-check">
+                                <input class="form-check-input" type="radio" name="tcgScope" id="tcgScopeAll" value="all">
+                                <label class="form-check-label" for="tcgScopeAll">All sellable inventory</label>
+                            </div>
+                        </div>
+                        <div class="col-sm-6">
+                            <label class="field-label d-block mb-1" for="tcgFallback">Fallback price (optional)</label>
+                            <div class="input-group input-group-sm">
+                                <span class="input-group-text">$</span>
+                                <input type="number" step="0.01" min="0" class="form-control" id="tcgFallback"
+                                       placeholder="used when an item has no market price">
+                            </div>
+                            <div class="form-text">Items with no price and no fallback are skipped.</div>
+                        </div>
+                    </div>
+
+                    <div id="tcgPreview" class="border rounded p-3 bg-light">
+                        <div class="text-muted"><i class="fas fa-spinner fa-spin me-2"></i>Loading preview…</div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <span id="tcgDownloadNote" class="text-muted small me-auto"></span>
+                    <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+                    <button type="button" class="btn btn-dark" id="tcgDownloadBtn" style="background:#F8991D;border-color:#F8991D;">
+                        <i class="fas fa-download me-1"></i>Download CSV
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- TCGplayer ID backfill import modal -->
+    <div class="modal fade" id="tcgImportModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-lg modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header text-white" style="background:#b26a00;">
+                    <h5 class="modal-title"><i class="fas fa-file-import me-2"></i>Backfill TCGplayer Ids from a Live export</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="text-muted small mb-3">
+                        Export your existing listings in the Seller Portal (<em>Pricing → Export from Live</em>) and
+                        upload that CSV here. Each row is matched to an inventory item by name, set, number, condition
+                        and foil, and the row's <strong>TCGplayer Id</strong> is written onto the matching record — so
+                        future sales match exactly and those items become listable.
+                    </p>
+
+                    <div class="mb-3">
+                        <label class="field-label d-block mb-1" for="tcgImportFile">TCGplayer Live-inventory export (.csv)</label>
+                        <input type="file" accept=".csv,text/csv" class="form-control form-control-sm" id="tcgImportFile">
+                    </div>
+
+                    <div class="row g-3 mb-2">
+                        <div class="col-sm-6">
+                            <label class="field-label d-block mb-1" for="tcgMinConf">Auto-apply matches at or above</label>
+                            <select id="tcgMinConf" class="form-select form-select-sm">
+                                <option value="exact">Exact — name + set + number + condition</option>
+                                <option value="strong" selected>Strong — name + set + number</option>
+                                <option value="loose">Loose — name + set</option>
+                            </select>
+                        </div>
+                        <div class="col-sm-6 d-flex flex-column justify-content-end">
+                            <div class="form-check">
+                                <input class="form-check-input" type="checkbox" id="tcgOnlyMissing" checked>
+                                <label class="form-check-label small" for="tcgOnlyMissing">Only items without a TCGplayer Id</label>
+                            </div>
+                            <div class="form-check">
+                                <input class="form-check-input" type="checkbox" id="tcgAssumeNm" checked>
+                                <label class="form-check-label small" for="tcgAssumeNm">Assume Near Mint when condition unknown</label>
+                            </div>
+                            <div class="form-check">
+                                <input class="form-check-input" type="checkbox" id="tcgCreateListings" checked>
+                                <label class="form-check-label small" for="tcgCreateListings">Also mark as active TCGplayer listings</label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="tcgImportResult" class="border rounded p-3 bg-light">
+                        <div class="text-muted small">Choose a file to preview matches.</div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <span class="text-muted small me-auto">Preview never writes. Apply is only enabled after a preview.</span>
+                    <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+                    <button type="button" class="btn btn-outline-dark" id="tcgImportPreviewBtn" disabled>
+                        <i class="fas fa-magnifying-glass me-1"></i>Preview
+                    </button>
+                    <button type="button" class="btn btn-dark" id="tcgImportApplyBtn" disabled
+                            style="background:#b26a00;border-color:#b26a00;">
+                        <i class="fas fa-floppy-disk me-1"></i>Apply
+                    </button>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -361,11 +595,17 @@
             const connected = CONNECTED[mk];
             let btns = '';
             if (s === 'not_listed' || s === 'error' || s === 'ended') {
-                btns = `<button class="btn btn-outline-dark mini-btn ms-1 row-push" data-mk="${mk}"
-                          ${connected ? '' : 'disabled title="Connect this shop first"'}>Push</button>`;
+                if (mk === 'tcgplayer') {
+                    // TCGplayer has no live API push — route to the CSV generator instead.
+                    btns = `<button class="btn btn-outline-dark mini-btn ms-1 row-tcgcsv">CSV</button>`;
+                } else {
+                    btns = `<button class="btn btn-outline-dark mini-btn ms-1 row-push" data-mk="${mk}"
+                              ${connected ? '' : 'disabled title="Connect this shop first"'}>Push</button>`;
+                }
             } else if ((s === 'active' || s === 'draft') && info.listing_id) {
                 const link = info.url ? `<a href="${info.url}" target="_blank" class="btn btn-outline-secondary mini-btn ms-1"><i class="fas fa-arrow-up-right-from-square"></i></a>` : '';
-                btns = `${link}<button class="btn btn-outline-danger mini-btn ms-1 row-unlist" data-listing="${info.listing_id}">End</button>`;
+                const endLabel = (mk === 'tcgplayer' && s === 'draft') ? 'Clear' : 'End';
+                btns = `${link}<button class="btn btn-outline-danger mini-btn ms-1 row-unlist" data-listing="${info.listing_id}">${endLabel}</button>`;
             }
             return `<div class="d-inline-flex align-items-center">${inner}${btns}</div>`;
         }
@@ -415,6 +655,12 @@
         document.getElementById('listingsBody').addEventListener('click', async (e) => {
             const pushBtn = e.target.closest('.row-push');
             const unlistBtn = e.target.closest('.row-unlist');
+            const tcgCsvRow = e.target.closest('.row-tcgcsv');
+            if (tcgCsvRow) {
+                const rid = parseInt(tcgCsvRow.closest('td').dataset.record, 10);
+                openTcgModal([rid]);
+                return;
+            }
             if (pushBtn) {
                 const mk = pushBtn.dataset.mk;
                 const rid = parseInt(pushBtn.closest('td').dataset.record, 10);
@@ -506,6 +752,289 @@
             toast(data.message || 'Pull complete.', data.status === 'success');
             btn.disabled = false; btn.innerHTML = orig;
             loadListings();
+        });
+
+        // ── TCGplayer import CSV ──
+        let tcgOverrideIds = null;   // set when opening the modal for a single row
+        const tcgModalEl = document.getElementById('tcgCsvModal');
+        const tcgModal = new bootstrap.Modal(tcgModalEl);
+
+        function tcgRequestBody() {
+            const scopeSel = document.querySelector('input[name="tcgScope"]:checked').value;
+            const fallback = document.getElementById('tcgFallback').value;
+            let record_ids = null;
+            if (tcgOverrideIds) record_ids = tcgOverrideIds;
+            else if (scopeSel === 'selected') record_ids = [...selected];
+            return { record_ids, fallback_price: fallback === '' ? null : fallback };
+        }
+
+        function openTcgModal(overrideIds) {
+            tcgOverrideIds = overrideIds || null;
+            const selRadio = document.getElementById('tcgScopeSel');
+            const allRadio = document.getElementById('tcgScopeAll');
+            if (tcgOverrideIds) {
+                // Single-row mode: lock scope to just that record.
+                document.getElementById('tcgSelCount').textContent = '1 (this row)';
+                selRadio.checked = true; selRadio.disabled = true; allRadio.disabled = true;
+            } else {
+                selRadio.disabled = false; allRadio.disabled = false;
+                document.getElementById('tcgSelCount').textContent = selected.size;
+                if (selected.size === 0) { allRadio.checked = true; } else { selRadio.checked = true; }
+            }
+            tcgModal.show();
+            tcgPreview();
+        }
+
+        async function tcgPreview() {
+            const box = document.getElementById('tcgPreview');
+            box.innerHTML = '<div class="text-muted"><i class="fas fa-spinner fa-spin me-2"></i>Loading preview…</div>';
+            try {
+                const res = await fetch('/shops/tcgplayer/preview', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(tcgRequestBody()),
+                });
+                const d = await res.json();
+                const dlBtn = document.getElementById('tcgDownloadBtn');
+                dlBtn.disabled = d.eligible === 0;
+                let html = `<div class="d-flex gap-4 mb-2">
+                    <div><span class="fs-4 fw-bold text-success">${d.eligible}</span> <span class="text-muted small">ready to list</span></div>
+                    <div><span class="fs-4 fw-bold text-secondary">${d.skipped.length}</span> <span class="text-muted small">skipped</span></div>
+                    <div><span class="fs-4 fw-bold">${d.total}</span> <span class="text-muted small">considered</span></div>
+                </div>`;
+                if (d.skipped.length) {
+                    const rows = d.skipped.slice(0, 50).map(s =>
+                        `<tr><td>${s.name}</td><td class="text-muted">${s.reason}</td></tr>`).join('');
+                    html += `<details class="mt-2"><summary class="small text-danger">${d.skipped.length} item(s) can't be listed yet</summary>
+                        <table class="table table-sm mt-2 mb-0"><thead><tr><th>Item</th><th>Reason</th></tr></thead><tbody>${rows}</tbody></table>
+                        <div class="form-text">Most fixes: match the card to a TCGplayer product so it has a TCGplayer Id, or set a market/fallback price.</div></details>`;
+                }
+                if (d.eligible === 0) {
+                    html += '<div class="alert alert-warning mt-2 mb-0 py-2 small">Nothing to export with the current selection.</div>';
+                }
+                box.innerHTML = html;
+            } catch (err) {
+                box.innerHTML = `<div class="text-danger small">Preview failed: ${err.message}</div>`;
+            }
+        }
+
+        document.querySelectorAll('input[name="tcgScope"]').forEach(r =>
+            r.addEventListener('change', tcgPreview));
+        let tcgFallbackTimer;
+        document.getElementById('tcgFallback').addEventListener('input', () => {
+            clearTimeout(tcgFallbackTimer); tcgFallbackTimer = setTimeout(tcgPreview, 400);
+        });
+        tcgModalEl.addEventListener('hidden.bs.modal', () => { tcgOverrideIds = null; });
+
+        document.getElementById('tcgCsvBtn').addEventListener('click', () => openTcgModal(null));
+
+        document.getElementById('tcgDownloadBtn').addEventListener('click', async (e) => {
+            const btn = e.currentTarget; const orig = btn.innerHTML;
+            btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Building…';
+            try {
+                const res = await fetch('/shops/tcgplayer/export_csv', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(tcgRequestBody()),
+                });
+                if (!res.ok) throw new Error('Server error ' + res.status);
+                const included = res.headers.get('X-CCIM-Included') || '?';
+                const skipped = res.headers.get('X-CCIM-Skipped') || '0';
+                const blob = await res.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = (res.headers.get('Content-Disposition') || '').split('filename=')[1]?.replace(/"/g, '')
+                             || 'tcgplayer_import.csv';
+                document.body.appendChild(a); a.click(); a.remove();
+                URL.revokeObjectURL(url);
+                toast(`CSV built: ${included} listing(s)${skipped !== '0' ? `, ${skipped} skipped` : ''}. Import it in the TCGplayer Seller Portal.`, true);
+                tcgModal.hide();
+                loadListings();
+            } catch (err) {
+                toast('Could not build CSV: ' + err.message, false);
+            } finally {
+                btn.disabled = false; btn.innerHTML = orig;
+            }
+        });
+
+        // ── TCGplayer ID backfill from a Live export ──
+        const tcgImportEl = document.getElementById('tcgImportModal');
+        const tcgImportModal = new bootstrap.Modal(tcgImportEl);
+        const tcgImportFile = document.getElementById('tcgImportFile');
+
+        function tcgImportForm(mode) {
+            const fd = new FormData();
+            fd.append('file', tcgImportFile.files[0]);
+            fd.append('mode', mode);
+            fd.append('min_confidence', document.getElementById('tcgMinConf').value);
+            fd.append('only_missing', document.getElementById('tcgOnlyMissing').checked ? '1' : '0');
+            fd.append('assume_nm', document.getElementById('tcgAssumeNm').checked ? '1' : '0');
+            fd.append('create_listings', document.getElementById('tcgCreateListings').checked ? '1' : '0');
+            return fd;
+        }
+
+        function renderImportResult(d) {
+            const box = document.getElementById('tcgImportResult');
+            if (d.status !== 'success') {
+                box.innerHTML = `<div class="text-danger small">${d.message || 'Import failed.'}</div>`;
+                return;
+            }
+            const applied = d.mode === 'apply';
+            const bc = d.by_confidence || {};
+            let html = `<div class="d-flex flex-wrap gap-4 mb-2">
+                <div><span class="fs-4 fw-bold text-success">${d.matched_count}</span> <span class="text-muted small">${applied ? 'applied' : 'will match'}</span></div>
+                <div><span class="fs-5 fw-bold text-warning">${d.ambiguous_count}</span> <span class="text-muted small">ambiguous</span></div>
+                <div><span class="fs-5 fw-bold text-secondary">${d.unmatched_count}</span> <span class="text-muted small">no match</span></div>
+                <div><span class="fs-6 fw-bold">${d.csv_rows}</span> <span class="text-muted small">CSV rows</span></div>
+            </div>
+            <div class="small text-muted mb-2">
+                Confidence — exact: ${bc.exact||0}, strong: ${bc.strong||0}, loose: ${bc.loose||0}.
+                ${d.skipped_existing ? d.skipped_existing + ' already had an Id (skipped). ' : ''}
+                ${d.csv_unused_count} export row(s) matched nothing in your inventory.
+            </div>`;
+            if (applied) {
+                html += `<div class="alert alert-success py-2 small mb-2">Wrote ${d.applied} TCGplayer Id(s)`
+                      + (d.listings_created ? `, created ${d.listings_created} listing(s)` : '') + `.</div>`;
+            }
+            const tbl = (title, arr, cols) => {
+                if (!arr || !arr.length) return '';
+                const head = cols.map(c => `<th>${c.h}</th>`).join('');
+                const body = arr.map(x => `<tr>${cols.map(c => `<td>${c.f(x)}</td>`).join('')}</tr>`).join('');
+                return `<details class="mt-2"><summary class="small">${title}</summary>
+                    <table class="table table-sm mt-2 mb-0"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></details>`;
+            };
+            html += tbl(`Matched (${d.matched_count})`, d.matched_sample, [
+                { h: 'Item', f: x => x.name }, { h: 'TCGplayer Id', f: x => x.tcg_id },
+                { h: 'Confidence', f: x => x.confidence }]);
+            html += tbl(`Ambiguous (${d.ambiguous_count}) — needs a manual pick`, d.ambiguous_sample, [
+                { h: 'Item', f: x => x.name }, { h: 'Candidate Ids', f: x => (x.candidates || []).join(', ') }]);
+            html += tbl(`No match (${d.unmatched_count})`, d.unmatched_sample, [
+                { h: 'Item', f: x => x.name }]);
+            box.innerHTML = html;
+        }
+
+        async function tcgImportRun(mode) {
+            if (!tcgImportFile.files.length) { toast('Choose a CSV file first.', false); return null; }
+            const box = document.getElementById('tcgImportResult');
+            box.innerHTML = '<div class="text-muted small"><i class="fas fa-spinner fa-spin me-2"></i>Working…</div>';
+            try {
+                const res = await fetch('/shops/tcgplayer/import_ids', { method: 'POST', body: tcgImportForm(mode) });
+                const d = await res.json();
+                renderImportResult(d);
+                return d;
+            } catch (err) {
+                box.innerHTML = `<div class="text-danger small">Request failed: ${err.message}</div>`;
+                return null;
+            }
+        }
+
+        function tcgSetApplyEnabled(d) {
+            document.getElementById('tcgImportApplyBtn').disabled = !(d && d.matched_count > 0);
+        }
+
+        document.getElementById('tcgImportBtn').addEventListener('click', () => {
+            document.getElementById('tcgImportResult').innerHTML =
+                '<div class="text-muted small">Choose a file to preview matches.</div>';
+            document.getElementById('tcgImportApplyBtn').disabled = true;
+            tcgImportModal.show();
+        });
+
+        tcgImportFile.addEventListener('change', () => {
+            document.getElementById('tcgImportPreviewBtn').disabled = tcgImportFile.files.length === 0;
+            document.getElementById('tcgImportApplyBtn').disabled = true;   // must preview first
+            if (tcgImportFile.files.length) tcgImportRun('preview').then(tcgSetApplyEnabled);
+        });
+        ['tcgMinConf', 'tcgOnlyMissing', 'tcgAssumeNm'].forEach(id =>
+            document.getElementById(id).addEventListener('change', () => {
+                if (tcgImportFile.files.length) tcgImportRun('preview').then(tcgSetApplyEnabled);
+            }));
+        document.getElementById('tcgImportPreviewBtn').addEventListener('click', () =>
+            tcgImportRun('preview').then(tcgSetApplyEnabled));
+
+        document.getElementById('tcgImportApplyBtn').addEventListener('click', async (e) => {
+            const btn = e.currentTarget; const orig = btn.innerHTML;
+            btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Applying…';
+            const d = await tcgImportRun('apply');
+            btn.innerHTML = orig;
+            if (d && d.status === 'success') {
+                toast(`Applied ${d.applied} TCGplayer Id(s).`, true);
+                loadListings();
+            }
+        });
+
+        // ── Sale email monitor ──
+        function emailFormData() {
+            const fd = new FormData(document.getElementById('emailForm'));
+            fd.set('use_ssl', document.getElementById('emUseSsl').checked ? '1' : '0');
+            fd.set('mark_seen', document.getElementById('emMarkSeen').checked ? '1' : '0');
+            return fd;
+        }
+        function setEmailPill(status) {
+            const pill = document.getElementById('pill-email');
+            pill.textContent = status;
+            const colors = { connected: 'rgba(255,255,255,0.35)', error: 'rgba(220,53,69,0.55)', disconnected: 'rgba(255,255,255,0.2)' };
+            pill.style.background = colors[status] || 'rgba(255,255,255,0.2)';
+        }
+
+        document.getElementById('emSaveBtn').addEventListener('click', async () => {
+            const d = await (await fetch('/shops/email/save', { method: 'POST', body: emailFormData() })).json();
+            toast(d.message, d.status === 'success');
+        });
+
+        document.getElementById('emTestBtn').addEventListener('click', async (e) => {
+            const btn = e.currentTarget; const orig = btn.innerHTML;
+            btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Testing…';
+            await fetch('/shops/email/save', { method: 'POST', body: emailFormData() });
+            const d = await (await fetch('/shops/email/test', { method: 'POST' })).json();
+            document.getElementById('status-email').innerHTML =
+                `<span class="${d.connected ? 'text-success' : 'text-danger'}">${d.message}</span>`;
+            setEmailPill(d.connected ? 'connected' : 'error');
+            toast(d.message, d.connected);
+            btn.disabled = false; btn.innerHTML = orig;
+        });
+
+        document.getElementById('emCheckBtn').addEventListener('click', async (e) => {
+            const btn = e.currentTarget; const orig = btn.innerHTML;
+            btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Checking…';
+            await fetch('/shops/email/save', { method: 'POST', body: emailFormData() });
+            const res = await fetch('/shops/email/check', { method: 'POST' });
+            const d = await res.json();
+            const box = document.getElementById('emResult');
+            if (d.status !== 'success') {
+                box.innerHTML = `<div class="alert alert-danger py-2 small mb-0">${d.message}</div>`;
+                setEmailPill('error');
+            } else {
+                const s = d.summary;
+                let html = `<div class="alert alert-success py-2 small mb-2">${d.message}</div>
+                    <div class="d-flex flex-wrap gap-4 mb-2">
+                        <div><span class="fs-5 fw-bold text-success">${s.processed}</span> <span class="text-muted small">sold &amp; delisted</span></div>
+                        <div><span class="fs-6 fw-bold text-secondary">${s.unmatched}</span> <span class="text-muted small">unmatched</span></div>
+                        <div><span class="fs-6 fw-bold text-muted">${s.duplicate}</span> <span class="text-muted small">already seen</span></div>
+                        <div><span class="fs-6 fw-bold text-muted">${s.unparsed}</span> <span class="text-muted small">need review</span></div>
+                    </div>`;
+                const lines = [];
+                (s.details || []).forEach(o => (o.items || []).forEach(it => {
+                    const badge = { processed: 'text-success', unmatched: 'text-danger', duplicate: 'text-muted', unparsed: 'text-warning' }[it.status] || '';
+                    let extra = it.status === 'processed'
+                        ? ` → ${it.remaining} left${(it.delisted || []).length ? ', delisted ' + it.delisted.filter(x => x.ok).map(x => x.marketplace).join(', ') : ''}`
+                        : (it.reason ? ` (${it.reason})` : '');
+                    lines.push(`<tr><td>${o.order_id || '—'}</td><td>${it.title}</td><td class="${badge}">${it.status}${extra}</td></tr>`);
+                }));
+                if (lines.length) {
+                    html += `<table class="table table-sm mb-0"><thead><tr><th>Order</th><th>Item</th><th>Result</th></tr></thead><tbody>${lines.join('')}</tbody></table>`;
+                }
+                box.innerHTML = html;
+                setEmailPill('connected');
+                loadListings();
+            }
+            btn.disabled = false; btn.innerHTML = orig;
+        });
+
+        document.getElementById('emDisconnectBtn').addEventListener('click', async () => {
+            if (!confirm('Disconnect the email monitor? The stored password is cleared.')) return;
+            const d = await (await fetch('/shops/email/disconnect', { method: 'POST' })).json();
+            setEmailPill('disconnected');
+            document.getElementById('status-email').innerHTML = '<span class="text-muted">Disconnected.</span>';
+            toast(d.message, true);
         });
 
         loadListings();
