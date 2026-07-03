@@ -605,6 +605,38 @@ def _resolve_category_for_game(game_str):
     return None, None
 
 
+def _collector_number_variants(num_str):
+    """
+    All plausible string forms of an N/M collector number, so an exact-string DB
+    lookup matches regardless of zero-padding. tcgcsv pads the N to the digit
+    width of the M (M=112 -> "024/112"; M=64 -> "05/64"; M=9 -> "3/9"), so the
+    primary variant follows that rule; the bare and fixed-3-digit forms are added
+    for safety against other conventions. Returns a set (empty if not an N/M).
+    """
+    m = _re.search(r"(\d{1,4})\s*/\s*(\d{1,4})", str(num_str or ""))
+    if not m:
+        return set()
+    n, tot = int(m.group(1)), int(m.group(2))
+    width = len(str(tot))                       # M's digit count drives N's padding
+    return {
+        f"{n}/{tot}",                           # stripped
+        f"{n:0{width}d}/{tot}",                 # pad N to M's width  (CSV convention)
+        f"{n:03d}/{tot:03d}",                   # legacy fixed 3-digit
+        f"{n:03d}/{tot}",
+    }
+
+
+def _canonical_collector_number(num_str):
+    """Return an N/M number padded to the CSV convention (N padded to M's digit
+    width, e.g. 24/112 -> 024/112, 5/64 -> 05/64). Returns the input unchanged if
+    it isn't a recognisable N/M number."""
+    m = _re.search(r"(\d{1,4})\s*/\s*(\d{1,4})", str(num_str or ""))
+    if not m:
+        return str(num_str or "").strip()
+    n, tot = int(m.group(1)), int(m.group(2))
+    return f"{n:0{len(str(tot))}d}/{tot}"
+
+
 def _reference_candidates_for_ocr(category_id, ocr_result, limit=8):
     """
     Build scored reference-card candidates for an OCR result within one game.
@@ -621,13 +653,7 @@ def _reference_candidates_for_ocr(category_id, ocr_result, limit=8):
 
     narrowed = None
     if number:
-        variants = {number}
-        try:
-            a, b = number.split("/")
-            variants.add(f"{int(a)}/{int(b)}")
-            variants.add(f"{int(a):03d}/{int(b):03d}")
-        except Exception:
-            pass
+        variants = _collector_number_variants(number) or {number}
         narrowed = base.filter(ReferenceCard.number.in_(list(variants))).limit(300).all()
     if not narrowed and name:
         first = (name.split() or [name])[0]
@@ -3164,7 +3190,9 @@ def ocr_apply(record_id):
         if name:
             updates["name"] = name
         if number:
-            updates["set_number"] = number   # collector number -> "Set Number" field
+            # pad to the CSV convention (N to M's digit width) so it lines up
+            # with the reference catalog's format, e.g. 24/112 -> 024/112.
+            updates["set_number"] = _canonical_collector_number(number)
 
     if not updates:
         return jsonify({
