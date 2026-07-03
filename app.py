@@ -8,7 +8,8 @@ import numpy as np
 from datetime import datetime
 from PIL import Image
 from werkzeug.utils import secure_filename
-from models import db, Product, ScanRecord, ShopConnection, Listing
+from models import (db, Product, ScanRecord, ShopConnection, Listing, EmailMonitor,
+                    SaleEvent, ReferenceCard, ReferenceSync)
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -20,6 +21,24 @@ try:
     import fitz  # PyMuPDF
 except ImportError:
     fitz = None
+
+# card_ocr provides front-image OCR (top/bottom band -> name + N/M collector
+# number) and a matcher against existing records. Imported optionally so the
+# app still boots on installs without pytesseract / the tesseract-ocr binary;
+# the /ocr_identify route reports a clear error instead of crashing.
+try:
+    import card_ocr
+except Exception:
+    card_ocr = None
+
+# tcgcsv_sync downloads a game's catalog from tcgcsv.com into ReferenceCard rows
+# so OCR results can be matched to a real card and used to auto-fill entry data.
+# Imported optionally so the app still boots if the module/urllib access is
+# unavailable; the /reference routes report a clear error instead of crashing.
+try:
+    import tcgcsv_sync
+except Exception:
+    tcgcsv_sync = None
 
 app = Flask(__name__, template_folder="templates")
 
@@ -465,6 +484,171 @@ def create_scan_record(image_path, template_name, extracted, image_path_back=Non
     db.session.commit()
 
     return matched_product, record
+
+
+# ====================== OCR IDENTIFICATION HELPERS ======================
+def _abs_record_image_path(path_value):
+    """Absolute on-disk path for a record's stored image, or None if it has no
+    real front image (blank sentinel / empty)."""
+    if not path_value or str(path_value).strip() in ("", "__blank__"):
+        return None
+    relative = normalize_to_upload_relative(path_value)
+    return os.path.join(app.config["UPLOAD_FOLDER"], relative)
+
+
+def _build_ocr_candidates(exclude_record_id=None, catalog_only=False):
+    """
+    Build the plain candidate list card_ocr.match_ocr_to_records expects from
+    existing ScanRecords. Each candidate carries the identity fields used for
+    scoring (name/serial) plus display fields (set/game/thumbnail) so the UI can
+    render the picker directly from the match result.
+
+    catalog_only=True restricts matching to imported reference rows (the CSV
+    "Imported Catalog"), which is usually the cleanest identification target.
+    """
+    candidates = []
+    for r in ScanRecord.query.all():
+        if exclude_record_id is not None and r.id == exclude_record_id:
+            continue
+        data = r.extracted_data or {}
+        if catalog_only and not _is_catalog_only(data):
+            continue
+
+        name = _get_name(data)
+        serial = _get_serial(data)
+        if not name and not serial:
+            continue  # nothing to match on
+
+        candidates.append({
+            "record_id": r.id,
+            "name":      name,
+            "serial":    serial,
+            "set":       str(data.get("set") or data.get("set_name") or "").strip(),
+            "game":      str(data.get("game") or "").strip(),
+            "thumbnail": build_uploaded_file_url(r.image_path) if r.image_path else None,
+        })
+    return candidates
+
+
+# Identity fields copied onto a record when the user accepts a matched source
+# record via /ocr_apply. Only non-empty values are copied.
+_OCR_COPY_KEYS = (
+    "name", "product_name", "card_name", "title",
+    "serial", "number", "set_number", "collector_number", "card_number",
+    "set", "set_name", "rarity", "game",
+)
+
+
+# ====================== TCGCSV REFERENCE-CATALOG HELPERS ======================
+# Fields copied onto a scan record when the user accepts a tcgcsv reference card.
+_REFERENCE_APPLY_MAP = {
+    # extracted_data key : ReferenceCard attribute
+    "name":       "name",
+    "set_number": "number",   # the N/M collector number -> the "Set Number" field
+    "set":        "set_name",
+    "rarity":     "rarity",
+    "game":       "game",
+}
+
+
+def _reference_upsert(rec):
+    """Insert or update a ReferenceCard from a normalized tcgcsv product dict
+    (see tcgcsv_sync.normalize_product). Keyed on the upstream productId."""
+    existing = ReferenceCard.query.filter_by(product_id=rec["product_id"]).first()
+    if existing is None:
+        existing = ReferenceCard(product_id=rec["product_id"])
+        db.session.add(existing)
+    existing.category_id  = rec["category_id"]
+    existing.group_id     = rec["group_id"]
+    existing.game         = rec["game"]
+    existing.set_name     = rec["set_name"]
+    existing.name         = rec["name"]
+    existing.clean_name   = rec["clean_name"]
+    existing.number       = rec["number"]
+    existing.rarity       = rec["rarity"]
+    existing.image_url    = rec["image_url"]
+    existing.url          = rec["url"]
+    existing.market_price = rec["market_price"]
+    existing.extended     = rec["extended"]
+    return existing
+
+
+def _resolve_category_for_game(game_str):
+    """
+    Map a record's game name (e.g. "Pokemon", "Pokémon TCG") to a downloaded
+    tcgcsv category. Returns (category_id, game_name) or (None, None). Only games
+    that have actually been synced (a ReferenceSync row exists) can resolve —
+    that row carries the authoritative tcgplayer categoryId.
+
+    Matching is accent- and punctuation-insensitive: records commonly store
+    "Pokémon" while tcgcsv's category is "Pokemon", and a naive compare would
+    never match those, producing zero reference matches despite a good name read.
+    """
+    import unicodedata
+
+    def _key(s):
+        s = unicodedata.normalize("NFKD", str(s or ""))
+        s = "".join(ch for ch in s if not unicodedata.combining(ch))  # drop accents
+        return "".join(ch for ch in s.lower() if ch.isalnum())        # alnum only
+
+    g = _key(game_str)
+    if not g:
+        return None, None
+    syncs = ReferenceSync.query.all()
+    for rs in syncs:                       # exact, accent/punctuation-insensitive
+        if _key(rs.game) == g:
+            return rs.category_id, rs.game
+    for rs in syncs:                       # loose contains match either direction
+        rg = _key(rs.game)
+        if rg and (rg in g or g in rg):
+            return rs.category_id, rs.game
+    return None, None
+
+
+def _reference_candidates_for_ocr(category_id, ocr_result, limit=8):
+    """
+    Build scored reference-card candidates for an OCR result within one game.
+    Pre-narrows by collector number (then name) so we never fuzzy-score an entire
+    game, then reuses card_ocr's scorer. Each candidate is tagged source
+    "reference" and carries product_id + rich fields for auto-fill.
+    """
+    if not category_id or card_ocr is None:
+        return []
+
+    number = (ocr_result.get("number_guess") or "").strip()
+    name   = (ocr_result.get("name_guess") or "").strip()
+    base   = ReferenceCard.query.filter(ReferenceCard.category_id == category_id)
+
+    narrowed = None
+    if number:
+        variants = {number}
+        try:
+            a, b = number.split("/")
+            variants.add(f"{int(a)}/{int(b)}")
+            variants.add(f"{int(a):03d}/{int(b):03d}")
+        except Exception:
+            pass
+        narrowed = base.filter(ReferenceCard.number.in_(list(variants))).limit(300).all()
+    if not narrowed and name:
+        first = (name.split() or [name])[0]
+        narrowed = base.filter(ReferenceCard.name.ilike(f"%{first}%")).limit(500).all()
+    if not narrowed:
+        narrowed = base.limit(500).all()
+
+    candidates = [{
+        "source":       "reference",
+        "product_id":   rc.product_id,
+        "name":         rc.name or "",
+        "serial":       rc.number or "",
+        "set":          rc.set_name or "",
+        "game":         rc.game or "",
+        "rarity":       rc.rarity or "",
+        "url":          rc.url or "",
+        "thumbnail":    rc.image_url or "",
+        "market_price": rc.market_price,
+    } for rc in narrowed]
+
+    return card_ocr.match_ocr_to_records(ocr_result, candidates, limit=limit)
 
 
 def remove_file_if_exists(path_value):
@@ -2833,6 +3017,322 @@ def tcg_clear_url(record_id):
     return jsonify({"status": "success", "message": "Pricing data removed"})
 
 
+# ====================== OCR IDENTIFICATION ROUTES ======================
+@app.route("/ocr_identify/<int:record_id>", methods=["GET"])
+def ocr_identify(record_id):
+    """
+    OCR the front image of this record (top band -> name, bottom band -> N/M
+    collector number) and rank existing records by how well they match. Saves
+    nothing — the UI uses this to present a picker.
+
+    Query params:
+      catalog=1   -> match only against imported catalog (reference) rows.
+
+    Response shape:
+      { status, ocr: { name_guess, number_guess, set_code_guess,
+                       conf_top, conf_bottom, raw_top, raw_bottom },
+        candidates: [ { record_id, name, serial, set, game, thumbnail,
+                        score, serial_match, name_similarity } ] }
+    """
+    record = ScanRecord.query.get_or_404(record_id)
+
+    if card_ocr is None:
+        return jsonify({
+            "status":  "error",
+            "message": "OCR is unavailable: install it with `pip install pytesseract` "
+                       "and the tesseract-ocr binary on the host.",
+        }), 503
+
+    abs_path = _abs_record_image_path(record.image_path)
+    if not abs_path or not os.path.exists(abs_path):
+        return jsonify({
+            "status":  "error",
+            "message": "This record has no readable front image to OCR.",
+        }), 400
+
+    try:
+        ocr = card_ocr.ocr_card_front(abs_path)
+    except Exception as exc:  # never let OCR crash the request
+        return jsonify({"status": "error", "message": f"OCR failed: {exc}"}), 500
+
+    if not ocr.get("ocr_available"):
+        return jsonify({
+            "status":  "error",
+            "message": "The tesseract-ocr binary was not found on the host. "
+                       "Install it (e.g. `apt install tesseract-ocr`) and retry.",
+        }), 503
+
+    catalog_only = request.args.get("catalog", "").strip().lower() in ("1", "true", "yes")
+    candidates = _build_ocr_candidates(exclude_record_id=record.id, catalog_only=catalog_only)
+    matches = card_ocr.match_ocr_to_records(ocr, candidates)
+    for m in matches:
+        m["source"] = "record"
+
+    # Also match against the downloaded tcgcsv catalog for this record's game,
+    # if that game has been synced. Reference matches carry rich fields the UI
+    # can auto-fill (set, rarity, TCGplayer URL, ...).
+    ext = record.extracted_data or {}
+    category_id, ref_game = _resolve_category_for_game(ext.get("game", ""))
+    ref_matches = _reference_candidates_for_ocr(category_id, ocr) if category_id else []
+
+    # Combine, sorted best-first, so number-matched cards float to the top
+    # regardless of which source they came from.
+    combined = sorted(ref_matches + matches, key=lambda c: c.get("score", 0), reverse=True)
+
+    return jsonify({
+        "status": "ok",
+        "ocr": {
+            "name_guess":     ocr.get("name_guess", ""),
+            "number_guess":   ocr.get("number_guess", ""),
+            "set_code_guess": ocr.get("set_code_guess", ""),
+            "conf_top":       ocr.get("conf_top", -1.0),
+            "conf_bottom":    ocr.get("conf_bottom", -1.0),
+            "raw_top":        ocr.get("raw_top", ""),
+            "raw_bottom":     ocr.get("raw_bottom", ""),
+        },
+        "reference": {
+            "game":         ref_game or ext.get("game", ""),
+            "synced":       bool(category_id),
+            "match_count":  len(ref_matches),
+        },
+        "candidates": combined,
+    })
+
+
+@app.route("/ocr_apply/<int:record_id>", methods=["POST"])
+def ocr_apply(record_id):
+    """
+    Commit an OCR result onto this record. Body is JSON, one of:
+
+      { "reference_product_id": <id> } -> fill fields from a tcgcsv reference
+                                          card (name/number/set/rarity/game +
+                                          TCGplayer URL under 'tcgplayer').
+      { "source_record_id": <id> }     -> copy identity fields from a matched
+                                          existing record.
+      { "name": "...", "number": "..." }  -> write the raw OCR reading.
+
+    Merges into extracted_data, then re-runs the Product match. Mirrors
+    /update_scan semantics.
+    """
+    record = ScanRecord.query.get_or_404(record_id)
+    body   = request.get_json() or {}
+    updates = {}
+
+    ref_pid = body.get("reference_product_id")
+    source_id = body.get("source_record_id")
+
+    if ref_pid:
+        try:
+            ref = ReferenceCard.query.filter_by(product_id=int(ref_pid)).first()
+        except (TypeError, ValueError):
+            ref = None
+        if ref is None:
+            return jsonify({"status": "error", "message": "reference_product_id not found."}), 404
+        for key, attr in _REFERENCE_APPLY_MAP.items():
+            val = getattr(ref, attr, None)
+            if str(val or "").strip():
+                updates[key] = val
+        # Preserve the TCGplayer link + market price the way JustTCG data is stored,
+        # so the price panel and export keep working.
+        if ref.url:
+            updates["tcgplayer"] = {
+                "url":          ref.url,
+                "full_url":     ref.url,
+                "source":       "tcgcsv",
+                "saved_at":     datetime.utcnow().isoformat(),
+                "product_id":   str(ref.product_id),
+                "product_name": ref.name or "",
+                "set_name":     ref.set_name or "",
+                "set_number":   ref.number or "",
+                "prices":       {"market": ref.market_price} if ref.market_price is not None else {},
+            }
+    elif source_id:
+        try:
+            source = ScanRecord.query.get(int(source_id))
+        except (TypeError, ValueError):
+            source = None
+        if source is None:
+            return jsonify({"status": "error", "message": "source_record_id not found."}), 404
+        sdata = source.extracted_data or {}
+        for k in _OCR_COPY_KEYS:
+            val = sdata.get(k)
+            if str(val or "").strip():
+                updates[k] = val
+    else:
+        name   = str(body.get("name", "")).strip()
+        number = str(body.get("number", "")).strip()
+        if name:
+            updates["name"] = name
+        if number:
+            updates["set_number"] = number   # collector number -> "Set Number" field
+
+    if not updates:
+        return jsonify({
+            "status":  "error",
+            "message": "Nothing to apply — provide source_record_id, or a name/number.",
+        }), 400
+
+    merged = {**(record.extracted_data or {}), **updates}
+    record.extracted_data = merged
+
+    matched = match_product_from_extracted(merged)
+    if matched:
+        record.matched_product_id = matched.id
+    db.session.commit()
+
+    return jsonify({
+        "status":         "success",
+        "message":        "Identification applied.",
+        "applied":        updates,
+        "extracted_data": merged,
+    })
+
+
+# ====================== TCGCSV REFERENCE-CATALOG ROUTES ======================
+# Small in-memory cache for the categories list so the picker doesn't re-hit
+# tcgcsv every time it's opened (their data only changes once a day).
+_REF_CATEGORIES_CACHE = {"at": None, "data": None}
+
+
+def _reference_recount(category_id):
+    """Recompute cached counts for a category's ReferenceSync row."""
+    rs = ReferenceSync.query.filter_by(category_id=category_id).first()
+    if rs is None:
+        return None
+    rs.product_count = ReferenceCard.query.filter_by(category_id=category_id).count()
+    rs.group_count = (ReferenceCard.query
+                      .filter_by(category_id=category_id)
+                      .with_entities(ReferenceCard.group_id).distinct().count())
+    return rs
+
+
+@app.route("/reference/status")
+def reference_status():
+    """Which games have been downloaded, with counts and last-sync time."""
+    syncs = ReferenceSync.query.order_by(ReferenceSync.game).all()
+    return jsonify({
+        "status": "ok",
+        "available": tcgcsv_sync is not None,
+        "games": [{
+            "category_id":   s.category_id,
+            "game":          s.game,
+            "product_count": s.product_count,
+            "group_count":   s.group_count,
+            "last_synced":   s.last_synced.isoformat() if s.last_synced else None,
+            "remote_updated": s.remote_updated,
+            "status":        s.status,
+        } for s in syncs],
+    })
+
+
+@app.route("/reference/categories")
+def reference_categories():
+    """List the games (categories) available on tcgcsv, for the sync picker."""
+    if tcgcsv_sync is None:
+        return jsonify({"status": "error", "message": "tcgcsv sync module unavailable."}), 503
+
+    # Serve from cache if fetched within the last 30 minutes.
+    now = datetime.utcnow()
+    cached = _REF_CATEGORIES_CACHE
+    if cached["data"] and cached["at"] and (now - cached["at"]).total_seconds() < 1800:
+        cats = cached["data"]
+    else:
+        try:
+            raw = tcgcsv_sync.get_categories()
+        except Exception as exc:
+            return jsonify({"status": "error", "message": f"Could not reach tcgcsv: {exc}"}), 502
+        cats = sorted(
+            [{"category_id": c.get("categoryId"),
+              "name": c.get("displayName") or c.get("name") or "",
+              "popularity": c.get("popularity", 0)} for c in raw],
+            key=lambda c: c.get("popularity", 0), reverse=True,
+        )
+        _REF_CATEGORIES_CACHE["data"] = cats
+        _REF_CATEGORIES_CACHE["at"] = now
+
+    return jsonify({"status": "ok", "categories": cats,
+                    "last_updated": tcgcsv_sync.get_last_updated()})
+
+
+@app.route("/reference/groups/<int:category_id>")
+def reference_groups(category_id):
+    """List a category's groups (sets) — the work items the client loops over."""
+    if tcgcsv_sync is None:
+        return jsonify({"status": "error", "message": "tcgcsv sync module unavailable."}), 503
+    try:
+        groups = tcgcsv_sync.get_groups(category_id)
+    except Exception as exc:
+        return jsonify({"status": "error", "message": f"Could not reach tcgcsv: {exc}"}), 502
+    return jsonify({
+        "status": "ok",
+        "groups": [{"group_id": g.get("groupId"), "name": g.get("name") or ""} for g in groups],
+    })
+
+
+@app.route("/reference/sync_group", methods=["POST"])
+def reference_sync_group():
+    """
+    Download ONE group's cards from tcgcsv and upsert them into ReferenceCard.
+    The client loops this over every group (mirroring the grade/price batch
+    pattern) so progress + Stop work naturally and rate-limiting is inherent.
+
+    Body: { category_id, category_name, group_id, group_name }
+    """
+    if tcgcsv_sync is None:
+        return jsonify({"status": "error", "message": "tcgcsv sync module unavailable."}), 503
+
+    body = request.get_json() or {}
+    try:
+        category_id = int(body.get("category_id"))
+        group_id    = int(body.get("group_id"))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "category_id and group_id are required."}), 400
+    category_name = str(body.get("category_name") or "").strip()
+    group_name    = str(body.get("group_name") or "").strip()
+
+    try:
+        cards = tcgcsv_sync.fetch_group_cards(category_id, category_name, group_id, group_name)
+    except Exception as exc:
+        return jsonify({"status": "error", "message": f"tcgcsv fetch failed: {exc}"}), 502
+
+    for rec in cards:
+        _reference_upsert(rec)
+
+    # Ensure a ReferenceSync row exists and refresh its counts.
+    rs = ReferenceSync.query.filter_by(category_id=category_id).first()
+    if rs is None:
+        rs = ReferenceSync(category_id=category_id)
+        db.session.add(rs)
+    rs.game = category_name or rs.game
+    rs.status = "ok"
+    rs.remote_updated = tcgcsv_sync.get_last_updated() or rs.remote_updated
+    db.session.flush()
+    _reference_recount(category_id)
+    db.session.commit()
+
+    return jsonify({
+        "status": "ok",
+        "added": len(cards),
+        "group_name": group_name,
+        "product_count": rs.product_count,
+    })
+
+
+@app.route("/reference/clear", methods=["POST"])
+def reference_clear():
+    """Delete all cached reference cards for a game (category_id in body)."""
+    body = request.get_json() or {}
+    try:
+        category_id = int(body.get("category_id"))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "category_id is required."}), 400
+
+    deleted = ReferenceCard.query.filter_by(category_id=category_id).delete()
+    ReferenceSync.query.filter_by(category_id=category_id).delete()
+    db.session.commit()
+    return jsonify({"status": "success", "deleted": deleted})
+
+
 # ====================== DUPLICATE IMAGE MANAGER ROUTES ======================
 @app.route("/duplicates")
 def duplicates():
@@ -3058,6 +3558,11 @@ def run_import_split():
     if not (v_cut1 < v_cut2 and h_cut1 < h_cut2):
         return jsonify({"status": "error", "message": "Cut 1 must be less than Cut 2"}), 400
 
+    # Auto-import mode: skip the per-tile straighten/alignment pass entirely and
+    # file the RAW cut images as the final card images. Everything downstream
+    # (the finalize/import step, front/back merging, etc.) is unchanged.
+    skip_align = request.form.get("skip_align", "").strip().lower() in ("1", "true", "yes", "on")
+
     safe_game  = secure_filename(game)  or "game"
     safe_album = secure_filename(album) or "album"
     safe_page  = secure_filename(page)  or "page"
@@ -3077,6 +3582,17 @@ def run_import_split():
             slot_filename = f"{safe_game}-{safe_album}-{safe_page}-{slot_num}-{side}.png"
             split_path    = os.path.join(app.config["TEMP_SPLIT_FOLDER"], slot_filename)
             piece.save(split_path)
+
+            if skip_align:
+                # Bypass alignment: the raw cut piece IS the final card image.
+                card_path = os.path.join(app.config["TEMP_CARD_FOLDER"], slot_filename)
+                piece.save(card_path)
+                results.append({
+                    "slot": slot_num, "filename": slot_filename,
+                    "status": "processed",
+                    "url": url_for("temp_card_file", filename=slot_filename),
+                })
+                continue
 
             try:
                 split_cv = cv2.imread(split_path)
@@ -3103,9 +3619,14 @@ def run_import_split():
         processed_count = sum(1 for r in results if r["status"] == "processed")
         fallback_count  = sum(1 for r in results if r["status"] == "fallback")
 
+        if skip_align:
+            message = f"Split completed. {processed_count} raw cut image(s) ready (alignment skipped)."
+        else:
+            message = f"Import completed. {processed_count} auto-processed, {fallback_count} fallback."
+
         return jsonify({
             "status":  "success",
-            "message": f"Import completed. {processed_count} auto-processed, {fallback_count} fallback.",
+            "message": message,
             "files":   results,
         })
 
@@ -3731,6 +4252,7 @@ def grade_condition(record_id):
 
 # ====================== SHOPS (marketplace sync) ======================
 import shop_providers
+import email_monitor
 from shop_providers import MARKETPLACES, SECRET_FIELDS, get_provider
 
 SHOP_SKU_PREFIX = "CCIM-"
@@ -3962,6 +4484,7 @@ def shops_page():
         connections=connections,
         total_records=total,
         active_counts=active_counts,
+        email_monitor=_email_public_view(_get_email_monitor(create=True)),
     )
 
 
@@ -4274,6 +4797,773 @@ def shops_pull(marketplace):
     })
 
 
+# ---------------------------------------------------------------------------
+# TCGplayer: no-API listing via a Seller Portal import CSV
+#
+# TCGplayer's developer API is closed, but Level 4 sellers can bulk-list by
+# importing a CSV in the Seller Portal (Pricing tab -> Import to Staged ->
+# Move to Live). This app generates that import file from selected inventory
+# records. Crucially, each row needs TCGplayer's own product/SKU id ("TCGplayer
+# Id"), so as a side effect of generating the file we record that id back onto
+# the record (tcgplayer_sku_id). That becomes the durable join key: when a sale
+# later comes back via the Orders CSV / email, it carries the same TCGplayer Id,
+# giving exact matching without ever needing to stamp our CCIM SKU onto TCGplayer.
+# ---------------------------------------------------------------------------
+import csv as _csv
+import io as _io
+
+# Column order mirrors the TCGplayer Pricing-tab export so the file imports cleanly.
+TCGPLAYER_CSV_COLUMNS = [
+    "TCGplayer Id", "Product Line", "Set Name", "Product Name", "Title", "Number",
+    "Rarity", "Condition", "TCG Market Price", "TCG Direct Low",
+    "TCG Low Price With Shipping", "TCG Low Price", "Total Quantity",
+    "Add to Quantity", "TCG Marketplace Price", "Photo URL",
+]
+
+
+def _record_tcgplayer_id(record):
+    """Best-effort TCGplayer product/SKU id from whatever the record already stores."""
+    d = record.extracted_data or {}
+    tcg = d.get("tcgplayer") if isinstance(d.get("tcgplayer"), dict) else {}
+    candidates = (
+        d.get("tcgplayer_sku_id"), tcg.get("sku_id"), tcg.get("skuId"),
+        d.get("tcgplayer_id"), tcg.get("product_id"), tcg.get("productId"),
+        tcg.get("id"), d.get("tcg_id"),
+    )
+    for v in candidates:
+        if v not in (None, "", 0):
+            return str(v).strip()
+    return ""
+
+
+def _condition_to_tcgplayer(record):
+    """Map the saved AI condition to TCGplayer's condition vocabulary (+ Foil suffix)."""
+    d = record.extracted_data or {}
+    label = ((d.get("grading") or {}).get("front") or {}).get("label", "")
+    m = {
+        "gem mint": "Near Mint", "mint": "Near Mint", "near mint": "Near Mint",
+        "excellent": "Lightly Played", "very good": "Lightly Played",
+        "lightly played": "Lightly Played", "good": "Moderately Played",
+        "moderately played": "Moderately Played", "played": "Moderately Played",
+        "heavily played": "Heavily Played", "poor": "Damaged", "damaged": "Damaged",
+    }
+    cond = m.get(str(label).lower(), "Near Mint")
+    foil = str(d.get("holographic", "")).strip().lower() in (
+        "true", "1", "yes", "foil", "holo", "holographic")
+    return f"{cond} Foil" if foil else cond
+
+
+def _records_from_request(body):
+    """Records for a TCGplayer CSV request: explicit ids, else all sellable inventory."""
+    ids = body.get("record_ids")
+    if ids:
+        out = []
+        for i in ids:
+            try:
+                r = ScanRecord.query.get(int(i))
+            except (TypeError, ValueError):
+                r = None
+            if r:
+                out.append(r)
+        return out
+    return _sellable_records_query()
+
+
+def _tcgplayer_rows(records, fallback_price=None):
+    """
+    Build CSV-ready rows for records that can be listed, plus a `skipped` list
+    explaining any exclusions (missing TCGplayer Id or missing price).
+    """
+    try:
+        fb = float(fallback_price) if fallback_price not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        fb = 0.0
+
+    rows, skipped = [], []
+    for r in records:
+        d = r.extracted_data or {}
+        name = _record_display_name(r)
+        tcg_id = _record_tcgplayer_id(r)
+        if not tcg_id:
+            skipped.append({"record_id": r.id, "name": name,
+                            "reason": "No TCGplayer Id on record"})
+            continue
+
+        market = _record_market_price(r)
+        price = market
+        if not price or price <= 0:
+            if fb > 0:
+                price = round(fb, 2)
+            else:
+                skipped.append({"record_id": r.id, "name": name,
+                                "reason": "No price (add a market price or set a fallback)"})
+                continue
+
+        qty = _record_quantity(r)
+        urls, _ = _record_image_sources(r)
+        rows.append({
+            "record_id": r.id,
+            "tcg_id": tcg_id,
+            "name": name,
+            "price": round(float(price), 2),
+            "qty": qty,
+            "csv": {
+                "TCGplayer Id": tcg_id,
+                "Product Line": d.get("game", ""),
+                "Set Name": d.get("set", ""),
+                "Product Name": name,
+                "Title": "",  # buyer-facing; only used for custom photo listings
+                "Number": _get_serial(d),
+                "Rarity": d.get("rarity", ""),
+                "Condition": _condition_to_tcgplayer(r),
+                "TCG Market Price": f"{market:.2f}" if market else "",
+                "TCG Direct Low": "",
+                "TCG Low Price With Shipping": "",
+                "TCG Low Price": "",
+                "Total Quantity": "",
+                "Add to Quantity": qty,             # additive: adds this stock on import
+                "TCG Marketplace Price": f"{round(float(price), 2):.2f}",  # required
+                "Photo URL": urls[0] if urls else "",
+            },
+        })
+    return rows, skipped
+
+
+@app.route("/shops/tcgplayer/preview", methods=["POST"])
+def shops_tcgplayer_preview():
+    """Report how many records can be listed and which would be skipped (and why)."""
+    body = request.get_json(silent=True) or {}
+    records = _records_from_request(body)
+    rows, skipped = _tcgplayer_rows(records, fallback_price=body.get("fallback_price"))
+    return jsonify({
+        "status": "success",
+        "total": len(records),
+        "eligible": len(rows),
+        "skipped": skipped,
+        "sample": [{"record_id": x["record_id"], "name": x["name"], "tcg_id": x["tcg_id"],
+                    "price": x["price"], "qty": x["qty"]} for x in rows[:25]],
+    })
+
+
+@app.route("/shops/tcgplayer/export_csv", methods=["POST"])
+def shops_tcgplayer_export_csv():
+    """
+    Return a TCGplayer Seller-Portal import CSV for the requested records, and as
+    a side effect record each row's TCGplayer Id onto its record and upsert a
+    draft TCGplayer Listing so the item shows as pending-import in the table.
+    """
+    body = request.get_json(silent=True) or {}
+    records = _records_from_request(body)
+    rows, skipped = _tcgplayer_rows(records, fallback_price=body.get("fallback_price"))
+
+    buf = _io.StringIO()
+    writer = _csv.DictWriter(buf, fieldnames=TCGPLAYER_CSV_COLUMNS, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row["csv"])
+    csv_text = buf.getvalue()
+
+    # Side effects: backfill the TCGplayer Id + mark a draft listing.
+    for row in rows:
+        rec = ScanRecord.query.get(row["record_id"])
+        if not rec:
+            continue
+        data = dict(rec.extracted_data or {})
+        if str(data.get("tcgplayer_sku_id", "")) != row["tcg_id"]:
+            data["tcgplayer_sku_id"] = row["tcg_id"]
+            rec.extracted_data = data
+
+        listing = _listing_for(rec.id, "tcgplayer")
+        if listing is None:
+            listing = Listing(record_id=rec.id, marketplace="tcgplayer")
+            db.session.add(listing)
+        listing.sku = f"{SHOP_SKU_PREFIX}{rec.id}"
+        listing.external_id = row["tcg_id"]
+        listing.title = row["name"]
+        listing.price = row["price"]
+        listing.quantity = row["qty"]
+        listing.status = "draft"          # generated into an import file, awaiting upload
+        listing.last_error = None
+        listing.last_synced = datetime.utcnow()
+    db.session.commit()
+
+    fname = f"tcgplayer_import_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.csv"
+    resp = app.response_class(csv_text, mimetype="text/csv")
+    resp.headers["Content-Disposition"] = f'attachment; filename="{fname}"'
+    resp.headers["X-CCIM-Included"] = str(len(rows))
+    resp.headers["X-CCIM-Skipped"] = str(len(skipped))
+    resp.headers["Access-Control-Expose-Headers"] = "X-CCIM-Included, X-CCIM-Skipped"
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# TCGplayer: bootstrap importer — backfill TCGplayer Ids from a Live export
+#
+# The user exports their existing TCGplayer Live inventory to CSV (Pricing tab ->
+# Export from Live) and uploads it here. We match each export row back to an
+# inventory ScanRecord by name/set/number/condition/foil and write the row's
+# TCGplayer Id onto the record (tcgplayer_sku_id). After that, sales match
+# exactly and the listing-CSV generator can include those items.
+#
+# Matching is tiered by confidence:
+#   exact  = name + set + number + condition + foil
+#   strong = name + set + number + foil
+#   loose  = name + set + foil
+# A record is only auto-assigned when its best available tier resolves to a
+# single TCGplayer Id; multiple candidates are reported as "ambiguous" instead.
+# ---------------------------------------------------------------------------
+
+# AI/grade label -> normalized TCGplayer base condition
+_TCG_COND_FROM_RECORD = {
+    "gem mint": "near mint", "mint": "near mint", "near mint": "near mint",
+    "excellent": "lightly played", "very good": "lightly played",
+    "lightly played": "lightly played", "good": "moderately played",
+    "moderately played": "moderately played", "played": "moderately played",
+    "heavily played": "heavily played", "poor": "damaged", "damaged": "damaged",
+}
+
+
+def _norm_txt(s):
+    return _re.sub(r"[^a-z0-9]+", " ", str(s or "").lower()).strip()
+
+
+def _norm_num(s):
+    return _re.sub(r"[^a-z0-9]+", "", str(s or "").lower())
+
+
+def _split_condition(cond_str):
+    """'Near Mint Foil' -> ('near mint', True)."""
+    c = str(cond_str or "").lower()
+    foil = "foil" in c
+    c = c.replace("foil", "")
+    return _norm_txt(c), foil
+
+
+def _record_condition_norm(record, assume_nm):
+    d = record.extracted_data or {}
+    label = d.get("condition") or ((d.get("grading") or {}).get("front") or {}).get("label")
+    if label:
+        return _TCG_COND_FROM_RECORD.get(str(label).lower(), _norm_txt(label))
+    return "near mint" if assume_nm else None
+
+
+def _record_foil(record):
+    d = record.extracted_data or {}
+    return str(d.get("holographic", "")).strip().lower() in (
+        "true", "1", "yes", "foil", "holo", "holographic")
+
+
+def _pick_col(fieldnames, *aliases):
+    norm = {}
+    for f in (fieldnames or []):
+        norm[_re.sub(r"[^a-z0-9]+", "", (f or "").lower())] = f
+    for a in aliases:
+        k = _re.sub(r"[^a-z0-9]+", "", a.lower())
+        if k in norm:
+            return norm[k]
+    return None
+
+
+def _parse_tcg_export(file_storage):
+    """Parse an uploaded TCGplayer export into normalized rows. Returns (rows, cols) or (None, None)."""
+    raw = file_storage.read()
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = raw.decode("latin-1", errors="ignore")
+    else:
+        text = str(raw)
+
+    reader = _csv.DictReader(_io.StringIO(text))
+    fn = reader.fieldnames or []
+    cols = {
+        "id":     _pick_col(fn, "TCGplayer Id", "TCGplayerID", "Id"),
+        "name":   _pick_col(fn, "Product Name", "Name"),
+        "set":    _pick_col(fn, "Set Name", "Set"),
+        "number": _pick_col(fn, "Number"),
+        "cond":   _pick_col(fn, "Condition"),
+        "price":  _pick_col(fn, "TCG Marketplace Price", "TCG Market Price", "Marketplace Price", "Price"),
+        "qty":    _pick_col(fn, "Total Quantity", "Add to Quantity", "Quantity"),
+    }
+    if not cols["id"] or not cols["name"]:
+        return None, None
+
+    rows = []
+    for r in reader:
+        tcg_id = str(r.get(cols["id"], "")).strip()
+        name = r.get(cols["name"], "")
+        if not tcg_id or not str(name).strip():
+            continue
+        base_cond, foil = _split_condition(r.get(cols["cond"], "")) if cols["cond"] else ("", False)
+        try:
+            price = float(str(r.get(cols["price"], "") or 0).replace("$", "").replace(",", "")) if cols["price"] else 0.0
+        except ValueError:
+            price = 0.0
+        try:
+            qty = int(float(r.get(cols["qty"], "") or 0)) if cols["qty"] else 0
+        except ValueError:
+            qty = 0
+        rows.append({
+            "tcg_id": tcg_id,
+            "name": _norm_txt(name),
+            "set": _norm_txt(r.get(cols["set"], "")) if cols["set"] else "",
+            "number": _norm_num(r.get(cols["number"], "")) if cols["number"] else "",
+            "cond": base_cond,
+            "foil": foil,
+            "price": round(price, 2),
+            "qty": qty,
+        })
+    return rows, cols
+
+
+def _index_tcg_rows(rows):
+    idx = {"full": {}, "strong": {}, "loose": {}}
+    for row in rows:
+        n, s, num, c, fo = row["name"], row["set"], row["number"], row["cond"], row["foil"]
+        if num and c:
+            idx["full"].setdefault((n, s, num, c, fo), []).append(row)
+        if num:
+            idx["strong"].setdefault((n, s, num, fo), []).append(row)
+        idx["loose"].setdefault((n, s, fo), []).append(row)
+    return idx
+
+
+def _match_record_to_tcg(record, idx, assume_nm, allowed_tiers):
+    d = record.extracted_data or {}
+    n = _norm_txt(_record_display_name(record))
+    s = _norm_txt(d.get("set", ""))
+    num = _norm_num(_get_serial(d))
+    fo = _record_foil(record)
+    c = _record_condition_norm(record, assume_nm)
+
+    tiers = []
+    if "full" in allowed_tiers and num and c:
+        tiers.append(("exact", idx["full"].get((n, s, num, c, fo))))
+    if "strong" in allowed_tiers and num:
+        tiers.append(("strong", idx["strong"].get((n, s, num, fo))))
+    if "loose" in allowed_tiers:
+        tiers.append(("loose", idx["loose"].get((n, s, fo))))
+
+    for conf, cands in tiers:
+        if not cands:
+            continue
+        ids = sorted({row["tcg_id"] for row in cands})
+        if len(ids) == 1:
+            return {"tcg_id": ids[0], "confidence": conf, "row": cands[0]}
+        return {"ambiguous": True, "confidence": conf, "candidates": ids[:6]}
+    return None
+
+
+@app.route("/shops/tcgplayer/import_ids", methods=["POST"])
+def shops_tcgplayer_import_ids():
+    """
+    Backfill TCGplayer Ids onto inventory records from an uploaded Live-inventory
+    export. mode=preview reports matches without writing; mode=apply writes the
+    ids (and optionally marks the items as active TCGplayer listings).
+    """
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"status": "error", "message": "No CSV file uploaded."}), 400
+
+    mode        = request.form.get("mode", "preview")
+    min_conf    = request.form.get("min_confidence", "strong")
+    only_missing = request.form.get("only_missing", "1") == "1"
+    assume_nm   = request.form.get("assume_nm", "1") == "1"
+    create_listings = request.form.get("create_listings", "1") == "1"
+
+    rows, _cols = _parse_tcg_export(f)
+    if rows is None:
+        return jsonify({"status": "error",
+                        "message": "This doesn't look like a TCGplayer export "
+                                   "(couldn't find 'TCGplayer Id' / 'Product Name' columns)."}), 400
+    if not rows:
+        return jsonify({"status": "error", "message": "No usable rows found in the file."}), 400
+
+    allowed = {"exact": ["full"], "strong": ["full", "strong"],
+               "loose": ["full", "strong", "loose"]}.get(min_conf, ["full", "strong"])
+    idx = _index_tcg_rows(rows)
+
+    records = _sellable_records_query()
+    matched, ambiguous, unmatched = [], [], []
+    used_ids = set()
+    skipped_existing = applied = listings_created = 0
+
+    for r in records:
+        if only_missing and _record_tcgplayer_id(r):
+            skipped_existing += 1
+            continue
+        m = _match_record_to_tcg(r, idx, assume_nm, allowed)
+        name = _record_display_name(r)
+        if not m:
+            unmatched.append({"record_id": r.id, "name": name})
+            continue
+        if m.get("ambiguous"):
+            ambiguous.append({"record_id": r.id, "name": name,
+                              "confidence": m["confidence"], "candidates": m["candidates"]})
+            continue
+
+        entry = {"record_id": r.id, "name": name, "tcg_id": m["tcg_id"],
+                 "confidence": m["confidence"], "price": m["row"]["price"], "qty": m["row"]["qty"]}
+        matched.append(entry)
+        used_ids.add(m["tcg_id"])
+
+        if mode == "apply":
+            data = dict(r.extracted_data or {})
+            data["tcgplayer_sku_id"] = m["tcg_id"]
+            r.extracted_data = data
+            applied += 1
+            if create_listings:
+                listing = _listing_for(r.id, "tcgplayer")
+                if listing is None:
+                    listing = Listing(record_id=r.id, marketplace="tcgplayer")
+                    db.session.add(listing)
+                    listings_created += 1
+                listing.sku = f"{SHOP_SKU_PREFIX}{r.id}"
+                listing.external_id = m["tcg_id"]
+                listing.title = name
+                listing.price = m["row"]["price"] or listing.price
+                listing.quantity = m["row"]["qty"] or _record_quantity(r)
+                listing.status = "active"      # these are live TCGplayer listings
+                listing.last_error = None
+                listing.last_synced = datetime.utcnow()
+
+    if mode == "apply":
+        db.session.commit()
+
+    by_conf = {"exact": 0, "strong": 0, "loose": 0}
+    for e in matched:
+        by_conf[e["confidence"]] = by_conf.get(e["confidence"], 0) + 1
+    csv_unused = sum(1 for row in rows if row["tcg_id"] not in used_ids)
+
+    return jsonify({
+        "status": "success",
+        "mode": mode,
+        "csv_rows": len(rows),
+        "records_considered": len(records) - skipped_existing,
+        "skipped_existing": skipped_existing,
+        "matched_count": len(matched),
+        "by_confidence": by_conf,
+        "ambiguous_count": len(ambiguous),
+        "unmatched_count": len(unmatched),
+        "csv_unused_count": csv_unused,
+        "applied": applied,
+        "listings_created": listings_created,
+        "matched_sample": matched[:25],
+        "ambiguous_sample": ambiguous[:25],
+        "unmatched_sample": unmatched[:25],
+    })
+
+
+# ---------------------------------------------------------------------------
+# Sale processing + IMAP email monitor
+#
+# TCGplayer's API is closed, so a sale becomes known to this app via its
+# notification email. A watched IMAP mailbox is polled (manually or on an
+# interval); matching messages are parsed (email_monitor.parse_tcgplayer_sale),
+# each sold line is matched to an inventory record, the record's quantity is
+# decremented, and — when it hits zero — the item is delisted on every other
+# connected marketplace via the providers' end_listing(). SaleEvent gives an
+# audit trail and idempotency so the same order is never processed twice.
+# ---------------------------------------------------------------------------
+
+def _mark_record_sold(record, sold_qty, source, order_id, sold_price=None):
+    """Decrement a record's quantity for a sale and fan out delists to other shops."""
+    data = dict(record.extracted_data or {})
+    remaining = max(_record_quantity(record) - int(sold_qty or 1), 0)
+    data["quantity"] = remaining
+    log = list(data.get("sales_log", []))
+    log.append({"source": source, "order_id": order_id, "qty": int(sold_qty or 1),
+                "price": sold_price, "at": datetime.utcnow().isoformat()})
+    data["sales_log"] = log
+    if remaining == 0:
+        data["sold"] = True
+        data["sold_at"] = datetime.utcnow().isoformat()
+    record.extracted_data = data
+
+    results = []
+    for listing in list(record.listings):
+        # The channel the sale came from: just reflect the new quantity/status.
+        if listing.marketplace == source:
+            listing.quantity = remaining
+            listing.status = "ended" if remaining == 0 else listing.status
+            listing.last_synced = datetime.utcnow()
+            continue
+
+        conn = _get_connection(listing.marketplace)
+        if not conn or not conn.enabled or listing.status not in ("active", "draft"):
+            continue
+        provider = get_provider(listing.marketplace, conn, persist=_shop_persist)
+        if provider is None:
+            continue
+
+        if remaining == 0:
+            r = provider.end_listing(listing)
+            listing.status = "ended" if r.get("ok") else "error"
+        else:
+            payload = _build_payload(record, listing.marketplace, quantity=remaining)
+            payload["external_id"] = listing.external_id
+            payload["extra"] = listing.extra or {}
+            r = provider.push(payload)
+        listing.last_error = None if r.get("ok") else r.get("message")
+        listing.last_synced = datetime.utcnow()
+        results.append({"marketplace": listing.marketplace, "ok": bool(r.get("ok")),
+                        "message": r.get("message", "")})
+
+    db.session.commit()
+    return {"record_id": record.id, "remaining": remaining, "delisted": results}
+
+
+def _match_email_item_to_record(item, source="tcgplayer"):
+    """Resolve a parsed sale line to a single ScanRecord, else (None, reason)."""
+    records = _sellable_records_query()
+
+    tid = str(item.get("tcgplayer_id") or "").strip()
+    if tid:
+        hits = [r for r in records if _record_tcgplayer_id(r) == tid]
+        if len(hits) == 1:
+            return hits[0], "id"
+        if len(hits) > 1:
+            # Narrow multiple copies of the same SKU to one (any is fine).
+            return hits[0], "id"
+
+    name = _norm_txt(item.get("name", ""))
+    if not name:
+        return None, "no-name"
+
+    cands = [r for r in records if _norm_txt(_record_display_name(r)) == name]
+    if not cands:
+        return None, "no-match"
+
+    st = _norm_txt(item.get("set", ""))
+    if st:
+        refined = [r for r in cands if _norm_txt((r.extracted_data or {}).get("set", "")) == st]
+        if refined:
+            cands = refined
+
+    fo = bool(item.get("foil"))
+    refined = [r for r in cands if _record_foil(r) == fo]
+    if refined:
+        cands = refined
+
+    # Prefer records actually listed on the source marketplace.
+    listed = [r for r in cands
+              if (_listing_for(r.id, source) and _listing_for(r.id, source).status in ("active", "draft"))]
+    if listed:
+        cands = listed
+
+    if len(cands) == 1:
+        return cands[0], "name"
+    return None, "ambiguous"
+
+
+def _process_sale_email(parsed, source="tcgplayer"):
+    """Turn one parsed email into SaleEvents + delist fan-out. Idempotent per order line."""
+    order_id = parsed.get("order_id") or ""
+    subject = parsed.get("subject", "")
+    out = {"order_id": order_id, "subject": subject,
+           "processed": 0, "unmatched": 0, "duplicate": 0, "items": []}
+
+    items = parsed.get("items", [])
+    if not items:
+        title = "(unparsed) " + (subject[:120] or "no items found")
+        if not SaleEvent.query.filter_by(source=source, order_id=order_id, item_title=title).first():
+            db.session.add(SaleEvent(source=source, order_id=order_id, item_title=title,
+                                     status="unparsed", email_subject=subject,
+                                     detail=(parsed.get("excerpt", "") or "")[:500]))
+            db.session.commit()
+        out["items"].append({"title": title, "status": "unparsed"})
+        return out
+
+    for item in items:
+        title = (item.get("name") or "").strip() or "(unknown)"
+        if item.get("set"):
+            title += f" ({item['set']})"
+
+        if SaleEvent.query.filter_by(source=source, order_id=order_id, item_title=title).first():
+            out["duplicate"] += 1
+            out["items"].append({"title": title, "status": "duplicate"})
+            continue
+
+        rec, conf = _match_email_item_to_record(item, source)
+        ev = SaleEvent(source=source, order_id=order_id, item_title=title,
+                       qty=int(item.get("qty", 1)), price=item.get("price"),
+                       record_id=rec.id if rec else None, email_subject=subject,
+                       status="matched" if rec else "unmatched",
+                       detail=None if rec else f"reason: {conf}")
+        db.session.add(ev)
+        db.session.flush()
+
+        if rec:
+            fan = _mark_record_sold(rec, item.get("qty", 1), source, order_id, item.get("price"))
+            ev.status = "processed"
+            ev.detail = json.dumps(fan.get("delisted", []))[:500]
+            out["processed"] += 1
+            out["items"].append({"title": title, "status": "processed", "record_id": rec.id,
+                                 "remaining": fan["remaining"], "delisted": fan["delisted"]})
+        else:
+            out["unmatched"] += 1
+            out["items"].append({"title": title, "status": "unmatched", "reason": conf})
+
+    db.session.commit()
+    return out
+
+
+# -- Email monitor config + routes -----------------------------------------
+def _get_email_monitor(create=False):
+    m = EmailMonitor.query.first()
+    if m is None and create:
+        m = EmailMonitor()
+        db.session.add(m)
+        db.session.commit()
+    return m
+
+
+def _email_cfg(m):
+    return {
+        "host": m.host, "port": m.port, "use_ssl": m.use_ssl,
+        "username": m.username, "password": m.password, "folder": m.folder,
+        "sender_filter": m.sender_filter, "subject_filter": m.subject_filter,
+        "mark_seen": m.mark_seen,
+    }
+
+
+def _email_public_view(m):
+    return {
+        "enabled": bool(m.enabled), "host": m.host or "", "port": m.port or 993,
+        "use_ssl": bool(m.use_ssl), "username": m.username or "",
+        "password_set": bool(m.password), "folder": m.folder or "INBOX",
+        "sender_filter": m.sender_filter or "", "subject_filter": m.subject_filter or "",
+        "source": m.source or "tcgplayer", "mark_seen": bool(m.mark_seen),
+        "poll_interval": m.poll_interval or 0,
+        "status": m.status or "disconnected", "status_detail": m.status_detail or "",
+        "last_checked": m.last_checked.strftime("%Y-%m-%d %H:%M") if m.last_checked else "",
+    }
+
+
+@app.route("/shops/email/save", methods=["POST"])
+def shops_email_save():
+    m = _get_email_monitor(create=True)
+    f = request.form
+    m.host = f.get("host", m.host or "").strip()
+    m.username = f.get("username", m.username or "").strip()
+    pw = f.get("password", None)
+    if pw:  # blank keeps the stored password
+        m.password = pw
+    try:
+        m.port = int(f.get("port") or m.port or 993)
+    except ValueError:
+        m.port = 993
+    m.use_ssl = f.get("use_ssl", "1") == "1"
+    m.folder = f.get("folder", m.folder or "INBOX").strip() or "INBOX"
+    m.sender_filter = f.get("sender_filter", m.sender_filter or "").strip()
+    m.subject_filter = f.get("subject_filter", m.subject_filter or "").strip()
+    m.source = f.get("source", m.source or "tcgplayer").strip() or "tcgplayer"
+    m.mark_seen = f.get("mark_seen", "1") == "1"
+    try:
+        m.poll_interval = max(int(f.get("poll_interval") or 0), 0)
+    except ValueError:
+        m.poll_interval = 0
+    db.session.commit()
+    return jsonify({"status": "success", "message": "Email monitor settings saved."})
+
+
+@app.route("/shops/email/test", methods=["POST"])
+def shops_email_test():
+    m = _get_email_monitor(create=True)
+    result = email_monitor.test_imap(_email_cfg(m))
+    m.status = "connected" if result.get("ok") else "error"
+    m.status_detail = result.get("message", "")
+    if result.get("ok"):
+        m.enabled = True
+    db.session.commit()
+    return jsonify({"status": "success" if result.get("ok") else "error",
+                    "message": result.get("message", ""), "connected": bool(result.get("ok"))})
+
+
+@app.route("/shops/email/check", methods=["POST"])
+def shops_email_check():
+    m = _get_email_monitor(create=True)
+    if not (m.host and m.username and m.password):
+        return jsonify({"status": "error", "message": "Configure and save the mailbox first."}), 400
+
+    res = email_monitor.fetch_sale_emails(_email_cfg(m), since_uid=m.last_uid or 0)
+    if not res.get("ok"):
+        m.status = "error"
+        m.status_detail = res.get("message", "")
+        db.session.commit()
+        return jsonify({"status": "error", "message": res.get("message", "Fetch failed.")}), 502
+
+    summary = {"emails": len(res["emails"]), "processed": 0, "unmatched": 0,
+               "duplicate": 0, "unparsed": 0, "details": []}
+    for pe in res["emails"]:
+        out = _process_sale_email(pe, source=m.source or "tcgplayer")
+        summary["processed"] += out["processed"]
+        summary["unmatched"] += out["unmatched"]
+        summary["duplicate"] += out["duplicate"]
+        summary["unparsed"] += sum(1 for i in out["items"] if i["status"] == "unparsed")
+        summary["details"].append(out)
+
+    m.last_uid = res.get("max_uid", m.last_uid)
+    m.last_checked = datetime.utcnow()
+    m.status = "connected"
+    m.status_detail = (f"Checked {summary['emails']} email(s): "
+                       f"{summary['processed']} sold, {summary['unmatched']} unmatched.")
+    db.session.commit()
+
+    return jsonify({"status": "success",
+                    "message": m.status_detail,
+                    "summary": summary})
+
+
+@app.route("/shops/email/disconnect", methods=["POST"])
+def shops_email_disconnect():
+    m = _get_email_monitor()
+    if m:
+        m.password = None
+        m.enabled = False
+        m.status = "disconnected"
+        m.status_detail = "Disconnected."
+        db.session.commit()
+    return jsonify({"status": "success", "message": "Email monitor disconnected."})
+
+
+# Optional background poller (opt-in via EMAIL_MONITOR_BACKGROUND=1). The manual
+# "Check now" button is the primary, always-available path.
+_email_poller_started = False
+
+
+def start_email_poller():
+    global _email_poller_started
+    if _email_poller_started:
+        return
+    _email_poller_started = True
+    import threading
+    import time as _time
+
+    def _loop():
+        while True:
+            interval = 60
+            try:
+                with app.app_context():
+                    m = _get_email_monitor()
+                    if m and m.enabled and (m.poll_interval or 0) > 0 and m.host and m.password:
+                        res = email_monitor.fetch_sale_emails(_email_cfg(m), since_uid=m.last_uid or 0)
+                        if res.get("ok"):
+                            for pe in res["emails"]:
+                                _process_sale_email(pe, source=m.source or "tcgplayer")
+                            m.last_uid = res.get("max_uid", m.last_uid)
+                            m.last_checked = datetime.utcnow()
+                            m.status = "connected"
+                            db.session.commit()
+                        interval = max(int(m.poll_interval or 60), 15)
+            except Exception:
+                interval = 60
+            _time.sleep(interval)
+
+    threading.Thread(target=_loop, daemon=True).start()
+
+
 # ====================== START ======================
 def migrate_add_image_path_back_column():
     """
@@ -4321,6 +5611,10 @@ if __name__ == "__main__":
         migrate_add_display_image_path_column()
 
     ensure_dirs()
+
+    # Optional background sale-email polling (off by default; "Check now" always works).
+    if os.environ.get("EMAIL_MONITOR_BACKGROUND") == "1":
+        start_email_poller()
 
     print("Card Collector Inventory Manager")
     print(" • /             — Create/edit Game templates (name + blank field list)")

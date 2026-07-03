@@ -334,6 +334,15 @@
         @media (min-width: 768px) {
             #mobileCardList { display: none !important; }
         }
+        .ocr-num-pill {
+            display: inline-block;
+            padding: 1px 8px;
+            border-radius: 999px;
+            background: #e6f4ea;
+            color: #1a7a3c;
+            font-size: 0.72rem;
+            font-weight: 700;
+        }
     </style>
 </head>
 <body class="bg-light">
@@ -396,6 +405,14 @@
                 </button>
                 <button class="btn btn-warning" id="editSelectedBtn" type="button">
                     <i class="fas fa-pen-to-square me-1"></i>Edit Selected
+                </button>
+                <button class="btn btn-outline-primary" id="refDataBtn" type="button"
+                        title="Download a game's card catalog from tcgcsv.com to use as reference for OCR identification">
+                    <i class="fas fa-cloud-arrow-down me-1"></i>Reference Data
+                </button>
+                <button class="btn btn-primary" id="ocrIdentifyBtn" type="button"
+                        title="Read the front image of each selected card (name + collector number) and match it to existing entries">
+                    <i class="fas fa-crosshairs me-1"></i>Identify (OCR)
                 </button>
                 <button class="btn btn-dark" id="gradeSelectedBtn" type="button"
                         title="Send front & back images of the selected cards to Ximilar for a condition check">
@@ -895,6 +912,170 @@
     </div>
 
     <!-- Grade Condition Modal -->
+    <!-- ==================== REFERENCE DATA (tcgcsv) MODAL ==================== -->
+    <div class="modal fade" id="refModal" tabindex="-1" aria-labelledby="refModalLabel" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
+        <div class="modal-dialog modal-dialog-centered modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="refModalLabel">
+                        <i class="fas fa-cloud-arrow-down me-2"></i>Reference Data <span class="text-muted small ms-2">from tcgcsv.com</span>
+                    </h5>
+                </div>
+                <div class="modal-body">
+                    <!-- Idle / setup -->
+                    <div id="refIdle">
+                        <p class="text-muted small mb-3">
+                            Download a game's full card catalog from <strong>tcgcsv.com</strong> (a daily TCGplayer mirror).
+                            Once downloaded, OCR identification can match a scanned card to a real product and auto-fill its
+                            name, collector number, set, rarity, and TCGplayer price.
+                        </p>
+
+                        <div class="mb-3">
+                            <label class="form-label small fw-semibold mb-1">Downloaded games</label>
+                            <div id="refSyncedList" class="border rounded p-2 bg-light small">
+                                <span class="text-muted">Loading…</span>
+                            </div>
+                        </div>
+
+                        <label for="refGameSelect" class="form-label small fw-semibold mb-1">Add / refresh a game</label>
+                        <div class="d-flex gap-2 align-items-center flex-wrap">
+                            <select id="refGameSelect" class="form-select form-select-sm" style="max-width:320px;">
+                                <option value="">Loading games…</option>
+                            </select>
+                            <span class="text-muted small" id="refLastUpdated"></span>
+                        </div>
+                        <p class="text-muted small mt-2 mb-0">
+                            <i class="fas fa-circle-info me-1"></i>A full game is fetched one set at a time to respect
+                            tcgcsv's rate limits, so large games (e.g. Pokémon, Magic) take a couple of minutes.
+                        </p>
+                    </div>
+
+                    <!-- Running -->
+                    <div id="refRunning" style="display:none;">
+                        <div class="mb-2 d-flex justify-content-between align-items-center">
+                            <span class="small fw-semibold text-muted">Downloading sets</span>
+                            <span class="small text-muted" id="refCounter">0 / 0</span>
+                        </div>
+                        <div class="progress mb-3" style="height:10px;">
+                            <div id="refBar" class="progress-bar progress-bar-striped progress-bar-animated"
+                                 role="progressbar" style="width:0%"></div>
+                        </div>
+                        <div class="border rounded px-3 py-2 bg-light mb-3" style="min-height:48px;">
+                            <div class="small text-muted mb-1">Current set</div>
+                            <div id="refCurrentSet" class="fw-semibold text-truncate">—</div>
+                        </div>
+                        <div class="d-flex gap-3 justify-content-center small mb-3">
+                            <span class="text-success"><i class="fas fa-check-circle me-1"></i><span id="refCountOk">0</span> sets</span>
+                            <span class="text-primary"><i class="fas fa-layer-group me-1"></i><span id="refCountCards">0</span> cards</span>
+                            <span class="text-danger"><i class="fas fa-times-circle me-1"></i><span id="refCountErr">0</span> errors</span>
+                        </div>
+                    </div>
+
+                    <!-- Done -->
+                    <div id="refDone" style="display:none;">
+                        <div class="alert alert-success mb-0" id="refDoneMsg"></div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" id="refCancelBtn">Cancel</button>
+                    <button type="button" class="btn btn-primary" id="refStartBtn" disabled>
+                        <i class="fas fa-download me-1"></i>Download
+                    </button>
+                    <button type="button" class="btn btn-warning" id="refStopBtn" style="display:none;">
+                        <i class="fas fa-stop me-1"></i>Stop
+                    </button>
+                    <button type="button" class="btn btn-primary" id="refCloseBtn" style="display:none;" data-bs-dismiss="modal">
+                        <i class="fas fa-check me-1"></i>Done
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== OCR IDENTIFY MODAL ==================== -->
+    <div class="modal fade" id="ocrModal" tabindex="-1" aria-labelledby="ocrModalLabel" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
+        <div class="modal-dialog modal-dialog-centered modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="ocrModalLabel">
+                        <i class="fas fa-crosshairs me-2"></i>Identify by OCR
+                    </h5>
+                </div>
+                <div class="modal-body">
+                    <!-- Pre-run state -->
+                    <div id="ocrIdle">
+                        <p class="mb-3 text-muted small" id="ocrIdleMsg">Loading…</p>
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="checkbox" id="ocrAutoApply" checked>
+                            <label class="form-check-label small" for="ocrAutoApply">
+                                Auto-apply confident matches (exact collector-number match)
+                            </label>
+                        </div>
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="checkbox" id="ocrBulkCatalog" checked>
+                            <label class="form-check-label small" for="ocrBulkCatalog">
+                                Match against imported catalog only
+                            </label>
+                        </div>
+                        <p class="text-muted small mt-3 mb-0">
+                            <i class="fas fa-circle-info me-1"></i>Each card's front image is read for its name and
+                            <strong>N/M</strong> collector number and matched to existing entries. Cards without a
+                            confident match are left untouched and flagged for manual review. Runs one card at a time.
+                        </p>
+                    </div>
+                    <!-- Running state -->
+                    <div id="ocrRunning" style="display:none;">
+                        <div class="mb-2 d-flex justify-content-between align-items-center">
+                            <span class="small fw-semibold text-muted">Progress</span>
+                            <span class="small text-muted" id="ocrCounter">0 / 0</span>
+                        </div>
+                        <div class="progress mb-3" style="height:10px;">
+                            <div id="ocrBar" class="progress-bar progress-bar-striped progress-bar-animated bg-primary"
+                                 role="progressbar" style="width:0%"></div>
+                        </div>
+                        <div class="border rounded px-3 py-2 bg-light mb-3" style="min-height:48px;">
+                            <div class="small text-muted mb-1">Current card</div>
+                            <div id="ocrCurrentCard" class="fw-semibold text-truncate">—</div>
+                        </div>
+                        <div class="d-flex gap-3 justify-content-center small mb-3">
+                            <span class="text-success"><i class="fas fa-check-circle me-1"></i><span id="ocrCountOk">0</span> identified</span>
+                            <span class="text-warning"><i class="fas fa-circle-question me-1"></i><span id="ocrCountSkip">0</span> need review</span>
+                            <span class="text-danger"><i class="fas fa-times-circle me-1"></i><span id="ocrCountErr">0</span> errors</span>
+                        </div>
+                        <div class="table-responsive" style="max-height:260px;overflow:auto;">
+                            <table class="table table-sm align-middle mb-0">
+                                <thead class="table-light">
+                                    <tr>
+                                        <th style="width:70px;">Record</th>
+                                        <th>Read</th>
+                                        <th>Result</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="ocrResultsBody"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <!-- Done state -->
+                    <div id="ocrDone" style="display:none;">
+                        <div class="alert alert-success mb-0" id="ocrDoneMsg"></div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" id="ocrCancelBtn">Cancel</button>
+                    <button type="button" class="btn btn-primary" id="ocrStartBtn" disabled>
+                        <i class="fas fa-play me-1"></i>Start
+                    </button>
+                    <button type="button" class="btn btn-warning" id="ocrStopBtn" style="display:none;">
+                        <i class="fas fa-stop me-1"></i>Stop
+                    </button>
+                    <button type="button" class="btn btn-primary" id="ocrCloseBtn" style="display:none;">
+                        <i class="fas fa-check me-1"></i>Done
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <div class="modal fade" id="gradeModal" tabindex="-1" aria-labelledby="gradeModalLabel" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
         <div class="modal-dialog modal-dialog-centered modal-lg">
             <div class="modal-content">
@@ -1766,6 +1947,370 @@
                                   + `Graded <strong>${ok}</strong> card${ok !== 1 ? 's' : ''}`
                                   + (err ? `, <strong>${err}</strong> error${err !== 1 ? 's' : ''}` : '')
                                   + `${stoppedNote}. Open a card's detail page to see its saved condition.`;
+                stopBtn.style.display  = 'none';
+                closeBtn.style.display = '';
+            });
+        })();
+
+        // ====================== REFERENCE DATA SYNC (tcgcsv) ======================
+        (function () {
+            const openBtn = document.getElementById('refDataBtn');
+            if (!openBtn) return;
+
+            const modal = new bootstrap.Modal(document.getElementById('refModal'));
+            const idleBox    = document.getElementById('refIdle');
+            const runningBox = document.getElementById('refRunning');
+            const doneBox    = document.getElementById('refDone');
+            const doneMsg    = document.getElementById('refDoneMsg');
+
+            const syncedList = document.getElementById('refSyncedList');
+            const gameSelect = document.getElementById('refGameSelect');
+            const lastUpd    = document.getElementById('refLastUpdated');
+
+            const counterEl = document.getElementById('refCounter');
+            const barEl     = document.getElementById('refBar');
+            const currentEl = document.getElementById('refCurrentSet');
+            const okEl      = document.getElementById('refCountOk');
+            const cardsEl   = document.getElementById('refCountCards');
+            const errEl     = document.getElementById('refCountErr');
+
+            const startBtn  = document.getElementById('refStartBtn');
+            const stopBtn   = document.getElementById('refStopBtn');
+            const closeBtn  = document.getElementById('refCloseBtn');
+            const cancelBtn = document.getElementById('refCancelBtn');
+
+            let stopFlag = false, syncedIds = new Set();
+            function escH(s){ return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+            async function loadStatus() {
+                syncedList.innerHTML = '<span class="text-muted">Loading…</span>';
+                try {
+                    const data = await (await fetch('/reference/status')).json();
+                    if (!data.available) {
+                        syncedList.innerHTML = '<span class="text-danger">tcgcsv sync module unavailable on the server.</span>';
+                        return;
+                    }
+                    syncedIds = new Set((data.games || []).map(g => g.category_id));
+                    if (!data.games || !data.games.length) {
+                        syncedList.innerHTML = '<span class="text-muted">No games downloaded yet.</span>';
+                    } else {
+                        syncedList.innerHTML = data.games.map(g => `
+                            <div class="d-flex justify-content-between align-items-center py-1">
+                                <span><strong>${escH(g.game || ('#' + g.category_id))}</strong>
+                                  <span class="text-muted">· ${g.product_count} cards · ${g.group_count} sets</span></span>
+                                <button class="btn btn-sm btn-outline-danger ref-clear-btn py-0 px-2"
+                                        data-cat="${g.category_id}" data-game="${escH(g.game || '')}" title="Delete downloaded data">
+                                    <i class="fas fa-trash"></i></button>
+                            </div>`).join('');
+                    }
+                } catch (e) {
+                    syncedList.innerHTML = `<span class="text-danger">Failed to load status: ${escH(e.message)}</span>`;
+                }
+            }
+
+            async function loadCategories() {
+                gameSelect.innerHTML = '<option value="">Loading games…</option>';
+                startBtn.disabled = true;
+                try {
+                    const data = await (await fetch('/reference/categories')).json();
+                    if (data.status !== 'ok') {
+                        gameSelect.innerHTML = `<option value="">${escH(data.message || 'Failed to load')}</option>`;
+                        return;
+                    }
+                    lastUpd.textContent = data.last_updated ? `tcgcsv updated: ${data.last_updated}` : '';
+                    gameSelect.innerHTML = '<option value="">— choose a game —</option>' +
+                        (data.categories || []).map(c =>
+                            `<option value="${c.category_id}" data-name="${escH(c.name)}">${escH(c.name)}${syncedIds.has(c.category_id) ? ' ✓ (re-download)' : ''}</option>`
+                        ).join('');
+                } catch (e) {
+                    gameSelect.innerHTML = `<option value="">${escH(e.message)}</option>`;
+                }
+            }
+
+            gameSelect.addEventListener('change', function () { startBtn.disabled = !this.value; });
+
+            openBtn.addEventListener('click', function () {
+                stopFlag = false;
+                idleBox.style.display = ''; runningBox.style.display = 'none'; doneBox.style.display = 'none';
+                startBtn.style.display = ''; startBtn.disabled = true;
+                stopBtn.style.display = 'none'; closeBtn.style.display = 'none'; cancelBtn.style.display = '';
+                modal.show();
+                loadStatus().then(loadCategories);
+            });
+
+            cancelBtn.addEventListener('click', () => modal.hide());
+            stopBtn.addEventListener('click', () => {
+                stopFlag = true; stopBtn.disabled = true;
+                stopBtn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Stopping…';
+            });
+
+            // Clear a downloaded game
+            syncedList.addEventListener('click', async function (e) {
+                const btn = e.target.closest('.ref-clear-btn');
+                if (!btn) return;
+                const cat = parseInt(btn.dataset.cat, 10);
+                if (!confirm(`Delete downloaded reference data for ${btn.dataset.game || ('category ' + cat)}?`)) return;
+                btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+                try {
+                    await fetch('/reference/clear', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ category_id: cat }),
+                    });
+                } catch (e) {}
+                loadStatus().then(loadCategories);
+            });
+
+            startBtn.addEventListener('click', async function () {
+                const opt = gameSelect.options[gameSelect.selectedIndex];
+                const categoryId = parseInt(gameSelect.value, 10);
+                const categoryName = opt ? (opt.dataset.name || opt.textContent.replace(/ ✓.*$/, '')) : '';
+                if (!categoryId) return;
+                stopFlag = false;
+
+                idleBox.style.display = 'none'; runningBox.style.display = '';
+                startBtn.style.display = 'none'; cancelBtn.style.display = 'none';
+                stopBtn.style.display = ''; stopBtn.disabled = false; stopBtn.innerHTML = '<i class="fas fa-stop me-1"></i>Stop';
+                currentEl.textContent = 'Loading set list…'; counterEl.textContent = '0 / 0';
+                okEl.textContent = '0'; cardsEl.textContent = '0'; errEl.textContent = '0'; barEl.style.width = '0%';
+
+                let groups = [];
+                try {
+                    const gd = await (await fetch(`/reference/groups/${categoryId}`)).json();
+                    if (gd.status !== 'ok') throw new Error(gd.message || 'Could not list sets');
+                    groups = gd.groups || [];
+                } catch (e) {
+                    runningBox.style.display = 'none'; doneBox.style.display = '';
+                    doneMsg.className = 'alert alert-danger mb-0';
+                    doneMsg.innerHTML = `<i class="fas fa-times-circle me-1"></i>${escH(e.message)}`;
+                    stopBtn.style.display = 'none'; closeBtn.style.display = ''; return;
+                }
+
+                const total = groups.length;
+                let done = 0, ok = 0, cards = 0, err = 0;
+                counterEl.textContent = `0 / ${total}`;
+
+                for (const g of groups) {
+                    if (stopFlag) break;
+                    currentEl.textContent = g.name || `Set #${g.group_id}`;
+                    try {
+                        const data = await (await fetch('/reference/sync_group', {
+                            method: 'POST', headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                category_id: categoryId, category_name: categoryName,
+                                group_id: g.group_id, group_name: g.name,
+                            }),
+                        })).json();
+                        if (data.status === 'ok') { ok++; cards += (data.added || 0); }
+                        else err++;
+                    } catch (e) { err++; }
+
+                    done++;
+                    counterEl.textContent = `${done} / ${total}`;
+                    okEl.textContent = ok; cardsEl.textContent = cards; errEl.textContent = err;
+                    barEl.style.width = `${Math.round((done / total) * 100)}%`;
+                    await new Promise(r => setTimeout(r, 120));  // be a good neighbour between sets
+                }
+
+                runningBox.style.display = 'none'; doneBox.style.display = '';
+                doneMsg.className = 'alert alert-success mb-0';
+                const stoppedNote = stopFlag ? ' (stopped early)' : '';
+                doneMsg.innerHTML = `<i class="fas fa-check-circle me-1"></i>Downloaded <strong>${cards}</strong> cards across `
+                                  + `<strong>${ok}</strong> set${ok !== 1 ? 's' : ''}`
+                                  + (err ? `, <strong>${err}</strong> error${err !== 1 ? 's' : ''}` : '')
+                                  + `${stoppedNote} for <strong>${escH(categoryName)}</strong>. `
+                                  + `OCR identification will now match against it.`;
+                stopBtn.style.display = 'none'; closeBtn.style.display = '';
+            });
+        })();
+
+        // ====================== IDENTIFY BY OCR (batch) ======================
+        (function () {
+            const startBtn = document.getElementById('ocrIdentifyBtn');
+            if (!startBtn) return;
+
+            const modalEl  = document.getElementById('ocrModal');
+            const modal    = new bootstrap.Modal(modalEl);
+
+            const idleBox    = document.getElementById('ocrIdle');
+            const idleMsg    = document.getElementById('ocrIdleMsg');
+            const runningBox = document.getElementById('ocrRunning');
+            const doneBox    = document.getElementById('ocrDone');
+            const doneMsg    = document.getElementById('ocrDoneMsg');
+
+            const autoApplyChk = document.getElementById('ocrAutoApply');
+            const catalogChk   = document.getElementById('ocrBulkCatalog');
+            const counterEl  = document.getElementById('ocrCounter');
+            const barEl      = document.getElementById('ocrBar');
+            const currentEl  = document.getElementById('ocrCurrentCard');
+            const okCountEl  = document.getElementById('ocrCountOk');
+            const skipCountEl= document.getElementById('ocrCountSkip');
+            const errCountEl = document.getElementById('ocrCountErr');
+            const bodyEl     = document.getElementById('ocrResultsBody');
+
+            const modalStartBtn = document.getElementById('ocrStartBtn');
+            const stopBtn       = document.getElementById('ocrStopBtn');
+            const closeBtn      = document.getElementById('ocrCloseBtn');
+            const cancelBtn     = document.getElementById('ocrCancelBtn');
+
+            let queue = [], stopFlag = false, appliedAny = false;
+
+            const CONF_THRESHOLD = 0.85;  // score at/above which a non-serial match is "confident"
+
+            function escH(s) {
+                return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;')
+                                      .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+            }
+            function collectIds() {
+                if (selectedIds.size > 0) return [...selectedIds];
+                const s = new Set();
+                document.querySelectorAll('.record-checkbox:checked').forEach(cb => {
+                    (cb.dataset.allIds || cb.value).split(',').forEach(v => {
+                        const n = parseInt(v.trim(), 10);
+                        if (!isNaN(n)) s.add(n);
+                    });
+                });
+                return [...s];
+            }
+            function readLabel(ocr) {
+                const bits = [];
+                if (ocr && ocr.name_guess)   bits.push(escH(ocr.name_guess));
+                if (ocr && ocr.number_guess) bits.push(`<span class="text-primary">${escH(ocr.number_guess)}</span>`);
+                return bits.length ? bits.join(' · ') : '<span class="text-muted">—</span>';
+            }
+
+            startBtn.addEventListener('click', function () {
+                const ids = collectIds();
+                if (!ids.length) { alert('Please select at least one record.'); return; }
+                queue = ids;
+                stopFlag = false;
+                appliedAny = false;
+
+                idleBox.style.display    = '';
+                runningBox.style.display = 'none';
+                doneBox.style.display    = 'none';
+                bodyEl.innerHTML = '';
+                idleMsg.innerHTML = `<strong>${ids.length}</strong> card${ids.length !== 1 ? 's' : ''} selected for OCR identification.`;
+
+                modalStartBtn.style.display = '';
+                modalStartBtn.disabled = false;
+                stopBtn.style.display  = 'none';
+                closeBtn.style.display = 'none';
+                cancelBtn.style.display = '';
+                modal.show();
+            });
+
+            cancelBtn.addEventListener('click', function () { modal.hide(); });
+            closeBtn.addEventListener('click', function () {
+                modal.hide();
+                if (appliedAny) window.location.reload();
+            });
+            stopBtn.addEventListener('click', function () {
+                stopFlag = true;
+                stopBtn.disabled = true;
+                stopBtn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Stopping…';
+            });
+
+            modalStartBtn.addEventListener('click', async function () {
+                const autoApply = autoApplyChk.checked;
+                const catalog   = catalogChk.checked ? '?catalog=1' : '';
+                const total = queue.length;
+                let done = 0, ok = 0, skip = 0, err = 0;
+
+                idleBox.style.display       = 'none';
+                runningBox.style.display    = '';
+                modalStartBtn.style.display = 'none';
+                cancelBtn.style.display     = 'none';
+                stopBtn.style.display       = '';
+                stopBtn.disabled = false;
+                stopBtn.innerHTML = '<i class="fas fa-stop me-1"></i>Stop';
+
+                counterEl.textContent = `0 / ${total}`;
+                okCountEl.textContent = '0'; skipCountEl.textContent = '0'; errCountEl.textContent = '0';
+                barEl.style.width = '0%';
+
+                for (const id of queue) {
+                    if (stopFlag) break;
+                    currentEl.textContent = `Record #${id}`;
+
+                    const row = document.createElement('tr');
+                    row.innerHTML = `<td class="fw-semibold">#${id}</td>`
+                                  + `<td colspan="2" class="text-muted small">`
+                                  + `<i class="fas fa-spinner fa-spin me-1"></i>Reading…</td>`;
+                    bodyEl.prepend(row);
+
+                    try {
+                        const res  = await fetch(`/ocr_identify/${id}${catalog}`);
+                        const data = await res.json();
+
+                        if (data.status !== 'ok') {
+                            err++;
+                            row.innerHTML = `<td class="fw-semibold">#${id}</td>`
+                                          + `<td class="text-muted small">—</td>`
+                                          + `<td class="text-danger small"><i class="fas fa-times-circle me-1"></i>${escH(data.message || 'Failed')}</td>`;
+                        } else {
+                            const ocr  = data.ocr || {};
+                            const cand = (data.candidates || [])[0] || null;
+                            const confident = cand && (cand.serial_match || (cand.score || 0) >= CONF_THRESHOLD);
+                            const readCell = `<td class="small">${readLabel(ocr)}</td>`;
+                            const link = `/inventory/${id}`;
+
+                            if (cand && confident && autoApply) {
+                                const ap = await fetch(`/ocr_apply/${id}`, {
+                                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ source_record_id: cand.record_id }),
+                                });
+                                const apData = await ap.json();
+                                if (apData.status === 'success') {
+                                    ok++; appliedAny = true;
+                                    row.innerHTML = `<td class="fw-semibold">#${id}</td>${readCell}`
+                                                  + `<td class="small"><span class="text-success"><i class="fas fa-check-circle me-1"></i>`
+                                                  + `${escH(cand.name || 'matched')}</span>`
+                                                  + (cand.serial_match ? ` <span class="ocr-num-pill">number match</span>` : '')
+                                                  + `</td>`;
+                                } else {
+                                    err++;
+                                    row.innerHTML = `<td class="fw-semibold">#${id}</td>${readCell}`
+                                                  + `<td class="text-danger small"><i class="fas fa-times-circle me-1"></i>${escH(apData.message || 'Apply failed')}</td>`;
+                                }
+                            } else if (cand) {
+                                skip++;
+                                const pct = Math.round((cand.score || 0) * 100);
+                                const verb = autoApply ? 'Low confidence' : 'Match found';
+                                row.innerHTML = `<td class="fw-semibold">#${id}</td>${readCell}`
+                                              + `<td class="small"><span class="text-warning"><i class="fas fa-circle-question me-1"></i>`
+                                              + `${verb}: ${escH(cand.name || '(unnamed)')} (${pct}%)</span> `
+                                              + `<a href="${link}" target="_blank" rel="noopener">review</a></td>`;
+                            } else {
+                                skip++;
+                                row.innerHTML = `<td class="fw-semibold">#${id}</td>${readCell}`
+                                              + `<td class="small"><span class="text-warning"><i class="fas fa-circle-question me-1"></i>No match</span> `
+                                              + `<a href="${link}" target="_blank" rel="noopener">review</a></td>`;
+                            }
+                        }
+                    } catch (e) {
+                        err++;
+                        row.innerHTML = `<td class="fw-semibold">#${id}</td>`
+                                      + `<td class="text-muted small">—</td>`
+                                      + `<td class="text-danger small"><i class="fas fa-times-circle me-1"></i>${escH(e.message)}</td>`;
+                    }
+
+                    done++;
+                    counterEl.textContent   = `${done} / ${total}`;
+                    okCountEl.textContent   = ok;
+                    skipCountEl.textContent = skip;
+                    errCountEl.textContent  = err;
+                    barEl.style.width       = `${Math.round((done / total) * 100)}%`;
+                }
+
+                runningBox.style.display = 'none';
+                doneBox.style.display    = '';
+                const stoppedNote = stopFlag ? ' (stopped early)' : '';
+                doneMsg.innerHTML = `<i class="fas fa-check-circle me-1"></i>`
+                                  + `Identified <strong>${ok}</strong>`
+                                  + `, <strong>${skip}</strong> need review`
+                                  + (err ? `, <strong>${err}</strong> error${err !== 1 ? 's' : ''}` : '')
+                                  + `${stoppedNote}.`
+                                  + (appliedAny ? ' Closing will reload to show applied identities.' : '');
                 stopBtn.style.display  = 'none';
                 closeBtn.style.display = '';
             });

@@ -93,3 +93,115 @@ class Listing(db.Model):
 
     def __repr__(self):
         return f"<Listing r{self.record_id} {self.marketplace} {self.status}>"
+
+
+class EmailMonitor(db.Model):
+    """
+    IMAP mailbox watched for marketplace sale-notification emails (e.g. TCGplayer
+    "you made a sale"). A single row is expected. The password is stored here so
+    the monitor is self-contained; like the shop tokens, treat inventory.db as a
+    secret. `last_uid` lets polling skip already-seen messages; idempotency of
+    actual sale processing is enforced separately via SaleEvent.
+    """
+    __tablename__ = 'email_monitors'
+    id             = db.Column(db.Integer, primary_key=True)
+    enabled        = db.Column(db.Boolean, default=False)
+    host           = db.Column(db.String(200), nullable=True)
+    port           = db.Column(db.Integer, default=993)
+    use_ssl        = db.Column(db.Boolean, default=True)
+    username       = db.Column(db.String(200), nullable=True)
+    password       = db.Column(db.String(300), nullable=True)   # app-password / mailbox password
+    folder         = db.Column(db.String(120), default='INBOX')
+    sender_filter  = db.Column(db.String(200), default='tcgplayer.com')
+    subject_filter = db.Column(db.String(200), default='sold')
+    source         = db.Column(db.String(30), default='tcgplayer')  # which marketplace these sales are from
+    mark_seen      = db.Column(db.Boolean, default=True)
+    poll_interval  = db.Column(db.Integer, default=0)   # seconds; 0 = manual only
+    last_uid       = db.Column(db.Integer, default=0)
+    last_checked   = db.Column(db.DateTime, nullable=True)
+    status         = db.Column(db.String(20), default='disconnected')
+    status_detail  = db.Column(db.Text, nullable=True)
+    updated_at     = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<EmailMonitor {self.username or '-'} {self.status}>"
+
+
+class SaleEvent(db.Model):
+    """
+    One parsed sale line from a notification email. Provides an audit trail and
+    idempotency: (source, order_id, item_title) is unique so re-reading the same
+    email never double-processes a sale.
+    """
+    __tablename__ = 'sale_events'
+    id           = db.Column(db.Integer, primary_key=True)
+    source       = db.Column(db.String(30), default='tcgplayer')
+    order_id     = db.Column(db.String(120), nullable=True)
+    item_title   = db.Column(db.String(400), nullable=True)
+    qty          = db.Column(db.Integer, default=1)
+    price        = db.Column(db.Float, nullable=True)
+    record_id    = db.Column(db.Integer, db.ForeignKey('scan_records.id'), nullable=True)
+    status       = db.Column(db.String(20), default='unmatched')  # unmatched|matched|processed|error|unparsed
+    detail       = db.Column(db.Text, nullable=True)
+    email_subject = db.Column(db.String(400), nullable=True)
+    created_at   = db.Column(db.DateTime, default=datetime.utcnow)
+
+    record = db.relationship('ScanRecord')
+
+    __table_args__ = (
+        db.UniqueConstraint('source', 'order_id', 'item_title', name='uq_saleevent_order_item'),
+    )
+
+    def __repr__(self):
+        return f"<SaleEvent {self.source} {self.order_id} {self.status}>"
+
+
+class ReferenceCard(db.Model):
+    """
+    Local cache of a single TCGplayer product pulled from tcgcsv.com, used as a
+    reference catalog to identify scanned cards and auto-fill entry fields from
+    OCR results. One row per TCGplayer productId. `extended` keeps the full
+    extendedData key/value map (Number, Rarity, HP, Stage, ...) so game-specific
+    fields stay available without needing a column each.
+    """
+    __tablename__ = 'reference_cards'
+    id           = db.Column(db.Integer, primary_key=True)
+    category_id  = db.Column(db.Integer, nullable=False, index=True)   # tcgplayer categoryId (the "game")
+    group_id     = db.Column(db.Integer, nullable=False, index=True)   # tcgplayer groupId  (the "set")
+    product_id   = db.Column(db.Integer, unique=True, nullable=False)  # tcgplayer productId (primary key upstream)
+    game         = db.Column(db.String(120), index=True)              # category display name, e.g. "Pokemon"
+    set_name     = db.Column(db.String(200))                          # group name, e.g. "SWSH12: Silver Tempest"
+    name         = db.Column(db.String(300), index=True)
+    clean_name   = db.Column(db.String(300))
+    number       = db.Column(db.String(40), index=True)              # extendedData "Number", e.g. "139/195"
+    rarity       = db.Column(db.String(80))
+    image_url    = db.Column(db.String(500))
+    url          = db.Column(db.String(500))
+    market_price = db.Column(db.Float, nullable=True)
+    extended     = db.Column(db.JSON, default=dict)                  # full extendedData as {name: value}
+    updated_at   = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<ReferenceCard {self.game} {self.name} {self.number}>"
+
+
+class ReferenceSync(db.Model):
+    """
+    Bookkeeping for reference-catalog downloads from tcgcsv.com. One row per
+    synced category (game): how many products are cached and when, plus the
+    tcgcsv last-updated stamp seen at sync time so we can skip redundant pulls
+    (tcgcsv only refreshes once daily).
+    """
+    __tablename__ = 'reference_syncs'
+    id             = db.Column(db.Integer, primary_key=True)
+    category_id    = db.Column(db.Integer, unique=True, nullable=False)
+    game           = db.Column(db.String(120))
+    product_count  = db.Column(db.Integer, default=0)
+    group_count    = db.Column(db.Integer, default=0)
+    remote_updated = db.Column(db.String(60), nullable=True)   # value of last-updated.txt at sync time
+    last_synced    = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    status         = db.Column(db.String(20), default='idle')  # idle|syncing|ok|error
+    status_detail  = db.Column(db.Text, nullable=True)
+
+    def __repr__(self):
+        return f"<ReferenceSync cat={self.category_id} {self.game} n={self.product_count}>"

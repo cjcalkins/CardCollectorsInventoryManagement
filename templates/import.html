@@ -213,6 +213,23 @@
     }
     .field-hidden-toggle input { margin: 0; cursor: pointer; }
 
+    .auto-import-toggle {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      margin-top: 10px;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #f8fafc;
+      cursor: pointer;
+      user-select: none;
+    }
+    .auto-import-toggle input { margin: 2px 0 0; cursor: pointer; }
+    .auto-import-toggle .auto-import-text { font-size: 12.5px; line-height: 1.45; color: #334155; }
+    .auto-import-toggle .auto-import-text strong { color: var(--primary); }
+    .auto-import-toggle.on { border-color: var(--primary); background: #f0fdfa; }
+
     .mapping-row .mapping-field-label {
       font-size: 14px;
       font-weight: 700;
@@ -805,6 +822,13 @@
               <label for="image">Image or PDF</label>
               <input type="file" id="image" name="image" accept="image/*,.pdf,application/pdf" required>
               <div class="hint">You can select a single 9-pocket page image, or a multi-page PDF. For a PDF, page 1 is treated as the front of the page, page 2 as its back, page 3 as the next page's front, page 4 its back, and so on — each pair is loaded here one after another.</div>
+
+              <label class="auto-import-toggle" id="autoImportToggle" title="Split and import automatically with no per-tile review">
+                <input type="checkbox" id="autoImport" name="auto_import">
+                <span class="auto-import-text">
+                  <strong>Auto-import</strong> — cut every page (and every page of a PDF) on the automatically detected cut lines and send the raw cuts straight to inventory. This bypasses the alignment step and per-tile review entirely. Just fill the required fields and press “Split and Process” once.
+                </span>
+              </label>
             </div>
 
             <!-- Hidden side field, driven automatically by the PDF batch queue.
@@ -866,11 +890,12 @@
             </div>
 
             <div class="hint">
-              Upload one 9-pocket page image, adjust the red cut lines, straighten the 9 split images, review any of the results, manually correct corners when needed, and then send all 9 aligned cards into inventory as blank entries for the selected Game.
+              Upload one 9-pocket page image. The red cut lines are placed automatically by detecting the white gaps between the cards — fine-tune them with the sliders if needed. Then straighten the 9 split images, review any of the results, manually correct corners when needed, and send all 9 aligned cards into inventory as blank entries for the selected Game.
             </div>
 
             <div class="actions">
               <button type="submit" class="btn-primary">Split and Process</button>
+              <button type="button" class="btn-secondary" id="autoDetectBtn">Re-detect cut lines</button>
               <button type="button" class="btn-secondary" id="refreshPreviewBtn">Refresh Preview</button>
             </div>
 
@@ -883,7 +908,7 @@
         <div class="canvas-panel">
           <div class="canvas-title">Live Cut Preview</div>
           <div class="canvas-subtitle">
-            Red lines show where the page will be split into 9 images before card alignment runs. This follows the same percentage-based 3x3 split workflow used in the splitter utility.
+            The red cut lines are placed automatically as soon as an image loads, by detecting the white gaps between the cards. They show where the page will be split into 9 images before card alignment runs — drag the sliders to fine-tune, or use "Re-detect cut lines" to run detection again.
           </div>
           <div class="canvas-shell">
             <canvas id="previewCanvas"></canvas>
@@ -1306,6 +1331,9 @@
     const statusBox = document.getElementById('statusBox');
     const resultsGrid = document.getElementById('resultsGrid');
     const refreshPreviewBtn = document.getElementById('refreshPreviewBtn');
+    const autoDetectBtn = document.getElementById('autoDetectBtn');
+    const autoImportCheckbox = document.getElementById('autoImport');
+    const autoImportToggle = document.getElementById('autoImportToggle');
     const runBatchOcrBtn = document.getElementById('runBatchOcrBtn');
     const ocrResults = document.getElementById('ocrResults');
 
@@ -1350,6 +1378,11 @@
     let pdfBasePage = 1;     // page number assigned to pair 0
     let pdfActive = false;
 
+    // Auto-import chaining: set true once the user presses "Split and Process"
+    // while Auto-import is on and a PDF batch is active, so that each subsequent
+    // PDF page splits + imports itself automatically without another click.
+    let autoImportChaining = false;
+
     function isPdfFile(file) {
       if (!file) return false;
       if (file.type === 'application/pdf') return true;
@@ -1374,6 +1407,7 @@
       pdfSide = 'front';
       pdfBasePage = 1;
       pdfActive = false;
+      autoImportChaining = false;
       sideField.value = 'front';
       pdfBatchBar.classList.remove('show');
     }
@@ -1493,6 +1527,144 @@
       hCut2Val.textContent = hCut2.value;
     }
 
+    // ── Auto-detect cut lines from the white gaps between cards ───────────
+    // The page is a 3x3 grid of cards photographed on a white background, with
+    // white margins between the rows and columns. We downscale the image,
+    // measure how "white" each column and each row is, and then place each of
+    // the four cut lines at the centre of the whitest band inside the region
+    // where that particular gap is expected to fall.
+
+    function findBandCenter(profile, loFrac, hiFrac) {
+      // Return the centre of the whitest sustained band within the
+      // [loFrac, hiFrac] slice of a whiteness profile, as a 0–100 percentage,
+      // or null if no convincing white gap is present in that slice.
+      const L = profile.length;
+      const lo = Math.floor(L * loFrac);
+      const hi = Math.floor(L * hiFrac);
+      if (hi <= lo) return null;
+
+      let peak = 0;
+      for (let i = lo; i < hi; i++) if (profile[i] > peak) peak = profile[i];
+      if (peak < 0.5) return null;              // no genuine white gap here
+
+      // Threshold just below the peak so we capture the full width of the
+      // white band (not just its single whitest column/row) and use its middle.
+      const thr = Math.max(0.6, peak - 0.15);
+      let bestLen = 0, bestStart = 0, curLen = 0, curStart = 0;
+      for (let i = lo; i < hi; i++) {
+        if (profile[i] >= thr) {
+          if (curLen === 0) curStart = i;
+          curLen++;
+          if (curLen > bestLen) { bestLen = curLen; bestStart = curStart; }
+        } else {
+          curLen = 0;
+        }
+      }
+      if (bestLen === 0) return null;
+      return (bestStart + bestLen / 2) / L * 100;
+    }
+
+    function detectCutLines(img) {
+      // Downscale for speed (and to match the validated detection size), draw
+      // to an offscreen canvas, then build per-column and per-row whiteness
+      // profiles. A pixel counts as "white" when it is bright on every channel
+      // and close to neutral (so coloured card art never reads as background).
+      const scale = Math.min(900 / img.width, 560 / img.height, 1);
+      const dw = Math.max(1, Math.round(img.width * scale));
+      const dh = Math.max(1, Math.round(img.height * scale));
+
+      const off = document.createElement('canvas');
+      off.width = dw;
+      off.height = dh;
+      const octx = off.getContext('2d', { willReadFrequently: true });
+      octx.drawImage(img, 0, 0, dw, dh);
+
+      let data;
+      try {
+        data = octx.getImageData(0, 0, dw, dh).data;
+      } catch (err) {
+        return null;   // tainted canvas etc. — fall back to manual sliders
+      }
+
+      const colWhite = new Float32Array(dw);
+      const rowWhite = new Float32Array(dh);
+      for (let y = 0; y < dh; y++) {
+        for (let x = 0; x < dw; x++) {
+          const o = (y * dw + x) * 4;
+          const r = data[o], g = data[o + 1], b = data[o + 2];
+          const mn = Math.min(r, g, b), mx = Math.max(r, g, b);
+          if (mn > 200 && (mx - mn) < 40) {   // near-white background pixel
+            colWhite[x] += 1;
+            rowWhite[y] += 1;
+          }
+        }
+      }
+      for (let x = 0; x < dw; x++) colWhite[x] /= dh;
+      for (let y = 0; y < dh; y++) rowWhite[y] /= dw;
+
+      // The two internal vertical gaps sit near 1/3 and 2/3 of the width; the
+      // two horizontal gaps near 1/3 and 2/3 of the height. Search a generous
+      // window around each so slightly off-centre grids are still caught,
+      // while never straying into the outer margins or the opposite gap.
+      return {
+        v1: findBandCenter(colWhite, 0.20, 0.47),
+        v2: findBandCenter(colWhite, 0.53, 0.80),
+        h1: findBandCenter(rowWhite, 0.20, 0.47),
+        h2: findBandCenter(rowWhite, 0.53, 0.80),
+      };
+    }
+
+    function clampCut(v) {
+      // Keep within the sliders' 5–95 range and snap to whole percentages.
+      return Math.min(95, Math.max(5, Math.round(v)));
+    }
+
+    // Detect the four cut lines for the currently loaded image and move the
+    // sliders onto them. Returns how many lines were confidently detected.
+    function autoDetectCutLines({ announce = true } = {}) {
+      if (!loadedImage) {
+        if (announce) setStatus('Load an image first, then auto-detect.', 'info');
+        return 0;
+      }
+
+      const cuts = detectCutLines(loadedImage);
+      if (!cuts) {
+        drawPreview();
+        if (announce) setStatus('Could not auto-detect cut lines — adjust the sliders manually.', 'info');
+        return 0;
+      }
+
+      let found = 0;
+      const apply = (slider, val) => {
+        if (val == null) return;
+        slider.value = clampCut(val);
+        found++;
+      };
+      apply(vCut1, cuts.v1);
+      apply(vCut2, cuts.v2);
+      apply(hCut1, cuts.h1);
+      apply(hCut2, cuts.h2);
+
+      // The backend requires cut 1 < cut 2 on each axis. Detection should
+      // always satisfy this, but guard anyway: if an axis came out inconsistent
+      // (e.g. one side undetected), reset that axis to even thirds.
+      if (parseFloat(vCut1.value) >= parseFloat(vCut2.value)) { vCut1.value = 33; vCut2.value = 66; }
+      if (parseFloat(hCut1.value) >= parseFloat(hCut2.value)) { hCut1.value = 33; hCut2.value = 66; }
+
+      drawPreview();
+
+      if (announce) {
+        if (found === 4) {
+          setStatus('Cut lines auto-detected from the white gaps between cards. Fine-tune with the sliders if needed.', 'success');
+        } else if (found > 0) {
+          setStatus(`Auto-detected ${found} of 4 cut lines — check the remaining ones with the sliders.`, 'info');
+        } else {
+          setStatus('Could not auto-detect cut lines — adjust the sliders manually.', 'info');
+        }
+      }
+      return found;
+    }
+
     function drawPreview() {
       updateCutLabels();
       if (!loadedImage) {
@@ -1553,8 +1725,19 @@
         const img = new Image();
         img.onload = function () {
           loadedImage = img;
-          drawPreview();
-          setStatus('Preview loaded. Adjust cut lines if needed.', 'info');
+          // Automatically place the cut lines on the white gaps between the
+          // cards. This sets the sliders and redraws the preview; the user can
+          // still fine-tune afterwards. autoDetectCutLines sets its own status.
+          autoDetectCutLines({ announce: true });
+
+          // If we're mid auto-import through a PDF batch, this freshly-loaded
+          // page should split + import itself with no further clicks. (The
+          // very first page never auto-fires — the user starts the run by
+          // pressing "Split and Process" — because autoImportChaining is only
+          // set once that button has been pressed.)
+          if (pdfActive && autoImportChaining && autoImportCheckbox.checked) {
+            runSplitAndProcess();
+          }
         };
         img.src = e.target.result;
       };
@@ -1952,6 +2135,7 @@
       resetPdfBatchState();
       setStatus('Exited PDF batch mode.', 'info');
     });
+    autoDetectBtn.addEventListener('click', () => autoDetectCutLines({ announce: true }));
     refreshPreviewBtn.addEventListener('click', drawPreview);
     closeManualBtn.addEventListener('click', closeManualModal);
     clearManualBtn.addEventListener('click', clearManualPoints);
@@ -1963,9 +2147,10 @@
       if (e.target === manualModal) closeManualModal();
     });
 
-    form.addEventListener('submit', async function (e) {
-      e.preventDefault();
-
+    // Split the current page into 9 images and (in Auto-import mode) send them
+    // straight to inventory. Broken out of the submit handler so the PDF batch
+    // can call it directly for each subsequent page without another click.
+    async function runSplitAndProcess() {
       const file = imageInput.files && imageInput.files[0];
       if (!file) {
         setStatus('Please select an image first.', 'error');
@@ -1982,7 +2167,18 @@
         return;
       }
 
+      const autoImport = autoImportCheckbox.checked;
+
+      // Once Auto-import starts on a PDF, keep chaining through every remaining
+      // page automatically (see the img.onload handler).
+      if (autoImport && pdfActive) autoImportChaining = true;
+
       const formData = new FormData(form);
+      if (autoImport) {
+        // Tell the backend to skip the straighten/alignment pass and file the
+        // raw cut images directly.
+        formData.set('skip_align', '1');
+      }
 
       // Clear previous results; keep the live cut preview visible during the split phase.
       resultsGrid.innerHTML = '';
@@ -1990,7 +2186,12 @@
       runBatchOcrBtn.disabled = true;
 
       // Phase 1: uploading + splitting — canvas with red cut lines stays visible.
-      setStatus('Step 1/2 — Uploading and splitting page into 9 images...', 'info');
+      setStatus(
+        autoImport
+          ? 'Auto-import — uploading and cutting page into 9 images...'
+          : 'Step 1/2 — Uploading and splitting page into 9 images...',
+        'info'
+      );
 
       const canvasPanel = document.querySelector('.canvas-panel');
 
@@ -2000,9 +2201,15 @@
           body: formData
         });
 
-        // Phase 2: split done, edge detection running — hide the cut preview now.
+        // Phase 2: split done. In manual mode alignment runs next; in
+        // auto-import mode alignment is skipped. Hide the cut preview now.
         canvasPanel.style.display = 'none';
-        setStatus('Step 2/2 — Running edge detection and card alignment...', 'info');
+        setStatus(
+          autoImport
+            ? 'Auto-import — cut complete, sending raw cards to inventory...'
+            : 'Step 2/2 — Running edge detection and card alignment...',
+          'info'
+        );
 
         const data = await response.json();
         if (!response.ok || data.status !== 'success') {
@@ -2011,9 +2218,9 @@
           throw new Error(data.message || 'Import failed.');
         }
 
-        // Edge detection complete — show only successfully aligned cards.
-        // Intermediate/fallback (raw split) images are filtered out of the
-        // initial display so only final output is visible before the next import.
+        // Show successfully aligned/cut cards first. Intermediate/fallback (raw
+        // split) images are filtered out of the initial display. In auto-import
+        // mode every tile comes back "processed", so there are no fallbacks.
         const processedFiles = data.files.filter(
           item => item.status === 'processed' || item.status === 'processed-manual'
         );
@@ -2041,6 +2248,16 @@
           updateBatchOcrButton();
         }
 
+        // Auto-import: skip the manual review step and send the 9 raw cuts
+        // straight to inventory. runBatchOcrImport handles advancing the PDF
+        // batch (which re-enters this function for the next page) or reloading
+        // once a single image is done.
+        if (autoImport && getAlignedFilenames().length === 9) {
+          setStatus('Auto-import — importing 9 raw cut cards...', 'info');
+          await runBatchOcrImport();
+          return;
+        }
+
         setStatus(data.message || 'Import completed successfully.', 'success');
       } catch (err) {
         console.error(err);
@@ -2048,6 +2265,16 @@
         canvasPanel.style.display = '';
         setStatus(err.message || 'Something went wrong during import.', 'error');
       }
+    }
+
+    form.addEventListener('submit', function (e) {
+      e.preventDefault();   // native "required" validation still runs before this fires
+      runSplitAndProcess();
+    });
+
+    // Reflect the Auto-import checkbox state on its container for styling.
+    autoImportCheckbox.addEventListener('change', function () {
+      autoImportToggle.classList.toggle('on', autoImportCheckbox.checked);
     });
 
     drawPreview();
