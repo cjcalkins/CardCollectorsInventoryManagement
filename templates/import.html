@@ -805,6 +805,34 @@
     .single-result .single-result-body { flex: 1; }
     .single-result .single-result-title { font-weight: 700; margin-bottom: 4px; }
 
+    /* ── Card edge-type selector (rounded vs square) ── */
+    .edge-toggle { display: flex; gap: 8px; }
+    .edge-toggle label {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      background: white;
+      color: var(--text);
+      transition: 0.15s ease;
+    }
+    .edge-toggle label:hover { border-color: #b9c6d6; }
+    .edge-toggle label i { font-size: 0.9rem; color: var(--muted); }
+    .edge-toggle input { display: none; }
+    .edge-toggle label.active {
+      background: var(--primary);
+      color: #fff;
+      border-color: var(--primary);
+    }
+    .edge-toggle label.active i { color: #fff; }
+
     @media (max-width: 640px) {
       .import-mode-toggle { flex-direction: column; }
     }
@@ -868,6 +896,15 @@
               <label for="singleAlbum">Album <span style="font-weight:400;color:var(--muted);">(optional)</span></label>
               <input type="text" id="singleAlbum" name="album" placeholder="binder1">
             </div>
+          </div>
+
+          <div class="field">
+            <label>Card edges</label>
+            <div class="edge-toggle" data-edge-group="single">
+              <label class="active"><input type="radio" name="card_edge_type" value="rounded" checked><i class="fas fa-circle-notch"></i> Rounded corners</label>
+              <label><input type="radio" name="card_edge_type" value="square"><i class="fas fa-square"></i> Square corners</label>
+            </div>
+            <div class="hint">How the card outline is detected before cropping. <strong>Rounded</strong> (most modern cards) fits a rectangle around the curved corners; <strong>Square</strong> (vintage / sharp-cut cards) follows the true corners precisely.</div>
           </div>
 
           <div class="grid-2">
@@ -956,6 +993,17 @@
                 <label for="page">Page</label>
                 <input type="number" id="page" name="page" min="1" step="1" placeholder="1" required>
               </div>
+              <div class="field">
+                <label>Card edges</label>
+                <div class="edge-toggle" data-edge-group="page">
+                  <label class="active"><input type="radio" name="card_edge_type" value="rounded" checked><i class="fas fa-circle-notch"></i> Rounded</label>
+                  <label><input type="radio" name="card_edge_type" value="square"><i class="fas fa-square"></i> Square</label>
+                </div>
+              </div>
+            </div>
+
+            <div class="hint" style="margin-top:-4px;">
+              After the page is split into 9, each card is detected and cropped using the selected edge type — <strong>Rounded</strong> for modern rounded-corner cards, <strong>Square</strong> for vintage sharp-cornered ones. Tiles where no card outline is found are lightly deskewed instead and can be fixed with Manual Adjust.
             </div>
 
             <div class="slider-group">
@@ -1085,6 +1133,18 @@
     }
     modeBtnPage.addEventListener('click', () => setImportMode('page3x3'));
     modeBtnSingle.addEventListener('click', () => setImportMode('single'));
+
+    // Card edge-type selectors (rounded vs square): highlight the chosen option.
+    // The submitted value comes from the checked radio; this is just styling.
+    document.querySelectorAll('.edge-toggle').forEach(group => {
+      const labels = [...group.querySelectorAll('label')];
+      labels.forEach(label => {
+        const radio = label.querySelector('input[type="radio"]');
+        radio.addEventListener('change', () => {
+          labels.forEach(l => l.classList.toggle('active', l.querySelector('input').checked));
+        });
+      });
+    });
 
     // ====================== SINGLE CARD IMPORT ======================
     const singleCardForm     = document.getElementById('singleCardForm');

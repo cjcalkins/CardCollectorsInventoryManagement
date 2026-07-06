@@ -335,6 +335,143 @@ def process_card_image(image, canny_low=50, canny_high=200, approx_eps=0.02, min
     return warped
 
 
+# Card edge types the detector understands (front-end selector values).
+CARD_EDGE_TYPES = ("rounded", "square")
+CARD_EDGE_DEFAULT = "rounded"
+
+
+def normalize_card_edge_type(value):
+    """Coerce a form value to a supported edge type, defaulting to 'rounded'."""
+    v = (value or "").strip().lower()
+    return v if v in CARD_EDGE_TYPES else CARD_EDGE_DEFAULT
+
+
+def _expand_quad(quad, center, margin):
+    """Push each corner of `quad` outward from `center` by `margin` pixels, so
+    the crop includes a thin sliver of background beyond the card edge (ensures
+    the complete card is captured and never clipped)."""
+    cx, cy = center
+    out = []
+    for (x, y) in quad:
+        vx, vy = float(x) - cx, float(y) - cy
+        n = (vx * vx + vy * vy) ** 0.5 or 1.0
+        out.append([x + margin * vx / n, y + margin * vy / n])
+    return np.array(out, dtype="float32")
+
+
+def _card_foreground_rect(bgr, scale_max=1400, min_area_pct=0.10):
+    """
+    Locate the card as the largest foreground region that differs from the
+    background. The background colour is sampled from the four corners of the
+    frame — almost always background for a 3x3-cut tile or a single-card photo —
+    and Otsu picks the foreground/background split on the colour-distance map.
+    This adapts to any background (white binder page, coloured mat, ...) and to
+    cards lighter OR darker than their surroundings, and is far more reliable
+    than edge-following when the card fills most of the frame.
+
+    Returns (contour, minAreaRect, area_frac) in FULL-resolution coordinates,
+    or None if nothing card-like is found.
+    """
+    H, W = bgr.shape[:2]
+    sf = scale_max / max(H, W) if max(H, W) > scale_max else 1.0
+    small = (cv2.resize(bgr, (max(1, int(W * sf)), max(1, int(H * sf))),
+                        interpolation=cv2.INTER_AREA) if sf < 1 else bgr)
+    sh, sw = small.shape[:2]
+
+    # Estimate background colour from the four corner patches.
+    k = max(6, int(0.04 * min(sh, sw)))
+    corners = np.concatenate([
+        small[:k, :k].reshape(-1, 3),  small[:k, -k:].reshape(-1, 3),
+        small[-k:, :k].reshape(-1, 3), small[-k:, -k:].reshape(-1, 3)])
+    bg = np.median(corners, axis=0)
+
+    dist = np.linalg.norm(small.astype(np.int16) - bg, axis=2)
+    dist = np.clip(dist, 0, 255).astype(np.uint8)
+    dist = cv2.GaussianBlur(dist, (5, 5), 0)
+    _, mask = cv2.threshold(dist, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    kc = max(9, int(0.03 * min(sh, sw)))
+    kc += (kc % 2 == 0)            # force odd kernel size
+    ker = np.ones((kc, kc), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, ker)   # fill holes in the card
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, ker)    # drop small background specks
+
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    c = max(cnts, key=cv2.contourArea)
+    area_frac = cv2.contourArea(c) / float(sh * sw)
+    if area_frac < min_area_pct:
+        return None
+    if sf < 1:                    # scale the contour back up to full-res coords
+        c = (c.astype("float32") / sf).astype("int32")
+    return c, cv2.minAreaRect(c), area_frac
+
+
+def detect_and_crop_card(bgr, edge_type=CARD_EDGE_DEFAULT, margin_frac=0.008, min_margin=2):
+    """
+    Detect the single card in `bgr`, correct its slight rotation, and crop
+    tightly to it — including a 1-3px sliver of background beyond the card edge
+    so the complete card is always captured (never clipped).
+
+    `edge_type` controls how the card's corners are taken from the detected
+    outline:
+
+      "rounded" — modern rounded-corner cards: the minimum-area rotated
+                  rectangle is used, which *encloses* the curved corners.
+
+      "square"  — vintage sharp-corner cards: a 4-corner polygon is fit to the
+                  outline so the crop follows the true corners (falling back to
+                  the rotated rectangle if a clean quad can't be found).
+
+    Returns (cropped_bgr, True) on success, or (bgr, False) when no card-shaped
+    region is found — conservative, so it can be applied unconditionally without
+    risking a good capture.
+    """
+    try:
+        edge_type = normalize_card_edge_type(edge_type)
+        found = _card_foreground_rect(bgr)
+        if found is None:
+            return bgr, False
+
+        contour, rect, area_frac = found
+        (cx, cy), (rw, rh), ang = rect
+        if rw < 1 or rh < 1:
+            return bgr, False
+        if area_frac > 0.985:                       # card fills frame: nothing to crop
+            return bgr, False
+        if not (1.15 <= (max(rw, rh) / min(rw, rh)) <= 1.85):  # ~2.5x3.5 card shape
+            return bgr, False
+
+        # A few pixels of outward margin so the whole card (including its edge)
+        # is captured. Scales gently with card size but stays small.
+        margin = max(min_margin, int(round(margin_frac * min(rw, rh))))
+
+        quad = None
+        if edge_type == "square":
+            peri = cv2.arcLength(contour, True)
+            for eps in (0.02, 0.03, 0.05, 0.08):
+                approx = cv2.approxPolyDP(contour, eps * peri, True)
+                if len(approx) == 4:
+                    quad = _expand_quad(approx.reshape(4, 2).astype("float32"),
+                                        (cx, cy), margin)
+                    break
+
+        # Rounded cards (and square cards whose quad fit failed) use the
+        # minimum-area rectangle, inflated by the margin.
+        if quad is None:
+            inflated = ((cx, cy), (rw + 2 * margin, rh + 2 * margin), ang)
+            quad = cv2.boxPoints(inflated).astype("float32")
+
+        warped = four_point_transform(bgr, quad)
+        if warped.shape[1] > warped.shape[0]:       # ensure portrait
+            warped = cv2.rotate(warped, cv2.ROTATE_90_CLOCKWISE)
+        warped = sharpen_image(warped)
+        return warped, True
+    except Exception:
+        return bgr, False
+
+
 def straighten_split_image(image, max_angle=15.0):
     """Slightly rotate a single split-page tile so the card sits upright.
 
@@ -1639,320 +1776,112 @@ def import_page():
     return render_template("import.html", templates=get_template_names())
 
 
-# ====================== CSV IMPORT ======================
-# CSV import is now template-driven rather than tied to a fixed TCGplayer
-# column layout: the person picks (or creates) a Game template, then maps
-# whichever CSV columns they want onto that template's fields. Rows become
-# hidden "catalog" ScanRecords (extracted_data['catalog_only'] = True) —
-# reference/lookup entries pullable into a real inventory entry later via
-# "Copy from Entry" — using exactly the field keys of the chosen Game, so a
-# copy lines up cleanly with entries created through the photo import flow.
-#
-# A handful of field KEYS get optional bonus handling if the person happens
-# to map them (this is best-effort convenience, not a requirement):
-#   product_id   + set + name  -> extrapolated TCGplayer product URL
-#   market_price               -> stored alongside the TCGplayer URL data
-#   printing                   -> best-effort mapped into an 'edition' value
-#                                  (Standard/First/Limited) if no explicit
-#                                  'edition' field was mapped
-#   quantity                   -> parsed into 'csv_quantity' (informational)
-#   photo_url / photo          -> used as the record's image instead of blank
-
-
-def _csv_map_printing_to_edition(printing_value: str) -> str:
+# ====================== SINGLE CARD IMPORT ======================
+@app.route("/import_single_card", methods=["POST"])
+def import_single_card():
     """
-    The app's 'edition' field is a strict 3-option dropdown
-    (Standard Edition / First Edition / Limited Edition), but TCGplayer's
-    'Printing' column commonly contains values like 'Normal', 'Unlimited',
-    'Holofoil', 'Reverse Holofoil', '1st Edition', etc.
+    Add ONE card to inventory from a front image (required) and an optional
+    back image.
 
-    Best-effort mapping into the dropdown's vocabulary, used only when the
-    person mapped a 'printing' column but no explicit 'edition' field.
-    """
-    v = (printing_value or "").strip().lower()
-    if not v:
-        return EDITION_DEFAULT
-    if "unlimited" in v:
-        return EDITION_DEFAULT
-    if "1st" in v or "first" in v:
-        return "First Edition"
-    if "limited" in v:
-        return "Limited Edition"
-    return EDITION_DEFAULT
-
-
-def _csv_parse_int(value, default=1, minimum=1):
-    try:
-        n = int(float(str(value).strip()))
-    except (ValueError, TypeError):
-        return default
-    return n if n >= minimum else default
-
-
-def _csv_parse_float(value):
-    try:
-        s = str(value).strip()
-        if not s:
-            return None
-        return float(s)
-    except (ValueError, TypeError):
-        return None
-
-
-def _slugify_tcg_component(text):
-    """Lowercase, alnum-only, hyphen-joined slug component for a TCGplayer URL."""
-    text = (text or "").strip().lower()
-    text = _re.sub(r"[^a-z0-9]+", "-", text)
-    text = _re.sub(r"-{2,}", "-", text)
-    return text.strip("-")
-
-
-def build_tcgplayer_url(product_id, game, set_name, product_name):
-    """
-    Extrapolate a TCGplayer.com product PAGE url (not the image CDN url) from
-    CSV columns, e.g.:
-      Product ID=42545, Game=Pokemon, Set=Base Set 2, Name=Starmie
-      -> https://www.tcgplayer.com/product/42545/pokemon-base-set-2-starmie?Language=English
-
-    TCGplayer routes on the numeric product ID — the slug text is cosmetic/SEO
-    only — so this is safe even where our best-effort slug doesn't exactly
-    match TCGplayer's own generated slug.
-    """
-    product_id = str(product_id or "").strip()
-    if not product_id:
-        return ""
-    slug_parts = [
-        _slugify_tcg_component(game),
-        _slugify_tcg_component(set_name),
-        _slugify_tcg_component(product_name),
-    ]
-    slug = "-".join(p for p in slug_parts if p) or "card"
-    return f"https://www.tcgplayer.com/product/{product_id}/{slug}?Language=English"
-
-
-@app.route("/csv_headers", methods=["POST"])
-def csv_headers():
-    """
-    Read just the header row of an uploaded CSV so the front-end can render
-    a column-mapping UI without guessing. Does not import anything.
-    """
-    import csv
-    import io
-
-    upload = request.files.get("csv_file")
-    if not upload or not upload.filename:
-        return jsonify({"status": "error", "message": "No CSV file was uploaded."}), 400
-
-    try:
-        raw_bytes = upload.stream.read()
-        text = raw_bytes.decode("utf-8-sig")
-        reader = csv.reader(io.StringIO(text))
-        headers = next(reader, [])
-        headers = [h.strip() for h in headers if h.strip()]
-    except Exception as exc:
-        return jsonify({"status": "error", "message": f"Could not read CSV headers: {exc}"}), 400
-
-    if not headers:
-        return jsonify({"status": "error", "message": "CSV file has no header row."}), 400
-
-    return jsonify({"status": "success", "headers": headers})
-
-
-@app.route("/import_csv", methods=["POST"])
-def import_csv():
-    """
-    Bulk-import a card catalog from any CSV, mapped onto a Game template's
-    fields.
+    Each image is best-effort auto-aligned (deskewed + cropped) the same way
+    the search-by-image flow is, falling back to the raw photo when a card
+    outline can't be found — so a good capture is never made worse. A single
+    blank inventory record is created for the chosen Game with the image(s)
+    attached; its fields are filled in by hand afterwards, or via the OCR
+    "Identify" tool on the card's detail page.
 
     Form fields:
-      csv_file            — the CSV file
-      template_mode        — "existing" | "new"
-      template_name         — existing Game name (when template_mode == "existing")
-      new_template_name     — new Game name (when template_mode == "new")
-      new_template_fields    — JSON {field_name: {field_type, dropdown_options}}
-                                (when template_mode == "new")
-      mapping               — JSON {field_key: csv_column_name} — csv_column_name
-                                may be "" to leave a field unmapped/blank
-
-    Each valid row becomes exactly ONE hidden "catalog" ScanRecord
-    (extracted_data['catalog_only'] = True) — a reference/lookup entry, not
-    an owned inventory item. Catalog records are filtered out of the
-    Inventory list, Album view, CSV export, and duplicate-resolution tools,
-    but remain fully searchable via the "Copy from Entry" box on the
-    Inventory Detail page.
+      game         — Game/template name (required)
+      album        — optional album name to file the card under
+      front_image  — the card front (required)
+      back_image   — the card back  (optional)
     """
-    import csv
-    import io
+    ensure_dirs()
 
-    upload = request.files.get("csv_file")
-    if not upload or not upload.filename:
-        return jsonify({"status": "error", "message": "No CSV file was uploaded."}), 400
+    game  = (request.form.get("game")  or "").strip()
+    album = (request.form.get("album") or "").strip()
+    edge_type = normalize_card_edge_type(request.form.get("card_edge_type"))
+    if not game:
+        return jsonify({"status": "error", "message": "Game is required"}), 400
 
-    if not upload.filename.lower().endswith(".csv"):
-        return jsonify({"status": "error", "message": "Please upload a .csv file."}), 400
-
-    template_mode = (request.form.get("template_mode") or "existing").strip().lower()
-
-    # ── Resolve (or create) the Game template this import will use ──────────
-    if template_mode == "new":
-        new_name = (request.form.get("new_template_name") or "").strip()
-        if not new_name:
-            return jsonify({"status": "error", "message": "New game name is required."}), 400
-
-        clean_name = _slugify_template_name(new_name)
-        if not clean_name:
-            return jsonify({"status": "error", "message": "Game name contains no valid characters."}), 400
-
-        try:
-            raw_fields = json.loads(request.form.get("new_template_fields") or "{}")
-        except (ValueError, TypeError):
-            return jsonify({"status": "error", "message": "Invalid field definition."}), 400
-
-        cleaned_fields = _clean_template_fields(raw_fields)
-        if not cleaned_fields:
-            return jsonify({"status": "error", "message": "Add at least one field to the new game."}), 400
-
-        try:
-            _write_template_file(clean_name, cleaned_fields)
-        except OSError as exc:
-            return jsonify({"status": "error", "message": f"Could not save new game: {exc}"}), 500
-
-        template_fields = cleaned_fields
-    else:
-        template_name = (request.form.get("template_name") or "").strip()
-        clean_name = _slugify_template_name(template_name)
-        if not clean_name:
-            return jsonify({"status": "error", "message": "Select a game to import into."}), 400
-        try:
-            tpl = load_template(clean_name)
-        except Exception:
-            return jsonify({"status": "error", "message": f"Game '{clean_name}' not found."}), 404
-        template_fields = tpl.get("fields", {}) or {}
-
-    # ── Resolve the column mapping ───────────────────────────────────────────
-    try:
-        mapping = json.loads(request.form.get("mapping") or "{}")
-    except (ValueError, TypeError):
-        return jsonify({"status": "error", "message": "Invalid column mapping."}), 400
-
-    if not isinstance(mapping, dict):
-        mapping = {}
-    # Normalize keys the same way field names are slugified when a template
-    # is saved (_clean_template_fields) — the mapping the front-end sends may
-    # use a field's raw display name (e.g. "Set Number") rather than its
-    # slugified key ("set_number"), especially right after creating a new
-    # game inline, so this keeps the two in sync.
-    mapping = {
-        _slugify_template_name(field_key): str(col or "").strip()
-        for field_key, col in mapping.items()
-    }
-    mapping = {
-        field_key: col
-        for field_key, col in mapping.items()
-        if field_key in template_fields
-    }
-    mapped_pairs = {k: v for k, v in mapping.items() if v}
-    if not mapped_pairs:
-        return jsonify({"status": "error", "message": "Map at least one field to a CSV column."}), 400
+    front = request.files.get("front_image")
+    if not front or not front.filename:
+        return jsonify({"status": "error", "message": "A front image is required"}), 400
+    back = request.files.get("back_image")
 
     try:
-        raw_bytes = upload.stream.read()
-        text = raw_bytes.decode("utf-8-sig")
-        text_stream = io.StringIO(text)
-        reader = csv.DictReader(text_stream)
-
-        if not reader.fieldnames:
-            return jsonify({"status": "error", "message": "CSV file has no header row."}), 400
-
-        missing_cols = sorted({col for col in mapped_pairs.values() if col not in reader.fieldnames})
-        if missing_cols:
-            return jsonify({
-                "status": "error",
-                "message": "CSV is missing mapped column(s): " + ", ".join(missing_cols),
-            }), 400
-
-        # Remember this mapping on the template itself so importing another
-        # CSV shaped like this one into the same game auto-fills the mapping.
-        try:
-            _write_template_file(clean_name, template_fields, csv_column_mapping=mapped_pairs)
-        except OSError:
-            pass  # non-fatal — the import can still proceed without saving it
-
-        rows_seen = 0
-        rows_skipped = 0
-        records_created = 0
-        new_records = []
-
-        for row in reader:
-            rows_seen += 1
-
-            extracted_data = {}
-            for field_key, column_name in mapped_pairs.items():
-                extracted_data[field_key] = (row.get(column_name) or "").strip()
-
-            if not any(extracted_data.values()):
-                rows_skipped += 1
-                continue
-
-            extracted_data["game"] = clean_name
-            extracted_data["catalog_only"] = True
-
-            # ── Optional bonus handling for recognizable field keys ──────────
-            if "printing" in extracted_data and not extracted_data.get("edition"):
-                extracted_data["edition"] = _csv_map_printing_to_edition(extracted_data["printing"])
-
-            if "quantity" in extracted_data:
-                extracted_data["csv_quantity"] = _csv_parse_int(extracted_data.get("quantity"), default=1)
-
-            image_path = "__blank__"
-            for photo_key in ("photo_url", "photo"):
-                if extracted_data.get(photo_key):
-                    image_path = extracted_data[photo_key]
-                    break
-
-            product_id = extracted_data.get("product_id", "")
-            if product_id:
-                tcg_url = build_tcgplayer_url(
-                    product_id, clean_name,
-                    extracted_data.get("set", ""), extracted_data.get("name", ""),
-                )
-                if tcg_url:
-                    extracted_data["tcgplayer"] = {
-                        "url":          tcg_url,
-                        "full_url":     tcg_url,
-                        "saved_at":     datetime.utcnow().isoformat(),
-                        "source":       "csv_import",
-                        "product_id":   product_id,
-                        "product_name": extracted_data.get("name", ""),
-                        "set_name":     extracted_data.get("set", ""),
-                        "set_number":   extracted_data.get("set_number", ""),
-                        "prices": {
-                            "market": _csv_parse_float(extracted_data.get("market_price")),
-                        },
-                    }
-
-            new_records.append(ScanRecord(
-                image_path=image_path,
-                template_used=clean_name,
-                extracted_data=extracted_data,
-            ))
-            records_created += 1
-
-        if new_records:
-            db.session.bulk_save_objects(new_records)
-            db.session.commit()
-
-        return jsonify({
-            "status":           "success",
-            "rows_seen":        rows_seen,
-            "rows_skipped":     rows_skipped,
-            "records_created":  records_created,
-            "games":            [clean_name],
-        })
-
+        template = load_template(game)
     except Exception as exc:
-        db.session.rollback()
-        return jsonify({"status": "error", "message": f"Import failed: {exc}"}), 500
+        return jsonify({"status": "error", "message": f"Could not load game '{game}': {exc}"}), 400
+
+    aligned_flags = {}
+
+    def _save_side(file_storage, suffix):
+        """Detect + crop the card (best-effort, based on the selected edge type)
+        and save the image into the inventory folder. Records whether the crop
+        succeeded in `aligned_flags`. Returns the upload-relative path, or None
+        if the upload was missing/unreadable."""
+        if not file_storage or not file_storage.filename:
+            return None
+        np_buf = np.frombuffer(file_storage.read(), np.uint8)
+        img = cv2.imdecode(np_buf, cv2.IMREAD_COLOR)
+        if img is None:
+            return None
+        img, cropped = detect_and_crop_card(img, edge_type)   # falls back to raw
+        aligned_flags[suffix] = cropped
+        final_name = f"single_{suffix}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
+        relative_path = normalize_to_upload_relative(
+            os.path.join("inventory_cards", final_name)
+        )
+        absolute_path = os.path.join(app.config["UPLOAD_FOLDER"], relative_path)
+        cv2.imwrite(absolute_path, img)
+        return relative_path
+
+    try:
+        front_path = _save_side(front, "front")
+        if not front_path:
+            return jsonify({"status": "error", "message": "Could not read the front image"}), 400
+        back_path = _save_side(back, "back")   # may be None
+    except Exception as exc:
+        return jsonify({"status": "error", "message": f"Could not process image: {exc}"}), 500
+
+    # Blank starting values for every field this Game defines, plus the
+    # identity fields the rest of the app reads. `game` is stored with
+    # underscores turned into spaces to match how the 9-pocket import files it,
+    # so single and batch cards of the same game group together in Inventory.
+    blank_fields = {k: "" for k in (template.get("fields", {}) or {}).keys()}
+    extracted = {**blank_fields, "game": game.replace("_", " ")}
+    if album:
+        extracted["album"] = album
+
+    matched_product, record = create_scan_record(
+        image_path=front_path,
+        template_name=game,
+        extracted=extracted,
+        image_path_back=back_path,
+    )
+
+    # Let the UI mention when a card outline couldn't be found and the raw
+    # photo was kept instead (so the user can retry or crop manually later).
+    not_detected = [side for side, ok in aligned_flags.items() if not ok]
+    if not_detected:
+        message = ("Card added to inventory. Couldn't detect a "
+                   f"{edge_type}-edged card in the {', '.join(not_detected)} "
+                   "image, so the original photo was kept for that side.")
+    else:
+        message = "Card added to inventory — detected and cropped to the card."
+
+    return jsonify({
+        "status":         "success",
+        "message":        message,
+        "record_id":      record.id,
+        "edge_type":      edge_type,
+        "front_aligned":  aligned_flags.get("front", False),
+        "back_aligned":   aligned_flags.get("back", False) if back_path else None,
+        "image_url":      build_uploaded_file_url(record.image_path),
+        "image_url_back": build_uploaded_file_url(record.image_path_back) if record.image_path_back else None,
+        "detail_url":     url_for("inventory_detail", record_id=record.id),
+    })
 
 
 
@@ -2261,11 +2190,11 @@ def _clean_template_fields(fields):
 def _write_template_file(clean_name, cleaned_fields, csv_column_mapping=None):
     """
     Write a template's JSON file. Field definitions are always replaced with
-    `cleaned_fields`. The saved CSV column mapping (see /import_csv) is
-    preserved across ordinary field edits — pass `csv_column_mapping` to
-    explicitly set/merge it (e.g. right after a CSV import), or leave it
-    None to just carry forward whatever was already saved. Mapping entries
-    for fields that no longer exist are dropped automatically.
+    `cleaned_fields`. Any legacy `csv_column_mapping` already saved on the
+    template is preserved across ordinary field edits — pass
+    `csv_column_mapping` to explicitly set/merge it, or leave it None to just
+    carry forward whatever was already saved. Mapping entries for fields that
+    no longer exist are dropped automatically.
     """
     ensure_dirs()
     template_path = os.path.join(app.config["ROI_TEMPLATE_FOLDER"], f"{clean_name}.json")
@@ -2359,23 +2288,6 @@ def template_delete():
 
 
 # ====================== TEMPLATE CONFIG (live field types) ======================
-@app.route("/template_csv_mapping/<template_name>")
-def template_csv_mapping(template_name):
-    """
-    Return the saved CSV column mapping for a template, if any — i.e. the
-    field->column pairing used the last time a CSV was successfully imported
-    into this game. The CSV import UI uses this to auto-fill the mapping
-    when the same game is selected again.
-    Shape: { "mapping": { fieldKey: "CSV Column Name", ... } }
-    """
-    try:
-        tpl = load_template(template_name)
-        mapping = tpl.get("csv_column_mapping", {}) or {}
-        return jsonify({"mapping": mapping})
-    except Exception:
-        return jsonify({"mapping": {}}), 200
-
-
 @app.route("/template_config/<template_name>")
 def template_config(template_name):
     """
@@ -3121,6 +3033,10 @@ def ocr_identify(record_id):
             "synced":       bool(category_id),
             "match_count":  len(ref_matches),
         },
+        # Whether this record already has an identity (name or set number). The
+        # UI uses this to decide between auto-applying a confident match on a
+        # fresh record vs. opening the picker for manual correction.
+        "already_populated": bool(_get_name(ext) or _get_serial(ext)),
         "candidates": combined,
     })
 
@@ -3568,6 +3484,7 @@ def run_import_split():
     album = request.form.get("album", "").strip()
     page  = request.form.get("page",  "").strip()
     side  = request.form.get("side",  "front").strip().lower()
+    edge_type = normalize_card_edge_type(request.form.get("card_edge_type"))
 
     if side not in ("front", "back"):
         side = "front"
@@ -3627,7 +3544,12 @@ def run_import_split():
                 if split_cv is None:
                     raise ValueError("Could not read split image")
 
-                processed = straighten_split_image(split_cv)
+                # Detect the card in this tile and crop tightly to it, using the
+                # corner strategy for the selected edge type. If no card outline
+                # is found, fall back to a slight deskew so the tile is still
+                # usable (and can be Manual-Adjusted afterwards).
+                cropped, ok = detect_and_crop_card(split_cv, edge_type)
+                processed = cropped if ok else straighten_split_image(split_cv)
 
                 card_path = os.path.join(app.config["TEMP_CARD_FOLDER"], slot_filename)
                 cv2.imwrite(card_path, processed)
