@@ -893,7 +893,9 @@
                         <p class="text-muted small mb-3">
                             Reads the top and bottom of this card's front image (name and
                             <span class="tcg-product-id">N/M</span> collector number), then finds
-                            matching entries you can apply.
+                            matching entries. On a blank card a 100% match is applied automatically;
+                            if the card is already filled in, the matches open in a list for manual
+                            correction.
                         </p>
                         <div class="form-check mb-3">
                             <input class="form-check-input" type="checkbox" id="ocrCatalogOnly" checked>
@@ -2228,10 +2230,16 @@
             confirmBtn.disabled = false;
         });
 
-        confirmBtn.addEventListener('click', async function () {
-            if (!selected) return;
-            getPickerModal().hide();
-            pickerModal = null;
+        // Build the /ocr_apply payload for a chosen candidate (reference vs record).
+        function candidatePayload(c) {
+            if (!c) return null;
+            if (c.source === 'reference' && c.product_id != null) return { reference_product_id: c.product_id };
+            if (c.record_id != null) return { source_record_id: c.record_id };
+            return null;
+        }
+
+        async function applySelection(payload, note) {
+            if (!payload) return;
             identifyBtn.disabled = true;
             identifyBtn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Applying…';
             status.innerHTML = '';
@@ -2239,12 +2247,12 @@
                 const res  = await fetch(`/ocr_apply/${recordId}`, {
                     method:  'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body:    JSON.stringify(selected),
+                    body:    JSON.stringify(payload),
                 });
                 const data = await res.json();
                 if (data.status === 'success') {
                     status.innerHTML = `<div class="alert alert-success mb-0">
-                        <i class="fas fa-check-circle me-1"></i>${esc(data.message)} Reloading…</div>`;
+                        <i class="fas fa-check-circle me-1"></i>${note || esc(data.message)} Reloading…</div>`;
                     setTimeout(() => window.location.reload(), 800);
                 } else {
                     status.innerHTML = `<div class="alert alert-danger mb-0">
@@ -2255,6 +2263,13 @@
                 status.innerHTML = `<div class="alert alert-danger mb-0">Network error: ${esc(err.message)}</div>`;
                 resetBtn();
             }
+        }
+
+        confirmBtn.addEventListener('click', function () {
+            if (!selected) return;
+            getPickerModal().hide();
+            pickerModal = null;
+            applySelection(selected);
         });
 
         identifyBtn.addEventListener('click', async function () {
@@ -2279,6 +2294,21 @@
                 const ocr        = data.ocr || {};
                 const ref        = data.reference || {};
                 const candidates = data.candidates || [];
+
+                // Auto-apply a 100% match when the record has no identity yet.
+                // If the fields are already populated, always open the picker so
+                // the read is used for manual correction instead.
+                const top = candidates[0] || null;
+                if (!data.already_populated && top && (top.score || 0) >= 0.999) {
+                    const payload = candidatePayload(top);
+                    if (payload) {
+                        const num = top.serial ? ' ' + esc(top.serial) : '';
+                        await applySelection(payload,
+                            `<i class="fas fa-bolt me-1"></i>Auto-applied 100% match: <strong>${esc(top.name || 'card')}</strong>${num}.`);
+                        return;
+                    }
+                }
+
                 const readBits   = [];
                 if (ocr.name_guess)   readBits.push(`name “${esc(ocr.name_guess)}”`);
                 if (ocr.number_guess) readBits.push(`number ${esc(ocr.number_guess)}`);

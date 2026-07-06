@@ -727,6 +727,87 @@
         padding: 14px;
       }
     }
+    /* ── Import mode selector ── */
+    .import-mode-toggle {
+      display: flex;
+      gap: 10px;
+      max-width: 760px;
+      margin: 0 auto 24px;
+    }
+    .import-mode-btn {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 14px 16px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--panel);
+      color: var(--muted);
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+      box-shadow: var(--shadow);
+      transition: 0.18s ease;
+    }
+    .import-mode-btn:hover { color: var(--text); border-color: #b9c6d6; }
+    .import-mode-btn.active {
+      background: var(--primary);
+      border-color: var(--primary);
+      color: #fff;
+    }
+    .import-mode-btn i { font-size: 1.05rem; }
+
+    /* ── Single-card previews ── */
+    .single-preview-wrap {
+      margin-top: 6px;
+      border: 1px dashed var(--border);
+      border-radius: 10px;
+      background: var(--panel-2);
+      min-height: 150px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      padding: 8px;
+    }
+    .single-preview {
+      max-width: 100%;
+      max-height: 240px;
+      object-fit: contain;
+      border-radius: 8px;
+    }
+    .single-preview-empty {
+      color: var(--muted);
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      font-size: 13px;
+    }
+    .single-result {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--panel-2);
+      padding: 14px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .single-result img {
+      width: 64px;
+      height: 88px;
+      object-fit: cover;
+      border-radius: 8px;
+      background: #fff;
+      border: 1px solid var(--border);
+    }
+    .single-result .single-result-body { flex: 1; }
+    .single-result .single-result-title { font-weight: 700; margin-bottom: 4px; }
+
+    @media (max-width: 640px) {
+      .import-mode-toggle { flex-direction: column; }
+    }
   </style>
 </head>
 <body>
@@ -747,72 +828,79 @@
   </nav>
 
   <main class="page">
-    <section class="panel" style="margin-bottom: 24px;">
-      <div class="panel-header">Import CSV Catalog</div>
+    <!-- Import mode selector: 9-pocket page vs single card -->
+    <div class="import-mode-toggle" id="importModeToggle">
+      <button type="button" class="import-mode-btn active" data-mode="page3x3" id="modeBtnPage">
+        <i class="fas fa-table-cells-large"></i> 9-Pocket Page (3×3)
+      </button>
+      <button type="button" class="import-mode-btn" data-mode="single" id="modeBtnSingle">
+        <i class="fas fa-id-card"></i> Single Card (front &amp; back)
+      </button>
+    </div>
+
+    <!-- ===================== SINGLE CARD IMPORT ===================== -->
+    <section class="panel hidden" id="modeSingle" style="max-width: 760px; margin: 0 auto 24px;">
+      <div class="panel-header">Import a Single Card</div>
       <div class="panel-body">
-        <form id="csvImportForm" class="stack">
-          <div class="field">
-            <label for="csvFile">CSV file</label>
-            <input type="file" id="csvFile" name="csv_file" accept=".csv,text/csv" required>
-            <div class="hint">
-              These rows are added as a <strong>hidden card catalog</strong> for one Game — they
-              will <strong>not</strong> appear in Inventory, Albums, or CSV export. Instead, open
-              any inventory entry and use its <strong>Copy from Entry</strong> box to search this
-              catalog and pull in its fields with one click. If your CSV covers more than one
-              game, filter it down first or run the import once per game.
+        <form id="singleCardForm" class="stack">
+          <div class="hint">
+            Add one card to inventory from a photo of its front (and, optionally, its back).
+            Both images are auto-straightened and cropped when a card outline can be found,
+            falling back to the original photo otherwise. This creates one blank inventory
+            entry for the selected Game — fill in its fields (or use <strong>Identify</strong>
+            on the card's detail page) afterwards.
+          </div>
+
+          <div class="grid-2">
+            <div class="field">
+              <label for="singleGame">Game</label>
+              <select id="singleGame" name="game" required>
+                <option value="" disabled {% if not templates %}selected{% endif %} selected>Select a game…</option>
+                {% for t in templates %}
+                <option value="{{ t }}">{{ t.replace('_', ' ')|title }}</option>
+                {% endfor %}
+              </select>
+              {% if not templates %}
+              <div class="hint">No games defined yet — <a href="{{ url_for('index') }}">create one</a> first.</div>
+              {% endif %}
+            </div>
+            <div class="field">
+              <label for="singleAlbum">Album <span style="font-weight:400;color:var(--muted);">(optional)</span></label>
+              <input type="text" id="singleAlbum" name="album" placeholder="binder1">
             </div>
           </div>
 
-          <div class="field">
-            <label>Template</label>
-            <div class="mode-toggle">
-              <label id="modeExistingLabel" class="active">
-                <input type="radio" name="template_mode" value="existing" checked>Use existing game
-              </label>
-              <label id="modeNewLabel">
-                <input type="radio" name="template_mode" value="new">Create new game
-              </label>
+          <div class="grid-2">
+            <div class="field">
+              <label for="singleFront">Front image</label>
+              <input type="file" id="singleFront" name="front_image" accept="image/*" required>
+              <div class="single-preview-wrap">
+                <img id="singleFrontPreview" class="single-preview" alt="Front preview" style="display:none;">
+                <span id="singleFrontPlaceholder" class="single-preview-empty">Front</span>
+              </div>
             </div>
-          </div>
-
-          <!-- ── Existing game picker ── -->
-          <div class="field" id="existingGameField">
-            <label for="csvTemplateSelect">Game</label>
-            <select id="csvTemplateSelect">
-              <option value="" disabled {% if not templates %}selected{% endif %}>Select a game…</option>
-              {% for t in templates %}
-              <option value="{{ t }}">{{ t.replace('_', ' ')|title }}</option>
-              {% endfor %}
-            </select>
-            {% if not templates %}
-            <div class="hint">No games defined yet — create one below, or on the <a href="{{ url_for('index') }}">Templates</a> page.</div>
-            {% endif %}
-          </div>
-
-          <!-- ── New game builder (hidden unless "Create new game" is picked) ── -->
-          <div class="field hidden" id="newGameField">
-            <label for="newGameName">New game name</label>
-            <input type="text" id="newGameName" placeholder="e.g. Pokemon">
-            <div id="newFieldsContainer" class="mt-1"></div>
-            <button type="button" class="btn-secondary" id="addNewFieldBtn" style="justify-self: start;">+ Add Field</button>
-          </div>
-
-          <!-- ── Column mapping ── -->
-          <div class="field hidden" id="mappingField">
-            <label>Map CSV columns to fields</label>
-            <div class="hint" id="mappingHint">Choose a game and a CSV file to map columns.</div>
-            <div id="mappingContainer"></div>
+            <div class="field">
+              <label for="singleBack">Back image <span style="font-weight:400;color:var(--muted);">(optional)</span></label>
+              <input type="file" id="singleBack" name="back_image" accept="image/*">
+              <div class="single-preview-wrap">
+                <img id="singleBackPreview" class="single-preview" alt="Back preview" style="display:none;">
+                <span id="singleBackPlaceholder" class="single-preview-empty">Back</span>
+              </div>
+            </div>
           </div>
 
           <div class="actions">
-            <button type="submit" class="btn-primary" id="csvImportBtn">Import CSV</button>
+            <button type="submit" class="btn-primary" id="singleCardBtn">Add card to inventory</button>
             <a href="{{ url_for('inventory') }}" class="btn-secondary" style="text-decoration:none; display:inline-flex; align-items:center;">View Inventory</a>
           </div>
-          <div id="csvStatusBox" class="status info"></div>
+          <div id="singleStatusBox" class="status info"></div>
+          <div id="singleResult" class="single-result" style="display:none;"></div>
         </form>
       </div>
     </section>
 
+    <!-- ===================== 9-POCKET PAGE IMPORT ===================== -->
+    <div id="modePage3x3">
     <div class="layout">
       <section class="panel">
         <div class="panel-header">Import Settings</div>
@@ -937,6 +1025,7 @@
         </div>
       </section>
     </div>
+    </div><!-- /#modePage3x3 -->
   </main>
 
   <!-- Import Progress Overlay -->
@@ -979,350 +1068,125 @@
   </div>
 
   <script>
-    // ====================== CSV IMPORT ======================
-    const csvImportForm     = document.getElementById('csvImportForm');
-    const csvFileInput      = document.getElementById('csvFile');
-    const csvStatusBox      = document.getElementById('csvStatusBox');
-    const csvImportBtn      = document.getElementById('csvImportBtn');
+    // ====================== IMPORT MODE TOGGLE ======================
+    // Two ways to import: a full 9-pocket page (3x3 split) or a single card
+    // (front + optional back). The toggle just shows/hides the two panels.
+    const modeBtnPage   = document.getElementById('modeBtnPage');
+    const modeBtnSingle = document.getElementById('modeBtnSingle');
+    const modePage3x3   = document.getElementById('modePage3x3');
+    const modeSingle    = document.getElementById('modeSingle');
 
-    const modeExistingLabel = document.getElementById('modeExistingLabel');
-    const modeNewLabel      = document.getElementById('modeNewLabel');
-    const existingGameField = document.getElementById('existingGameField');
-    const newGameField      = document.getElementById('newGameField');
-    const csvTemplateSelect = document.getElementById('csvTemplateSelect');
-    const newGameName       = document.getElementById('newGameName');
-    const newFieldsContainer = document.getElementById('newFieldsContainer');
-    const addNewFieldBtn    = document.getElementById('addNewFieldBtn');
-    const mappingField      = document.getElementById('mappingField');
-    const mappingHint       = document.getElementById('mappingHint');
-    const mappingContainer  = document.getElementById('mappingContainer');
+    function setImportMode(mode) {
+      const single = mode === 'single';
+      modeSingle.classList.toggle('hidden', !single);
+      modePage3x3.classList.toggle('hidden', single);
+      modeBtnSingle.classList.toggle('active', single);
+      modeBtnPage.classList.toggle('active', !single);
+    }
+    modeBtnPage.addEventListener('click', () => setImportMode('page3x3'));
+    modeBtnSingle.addEventListener('click', () => setImportMode('single'));
 
-    let csvHeaders = [];              // headers from the uploaded CSV
-    let existingTemplateFields = {};  // cache: { gameName: [ {key, field_type, dropdown_options}, ... ] }
-    let existingTemplateMapping = {}; // cache: { gameName: { fieldKey: "Saved Column Name" } }
+    // ====================== SINGLE CARD IMPORT ======================
+    const singleCardForm     = document.getElementById('singleCardForm');
+    const singleGame         = document.getElementById('singleGame');
+    const singleFront        = document.getElementById('singleFront');
+    const singleBack         = document.getElementById('singleBack');
+    const singleCardBtn      = document.getElementById('singleCardBtn');
+    const singleStatusBox    = document.getElementById('singleStatusBox');
+    const singleResult       = document.getElementById('singleResult');
+    const singleFrontPreview = document.getElementById('singleFrontPreview');
+    const singleBackPreview  = document.getElementById('singleBackPreview');
+    const singleFrontPlaceholder = document.getElementById('singleFrontPlaceholder');
+    const singleBackPlaceholder  = document.getElementById('singleBackPlaceholder');
 
-    function setCsvStatus(message, type = 'info') {
-      csvStatusBox.textContent = message;
-      csvStatusBox.className = `status show ${type}`;
+    function setSingleStatus(message, type = 'info') {
+      singleStatusBox.textContent = message;
+      singleStatusBox.className = `status show ${type}`;
     }
 
-    // ── Mode toggle (existing game vs. create new game) ─────────────────
-    function currentTemplateMode() {
-      const checked = csvImportForm.querySelector('input[name="template_mode"]:checked');
-      return checked ? checked.value : 'existing';
-    }
-
-    function updateModeUI() {
-      const mode = currentTemplateMode();
-      modeExistingLabel.classList.toggle('active', mode === 'existing');
-      modeNewLabel.classList.toggle('active', mode === 'new');
-      existingGameField.classList.toggle('hidden', mode !== 'existing');
-      newGameField.classList.toggle('hidden', mode !== 'new');
-      updateMappingUI();
-    }
-
-    csvImportForm.querySelectorAll('input[name="template_mode"]').forEach(input => {
-      input.addEventListener('change', updateModeUI);
-    });
-
-    // ── New-game inline field builder (mirrors the Templates page) ──────
-    function addNewFieldRow(name = '', fieldType = 'text', dropdownOptions = [], hidden = false) {
-      const row = document.createElement('div');
-      row.className = 'new-field-row' + (fieldType === 'dropdown' ? ' type-dropdown' : '');
-      row.innerHTML = `
-        <input type="text" class="new-field-name" placeholder="Field name (e.g. set_number)" value="${name.replace(/"/g, '&quot;')}">
-        <select class="new-field-type">
-          <option value="text"     ${fieldType === 'text' ? 'selected' : ''}>Text</option>
-          <option value="dropdown" ${fieldType === 'dropdown' ? 'selected' : ''}>Dropdown</option>
-          <option value="boolean"  ${fieldType === 'boolean' ? 'selected' : ''}>Yes / No</option>
-        </select>
-        <input type="text" class="field-opts" placeholder="Options, comma separated" value="${dropdownOptions.join(', ').replace(/"/g, '&quot;')}">
-        <label class="field-hidden-toggle" title="Stored on every record, but left off the Inventory Detail page">
-          <input type="checkbox" class="new-field-hidden" ${hidden ? 'checked' : ''}>
-          Hidden
-        </label>
-        <button type="button" class="btn-danger remove-new-field-btn" title="Remove field">✕</button>
-      `;
-      row.querySelector('.new-field-type').addEventListener('change', function () {
-        row.classList.toggle('type-dropdown', this.value === 'dropdown');
-        updateMappingUI();
-      });
-      row.querySelector('.remove-new-field-btn').addEventListener('click', function () {
-        row.remove();
-        updateMappingUI();
-      });
-      row.querySelector('.new-field-name').addEventListener('input', updateMappingUI);
-      row.querySelector('.new-field-hidden').addEventListener('change', updateMappingUI);
-      newFieldsContainer.appendChild(row);
-    }
-
-    addNewFieldBtn.addEventListener('click', () => { addNewFieldRow(); updateMappingUI(); });
-    newGameName.addEventListener('input', updateMappingUI);
-    addNewFieldRow(); // start with one blank row
-
-    function slugifyFieldName(name) {
-      return name.trim().toLowerCase().replace(/ /g, '_').replace(/[^a-z0-9_]/g, '');
-    }
-
-    function collectNewFields() {
-      const fields = [];
-      const rawFields = {};
-      newFieldsContainer.querySelectorAll('.new-field-row').forEach(row => {
-        const rawName = row.querySelector('.new-field-name').value.trim();
-        const key = slugifyFieldName(rawName);
-        if (!key) return;
-        const fieldType = row.querySelector('.new-field-type').value;
-        const isHidden = row.querySelector('.new-field-hidden').checked;
-        const entry = { field_type: fieldType, hidden: isHidden };
-        if (fieldType === 'dropdown') {
-          entry.dropdown_options = row.querySelector('.field-opts').value
-            .split(',').map(o => o.trim()).filter(Boolean);
+    function wireSinglePreview(input, img, placeholder) {
+      input.addEventListener('change', function () {
+        const file = input.files && input.files[0];
+        if (!file) {
+          img.style.display = 'none';
+          img.removeAttribute('src');
+          placeholder.style.display = '';
+          return;
         }
-        fields.push({ key, field_type: fieldType, dropdown_options: entry.dropdown_options || [], hidden: isHidden });
-        rawFields[key] = entry;
-      });
-      return { fields, rawFields };
-    }
-
-    // ── Existing-game fields, fetched from the server on selection ──────
-    // Also called once on page load below: browsers auto-select the first
-    // non-disabled <option> in a <select> when nothing has the `selected`
-    // attribute, so a game can already be "selected" on load without the
-    // person ever touching the dropdown — and thus without a `change`
-    // event ever firing. Without this, that pre-selected game's fields
-    // never get fetched and the mapping list silently stays empty.
-    async function loadExistingGameFields(name) {
-      if (!name) { updateMappingUI(); return; }
-      if (!existingTemplateFields[name]) {
-        mappingHint.textContent = 'Loading fields…';
-        mappingField.classList.remove('hidden');
-        try {
-          const res = await fetch(`/template_config/${encodeURIComponent(name)}`);
-          const data = await res.json();
-          existingTemplateFields[name] = Object.entries(data).map(([key, cfg]) => ({
-            key,
-            field_type: cfg.field_type || 'text',
-            dropdown_options: cfg.dropdown_options || [],
-            hidden: !!cfg.hidden,
-          }));
-        } catch (err) {
-          console.error(err);
-          existingTemplateFields[name] = [];
-        }
-      }
-      if (!existingTemplateMapping[name]) {
-        try {
-          const res = await fetch(`/template_csv_mapping/${encodeURIComponent(name)}`);
-          const data = await res.json();
-          existingTemplateMapping[name] = data.mapping || {};
-        } catch (err) {
-          console.error(err);
-          existingTemplateMapping[name] = {};
-        }
-      }
-      updateMappingUI();
-    }
-
-    csvTemplateSelect.addEventListener('change', function () {
-      loadExistingGameFields(this.value);
-    });
-
-    // ── CSV header detection ─────────────────────────────────────────────
-    csvFileInput.addEventListener('change', async function () {
-      const file = this.files && this.files[0];
-      csvHeaders = [];
-      if (!file) { updateMappingUI(); return; }
-
-      mappingHint.textContent = 'Reading CSV headers…';
-      mappingField.classList.remove('hidden');
-
-      const fd = new FormData();
-      fd.append('csv_file', file);
-      try {
-        const res = await fetch('/csv_headers', { method: 'POST', body: fd });
-        const data = await res.json();
-        if (res.ok && data.status === 'success') {
-          csvHeaders = data.headers || [];
-        } else {
-          setCsvStatus(data.message || 'Could not read CSV headers.', 'error');
-        }
-      } catch (err) {
-        console.error(err);
-        setCsvStatus('Could not read CSV headers.', 'error');
-      }
-      updateMappingUI();
-    });
-
-    // ── Best-effort auto-match of a field key to a CSV header ────────────
-    function normalizeForMatch(s) {
-      return s.toLowerCase().replace(/[^a-z0-9]/g, '');
-    }
-    function guessHeaderForField(fieldKey, headers) {
-      const target = normalizeForMatch(fieldKey);
-      return headers.find(h => normalizeForMatch(h) === target) || '';
-    }
-
-    function currentFields() {
-      return currentTemplateMode() === 'new'
-        ? collectNewFields().fields
-        : (existingTemplateFields[csvTemplateSelect.value] || []);
-    }
-
-    function updateMappingUI() {
-      const fields = currentFields();
-
-      if (!fields.length || !csvHeaders.length) {
-        mappingContainer.innerHTML = '';
-        mappingHint.textContent = !csvHeaders.length
-          ? 'Choose a CSV file to map columns.'
-          : 'Choose (or create) a game with at least one field to map columns.';
-        mappingField.classList.toggle('hidden', !(fields.length || csvHeaders.length));
-        return;
-      }
-
-      mappingField.classList.remove('hidden');
-
-      const savedMapping = currentTemplateMode() === 'existing'
-        ? (existingTemplateMapping[csvTemplateSelect.value] || {})
-        : {};
-      const hasSavedMapping = Object.keys(savedMapping).length > 0;
-      mappingHint.textContent = hasSavedMapping
-        ? 'Columns were auto-filled from the last CSV imported into this game — adjust anything that doesn\'t match.'
-        : 'Pick which CSV column fills each field. Leave a field unmapped to skip it.';
-
-      // Preserve any selections the person already made where possible.
-      const previous = {};
-      mappingContainer.querySelectorAll('.mapping-row').forEach(row => {
-        previous[row.dataset.fieldKey] = row.querySelector('select').value;
-      });
-
-      mappingContainer.innerHTML = '';
-      fields.forEach(f => {
-        const row = document.createElement('div');
-        row.className = 'mapping-row';
-        row.dataset.fieldKey = f.key;
-
-        let preselected;
-        if (previous[f.key] !== undefined) {
-          preselected = previous[f.key];
-        } else if (savedMapping[f.key] && csvHeaders.includes(savedMapping[f.key])) {
-          preselected = savedMapping[f.key];
-        } else {
-          preselected = guessHeaderForField(f.key, csvHeaders);
-        }
-
-        const options = ['<option value="">— Leave unmapped —</option>']
-          .concat(csvHeaders.map(h => `<option value="${h.replace(/"/g, '&quot;')}" ${h === preselected ? 'selected' : ''}>${h}</option>`));
-
-        row.innerHTML = `
-          <span class="mapping-field-label">${f.key}${f.hidden ? '<span class="hidden-field-badge">Hidden</span>' : ''}</span>
-          <span class="mapping-field-type">${f.field_type}</span>
-          <select>${options.join('')}</select>
-        `;
-        mappingContainer.appendChild(row);
+        const reader = new FileReader();
+        reader.onload = ev => {
+          img.src = ev.target.result;
+          img.style.display = 'block';
+          placeholder.style.display = 'none';
+        };
+        reader.readAsDataURL(file);
       });
     }
+    wireSinglePreview(singleFront, singleFrontPreview, singleFrontPlaceholder);
+    wireSinglePreview(singleBack, singleBackPreview, singleBackPlaceholder);
 
-    function collectMapping() {
-      const mapping = {};
-      mappingContainer.querySelectorAll('.mapping-row').forEach(row => {
-        mapping[row.dataset.fieldKey] = row.querySelector('select').value;
-      });
-      return mapping;
-    }
-
-    function resetCsvForm() {
-      csvImportForm.reset();
-      csvHeaders = [];
-      newFieldsContainer.innerHTML = '';
-      addNewFieldRow();
-      mappingContainer.innerHTML = '';
-      updateModeUI();
-    }
-
-    if (csvImportForm) {
-      csvImportForm.addEventListener('submit', async (e) => {
+    if (singleCardForm) {
+      singleCardForm.addEventListener('submit', async (e) => {
         e.preventDefault();
-        const file = csvFileInput.files[0];
-        if (!file) return;
 
-        const mode = currentTemplateMode();
-        const mapping = collectMapping();
-        const mappedCount = Object.values(mapping).filter(Boolean).length;
-        if (mappedCount === 0) {
-          setCsvStatus('Map at least one field to a CSV column.', 'error');
+        const game = singleGame.value;
+        if (!game) { setSingleStatus('Select a Game first.', 'error'); return; }
+        if (!singleFront.files || !singleFront.files[0]) {
+          setSingleStatus('A front image is required.', 'error');
           return;
         }
 
-        const formData = new FormData();
-        formData.append('csv_file', file);
-        formData.append('template_mode', mode);
-        formData.append('mapping', JSON.stringify(mapping));
+        singleResult.style.display = 'none';
+        singleResult.innerHTML = '';
+        singleCardBtn.disabled = true;
+        singleCardBtn.textContent = 'Adding…';
+        setSingleStatus('Aligning image(s) and adding the card to inventory…', 'info');
 
-        if (mode === 'new') {
-          const name = newGameName.value.trim();
-          if (!name) { setCsvStatus('New game name is required.', 'error'); return; }
-          const { rawFields } = collectNewFields();
-          if (Object.keys(rawFields).length === 0) { setCsvStatus('Add at least one field to the new game.', 'error'); return; }
-          formData.append('new_template_name', name);
-          formData.append('new_template_fields', JSON.stringify(rawFields));
-        } else {
-          if (!csvTemplateSelect.value) { setCsvStatus('Select a game to import into.', 'error'); return; }
-          formData.append('template_name', csvTemplateSelect.value);
-        }
-
-        csvImportBtn.disabled = true;
-        setCsvStatus('Importing CSV…', 'info');
+        const formData = new FormData(singleCardForm);
 
         try {
-          const res = await fetch('/import_csv', { method: 'POST', body: formData });
+          const res = await fetch('/import_single_card', { method: 'POST', body: formData });
           const data = await res.json();
 
           if (!res.ok || data.status !== 'success') {
-            setCsvStatus('Import failed: ' + (data.message || 'Unknown error'), 'error');
-            return;
+            throw new Error(data.message || 'Import failed.');
           }
 
-          const gamesList = data.games && data.games.length ? data.games.join(', ') : '—';
-          let msg = `Added ${data.records_created} card(s) to the hidden catalog from ${data.rows_seen} row(s).`;
-          if (data.rows_skipped > 0) {
-            msg += ` Skipped ${data.rows_skipped} row(s) with no mapped data.`;
-          }
-          msg += `\nGame: ${gamesList}`;
-          msg += `\nThe column mapping used here has been saved to this game, so it'll auto-fill next time.`;
-          msg += `\nThese won't show in Inventory — use "Copy from Entry" on any inventory entry to pull fields from them.`;
-          setCsvStatus(msg, 'success');
+          setSingleStatus(data.message || 'Card added to inventory.', 'success');
 
-          // Drop cached fields/mapping for this game so they're re-fetched
-          // fresh (they may have just changed as a result of this import).
-          (data.games || []).forEach(g => {
-            delete existingTemplateFields[g];
-            delete existingTemplateMapping[g];
+          const frontThumb = data.image_url
+            ? `<img src="${data.image_url}" alt="Card front">` : '';
+          singleResult.innerHTML = `
+            ${frontThumb}
+            <div class="single-result-body">
+              <div class="single-result-title">Card #${data.record_id} added to inventory</div>
+              <div class="hint" style="margin:0;">Open its detail page to fill in fields or run Identify.</div>
+              <div class="actions" style="margin-top:10px;">
+                <a href="${data.detail_url}" class="btn-primary" style="text-decoration:none;display:inline-flex;align-items:center;">Open card</a>
+                <button type="button" class="btn-secondary" id="singleAddAnother">Add another</button>
+              </div>
+            </div>`;
+          singleResult.style.display = 'flex';
+
+          document.getElementById('singleAddAnother').addEventListener('click', () => {
+            singleCardForm.reset();
+            singleFrontPreview.style.display = 'none';
+            singleBackPreview.style.display = 'none';
+            singleFrontPlaceholder.style.display = '';
+            singleBackPlaceholder.style.display = '';
+            singleResult.style.display = 'none';
+            singleResult.innerHTML = '';
+            setSingleStatus('', 'info');
+            singleStatusBox.className = 'status info';
           });
-
-          if (mode === 'new') {
-            // The new game needs to appear in the "existing game" dropdowns
-            // on this page (and the Templates page) — reload to pick it up.
-            setTimeout(() => window.location.reload(), 600);
-          } else {
-            resetCsvForm();
-          }
         } catch (err) {
-          console.error('CSV import error:', err);
-          setCsvStatus('Import failed. Please try again.', 'error');
+          console.error('Single card import error:', err);
+          setSingleStatus(err.message || 'Import failed. Please try again.', 'error');
         } finally {
-          csvImportBtn.disabled = false;
+          singleCardBtn.disabled = false;
+          singleCardBtn.textContent = 'Add card to inventory';
         }
       });
-    }
-
-    updateModeUI();
-
-    // Prime the mapping list for whichever game the browser auto-selected
-    // on load (see comment on loadExistingGameFields above) — otherwise the
-    // mapping UI can stay empty even though a real game is already chosen.
-    if (currentTemplateMode() === 'existing' && csvTemplateSelect.value) {
-      loadExistingGameFields(csvTemplateSelect.value);
     }
 
     const imageInput = document.getElementById('image');
