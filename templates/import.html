@@ -948,10 +948,10 @@
               <input type="file" id="image" name="image" accept="image/*,.pdf,application/pdf" required>
               <div class="hint">You can select a single 9-pocket page image, or a multi-page PDF. For a PDF, page 1 is treated as the front of the page, page 2 as its back, page 3 as the next page's front, page 4 its back, and so on — each pair is loaded here one after another.</div>
 
-              <label class="auto-import-toggle" id="autoImportToggle" title="Split and import automatically with no per-tile review">
+              <label class="auto-import-toggle" id="autoImportToggle" title="Cut, align/crop, identify and import automatically with no per-tile review">
                 <input type="checkbox" id="autoImport" name="auto_import">
                 <span class="auto-import-text">
-                  <strong>Auto-import</strong> — cut every page (and every page of a PDF) on the automatically detected cut lines and send the raw cuts straight to inventory. This bypasses the alignment step and per-tile review entirely. Just fill the required fields and press “Split and Process” once.
+                  <strong>Auto-import</strong> — run the whole process automatically for every page (and every page of a PDF): cut into 9, align &amp; crop each card to the selected edge type, match its name/serial, and update inventory — filling in any 100% matches and leaving the rest blank for later. No per-tile review or approval. Just fill the required fields and press “Split and Process” once.
                 </span>
               </label>
             </div>
@@ -1216,11 +1216,17 @@
 
           const frontThumb = data.image_url
             ? `<img src="${data.image_url}" alt="Card front">` : '';
+          const idBadge = data.identified
+            ? `<span class="badge ok">Identified${data.identified_name ? ' — ' + data.identified_name : ''}</span>`
+            : `<span class="badge info">Blank — manual entry</span>`;
+          const idHint = data.identified
+            ? 'Fields were filled in automatically from a confident match. Open the card to review.'
+            : 'No confident match, so the entry was left blank. Open its detail page to fill in fields or run Identify.';
           singleResult.innerHTML = `
             ${frontThumb}
             <div class="single-result-body">
-              <div class="single-result-title">Card #${data.record_id} added to inventory</div>
-              <div class="hint" style="margin:0;">Open its detail page to fill in fields or run Identify.</div>
+              <div class="single-result-title">Card #${data.record_id} added to inventory ${idBadge}</div>
+              <div class="hint" style="margin:0;">${idHint}</div>
               <div class="actions" style="margin-top:10px;">
                 <a href="${data.detail_url}" class="btn-primary" style="text-decoration:none;display:inline-flex;align-items:center;">Open card</a>
                 <button type="button" class="btn-secondary" id="singleAddAnother">Add another</button>
@@ -1901,12 +1907,34 @@
         return;
       }
 
+      const ok = results.filter(r => r && r.status === 'success');
+      const backs = ok.filter(r => r.side === 'back');
+      const fronts = ok.filter(r => r.side !== 'back');
+      const idCount = fronts.filter(r => r.identified).length;
+      const summary = document.createElement('div');
+      summary.className = 'ocr-item';
+      let summaryText = `${ok.length} card(s) imported — ${idCount} auto-identified, `
+        + `${Math.max(0, fronts.length - idCount)} left blank for manual entry`;
+      if (backs.length) summaryText += `, ${backs.length} back page(s) (no ID check)`;
+      summary.innerHTML = `<strong>${summaryText}.</strong>`;
+      ocrResults.appendChild(summary);
+
       results.forEach(item => {
         const div = document.createElement('div');
         div.className = 'ocr-item';
-        let topLine = `${item.filename} — ${item.status}`;
+        let badge;
+        if (item.status !== 'success') {
+          badge = `<span class="badge warn">${item.status}</span>`;
+        } else if (item.side === 'back') {
+          badge = `<span class="badge info">Back page — no ID check</span>`;
+        } else if (item.identified) {
+          const nm = item.identified_name ? ` — ${item.identified_name}` : '';
+          badge = `<span class="badge ok">Identified${nm}</span>`;
+        } else {
+          badge = `<span class="badge info">Blank — manual entry</span>`;
+        }
         div.innerHTML = `
-          <strong>${topLine}</strong>
+          <strong>${item.filename}</strong> ${badge}
           <div class="hint">${JSON.stringify(item.extracted, null, 2)}</div>
         `;
         ocrResults.appendChild(div);
@@ -1930,7 +1958,15 @@
       const pct   = Math.round((done / total) * 100);
       ocrProgressFill.style.width   = pct + '%';
       ocrProgressCount.textContent  = `${done} / ${total}`;
-      if (result && result.status === 'error') ocrProgressSub.textContent = `Card ${done}: ⚠ Error`;
+      if (result && result.status === 'error') {
+        ocrProgressSub.textContent = `Card ${done}: ⚠ Error`;
+      } else if (result && result.side === 'back') {
+        ocrProgressSub.textContent = `Card ${done}: back page (no ID check)`;
+      } else if (result && result.identified) {
+        ocrProgressSub.textContent = `Card ${done}: identified${result.identified_name ? ' — ' + result.identified_name : ''}`;
+      } else if (result) {
+        ocrProgressSub.textContent = `Card ${done}: left blank for manual entry`;
+      }
     }
 
     function hideOcrProgress() {
@@ -2099,9 +2135,9 @@
 
       const formData = new FormData(form);
       if (autoImport) {
-        // Tell the backend to skip the straighten/alignment pass and file the
-        // raw cut images directly.
-        formData.set('skip_align', '1');
+        // Auto-import runs the full pipeline (cut -> align/crop -> identify ->
+        // file to inventory) with no per-tile review.
+        formData.set('auto_import', '1');
       }
 
       // Clear previous results; keep the live cut preview visible during the split phase.
@@ -2112,7 +2148,7 @@
       // Phase 1: uploading + splitting — canvas with red cut lines stays visible.
       setStatus(
         autoImport
-          ? 'Auto-import — uploading and cutting page into 9 images...'
+          ? 'Auto-import — uploading, cutting, aligning and cropping 9 cards...'
           : 'Step 1/2 — Uploading and splitting page into 9 images...',
         'info'
       );
@@ -2125,12 +2161,12 @@
           body: formData
         });
 
-        // Phase 2: split done. In manual mode alignment runs next; in
-        // auto-import mode alignment is skipped. Hide the cut preview now.
+        // Phase 2: split done. Alignment/crop runs in both modes now; auto-import
+        // simply proceeds to identify + file without review. Hide the cut preview.
         canvasPanel.style.display = 'none';
         setStatus(
           autoImport
-            ? 'Auto-import — cut complete, sending raw cards to inventory...'
+            ? 'Auto-import — cards aligned and cropped, matching and filing to inventory...'
             : 'Step 2/2 — Running edge detection and card alignment...',
           'info'
         );
@@ -2172,12 +2208,12 @@
           updateBatchOcrButton();
         }
 
-        // Auto-import: skip the manual review step and send the 9 raw cuts
-        // straight to inventory. runBatchOcrImport handles advancing the PDF
-        // batch (which re-enters this function for the next page) or reloading
-        // once a single image is done.
+        // Auto-import: skip the manual review step and send the 9 aligned +
+        // cropped cards straight through identification into inventory.
+        // runBatchOcrImport handles advancing the PDF batch (which re-enters
+        // this function for the next page) or reloading once a single image is done.
         if (autoImport && getAlignedFilenames().length === 9) {
-          setStatus('Auto-import — importing 9 raw cut cards...', 'info');
+          setStatus('Auto-import — matching names/serials and updating inventory...', 'info');
           await runBatchOcrImport();
           return;
         }

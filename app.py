@@ -861,6 +861,141 @@ def _get_serial(data: dict) -> str:
     return ""
 
 
+# ====================== AUTO-IDENTIFY (used at end of import) ======================
+# "100% match" for auto-apply. match_ocr_to_records caps its score at 1.0, and a
+# score of 1.0 requires an exact collector-number match plus a strong name match
+# — a confident, unambiguous identification. Anything less is left for the person
+# to check by hand.
+AUTO_IDENTIFY_MIN_SCORE = 1.0
+
+
+def _apply_ocr_candidate(record, cand):
+    """
+    Merge identity fields from a matched candidate onto `record` (in memory; the
+    caller commits). `cand` is one entry produced by the OCR matcher, either a
+    tcgcsv reference card (source="reference", carries product_id + rich fields)
+    or another existing record (source="record"). Returns the dict of applied
+    updates, or {} if nothing could be applied.
+    """
+    updates = {}
+
+    if cand.get("source") == "reference":
+        try:
+            ref = ReferenceCard.query.filter_by(product_id=int(cand.get("product_id"))).first()
+        except (TypeError, ValueError):
+            ref = None
+        if ref is None:
+            return {}
+        for key, attr in _REFERENCE_APPLY_MAP.items():
+            val = getattr(ref, attr, None)
+            if str(val or "").strip():
+                updates[key] = val
+        if ref.url:
+            updates["tcgplayer"] = {
+                "url":          ref.url,
+                "full_url":     ref.url,
+                "source":       "tcgcsv",
+                "saved_at":     datetime.utcnow().isoformat(),
+                "product_id":   str(ref.product_id),
+                "product_name": ref.name or "",
+                "set_name":     ref.set_name or "",
+                "set_number":   ref.number or "",
+                "prices":       {"market": ref.market_price} if ref.market_price is not None else {},
+            }
+    else:  # an existing record
+        try:
+            source = ScanRecord.query.get(int(cand.get("record_id")))
+        except (TypeError, ValueError):
+            source = None
+        if source is None:
+            return {}
+        sdata = source.extracted_data or {}
+        for k in _OCR_COPY_KEYS:
+            val = sdata.get(k)
+            if str(val or "").strip():
+                updates[k] = val
+
+    if not updates:
+        return {}
+
+    merged = {**(record.extracted_data or {}), **updates}
+    record.extracted_data = merged
+    matched = match_product_from_extracted(merged)
+    if matched:
+        record.matched_product_id = matched.id
+    return updates
+
+
+def auto_identify_record(record, min_score=AUTO_IDENTIFY_MIN_SCORE):
+    """
+    OCR a record's front image and, only if a candidate matches with full
+    confidence (score >= min_score — a 100% match), apply that identity to the
+    record. Otherwise the record is left untouched (blank) for manual entry.
+
+    This is the same identification the inventory-detail page runs, invoked
+    automatically at the end of an import. It never raises and never commits: any
+    OCR/matching problem simply yields identified=False, and the caller decides
+    when to persist.
+
+    Returns: { identified: bool, reason: str, score: float|None,
+               name: str, applied: {field: value, ...} }
+    """
+    out = {"identified": False, "reason": "", "score": None, "name": "", "applied": {}}
+
+    if card_ocr is None:
+        out["reason"] = "ocr_unavailable"
+        return out
+
+    abs_path = _abs_record_image_path(record.image_path)
+    if not abs_path or not os.path.exists(abs_path):
+        out["reason"] = "no_front_image"
+        return out
+
+    try:
+        ocr = card_ocr.ocr_card_front(abs_path)
+    except Exception:
+        out["reason"] = "ocr_error"
+        return out
+    if not ocr.get("ocr_available"):
+        out["reason"] = "ocr_unavailable"
+        return out
+
+    ext = record.extracted_data or {}
+    # Reference catalog (rich auto-fill) for this record's game, if synced, plus
+    # any already-identified existing records — same sources as /ocr_identify.
+    category_id, _ = _resolve_category_for_game(ext.get("game", ""))
+    ref_matches = _reference_candidates_for_ocr(category_id, ocr) if category_id else []
+    rec_matches = card_ocr.match_ocr_to_records(
+        ocr, _build_ocr_candidates(exclude_record_id=record.id))
+    for m in rec_matches:
+        m["source"] = "record"
+
+    # Best first; reference matches precede record matches on ties (listed first
+    # and Python's sort is stable), so a confident catalog hit wins — it carries
+    # set/rarity/TCGplayer data a bare record match can't.
+    combined = sorted(ref_matches + rec_matches, key=lambda c: c.get("score", 0), reverse=True)
+    if not combined:
+        out["reason"] = "no_candidates"
+        return out
+
+    top = combined[0]
+    out["score"] = top.get("score")
+    out["name"] = top.get("name", "")
+    if float(top.get("score", 0) or 0) < float(min_score) - 1e-9:
+        out["reason"] = "below_threshold"     # not a 100% match -> leave blank
+        return out
+
+    applied = _apply_ocr_candidate(record, top)
+    if not applied:
+        out["reason"] = "apply_failed"
+        return out
+
+    out["identified"] = True
+    out["reason"] = "applied"
+    out["applied"] = applied
+    return out
+
+
 EDITION_OPTIONS = ("Standard Edition", "First Edition", "Limited Edition")
 EDITION_DEFAULT = "Standard Edition"
 
@@ -1861,6 +1996,18 @@ def import_single_card():
         image_path_back=back_path,
     )
 
+    # ── Auto-identify at the end of import ──
+    # Run the same OCR identification the detail page uses. On a 100% match,
+    # apply it and save; otherwise leave the entry blank for manual entry later.
+    ident = {"identified": False, "reason": "skipped"}
+    try:
+        ident = auto_identify_record(record)
+        if ident.get("identified"):
+            db.session.commit()
+    except Exception:
+        db.session.rollback()
+        ident = {"identified": False, "reason": "error"}
+
     # Let the UI mention when a card outline couldn't be found and the raw
     # photo was kept instead (so the user can retry or crop manually later).
     not_detected = [side for side, ok in aligned_flags.items() if not ok]
@@ -1871,16 +2018,25 @@ def import_single_card():
     else:
         message = "Card added to inventory — detected and cropped to the card."
 
+    if ident.get("identified"):
+        ident_name = (ident.get("applied") or {}).get("name", "")
+        message += (f" Identified as “{ident_name}” and filled in automatically."
+                    if ident_name else " Identified and filled in automatically.")
+    else:
+        message += " Left blank for manual entry (no confident match)."
+
     return jsonify({
-        "status":         "success",
-        "message":        message,
-        "record_id":      record.id,
-        "edge_type":      edge_type,
-        "front_aligned":  aligned_flags.get("front", False),
-        "back_aligned":   aligned_flags.get("back", False) if back_path else None,
-        "image_url":      build_uploaded_file_url(record.image_path),
-        "image_url_back": build_uploaded_file_url(record.image_path_back) if record.image_path_back else None,
-        "detail_url":     url_for("inventory_detail", record_id=record.id),
+        "status":          "success",
+        "message":         message,
+        "record_id":       record.id,
+        "edge_type":       edge_type,
+        "front_aligned":   aligned_flags.get("front", False),
+        "back_aligned":    aligned_flags.get("back", False) if back_path else None,
+        "identified":      bool(ident.get("identified")),
+        "identified_name": (ident.get("applied") or {}).get("name", "") if ident.get("identified") else "",
+        "image_url":       build_uploaded_file_url(record.image_path),
+        "image_url_back":  build_uploaded_file_url(record.image_path_back) if record.image_path_back else None,
+        "detail_url":      url_for("inventory_detail", record_id=record.id),
     })
 
 
@@ -3503,10 +3659,12 @@ def run_import_split():
     if not (v_cut1 < v_cut2 and h_cut1 < h_cut2):
         return jsonify({"status": "error", "message": "Cut 1 must be less than Cut 2"}), 400
 
-    # Auto-import mode: skip the per-tile straighten/alignment pass entirely and
-    # file the RAW cut images as the final card images. Everything downstream
-    # (the finalize/import step, front/back merging, etc.) is unchanged.
-    skip_align = request.form.get("skip_align", "").strip().lower() in ("1", "true", "yes", "on")
+    # Auto-import mode: run the whole pipeline automatically (cut -> align/crop
+    # -> identify -> file to inventory) with no per-tile review. It uses the
+    # SAME align/crop as manual mode; the only difference here is that on a hard
+    # alignment failure we still file the raw cut, so all 9 cards reach inventory
+    # unattended rather than waiting for manual adjustment.
+    auto_import = request.form.get("auto_import", "").strip().lower() in ("1", "true", "yes", "on")
 
     safe_game  = secure_filename(game)  or "game"
     safe_album = secure_filename(album) or "album"
@@ -3527,17 +3685,6 @@ def run_import_split():
             slot_filename = f"{safe_game}-{safe_album}-{safe_page}-{slot_num}-{side}.png"
             split_path    = os.path.join(app.config["TEMP_SPLIT_FOLDER"], slot_filename)
             piece.save(split_path)
-
-            if skip_align:
-                # Bypass alignment: the raw cut piece IS the final card image.
-                card_path = os.path.join(app.config["TEMP_CARD_FOLDER"], slot_filename)
-                piece.save(card_path)
-                results.append({
-                    "slot": slot_num, "filename": slot_filename,
-                    "status": "processed",
-                    "url": url_for("temp_card_file", filename=slot_filename),
-                })
-                continue
 
             try:
                 split_cv = cv2.imread(split_path)
@@ -3560,6 +3707,21 @@ def run_import_split():
                     "url": url_for("temp_card_file", filename=slot_filename),
                 })
             except Exception:
+                # Alignment couldn't run on this tile. In auto-import we still
+                # file the raw cut so the card reaches inventory unattended; in
+                # manual mode we surface it as a fallback for review.
+                if auto_import:
+                    try:
+                        card_path = os.path.join(app.config["TEMP_CARD_FOLDER"], slot_filename)
+                        piece.save(card_path)
+                        results.append({
+                            "slot": slot_num, "filename": slot_filename,
+                            "status": "processed",
+                            "url": url_for("temp_card_file", filename=slot_filename),
+                        })
+                        continue
+                    except Exception:
+                        pass
                 results.append({
                     "slot": slot_num, "filename": slot_filename,
                     "status": "fallback",
@@ -3569,8 +3731,8 @@ def run_import_split():
         processed_count = sum(1 for r in results if r["status"] == "processed")
         fallback_count  = sum(1 for r in results if r["status"] == "fallback")
 
-        if skip_align:
-            message = f"Split completed. {processed_count} raw cut image(s) ready (alignment skipped)."
+        if auto_import:
+            message = f"Auto-import — {processed_count} card(s) aligned and cut, filing to inventory."
         else:
             message = f"Import completed. {processed_count} auto-processed, {fallback_count} fallback."
 
@@ -3729,6 +3891,27 @@ def import_finalize_batch():
 
                     matched_product, record = create_scan_record(**create_kwargs)
 
+                # ── Auto-identify at the end of import (FRONTS ONLY) ──
+                # Run the same OCR identification the detail page uses on a
+                # 100% match, then apply + save; otherwise leave the entry blank
+                # for manual entry later. Only front pages (odd pages) carry the
+                # name/serial — even pages are card BACKS and are never OCR
+                # name/serial-checked. Also skips if already identified/filled.
+                ident = {"identified": False, "reason": "skipped"}
+                try:
+                    rext = record.extracted_data or {}
+                    has_front = record.image_path and record.image_path != "__blank__"
+                    if side == "front" and has_front and not (_get_name(rext) or _get_serial(rext)):
+                        ident = auto_identify_record(record)
+                        if ident.get("identified"):
+                            db.session.commit()
+                            matched_product = record.matched_product or matched_product
+                    elif side == "back":
+                        ident = {"identified": False, "reason": "back_page_skipped"}
+                except Exception:
+                    db.session.rollback()
+                    ident = {"identified": False, "reason": "error"}
+
                 result = {
                     "filename":        filename,
                     "status":          "success",
@@ -3738,6 +3921,8 @@ def import_finalize_batch():
                     "image_url_back":  build_uploaded_file_url(record.image_path_back) if record.image_path_back else None,
                     "extracted":       extracted,
                     "matched_product": matched_product.product_name if matched_product else "No match",
+                    "identified":      bool(ident.get("identified")),
+                    "identified_name": (ident.get("applied") or {}).get("name", "") if ident.get("identified") else "",
                 }
             except Exception as e:
                 result = {"filename": filename, "status": "error", "message": str(e)}
