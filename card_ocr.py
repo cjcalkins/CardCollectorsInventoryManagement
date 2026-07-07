@@ -273,7 +273,7 @@ def parse_set_code(text, drop=""):
 # --------------------------------------------------------------------------- #
 # Public: OCR a front image
 # --------------------------------------------------------------------------- #
-def ocr_card_front(image_or_path, normalize=True, debug_dir=None):
+def ocr_card_front(image_or_path, normalize=True, debug_dir=None, game=None, type_refs=None):
     """
     OCR the name and collector number from a card front.
 
@@ -281,8 +281,14 @@ def ocr_card_front(image_or_path, normalize=True, debug_dir=None):
     what lets fixed name/number zones work when the card is off-centre or tilted
     (e.g. photographed in a binder page).
 
+    `game` (optional) enables per-TCG "type" detection from the small type icon
+    (e.g. a Pokemon energy symbol). `type_refs` (optional, prepared via
+    prepare_type_references) makes type detection use a reference-icon library by
+    template matching; without it, a built-in colour heuristic is used.
+
     Returns a dict with: ocr_available, name_guess, number_guess, set_code_guess,
-    raw_top, raw_bottom, conf_top, conf_bottom, normalized (bool).
+    raw_top, raw_bottom, conf_top, conf_bottom, type_guess, type_confidence,
+    normalized (bool).
     """
     bgr = _to_bgr(image_or_path)
     did_norm = False
@@ -299,6 +305,7 @@ def ocr_card_front(image_or_path, normalize=True, debug_dir=None):
     name_guess, conf_top = _read_name(bgr)
     number_guess, raw_bottom = _read_number(bgr)
     set_code_guess = parse_set_code(raw_bottom, drop=number_guess.replace("/", ""))
+    type_guess, type_conf = detect_card_type(bgr, game, type_refs)
 
     return {
         "ocr_available": _TESS_OK,
@@ -309,8 +316,313 @@ def ocr_card_front(image_or_path, normalize=True, debug_dir=None):
         "raw_bottom": raw_bottom,
         "conf_top": conf_top,
         "conf_bottom": 100.0 if number_guess else -1.0,
+        "type_guess": type_guess,
+        "type_confidence": type_conf,
         "normalized": did_norm,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Card "type" detection from the type icon (e.g. Pokemon energy type)
+# --------------------------------------------------------------------------- #
+# Different TCGs mark a card's "type" with a small coloured icon: Pokemon energy
+# (Fire/Water/Grass/...), etc. We isolate the most icon-like coloured blob in the
+# card's top-right corner — next to the HP, and inset so the gold border and the
+# dark HP digits are excluded — and classify it by colour signature. This is a
+# best-effort VISUAL guess returned with a 0..1 confidence, not a certainty:
+# colour-distinct types (Water, Grass, Psychic, Water) read most reliably, while
+# red-orange types (Fire/Fighting) and neutral ones (Colorless/Metal/Darkness)
+# are inherently harder and come back at lower confidence (or blank).
+#
+# Only colour is used (no shipped icon templates), so treat it as a suggestion
+# the user can confirm. The design is a per-game registry so other TCGs' type
+# schemes (Magic colours, Yu-Gi-Oh attributes, ...) can be added later.
+
+def _pokemon_type_for_hsv(h, s, v):
+    """Map a dominant OpenCV-HSV colour (h in 0..179) to a Pokemon energy type."""
+    if h <= 12 or h >= 168:
+        return "Fire"                       # red
+    if 13 <= h <= 21:
+        return "Fighting" if v < 165 else "Fire"   # brown(darker) vs orange
+    if 22 <= h <= 34:
+        return "Lightning"                  # yellow (note: gold border is similar)
+    if 35 <= h <= 85:
+        return "Grass"                      # green
+    if 86 <= h <= 130:
+        return "Water"                      # blue / cyan
+    if 131 <= h <= 150:
+        return "Psychic"                    # purple / violet
+    if 151 <= h <= 167:
+        return "Fairy"                      # pink / magenta
+    return ""
+
+
+def detect_pokemon_energy_type(bgr):
+    """
+    Best-effort Pokemon energy type from the top-right type icon.
+    Returns (type_name, confidence 0..1); ('', 0.0) when nothing usable.
+    """
+    try:
+        H, W = bgr.shape[:2]
+        # Top-right corner, inset to skip the gold frame at the very edges.
+        x0, x1 = int(0.70 * W), int(0.975 * W)
+        y0, y1 = int(0.015 * H), int(0.10 * H)
+        box = bgr[y0:y1, x0:x1]
+        if box.size == 0:
+            return "", 0.0
+
+        hsv = cv2.cvtColor(box, cv2.COLOR_BGR2HSV)
+        S, V = hsv[:, :, 1], hsv[:, :, 2]
+        # Coloured icon pixels: saturated and not dark (drops HP digits & shadows).
+        colored = (S > 80) & (V > 70)
+        if float(colored.mean()) < 0.04:
+            return "", 0.0                  # essentially no coloured icon found
+
+        hues = hsv[:, :, 0][colored].astype(np.int32)
+        # Dominant hue via a coarse histogram peak (robust to a few stray pixels).
+        hist = np.bincount(hues // 5, minlength=36)
+        peak_h = int(np.argmax(hist)) * 5 + 2
+        # Concentration of hue around the peak (circular distance) -> confidence.
+        near = np.abs(((hues - peak_h + 90) % 180) - 90) <= 10
+        purity = float(near.mean())
+        med_s = float(np.median(S[colored]))
+        med_v = float(np.median(V[colored]))
+
+        t = _pokemon_type_for_hsv(peak_h, med_s, med_v)
+        if not t:
+            return "", 0.0
+        conf = 0.35 + 0.55 * purity
+        if t in ("Fire", "Fighting", "Lightning"):   # red-orange/gold ambiguity
+            conf *= 0.75
+        return t, round(max(0.0, min(1.0, conf)), 2)
+    except Exception:
+        return "", 0.0
+
+
+# game-name substring -> detector. Extend here for other TCGs.
+_TYPE_DETECTORS = {
+    "pokemon": detect_pokemon_energy_type,
+    "pokémon": detect_pokemon_energy_type,
+}
+
+# Regions where a card's "type" marker lives. Corner regions hold a small icon
+# (isolated as the largest coloured blob); the "header" region is the full-width
+# top band, matched as a whole design — this is how card kinds with different
+# header layouts are told apart (e.g. a Pokemon Trainer/Supporter header vs an
+# Energy header vs a normal Pokemon name/HP header). Each preset gives
+# coords (x0, x1, y0, y1 as fractions) and a mode ('icon' | 'band').
+_TYPE_REGIONS = {
+    "top_right": {"coords": (0.70, 0.975, 0.015, 0.10), "mode": "icon"},
+    "top_left":  {"coords": (0.025, 0.30, 0.015, 0.10), "mode": "icon"},
+    "header":    {"coords": (0.03, 0.97, 0.012, 0.115), "mode": "band"},
+}
+_DEFAULT_TYPE_REGION = "top_right"
+# Back-compat alias (used by the built-in Pokemon colour heuristic).
+_TYPE_ICON_REGION = _TYPE_REGIONS["top_right"]["coords"]
+
+# Feature sizes: square icons vs wide header bands (keep the band wide so the
+# header layout isn't squashed away).
+_ICON_SIZE = 64
+_BAND_SIZE = (160, 48)   # (width, height)
+
+
+def normalize_type_region(region):
+    """Coerce a region value to a supported preset, defaulting to top-right."""
+    r = (region or "").strip().lower().replace("-", "_")
+    return r if r in _TYPE_REGIONS else _DEFAULT_TYPE_REGION
+
+
+def region_mode(region):
+    """'icon' (corner blob) or 'band' (full header) for a region."""
+    return _TYPE_REGIONS.get(normalize_type_region(region),
+                             _TYPE_REGIONS[_DEFAULT_TYPE_REGION])["mode"]
+
+
+def _extract_type_region(bgr, region=_DEFAULT_TYPE_REGION):
+    """
+    Crop the card's type marker for `region`.
+
+    • icon regions (top_left/top_right): isolate the largest saturated colour
+      blob — a small corner icon. Returns None if no coloured icon is found.
+    • band regions (header): return the whole top band as-is (the header design).
+
+    Returns a BGR crop, or None.
+    """
+    try:
+        spec = _TYPE_REGIONS.get(normalize_type_region(region),
+                                 _TYPE_REGIONS[_DEFAULT_TYPE_REGION])
+        x0, x1, y0, y1 = spec["coords"]
+        mode = spec["mode"]
+        H, W = bgr.shape[:2]
+        box = bgr[int(y0 * H):int(y1 * H), int(x0 * W):int(x1 * W)]
+        if box.size == 0:
+            return None
+        if mode == "band":
+            return box.copy()
+
+        # icon mode: isolate the largest saturated blob (drops HP text; the inset
+        # already excludes the border).
+        hsv = cv2.cvtColor(box, cv2.COLOR_BGR2HSV)
+        S, V = hsv[:, :, 1], hsv[:, :, 2]
+        mask = (((S > 80) & (V > 70)).astype(np.uint8)) * 255
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        n, _, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+        if n <= 1:
+            return None
+        idx = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        x, y, w, h, area = stats[idx]
+        if area < 30:
+            return None
+        pad = 2
+        yA, yB = max(0, y - pad), min(box.shape[0], y + h + pad)
+        xA, xB = max(0, x - pad), min(box.shape[1], x + w + pad)
+        crop = box[yA:yB, xA:xB].copy()
+        return crop if crop.size else None
+    except Exception:
+        return None
+
+
+# Back-compat name kept for any external callers.
+def _extract_type_icon(bgr, region=_DEFAULT_TYPE_REGION):
+    return _extract_type_region(bgr, region)
+
+
+def _square_pad(img):
+    """Letterbox an icon to a square (white border) so wide card-captured icons
+    and tight uploaded ones compare consistently after resizing."""
+    h, w = img.shape[:2]
+    s = max(h, w)
+    top, left = (s - h) // 2, (s - w) // 2
+    return cv2.copyMakeBorder(img, top, s - h - top, left, s - w - left,
+                              cv2.BORDER_CONSTANT, value=(255, 255, 255))
+
+
+def _features(img, mode="icon"):
+    """
+    Fixed-size grayscale (contrast-normalised) + hue histogram for matching.
+    Icons are letterboxed to a square; header bands keep their wide aspect so the
+    header layout is preserved. Query and reference must use the same mode (they
+    always do — they share a region).
+    """
+    if mode == "band":
+        resized = cv2.resize(img, _BAND_SIZE, interpolation=cv2.INTER_AREA)
+    else:
+        resized = cv2.resize(_square_pad(img), (_ICON_SIZE, _ICON_SIZE), interpolation=cv2.INTER_AREA)
+    gray = cv2.equalizeHist(cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY))
+    hsv = cv2.cvtColor(resized, cv2.COLOR_BGR2HSV)
+    sat_mask = (hsv[:, :, 1] > 60).astype(np.uint8)
+    hist = cv2.calcHist([hsv], [0], sat_mask, [30], [0, 180])
+    cv2.normalize(hist, hist)
+    return gray, hist
+
+
+# Back-compat alias.
+def _icon_features(icon_bgr, size=64):
+    return _features(icon_bgr, "icon")
+
+
+def prepare_type_references(raw_refs, size=64):
+    """
+    Precompute match features for a game's reference images.
+    `raw_refs`: list of {'type_name', 'region', 'image'(BGR)}. Returns a list with
+    cached 'gray'/'hist' features, region and mode (unreadable entries skipped).
+    """
+    out = []
+    for r in raw_refs or []:
+        img = r.get("image")
+        if img is None or getattr(img, "size", 0) == 0:
+            continue
+        region = normalize_type_region(r.get("region"))
+        mode = region_mode(region)
+        try:
+            g, h = _features(img, mode)
+        except Exception:
+            continue
+        out.append({
+            "type_name": r.get("type_name", ""),
+            "region": region, "mode": mode, "gray": g, "hist": h,
+        })
+    return out
+
+
+def match_card_types(bgr, references, size=64):
+    """
+    Match a card against prepared references, each of which knows the region its
+    marker lives in (a top corner icon, or the full header band). The card's
+    marker is extracted and feature-ised once per region in use, and every
+    reference is scored against the marker from its own region. Corner matches
+    blend shape+colour evenly; header matches weight shape (structure) higher,
+    since header colours are similar across kinds. The winner's confidence is
+    tempered by its margin over the runner-up type.
+
+    Returns (best_type, score 0..1); ('', 0.0) when nothing matches.
+    """
+    if not references:
+        return "", 0.0
+
+    # Extract + feature-ise the card's marker once per region actually used.
+    region_feats = {}
+    for r in references:
+        reg = r.get("region", _DEFAULT_TYPE_REGION)
+        if reg not in region_feats:
+            crop = _extract_type_region(bgr, reg)
+            try:
+                region_feats[reg] = _features(crop, region_mode(reg)) if crop is not None else None
+            except Exception:
+                region_feats[reg] = None
+
+    best_by_type = {}
+    for r in references:
+        feats = region_feats.get(r.get("region", _DEFAULT_TYPE_REGION))
+        if feats is None:
+            continue
+        qg, qh = feats
+        try:
+            shape = max(0.0, float(cv2.matchTemplate(qg, r["gray"], cv2.TM_CCOEFF_NORMED)[0, 0]))
+            color = max(0.0, float(cv2.compareHist(qh, r["hist"], cv2.HISTCMP_CORREL)))
+        except Exception:
+            continue
+        if r.get("mode") == "band":
+            s = 0.7 * shape + 0.3 * color      # header: structure dominates
+        else:
+            s = 0.5 * shape + 0.5 * color
+        t = r["type_name"]
+        if s > best_by_type.get(t, -1.0):
+            best_by_type[t] = s
+    if not best_by_type:
+        return "", 0.0
+
+    ranked = sorted(best_by_type.items(), key=lambda kv: kv[1], reverse=True)
+    best_t, best_s = ranked[0]
+    conf = best_s
+    if len(ranked) >= 2:                        # temper by separation from runner-up
+        margin = best_s - ranked[1][1]
+        conf = best_s * (0.6 + 0.4 * min(1.0, margin / 0.15))
+    return best_t, round(max(0.0, min(1.0, conf)), 2)
+
+
+def detect_card_type(bgr, game, type_refs=None):
+    """
+    Detect a card's "type".
+
+    If `type_refs` (prepared reference icons for this game) are supplied, match
+    the card's icon against them in each reference's designated corner — the
+    general, per-game mechanism that works for any TCG once a library exists.
+    Otherwise fall back to the built-in colour heuristic (currently Pokemon).
+
+    Returns (type_name, confidence 0..1).
+    """
+    if type_refs:
+        return match_card_types(bgr, type_refs)
+
+    g = (game or "").strip().lower()
+    if not g:
+        return "", 0.0
+    for key, fn in _TYPE_DETECTORS.items():
+        if key in g:
+            return fn(bgr)
+    return "", 0.0
 
 
 # --------------------------------------------------------------------------- #

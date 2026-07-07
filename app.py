@@ -9,7 +9,7 @@ from datetime import datetime
 from PIL import Image
 from werkzeug.utils import secure_filename
 from models import (db, Product, ScanRecord, ShopConnection, Listing, EmailMonitor,
-                    SaleEvent, ReferenceCard, ReferenceSync)
+                    SaleEvent, ReferenceCard, ReferenceSync, TypeReference)
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -52,6 +52,7 @@ app.config["TEMP_SPLIT_FOLDER"] = os.path.join(app.config["UPLOAD_FOLDER"], "tem
 app.config["TEMP_CARD_FOLDER"] = os.path.join(app.config["UPLOAD_FOLDER"], "temp_cards")
 app.config["INVENTORY_IMAGE_FOLDER"] = os.path.join(app.config["UPLOAD_FOLDER"], "inventory_cards")
 app.config["TEMP_PDF_FOLDER"] = os.path.join(app.config["UPLOAD_FOLDER"], "temp_pdf_pages")
+app.config["TYPE_REF_FOLDER"] = os.path.join(app.config["UPLOAD_FOLDER"], "type_refs")
 
 db.init_app(app)
 
@@ -66,6 +67,7 @@ def ensure_dirs():
     os.makedirs(app.config["TEMP_CARD_FOLDER"], exist_ok=True)
     os.makedirs(app.config["INVENTORY_IMAGE_FOLDER"], exist_ok=True)
     os.makedirs(app.config["TEMP_PDF_FOLDER"], exist_ok=True)
+    os.makedirs(app.config["TYPE_REF_FOLDER"], exist_ok=True)
 
 
 # ====================== PATH HELPERS ======================
@@ -868,6 +870,113 @@ def _get_serial(data: dict) -> str:
 # to check by hand.
 AUTO_IDENTIFY_MIN_SCORE = 1.0
 
+# ── Card "type" field (e.g. Pokemon energy type) ──
+# Minimum confidence for a VISUAL type guess to auto-fill a record's type field.
+# Colour-distinct types clear this; ambiguous red-orange/neutral guesses (kept at
+# lower confidence in card_ocr) fall below it and are left blank.
+TYPE_MIN_CONFIDENCE = 0.6
+# extendedData keys that carry a card's type/colour when the reference catalog
+# has it (authoritative). "Card Type" is intentionally excluded — for Pokemon it
+# means Pokemon/Trainer/Energy, not the energy colour.
+_TYPE_EXTENDED_KEYS = ("energy type", "color", "colors", "type", "attribute", "element")
+
+
+def _template_type_field_key(template):
+    """Return the template's type-like field key (matches type/energy/element/
+    colour/attribute), or None if the game doesn't define one."""
+    import re as _re
+    for key in (template.get("fields", {}) or {}).keys():
+        if _re.search(r"type|energy|element|colou?r|attribute", str(key), _re.I):
+            return key
+    return None
+
+
+def _reference_type_value(product_id):
+    """The card's type/colour from the matched reference card's extendedData,
+    if present (authoritative). '' when unknown."""
+    try:
+        ref = ReferenceCard.query.filter_by(product_id=int(product_id)).first()
+    except (TypeError, ValueError):
+        ref = None
+    if ref is None:
+        return ""
+    ext = ref.extended or {}
+    lowered = {str(k).strip().lower(): v for k, v in ext.items()}
+    for k in _TYPE_EXTENDED_KEYS:
+        v = lowered.get(k)
+        if str(v or "").strip():
+            return str(v).strip()
+    return ""
+
+
+def _fill_type_field(record, type_value):
+    """Set the record's type field to `type_value` if its Game defines one and it
+    isn't already filled. Returns (field_key, value) on success, else None.
+    Mutates record.extracted_data in memory; the caller commits."""
+    if not type_value:
+        return None
+    try:
+        template = load_template(record.template_used)
+    except Exception:
+        return None
+    key = _template_type_field_key(template)
+    if not key:
+        return None
+    ext = record.extracted_data or {}
+    if str(ext.get(key) or "").strip():
+        return None                       # already has a type — don't overwrite
+    record.extracted_data = {**ext, key: type_value}
+    return key, type_value
+
+
+# ── Reference-icon library (template matching source) ──
+def _type_game_key(game):
+    """Normalise a game name to the key used for type-reference lookup."""
+    return (game or "").strip().lower()
+
+
+# Small cache of prepared (feature-computed) references per game key, invalidated
+# whenever the library changes. Avoids re-reading/preparing icons for every card
+# in a batch.
+_TYPE_REF_CACHE = {}
+_TYPE_REF_VERSION = 0
+
+
+def _bump_type_refs():
+    """Invalidate the prepared-reference cache after any add/delete."""
+    global _TYPE_REF_VERSION
+    _TYPE_REF_VERSION += 1
+    _TYPE_REF_CACHE.clear()
+
+
+def _load_prepared_type_refs(game):
+    """
+    Return prepared reference icons (features cached) for a game, or [] if the
+    game has no library yet. Used to drive template-matching type detection.
+    """
+    if card_ocr is None:
+        return []
+    key = _type_game_key(game)
+    if not key:
+        return []
+    cached = _TYPE_REF_CACHE.get(key)
+    if cached is not None and cached[0] == _TYPE_REF_VERSION:
+        return cached[1]
+
+    rows = TypeReference.query.filter(db.func.lower(TypeReference.game) == key).all()
+    raw = []
+    for r in rows:
+        abs_path = _abs_record_image_path(r.image_path)
+        if not abs_path or not os.path.exists(abs_path):
+            continue
+        img = cv2.imread(abs_path)
+        if img is None:
+            continue
+        raw.append({"type_name": r.type_name, "region": r.region, "image": img})
+    prepared = card_ocr.prepare_type_references(raw)
+    _TYPE_REF_CACHE[key] = (_TYPE_REF_VERSION, prepared)
+    return prepared
+
 
 def _apply_ocr_candidate(record, cand):
     """
@@ -902,6 +1011,13 @@ def _apply_ocr_candidate(record, cand):
                 "set_number":   ref.number or "",
                 "prices":       {"market": ref.market_price} if ref.market_price is not None else {},
             }
+        # Catalog type/colour (authoritative), if the game has a type field and
+        # the reference data carries it.
+        cat_type = _reference_type_value(ref.product_id)
+        if cat_type:
+            type_key = _template_type_field_key(load_template(record.template_used))
+            if type_key and not str((record.extracted_data or {}).get(type_key) or "").strip():
+                updates[type_key] = cat_type
     else:  # an existing record
         try:
             source = ScanRecord.query.get(int(cand.get("record_id")))
@@ -937,10 +1053,17 @@ def auto_identify_record(record, min_score=AUTO_IDENTIFY_MIN_SCORE):
     OCR/matching problem simply yields identified=False, and the caller decides
     when to persist.
 
-    Returns: { identified: bool, reason: str, score: float|None,
-               name: str, applied: {field: value, ...} }
+    Separately from the name/serial identity, it also fills the Game's "type"
+    field (e.g. Pokemon energy type) when the card provides one — from the
+    matched reference card if identified, otherwise from a confident VISUAL
+    reading of the type icon. This runs even when there's no 100% identity match,
+    so cards can still be sorted by type.
+
+    Returns: { identified, reason, score, name, applied: {..},
+               type_guess, type_confidence, type_applied: {field, value}|None }
     """
-    out = {"identified": False, "reason": "", "score": None, "name": "", "applied": {}}
+    out = {"identified": False, "reason": "", "score": None, "name": "",
+           "applied": {}, "type_guess": "", "type_confidence": 0.0, "type_applied": None}
 
     if card_ocr is None:
         out["reason"] = "ocr_unavailable"
@@ -951,8 +1074,12 @@ def auto_identify_record(record, min_score=AUTO_IDENTIFY_MIN_SCORE):
         out["reason"] = "no_front_image"
         return out
 
+    ext = record.extracted_data or {}
+    game = ext.get("game", "")
+
     try:
-        ocr = card_ocr.ocr_card_front(abs_path)
+        ocr = card_ocr.ocr_card_front(abs_path, game=game,
+                                      type_refs=_load_prepared_type_refs(game))
     except Exception:
         out["reason"] = "ocr_error"
         return out
@@ -960,10 +1087,12 @@ def auto_identify_record(record, min_score=AUTO_IDENTIFY_MIN_SCORE):
         out["reason"] = "ocr_unavailable"
         return out
 
-    ext = record.extracted_data or {}
+    out["type_guess"] = ocr.get("type_guess", "")
+    out["type_confidence"] = ocr.get("type_confidence", 0.0)
+
     # Reference catalog (rich auto-fill) for this record's game, if synced, plus
     # any already-identified existing records — same sources as /ocr_identify.
-    category_id, _ = _resolve_category_for_game(ext.get("game", ""))
+    category_id, _ = _resolve_category_for_game(game)
     ref_matches = _reference_candidates_for_ocr(category_id, ocr) if category_id else []
     rec_matches = card_ocr.match_ocr_to_records(
         ocr, _build_ocr_candidates(exclude_record_id=record.id))
@@ -974,25 +1103,49 @@ def auto_identify_record(record, min_score=AUTO_IDENTIFY_MIN_SCORE):
     # and Python's sort is stable), so a confident catalog hit wins — it carries
     # set/rarity/TCGplayer data a bare record match can't.
     combined = sorted(ref_matches + rec_matches, key=lambda c: c.get("score", 0), reverse=True)
-    if not combined:
-        out["reason"] = "no_candidates"
-        return out
+    top = combined[0] if combined else None
 
-    top = combined[0]
-    out["score"] = top.get("score")
-    out["name"] = top.get("name", "")
-    if float(top.get("score", 0) or 0) < float(min_score) - 1e-9:
-        out["reason"] = "below_threshold"     # not a 100% match -> leave blank
-        return out
+    if top is not None:
+        out["score"] = top.get("score")
+        out["name"] = top.get("name", "")
 
-    applied = _apply_ocr_candidate(record, top)
-    if not applied:
-        out["reason"] = "apply_failed"
-        return out
+    # 1) Identity fields — only on a 100% match (unchanged rule).
+    if top is not None and float(top.get("score", 0) or 0) >= float(min_score) - 1e-9:
+        applied = _apply_ocr_candidate(record, top)
+        if applied:
+            out["identified"] = True
+            out["reason"] = "applied"
+            out["applied"] = applied
+        else:
+            out["reason"] = "apply_failed"
+    else:
+        out["reason"] = "below_threshold" if top is not None else "no_candidates"
 
-    out["identified"] = True
-    out["reason"] = "applied"
-    out["applied"] = applied
+    # 2) Type field — independent of the identity match. Prefer the catalog value
+    #    (authoritative) when we identified a reference card; otherwise use a
+    #    confident visual guess. _apply_ocr_candidate may already have filled it
+    #    from the catalog, in which case _fill_type_field is a no-op.
+    type_value = ""
+    if out["identified"] and top is not None and top.get("source") == "reference":
+        type_value = _reference_type_value(top.get("product_id"))
+    if not type_value and out["type_confidence"] >= TYPE_MIN_CONFIDENCE:
+        type_value = out["type_guess"]
+    if type_value:
+        filled = _fill_type_field(record, type_value)
+        if filled:
+            out["type_applied"] = {"field": filled[0], "value": filled[1]}
+
+    # Reflect a type that was already filled from the catalog inside
+    # _apply_ocr_candidate, so callers/UI can report it consistently.
+    if out["type_applied"] is None:
+        try:
+            tkey = _template_type_field_key(load_template(record.template_used))
+            tval = str((record.extracted_data or {}).get(tkey) or "").strip() if tkey else ""
+            if tval:
+                out["type_applied"] = {"field": tkey, "value": tval}
+        except Exception:
+            pass
+
     return out
 
 
@@ -1912,24 +2065,143 @@ def import_page():
 
 
 # ====================== SINGLE CARD IMPORT ======================
+def _pdf_bytes_to_bgr_pages(pdf_bytes, zoom=2.0):
+    """
+    Rasterize each page of a PDF (given as bytes) into a BGR image, returned in
+    page order. Used by the single-card importer to treat a PDF as front/back
+    pairs. Raises RuntimeError if PyMuPDF isn't installed.
+    """
+    if fitz is None:
+        raise RuntimeError("PDF support isn't installed on the server. Run: pip install PyMuPDF")
+    pages = []
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        matrix = fitz.Matrix(zoom, zoom)
+        for i in range(doc.page_count):
+            pix = doc.load_page(i).get_pixmap(matrix=matrix)
+            arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+            if pix.n == 4:
+                bgr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+            elif pix.n == 3:
+                bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+            else:
+                bgr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+            pages.append(bgr)
+    finally:
+        doc.close()
+    return pages
+
+
+def _save_single_card_image(bgr, suffix, edge_type):
+    """Align/crop a card image (best-effort) by edge type and save it into the
+    inventory folder. Returns (relative_path, was_cropped)."""
+    img, cropped = detect_and_crop_card(bgr, edge_type)   # falls back to raw
+    final_name = f"single_{suffix}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
+    relative_path = normalize_to_upload_relative(os.path.join("inventory_cards", final_name))
+    absolute_path = os.path.join(app.config["UPLOAD_FOLDER"], relative_path)
+    cv2.imwrite(absolute_path, img)
+    return relative_path, cropped
+
+
+def _create_single_card(front_path, back_path, game, album, template):
+    """
+    Create a blank inventory record for `game` (+optional album) with the given
+    front (required) and back (optional) image paths, then OCR-identify the
+    FRONT ONLY — the back is never name/serial-checked. A 100% match is applied
+    and saved; anything less leaves the entry blank for manual entry.
+
+    Returns (record, ident_dict).
+    """
+    blank_fields = {k: "" for k in (template.get("fields", {}) or {}).keys()}
+    extracted = {**blank_fields, "game": game.replace("_", " ")}
+    if album:
+        extracted["album"] = album
+
+    _, record = create_scan_record(
+        image_path=front_path,
+        template_name=game,
+        extracted=extracted,
+        image_path_back=back_path,
+    )
+
+    ident = {"identified": False, "reason": "skipped"}
+    try:
+        ident = auto_identify_record(record)   # uses the FRONT image only
+        if ident.get("identified") or ident.get("type_applied"):
+            db.session.commit()
+    except Exception:
+        db.session.rollback()
+        ident = {"identified": False, "reason": "error"}
+    return record, ident
+
+
+def _import_single_card_pdf(pdf_bytes, game, album, edge_type, template):
+    """
+    Import a PDF as front/back pairs: odd pages (1, 3, 5, ...) are card FRONTS
+    and even pages (2, 4, 6, ...) are the matching BACKS. Each pair becomes one
+    inventory record. Only the front of each pair is OCR name/serial-checked.
+    """
+    try:
+        pages = _pdf_bytes_to_bgr_pages(pdf_bytes)
+    except RuntimeError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 500
+    except Exception as exc:
+        return jsonify({"status": "error", "message": f"Could not read PDF: {exc}"}), 500
+    if not pages:
+        return jsonify({"status": "error", "message": "PDF has no pages"}), 400
+
+    cards = []
+    for i in range(0, len(pages), 2):
+        front_img = pages[i]
+        back_img  = pages[i + 1] if i + 1 < len(pages) else None
+
+        front_path, _ = _save_single_card_image(front_img, "front", edge_type)
+        back_path = None
+        if back_img is not None:
+            back_path, _ = _save_single_card_image(back_img, "back", edge_type)
+
+        record, ident = _create_single_card(front_path, back_path, game, album, template)
+        cards.append({
+            "record_id":       record.id,
+            "front_page":      i + 1,
+            "back_page":       (i + 2) if back_img is not None else None,
+            "identified":      bool(ident.get("identified")),
+            "identified_name": (ident.get("applied") or {}).get("name", "") if ident.get("identified") else "",
+            "card_type":       (ident.get("type_applied") or {}).get("value", ""),
+            "image_url":       build_uploaded_file_url(record.image_path),
+            "detail_url":      url_for("inventory_detail", record_id=record.id),
+        })
+
+    id_count = sum(1 for c in cards if c["identified"])
+    message = (f"Imported {len(cards)} card(s) from PDF — odd pages as fronts, even pages as backs. "
+               f"{id_count} auto-identified, {len(cards) - id_count} left blank for manual entry.")
+    return jsonify({
+        "status":           "success",
+        "mode":             "pdf",
+        "message":          message,
+        "count":            len(cards),
+        "identified_count": id_count,
+        "cards":            cards,
+    })
+
+
 @app.route("/import_single_card", methods=["POST"])
 def import_single_card():
     """
-    Add ONE card to inventory from a front image (required) and an optional
-    back image.
+    Add card(s) to inventory from the single-card importer.
 
-    Each image is best-effort auto-aligned (deskewed + cropped) the same way
-    the search-by-image flow is, falling back to the raw photo when a card
-    outline can't be found — so a good capture is never made worse. A single
-    blank inventory record is created for the chosen Game with the image(s)
-    attached; its fields are filled in by hand afterwards, or via the OCR
-    "Identify" tool on the card's detail page.
+    Two upload shapes are accepted in `front_image`:
+      • an image  — one card: `front_image` (required) + `back_image` (optional).
+      • a PDF     — a front/back batch: odd pages (1,3,5,...) are fronts, even
+                    pages (2,4,6,...) are backs; each pair becomes one card.
 
-    Form fields:
-      game         — Game/template name (required)
-      album        — optional album name to file the card under
-      front_image  — the card front (required)
-      back_image   — the card back  (optional)
+    Every image is best-effort auto-aligned/cropped by the selected edge type
+    (falling back to the raw photo if no card outline is found). Only the FRONT
+    of each card is OCR name/serial-checked; a 100% match is applied, otherwise
+    the entry is left blank for manual entry.
+
+    Form fields: game (required), album (optional), card_edge_type,
+                 front_image (image or PDF, required), back_image (optional).
     """
     ensure_dirs()
 
@@ -1941,7 +2213,7 @@ def import_single_card():
 
     front = request.files.get("front_image")
     if not front or not front.filename:
-        return jsonify({"status": "error", "message": "A front image is required"}), 400
+        return jsonify({"status": "error", "message": "A front image or PDF is required"}), 400
     back = request.files.get("back_image")
 
     try:
@@ -1949,64 +2221,36 @@ def import_single_card():
     except Exception as exc:
         return jsonify({"status": "error", "message": f"Could not load game '{game}': {exc}"}), 400
 
+    # Read the primary upload once, then sniff whether it's a PDF.
+    front_bytes = front.read()
+    is_pdf = (
+        (getattr(front, "mimetype", "") or "").lower() == "application/pdf"
+        or os.path.splitext(front.filename)[1].lower() == ".pdf"
+        or front_bytes[:5] == b"%PDF-"
+    )
+
+    if is_pdf:
+        return _import_single_card_pdf(front_bytes, game, album, edge_type, template)
+
+    # ---- Single image: front (required) + optional back ----
     aligned_flags = {}
-
-    def _save_side(file_storage, suffix):
-        """Detect + crop the card (best-effort, based on the selected edge type)
-        and save the image into the inventory folder. Records whether the crop
-        succeeded in `aligned_flags`. Returns the upload-relative path, or None
-        if the upload was missing/unreadable."""
-        if not file_storage or not file_storage.filename:
-            return None
-        np_buf = np.frombuffer(file_storage.read(), np.uint8)
-        img = cv2.imdecode(np_buf, cv2.IMREAD_COLOR)
-        if img is None:
-            return None
-        img, cropped = detect_and_crop_card(img, edge_type)   # falls back to raw
-        aligned_flags[suffix] = cropped
-        final_name = f"single_{suffix}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
-        relative_path = normalize_to_upload_relative(
-            os.path.join("inventory_cards", final_name)
-        )
-        absolute_path = os.path.join(app.config["UPLOAD_FOLDER"], relative_path)
-        cv2.imwrite(absolute_path, img)
-        return relative_path
-
     try:
-        front_path = _save_side(front, "front")
-        if not front_path:
+        front_img = cv2.imdecode(np.frombuffer(front_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if front_img is None:
             return jsonify({"status": "error", "message": "Could not read the front image"}), 400
-        back_path = _save_side(back, "back")   # may be None
+        front_path, front_cropped = _save_single_card_image(front_img, "front", edge_type)
+        aligned_flags["front"] = front_cropped
+
+        back_path = None
+        if back and back.filename:
+            back_img = cv2.imdecode(np.frombuffer(back.read(), np.uint8), cv2.IMREAD_COLOR)
+            if back_img is not None:
+                back_path, back_cropped = _save_single_card_image(back_img, "back", edge_type)
+                aligned_flags["back"] = back_cropped
     except Exception as exc:
         return jsonify({"status": "error", "message": f"Could not process image: {exc}"}), 500
 
-    # Blank starting values for every field this Game defines, plus the
-    # identity fields the rest of the app reads. `game` is stored with
-    # underscores turned into spaces to match how the 9-pocket import files it,
-    # so single and batch cards of the same game group together in Inventory.
-    blank_fields = {k: "" for k in (template.get("fields", {}) or {}).keys()}
-    extracted = {**blank_fields, "game": game.replace("_", " ")}
-    if album:
-        extracted["album"] = album
-
-    matched_product, record = create_scan_record(
-        image_path=front_path,
-        template_name=game,
-        extracted=extracted,
-        image_path_back=back_path,
-    )
-
-    # ── Auto-identify at the end of import ──
-    # Run the same OCR identification the detail page uses. On a 100% match,
-    # apply it and save; otherwise leave the entry blank for manual entry later.
-    ident = {"identified": False, "reason": "skipped"}
-    try:
-        ident = auto_identify_record(record)
-        if ident.get("identified"):
-            db.session.commit()
-    except Exception:
-        db.session.rollback()
-        ident = {"identified": False, "reason": "error"}
+    record, ident = _create_single_card(front_path, back_path, game, album, template)
 
     # Let the UI mention when a card outline couldn't be found and the raw
     # photo was kept instead (so the user can retry or crop manually later).
@@ -2025,8 +2269,13 @@ def import_single_card():
     else:
         message += " Left blank for manual entry (no confident match)."
 
+    card_type = (ident.get("type_applied") or {}).get("value", "")
+    if card_type:
+        message += f" Type detected: {card_type}."
+
     return jsonify({
         "status":          "success",
+        "mode":            "single",
         "message":         message,
         "record_id":       record.id,
         "edge_type":       edge_type,
@@ -2034,6 +2283,7 @@ def import_single_card():
         "back_aligned":    aligned_flags.get("back", False) if back_path else None,
         "identified":      bool(ident.get("identified")),
         "identified_name": (ident.get("applied") or {}).get("name", "") if ident.get("identified") else "",
+        "card_type":       card_type,
         "image_url":       build_uploaded_file_url(record.image_path),
         "image_url_back":  build_uploaded_file_url(record.image_path_back) if record.image_path_back else None,
         "detail_url":      url_for("inventory_detail", record_id=record.id),
@@ -3145,7 +3395,9 @@ def ocr_identify(record_id):
         }), 400
 
     try:
-        ocr = card_ocr.ocr_card_front(abs_path)
+        _g = (record.extracted_data or {}).get("game", "")
+        ocr = card_ocr.ocr_card_front(abs_path, game=_g,
+                                      type_refs=_load_prepared_type_refs(_g))
     except Exception as exc:  # never let OCR crash the request
         return jsonify({"status": "error", "message": f"OCR failed: {exc}"}), 500
 
@@ -3179,6 +3431,8 @@ def ocr_identify(record_id):
             "name_guess":     ocr.get("name_guess", ""),
             "number_guess":   ocr.get("number_guess", ""),
             "set_code_guess": ocr.get("set_code_guess", ""),
+            "type_guess":     ocr.get("type_guess", ""),
+            "type_confidence": ocr.get("type_confidence", 0.0),
             "conf_top":       ocr.get("conf_top", -1.0),
             "conf_bottom":    ocr.get("conf_bottom", -1.0),
             "raw_top":        ocr.get("raw_top", ""),
@@ -3431,6 +3685,147 @@ def reference_clear():
     ReferenceSync.query.filter_by(category_id=category_id).delete()
     db.session.commit()
     return jsonify({"status": "success", "deleted": deleted})
+
+
+# ====================== TYPE-ICON LIBRARY ROUTES ======================
+# A per-game library of labelled "type" icons (Pokemon energy, Yu-Gi-Oh
+# attribute, ...). Populate it by uploading an icon image or capturing one from a
+# scanned card; type detection then matches a card's icon against this library.
+def _known_games_for_types():
+    """Distinct games seen in inventory + defined templates, for the picker."""
+    games = set()
+    for rec in ScanRecord.query.all():
+        g = str((rec.extracted_data or {}).get("game") or "").strip()
+        if g and not _is_catalog_only(rec.extracted_data or {}):
+            games.add(g)
+    for t in get_template_names():
+        games.add(t.replace("_", " "))
+    return sorted(games, key=str.lower)
+
+
+def _save_type_reference_image(icon_bgr, game_key, type_name, region):
+    """Persist an icon crop under type_refs/<game>/<region>/<type>/ and return
+    its upload-relative path."""
+    ensure_dirs()
+    safe_game = secure_filename(game_key) or "game"
+    safe_type = secure_filename(type_name) or "type"
+    safe_region = secure_filename(region) or "top_right"
+    folder = os.path.join(app.config["TYPE_REF_FOLDER"], safe_game, safe_region, safe_type)
+    os.makedirs(folder, exist_ok=True)
+    fname = f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
+    abs_path = os.path.join(folder, fname)
+    cv2.imwrite(abs_path, icon_bgr)
+    return normalize_to_upload_relative(
+        os.path.join("type_refs", safe_game, safe_region, safe_type, fname))
+
+
+@app.route("/types")
+def type_references_page():
+    """Management page for the type-icon library."""
+    rows = TypeReference.query.order_by(TypeReference.game, TypeReference.type_name,
+                                        TypeReference.id).all()
+    library = {}
+    for r in rows:
+        library.setdefault(r.game, {}).setdefault(r.type_name, []).append({
+            "id": r.id,
+            "url": build_uploaded_file_url(r.image_path),
+            "source": r.source,
+            "region": r.region or "top_right",
+        })
+    return render_template("type_references.html",
+                           library=library,
+                           games=_known_games_for_types())
+
+
+@app.route("/types/add", methods=["POST"])
+def type_reference_add():
+    """
+    Add a reference image. Two ways:
+      • upload an image        (form 'image')
+      • capture from a card    (form 'record_id' — crops the marker from its front)
+    Common form fields: game (required), type_name (required),
+                        region ('top_left' | 'top_right' | 'header', default top_right).
+    Corner regions capture a small icon; the 'header' region captures the whole
+    top band (for card kinds whose full header design differs).
+    """
+    ensure_dirs()
+    game = (request.form.get("game") or "").strip()
+    type_name = (request.form.get("type_name") or "").strip()
+    region = card_ocr.normalize_type_region(request.form.get("region")) if card_ocr \
+        else (request.form.get("region") or "top_right")
+    if not game or not type_name:
+        return jsonify({"status": "error", "message": "Game and type name are required."}), 400
+
+    mode = card_ocr.region_mode(region) if card_ocr else "icon"
+    game_key = _type_game_key(game)
+    icon = None
+    source = "upload"
+
+    up = request.files.get("image")
+    record_id = (request.form.get("record_id") or "").strip()
+
+    if up and up.filename:
+        img = cv2.imdecode(np.frombuffer(up.read(), np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            return jsonify({"status": "error", "message": "Could not read the uploaded image."}), 400
+        if mode == "band":
+            # A full-card upload -> crop the header band; a header strip -> as-is.
+            h, w = img.shape[:2]
+            if h > w and card_ocr:
+                crop = card_ocr._extract_type_region(img, region)
+                icon = crop if crop is not None else img
+            else:
+                icon = img
+        else:
+            # A whole card -> crop the corner icon; a tight icon -> as-is.
+            icon = card_ocr._extract_type_region(img, region) if card_ocr else None
+            if icon is None:
+                icon = img
+    elif record_id:
+        try:
+            record = ScanRecord.query.get(int(record_id))
+        except (TypeError, ValueError):
+            record = None
+        if record is None:
+            return jsonify({"status": "error", "message": f"No record #{record_id}."}), 404
+        abs_path = _abs_record_image_path(record.image_path)
+        if not abs_path or not os.path.exists(abs_path) or card_ocr is None:
+            return jsonify({"status": "error", "message": "That card has no readable front image."}), 400
+        card = cv2.imread(abs_path)
+        if card is not None:
+            card, _ = card_ocr.normalize_card_image(card)
+        icon = card_ocr._extract_type_region(card, region) if card is not None else None
+        if icon is None:
+            where = "header" if mode == "band" else region.replace("_", "-")
+            return jsonify({"status": "error", "message":
+                            f"Couldn't read the {where} of that card. Try a different "
+                            "region, or upload an image instead."}), 422
+        source = "capture"
+    else:
+        return jsonify({"status": "error", "message": "Provide an icon image or a card to capture from."}), 400
+
+    rel = _save_type_reference_image(icon, game_key, type_name, region)
+    row = TypeReference(game=game_key, type_name=type_name, region=region,
+                        image_path=rel, source=source)
+    db.session.add(row)
+    db.session.commit()
+    _bump_type_refs()
+    return jsonify({
+        "status": "success",
+        "reference": {"id": row.id, "game": game_key, "type_name": type_name,
+                      "region": region, "url": build_uploaded_file_url(rel),
+                      "source": source},
+    })
+
+
+@app.route("/types/delete/<int:ref_id>", methods=["POST"])
+def type_reference_delete(ref_id):
+    row = TypeReference.query.get_or_404(ref_id)
+    remove_file_if_exists(row.image_path)
+    db.session.delete(row)
+    db.session.commit()
+    _bump_type_refs()
+    return jsonify({"status": "success", "deleted": ref_id})
 
 
 # ====================== DUPLICATE IMAGE MANAGER ROUTES ======================
@@ -3903,7 +4298,7 @@ def import_finalize_batch():
                     has_front = record.image_path and record.image_path != "__blank__"
                     if side == "front" and has_front and not (_get_name(rext) or _get_serial(rext)):
                         ident = auto_identify_record(record)
-                        if ident.get("identified"):
+                        if ident.get("identified") or ident.get("type_applied"):
                             db.session.commit()
                             matched_product = record.matched_product or matched_product
                     elif side == "back":
@@ -3923,6 +4318,7 @@ def import_finalize_batch():
                     "matched_product": matched_product.product_name if matched_product else "No match",
                     "identified":      bool(ident.get("identified")),
                     "identified_name": (ident.get("applied") or {}).get("name", "") if ident.get("identified") else "",
+                    "card_type":       (ident.get("type_applied") or {}).get("value", ""),
                 }
             except Exception as e:
                 result = {"filename": filename, "status": "error", "message": str(e)}
@@ -5739,11 +6135,30 @@ def migrate_add_display_image_path_column():
             conn.execute(text("ALTER TABLE scan_records ADD COLUMN display_image_path VARCHAR(255)"))
 
 
+def migrate_add_type_reference_region_column():
+    """
+    Add the type_references.region column ('top_left' | 'top_right') to installs
+    that created the table before it existed. No-op afterwards.
+    """
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(db.engine)
+    if "type_references" not in inspector.get_table_names():
+        return  # fresh DB — db.create_all() already created it with the column
+
+    columns = {col["name"] for col in inspector.get_columns("type_references")}
+    if "region" not in columns:
+        with db.engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE type_references ADD COLUMN region VARCHAR(20) DEFAULT 'top_right'"))
+
+
 if __name__ == "__main__":
     with app.app_context():
         db.create_all()
         migrate_add_image_path_back_column()
         migrate_add_display_image_path_column()
+        migrate_add_type_reference_region_column()
 
     ensure_dirs()
 

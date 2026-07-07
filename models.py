@@ -205,3 +205,29 @@ class ReferenceSync(db.Model):
 
     def __repr__(self):
         return f"<ReferenceSync cat={self.category_id} {self.game} n={self.product_count}>"
+
+
+class TypeReference(db.Model):
+    """
+    A labelled reference image of a card "type" icon (e.g. a Pokemon energy
+    symbol, a Yu-Gi-Oh attribute, ...), used to identify a scanned card's type
+    by template matching rather than colour alone.
+
+    One row per exemplar image; a type can have several exemplars, and each game
+    keeps its own set. `game` is stored lower-cased for matching against a
+    record's game. `image_path` is an upload-relative PNG of the (tight) icon.
+    `source` records how it was added: 'upload' (user supplied an icon image) or
+    'capture' (cropped from one of the user's own scanned cards).
+    """
+    __tablename__ = 'type_references'
+    id          = db.Column(db.Integer, primary_key=True)
+    game        = db.Column(db.String(120), index=True, nullable=False)  # lower-cased game key
+    type_name   = db.Column(db.String(80), nullable=False)               # "Fire", "Water", ...
+    region      = db.Column(db.String(20), default='top_right')          # top_left | top_right
+    image_path  = db.Column(db.String(255), nullable=False)              # upload-relative PNG of the icon
+    source      = db.Column(db.String(30), default='upload')            # upload | capture
+    note        = db.Column(db.String(200), nullable=True)
+    created_at  = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<TypeReference {self.game} {self.type_name} [{self.region}] #{self.id}>"

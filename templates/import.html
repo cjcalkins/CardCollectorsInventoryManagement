@@ -865,6 +865,11 @@
         <i class="fas fa-id-card"></i> Single Card (front &amp; back)
       </button>
     </div>
+    <div style="max-width:760px; margin:-12px auto 20px; text-align:right;">
+      <a href="{{ url_for('type_references_page') }}" class="small text-decoration-none" title="Teach the scanner each game's type icons">
+        <i class="fas fa-shapes me-1"></i>Manage type icons
+      </a>
+    </div>
 
     <!-- ===================== SINGLE CARD IMPORT ===================== -->
     <section class="panel hidden" id="modeSingle" style="max-width: 760px; margin: 0 auto 24px;">
@@ -907,16 +912,22 @@
             <div class="hint">How the card outline is detected before cropping. <strong>Rounded</strong> (most modern cards) fits a rectangle around the curved corners; <strong>Square</strong> (vintage / sharp-cut cards) follows the true corners precisely.</div>
           </div>
 
+          <div class="hint" id="singlePdfHint" style="margin-top:-4px;">
+            Upload an image for a single card, or a <strong>PDF</strong> to import several at once —
+            odd pages (1, 3, 5, …) are treated as fronts and even pages (2, 4, 6, …) as their backs.
+            Only the front of each card is checked for a name/serial match.
+          </div>
+
           <div class="grid-2">
             <div class="field">
-              <label for="singleFront">Front image</label>
-              <input type="file" id="singleFront" name="front_image" accept="image/*" required>
+              <label for="singleFront">Front image or PDF</label>
+              <input type="file" id="singleFront" name="front_image" accept="image/*,application/pdf" required>
               <div class="single-preview-wrap">
                 <img id="singleFrontPreview" class="single-preview" alt="Front preview" style="display:none;">
                 <span id="singleFrontPlaceholder" class="single-preview-empty">Front</span>
               </div>
             </div>
-            <div class="field">
+            <div class="field" id="singleBackField">
               <label for="singleBack">Back image <span style="font-weight:400;color:var(--muted);">(optional)</span></label>
               <input type="file" id="singleBack" name="back_image" accept="image/*">
               <div class="single-preview-wrap">
@@ -1182,8 +1193,50 @@
         reader.readAsDataURL(file);
       });
     }
-    wireSinglePreview(singleFront, singleFrontPreview, singleFrontPlaceholder);
+    // Back preview: plain image preview.
     wireSinglePreview(singleBack, singleBackPreview, singleBackPlaceholder);
+
+    const singleBackField = document.getElementById('singleBackField');
+    function singleIsPdf(file) {
+      return !!file && (file.type === 'application/pdf' || /\.pdf$/i.test(file.name || ''));
+    }
+    // Front input: an image -> preview + back enabled; a PDF -> badge + back
+    // disabled (the PDF supplies both sides via odd/even page pairing).
+    singleFront.addEventListener('change', function () {
+      const file = singleFront.files && singleFront.files[0];
+      const pdf = singleIsPdf(file);
+
+      singleBackField.style.opacity = pdf ? '0.45' : '';
+      singleBack.disabled = pdf;
+      if (pdf) {
+        singleBack.value = '';
+        singleBackPreview.style.display = 'none';
+        singleBackPreview.removeAttribute('src');
+        singleBackPlaceholder.style.display = '';
+      }
+
+      if (!file) {
+        singleFrontPreview.style.display = 'none';
+        singleFrontPreview.removeAttribute('src');
+        singleFrontPlaceholder.textContent = 'Front';
+        singleFrontPlaceholder.style.display = '';
+        return;
+      }
+      if (pdf) {
+        singleFrontPreview.style.display = 'none';
+        singleFrontPreview.removeAttribute('src');
+        singleFrontPlaceholder.textContent = 'PDF — pages paired front / back';
+        singleFrontPlaceholder.style.display = '';
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = ev => {
+        singleFrontPreview.src = ev.target.result;
+        singleFrontPreview.style.display = 'block';
+        singleFrontPlaceholder.style.display = 'none';
+      };
+      reader.readAsDataURL(file);
+    });
 
     if (singleCardForm) {
       singleCardForm.addEventListener('submit', async (e) => {
@@ -1192,15 +1245,18 @@
         const game = singleGame.value;
         if (!game) { setSingleStatus('Select a Game first.', 'error'); return; }
         if (!singleFront.files || !singleFront.files[0]) {
-          setSingleStatus('A front image is required.', 'error');
+          setSingleStatus('A front image or PDF is required.', 'error');
           return;
         }
+        const isPdf = singleIsPdf(singleFront.files[0]);
 
         singleResult.style.display = 'none';
         singleResult.innerHTML = '';
         singleCardBtn.disabled = true;
         singleCardBtn.textContent = 'Adding…';
-        setSingleStatus('Aligning image(s) and adding the card to inventory…', 'info');
+        setSingleStatus(
+          isPdf ? 'Reading PDF, aligning pages and importing front/back pairs…'
+                : 'Aligning image(s) and adding the card to inventory…', 'info');
 
         const formData = new FormData(singleCardForm);
 
@@ -1212,34 +1268,68 @@
             throw new Error(data.message || 'Import failed.');
           }
 
-          setSingleStatus(data.message || 'Card added to inventory.', 'success');
+          setSingleStatus(data.message || 'Added to inventory.', 'success');
 
-          const frontThumb = data.image_url
-            ? `<img src="${data.image_url}" alt="Card front">` : '';
-          const idBadge = data.identified
-            ? `<span class="badge ok">Identified${data.identified_name ? ' — ' + data.identified_name : ''}</span>`
-            : `<span class="badge info">Blank — manual entry</span>`;
-          const idHint = data.identified
-            ? 'Fields were filled in automatically from a confident match. Open the card to review.'
-            : 'No confident match, so the entry was left blank. Open its detail page to fill in fields or run Identify.';
-          singleResult.innerHTML = `
-            ${frontThumb}
-            <div class="single-result-body">
-              <div class="single-result-title">Card #${data.record_id} added to inventory ${idBadge}</div>
-              <div class="hint" style="margin:0;">${idHint}</div>
-              <div class="actions" style="margin-top:10px;">
-                <a href="${data.detail_url}" class="btn-primary" style="text-decoration:none;display:inline-flex;align-items:center;">Open card</a>
-                <button type="button" class="btn-secondary" id="singleAddAnother">Add another</button>
-              </div>
-            </div>`;
-          singleResult.style.display = 'flex';
+          if (data.mode === 'pdf') {
+            const idc = data.identified_count || 0;
+            const rows = (data.cards || []).map(c => {
+              const badge = c.identified
+                ? `<span class="badge ok">Identified${c.identified_name ? ' — ' + c.identified_name : ''}</span>`
+                : `<span class="badge info">Blank — manual entry</span>`;
+              const pages = c.back_page
+                ? `pages ${c.front_page} / ${c.back_page}`
+                : `page ${c.front_page} (no back)`;
+              const tchip = c.card_type ? ` <span class="badge info">${c.card_type}</span>` : '';
+              return `<div class="ocr-item"><strong>Card #${c.record_id}</strong>
+                        <span class="hint" style="margin:0">${pages}</span> ${badge}${tchip}
+                        &nbsp;<a href="${c.detail_url}">open</a></div>`;
+            }).join('');
+            singleResult.style.display = 'flex';
+            singleResult.style.flexDirection = 'column';
+            singleResult.style.alignItems = 'stretch';
+            singleResult.innerHTML = `
+              <div class="single-result-body" style="width:100%">
+                <div class="single-result-title">${data.count} card(s) imported from PDF — ${idc} identified, ${Math.max(0, data.count - idc)} blank</div>
+                <div style="margin-top:8px; display:flex; flex-direction:column; gap:6px;">${rows}</div>
+                <div class="actions" style="margin-top:12px;">
+                  <a href="{{ url_for('inventory') }}" class="btn-primary" style="text-decoration:none;display:inline-flex;align-items:center;">View Inventory</a>
+                  <button type="button" class="btn-secondary" id="singleAddAnother">Import more</button>
+                </div>
+              </div>`;
+          } else {
+            const frontThumb = data.image_url
+              ? `<img src="${data.image_url}" alt="Card front">` : '';
+            const idBadge = data.identified
+              ? `<span class="badge ok">Identified${data.identified_name ? ' — ' + data.identified_name : ''}</span>`
+              : `<span class="badge info">Blank — manual entry</span>`;
+            const typeChip = data.card_type ? ` <span class="badge info">Type: ${data.card_type}</span>` : '';
+            const idHint = data.identified
+              ? 'Fields were filled in automatically from a confident match. Open the card to review.'
+              : 'No confident match, so the entry was left blank. Open its detail page to fill in fields or run Identify.';
+            singleResult.style.flexDirection = '';
+            singleResult.style.alignItems = '';
+            singleResult.style.display = 'flex';
+            singleResult.innerHTML = `
+              ${frontThumb}
+              <div class="single-result-body">
+                <div class="single-result-title">Card #${data.record_id} added to inventory ${idBadge}${typeChip}</div>
+                <div class="hint" style="margin:0;">${idHint}</div>
+                <div class="actions" style="margin-top:10px;">
+                  <a href="${data.detail_url}" class="btn-primary" style="text-decoration:none;display:inline-flex;align-items:center;">Open card</a>
+                  <button type="button" class="btn-secondary" id="singleAddAnother">Add another</button>
+                </div>
+              </div>`;
+          }
 
           document.getElementById('singleAddAnother').addEventListener('click', () => {
             singleCardForm.reset();
             singleFrontPreview.style.display = 'none';
             singleBackPreview.style.display = 'none';
+            singleFrontPlaceholder.textContent = 'Front';
             singleFrontPlaceholder.style.display = '';
             singleBackPlaceholder.style.display = '';
+            singleBack.disabled = false;
+            singleBackField.style.opacity = '';
             singleResult.style.display = 'none';
             singleResult.innerHTML = '';
             setSingleStatus('', 'info');
@@ -1933,8 +2023,9 @@
         } else {
           badge = `<span class="badge info">Blank — manual entry</span>`;
         }
+        const tchip = item.card_type ? ` <span class="badge info">Type: ${item.card_type}</span>` : '';
         div.innerHTML = `
-          <strong>${item.filename}</strong> ${badge}
+          <strong>${item.filename}</strong> ${badge}${tchip}
           <div class="hint">${JSON.stringify(item.extracted, null, 2)}</div>
         `;
         ocrResults.appendChild(div);

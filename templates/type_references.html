@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <link rel="icon" type="image/jpeg" href="{{ url_for('static', filename='favicon.jpg') }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Type Icons - Card Collector Inventory Manager</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <style>
+        body { background: #f8f9fa; }
+        .nav-tabs-minimal { display: flex; gap: 10px; margin-left: auto; flex-wrap: wrap; }
+        .nav-tab {
+            padding: 8px 14px; text-decoration: none; border-radius: 8px;
+            background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.85);
+            font-weight: 600; transition: 0.2s ease;
+        }
+        .nav-tab:hover { background: rgba(255,255,255,0.18); color: #fff; }
+        .nav-tab.active { background: #fff; color: #212529; }
+
+        .panel { background:#fff; border:1px solid #e5e9f0; border-radius:14px; box-shadow:0 4px 18px rgba(0,0,0,.05); }
+        .type-group { border:1px solid #e9ecef; border-radius:12px; padding:14px; margin-bottom:14px; }
+        .type-row { display:flex; align-items:center; gap:12px; flex-wrap:wrap; padding:8px 0; border-top:1px dashed #e9ecef; }
+        .type-row:first-of-type { border-top:none; }
+        .type-name { font-weight:700; min-width:120px; }
+        .icon-chip { position:relative; width:52px; height:52px; border:1px solid #dee2e6; border-radius:10px;
+                     background:#f1f3f5 center/contain no-repeat; }
+        .icon-chip.wide { width:130px; }
+        .icon-chip .del { position:absolute; top:-8px; right:-8px; width:20px; height:20px; border-radius:50%;
+                          background:#dc3545; color:#fff; border:none; font-size:11px; line-height:1;
+                          display:flex; align-items:center; justify-content:center; cursor:pointer; }
+        .src-cap { position:absolute; bottom:-6px; left:50%; transform:translateX(-50%); font-size:9px;
+                   background:#0d6efd; color:#fff; border-radius:8px; padding:0 5px; }
+        .region-tag { position:absolute; top:-7px; left:-7px; font-size:9px; font-weight:700;
+                      background:#495057; color:#fff; border-radius:6px; padding:0 4px; line-height:15px; }
+        .empty { color:#6c757d; text-align:center; padding:3rem 1rem; }
+        .empty i { font-size:3rem; opacity:.35; display:block; margin-bottom:1rem; }
+        .seg { display:flex; gap:8px; }
+        .seg label { flex:1; text-align:center; border:1px solid #ced4da; border-radius:8px; padding:8px; cursor:pointer; font-weight:600; }
+        .seg input { display:none; }
+        .seg label.active { background:#0d6efd; color:#fff; border-color:#0d6efd; }
+        .preview { width:64px; height:64px; border:1px dashed #ced4da; border-radius:10px; object-fit:contain; background:#f8f9fa; display:none; }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+        <div class="container d-flex flex-wrap align-items-center">
+            <a class="navbar-brand" href="{{ url_for('index') }}">
+                <img src="{{ url_for('static', filename='favicon.jpg') }}" alt="logo" width="24" height="24"
+                     style="object-fit:cover;border-radius:4px;margin-right:0.5rem;" class="me-2">Card Collector Inventory Manager
+            </a>
+            <div class="nav-tabs-minimal">
+                <a href="{{ url_for('import_page') }}" class="nav-tab">Import</a>
+                <a href="{{ url_for('index') }}"        class="nav-tab">Templates</a>
+                <a href="{{ url_for('inventory') }}"    class="nav-tab">Inventory</a>
+                <a href="{{ url_for('albums_list') }}"  class="nav-tab">Album</a>
+                <a href="{{ url_for('shops_page') }}"   class="nav-tab">Shops</a>
+                <a href="{{ url_for('type_references_page') }}" class="nav-tab active">Type Icons</a>
+                <a href="{{ url_for('search_by_image_page') }}" class="nav-tab" title="Search by photo"><i class="fas fa-camera"></i></a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container py-5">
+        <div class="mb-4">
+            <h2 class="mb-1"><i class="fas fa-shapes me-2"></i>Type-Icon Library</h2>
+            <div class="text-muted">
+                Teach the scanner each game's type icons (Pokémon energy, Yu-Gi-Oh attribute, …). During import and
+                Identify, a card's icon is matched against this library to fill its <strong>type</strong> field. Add several
+                exemplars per type (different eras/styles) for best results. Until a game has a library, Pokémon falls back to
+                a built-in colour guess and other games get no type.
+            </div>
+        </div>
+
+        <div class="row g-4">
+            <!-- Add form -->
+            <div class="col-lg-4">
+                <div class="panel p-3">
+                    <h5 class="mb-3">Add a type icon</h5>
+                    <div class="mb-2">
+                        <label class="form-label mb-1">Game</label>
+                        <input class="form-control" id="tGame" list="gameList" placeholder="Pokemon" autocomplete="off">
+                        <datalist id="gameList">
+                            {% for g in games %}<option value="{{ g }}"></option>{% endfor %}
+                        </datalist>
+                    </div>
+                    <div class="mb-2">
+                        <label class="form-label mb-1">Type name</label>
+                        <input class="form-control" id="tType" placeholder="Water" autocomplete="off">
+                    </div>
+                    <div class="mb-2">
+                        <label class="form-label mb-1">Match region</label>
+                        <div class="seg" id="regionSeg">
+                            <label class="active" data-region="top_right"><input type="radio" name="region" value="top_right" checked>Top-right</label>
+                            <label data-region="top_left"><input type="radio" name="region" value="top_left">Top-left</label>
+                            <label data-region="header"><input type="radio" name="region" value="header">Full header</label>
+                        </div>
+                        <div class="form-text">
+                            <strong>Top-right / Top-left</strong>: a small corner icon (e.g. Pokémon energy).
+                            <strong>Full header</strong>: the whole top band — use this when a card <em>kind</em> has a
+                            distinct header design (e.g. a Pokémon Trainer/Supporter or Energy card).
+                        </div>
+                    </div>
+                    <div class="mb-2">
+                        <label class="form-label mb-1">Source</label>
+                        <div class="seg" id="srcSeg">
+                            <label class="active" data-src="upload"><input type="radio" name="src" value="upload" checked>Upload icon</label>
+                            <label data-src="capture"><input type="radio" name="src" value="capture">Capture from card #</label>
+                        </div>
+                    </div>
+                    <div class="mb-2" id="uploadField">
+                        <input type="file" class="form-control" id="tImage" accept="image/*">
+                        <div class="form-text">A tight icon works best; a whole-card photo is auto-cropped to the top-right icon.</div>
+                        <img id="tPreview" class="preview mt-2" alt="preview">
+                    </div>
+                    <div class="mb-2" id="captureField" style="display:none;">
+                        <input class="form-control" id="tRecord" type="number" min="1" placeholder="Inventory card # (e.g. 42)">
+                        <div class="form-text">Crops the type icon from that card's front image.</div>
+                    </div>
+                    <button class="btn btn-primary w-100" id="tAdd">Add to library</button>
+                    <div id="tMsg" class="small mt-2"></div>
+                </div>
+            </div>
+
+            <!-- Library -->
+            <div class="col-lg-8">
+                <div class="panel p-3" id="libraryPanel">
+                    {% if library %}
+                        {% for game, types in library.items() %}
+                        <div class="type-group" data-game="{{ game }}">
+                            <div class="d-flex justify-content-between align-items-center mb-2">
+                                <h5 class="mb-0 text-capitalize">{{ game }}</h5>
+                                <span class="badge bg-secondary">{{ types | length }} type(s)</span>
+                            </div>
+                            {% for type_name, icons in types.items() %}
+                            <div class="type-row" data-type="{{ type_name }}">
+                                <div class="type-name">{{ type_name }}</div>
+                                {% for ic in icons %}
+                                <div class="icon-chip{{ ' wide' if ic.region == 'header' else '' }}" style="background-image:url('{{ ic.url }}')" data-id="{{ ic.id }}">
+                                    <span class="region-tag">{{ 'HDR' if ic.region == 'header' else ('TL' if ic.region == 'top_left' else 'TR') }}</span>
+                                    {% if ic.source == 'capture' %}<span class="src-cap">card</span>{% endif %}
+                                    <button class="del" title="Delete" onclick="deleteRef({{ ic.id }}, this)">&times;</button>
+                                </div>
+                                {% endfor %}
+                            </div>
+                            {% endfor %}
+                        </div>
+                        {% endfor %}
+                    {% else %}
+                        <div class="empty" id="emptyState">
+                            <i class="fas fa-shapes"></i>
+                            <h5>No type icons yet</h5>
+                            <p>Add your first icon on the left to start building a library.</p>
+                        </div>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        const $ = id => document.getElementById(id);
+
+        // Source toggle
+        $('srcSeg').querySelectorAll('label').forEach(l => l.addEventListener('click', () => {
+            $('srcSeg').querySelectorAll('label').forEach(x => x.classList.remove('active'));
+            l.classList.add('active');
+            l.querySelector('input').checked = true;
+            const cap = l.dataset.src === 'capture';
+            $('captureField').style.display = cap ? '' : 'none';
+            $('uploadField').style.display  = cap ? 'none' : '';
+        }));
+
+        // Corner (region) toggle
+        $('regionSeg').querySelectorAll('label').forEach(l => l.addEventListener('click', () => {
+            $('regionSeg').querySelectorAll('label').forEach(x => x.classList.remove('active'));
+            l.classList.add('active');
+            l.querySelector('input').checked = true;
+        }));
+
+        // Image preview
+        $('tImage').addEventListener('change', e => {
+            const f = e.target.files[0];
+            const img = $('tPreview');
+            if (!f) { img.style.display = 'none'; return; }
+            const r = new FileReader();
+            r.onload = ev => { img.src = ev.target.result; img.style.display = 'block'; };
+            r.readAsDataURL(f);
+        });
+
+        function setMsg(text, ok) {
+            const m = $('tMsg');
+            m.textContent = text;
+            m.className = 'small mt-2 ' + (ok ? 'text-success' : 'text-danger');
+        }
+
+        async function addRef() {
+            const game = $('tGame').value.trim();
+            const type = $('tType').value.trim();
+            const src  = document.querySelector('input[name="src"]:checked').value;
+            if (!game || !type) { setMsg('Game and type name are required.', false); return; }
+
+            const fd = new FormData();
+            fd.append('game', game);
+            fd.append('type_name', type);
+            fd.append('region', document.querySelector('input[name="region"]:checked').value);
+            if (src === 'upload') {
+                const f = $('tImage').files[0];
+                if (!f) { setMsg('Choose an icon image to upload.', false); return; }
+                fd.append('image', f);
+            } else {
+                const rid = $('tRecord').value.trim();
+                if (!rid) { setMsg('Enter the inventory card number to capture from.', false); return; }
+                fd.append('record_id', rid);
+            }
+
+            $('tAdd').disabled = true;
+            try {
+                const res = await fetch('/types/add', { method: 'POST', body: fd });
+                const data = await res.json();
+                if (!res.ok || data.status !== 'success') throw new Error(data.message || 'Failed.');
+                setMsg('Added.', true);
+                addToLibraryDOM(game, type, data.reference);
+                $('tImage').value = ''; $('tPreview').style.display = 'none'; $('tRecord').value = '';
+            } catch (err) {
+                setMsg(err.message, false);
+            } finally {
+                $('tAdd').disabled = false;
+            }
+        }
+        $('tAdd').addEventListener('click', addRef);
+
+        // Insert a new icon chip into the library, creating game/type sections as needed.
+        function addToLibraryDOM(game, type, ref) {
+            const panel = $('libraryPanel');
+            const empty = $('emptyState'); if (empty) empty.remove();
+            const gkey = ref.game;
+            let group = panel.querySelector(`.type-group[data-game="${gkey}"]`);
+            if (!group) {
+                group = document.createElement('div');
+                group.className = 'type-group'; group.dataset.game = gkey;
+                group.innerHTML = `<div class="d-flex justify-content-between align-items-center mb-2">
+                    <h5 class="mb-0 text-capitalize">${gkey}</h5></div>`;
+                panel.appendChild(group);
+            }
+            let row = group.querySelector(`.type-row[data-type="${CSS.escape(type)}"]`);
+            if (!row) {
+                row = document.createElement('div');
+                row.className = 'type-row'; row.dataset.type = type;
+                row.innerHTML = `<div class="type-name">${type}</div>`;
+                group.appendChild(row);
+            }
+            const chip = document.createElement('div');
+            chip.className = 'icon-chip' + (ref.region === 'header' ? ' wide' : '');
+            chip.style.backgroundImage = `url('${ref.url}')`;
+            chip.dataset.id = ref.id;
+            const rtag = (ref.region === 'header') ? 'HDR' : ((ref.region === 'top_left') ? 'TL' : 'TR');
+            chip.innerHTML = `<span class="region-tag">${rtag}</span>`
+                + (ref.source === 'capture' ? '<span class="src-cap">card</span>' : '')
+                + `<button class="del" title="Delete" onclick="deleteRef(${ref.id}, this)">&times;</button>`;
+            row.appendChild(chip);
+        }
+
+        async function deleteRef(id, btn) {
+            if (!confirm('Delete this reference icon?')) return;
+            try {
+                const res = await fetch('/types/delete/' + id, { method: 'POST' });
+                const data = await res.json();
+                if (!res.ok || data.status !== 'success') throw new Error(data.message || 'Failed');
+                const chip = btn.closest('.icon-chip');
+                const row = chip.closest('.type-row');
+                const group = chip.closest('.type-group');
+                chip.remove();
+                if (row && !row.querySelector('.icon-chip')) row.remove();
+                if (group && !group.querySelector('.type-row')) group.remove();
+            } catch (err) { alert(err.message); }
+        }
+    </script>
+</body>
+</html>
