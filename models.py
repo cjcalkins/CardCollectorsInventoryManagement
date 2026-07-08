@@ -33,6 +33,33 @@ class ScanRecord(db.Model):
     matched_product_id = db.Column(db.Integer, db.ForeignKey('products.id'), nullable=True)
     matched_product = db.relationship('Product')
 
+    # ------------------------------------------------------------------ #
+    # Denormalized "hot" columns, derived from extracted_data at write time
+    # (see the SQLAlchemy before_insert/before_update events in app.py). They
+    # are pure cache — extracted_data remains the source of truth — but they let
+    # filtering, sorting, de-duplication, and pagination happen in indexed SQL
+    # instead of by loading and looping over every row in Python, which is what
+    # keeps queries fast into the millions of records.
+    #   *_key      : normalized (lower/stripped) copies of common fields
+    #   dup_hash   : identity of a duplicate group (name|serial|edition|holo) for
+    #                FINALIZED records; NULL for unfinalized (each is its own group)
+    #   is_*       : booleans promoted out of the JSON for fast WHERE clauses
+    # ------------------------------------------------------------------ #
+    game_key      = db.Column(db.String(120), index=True)
+    album_key     = db.Column(db.String(200), index=True)
+    name_key      = db.Column(db.String(300), index=True)
+    card_type_key = db.Column(db.String(80),  index=True)
+    dup_hash      = db.Column(db.String(64),  index=True)
+    is_finalized  = db.Column(db.Boolean, default=False, index=True)
+    is_catalog    = db.Column(db.Boolean, default=False, index=True)
+    is_archived   = db.Column(db.Boolean, default=False, index=True)
+
+    __table_args__ = (
+        # Serves the hot Inventory query: filter by game + owned/active, order by recency.
+        db.Index('idx_scan_hot', 'game_key', 'is_catalog', 'is_archived', 'scan_date'),
+        db.Index('idx_scan_album_hot', 'album_key', 'is_catalog', 'is_archived'),
+    )
+
 
 class ShopConnection(db.Model):
     """

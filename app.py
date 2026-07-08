@@ -1453,6 +1453,77 @@ def _is_catalog_only(data: dict) -> bool:
     return val is True or str(val).strip().lower() == "true"
 
 
+# ====================== DENORMALIZED COLUMN SYNC ======================
+# The ScanRecord.*_key / dup_hash / is_* columns are a write-time cache of values
+# that otherwise live inside the extracted_data JSON. They exist so filtering,
+# sorting, de-duplication, and pagination can run in indexed SQL instead of by
+# loading every row into Python — the key to staying fast into the millions.
+#
+# extracted_data stays the single source of truth: these columns are ALWAYS
+# recomputed from it by the before_insert/before_update mapper events below, so
+# every existing write path (which reassigns extracted_data) keeps them correct
+# without needing to be touched individually.
+import hashlib as _hashlib
+from sqlalchemy import event as _sa_event2
+
+
+def _bool_from(data, key):
+    v = (data or {}).get(key, False)
+    return v is True or str(v).strip().lower() == "true"
+
+
+def _derive_card_type(data):
+    """Best-effort type/colour value for a card, for optional fast filtering.
+    Picks the first type-ish field present, ignoring the generic 'Card Type'."""
+    for k, v in (data or {}).items():
+        kl = str(k).strip().lower()
+        if kl in ("card type", "card_type"):
+            continue
+        if _re.search(r"type|energy|element|colou?r|attribute", kl, _re.I):
+            sv = str(v or "").strip()
+            if sv:
+                return sv.lower()
+    return ""
+
+
+def _compute_dup_hash(data):
+    """Stable hash of a FINALIZED record's duplicate identity
+    (name|serial|edition|holographic). Returns None for unfinalized records so
+    each stays its own group (never merged)."""
+    if not _bool_from(data, "finalized"):
+        return None
+    parts = (
+        _get_name(data),
+        _get_serial(data),
+        _get_edition(data),
+        str((data or {}).get("holographic", "")).strip().lower(),
+    )
+    return _hashlib.sha1("\x1f".join(parts).encode("utf-8")).hexdigest()
+
+
+def _derive_scan_columns(record):
+    """Populate a ScanRecord's denormalized columns from its extracted_data."""
+    data = record.extracted_data or {}
+    record.game_key      = (str(data.get("game", "")).strip().lower() or None)
+    record.album_key     = (str(data.get("album", "")).strip().lower() or None)
+    record.name_key      = (_get_name(data) or None)
+    record.card_type_key = (_derive_card_type(data) or None)
+    record.dup_hash      = _compute_dup_hash(data)
+    record.is_finalized  = _bool_from(data, "finalized")
+    record.is_catalog    = _is_catalog_only(data)
+    record.is_archived   = _bool_from(data, "archived")
+
+
+@_sa_event2.listens_for(ScanRecord, "before_insert")
+def _scan_before_insert(_mapper, _conn, target):
+    _derive_scan_columns(target)
+
+
+@_sa_event2.listens_for(ScanRecord, "before_update")
+def _scan_before_update(_mapper, _conn, target):
+    _derive_scan_columns(target)
+
+
 def _is_entry_field(key: str) -> bool:
     """Return True if key should appear as a dynamic entry column."""
     if key in _STATIC_ENTRY_KEYS:
@@ -1586,6 +1657,174 @@ def _inventory_game_select():
     return render_template("inventory_game_select.html", games=games, catalog_count=catalog_count)
 
 
+class _InvPagination:
+    """Template-compatible pagination object shared by both inventory paths."""
+    def __init__(self, items, total, cur_page, pp, start):
+        self.items    = items
+        self.total    = total
+        self.page     = cur_page
+        self.per_page = pp
+        self.pages    = max(1, -(-total // pp))  # ceiling division
+        self.has_prev = cur_page > 1
+        self.has_next = cur_page < self.pages
+        self.prev_num = cur_page - 1
+        self.next_num = cur_page + 1
+        self.first    = start + 1 if items else 0
+        self.last     = min(start + len(items), total)
+
+    def iter_pages(self, left_edge=1, right_edge=1, left_current=2, right_current=2):
+        last = self.pages
+        for num in range(1, last + 1):
+            if (num <= left_edge or num > last - right_edge
+                    or (self.page - left_current <= num <= self.page + right_current)):
+                yield num
+            else:
+                yield None
+
+
+def _inventory_base_conditions(f_game, f_album, f_template, view_catalog):
+    """WHERE conditions (on denormalized columns) shared by the fast-path
+    representative query, count, member lookup, and field sampling."""
+    from sqlalchemy import func as _f
+    conds = [
+        _f.coalesce(ScanRecord.is_catalog, False) == bool(view_catalog),
+    ]
+    if not view_catalog:
+        conds.append(_f.coalesce(ScanRecord.is_archived, False) == False)  # noqa: E712
+    if f_template:
+        conds.append(ScanRecord.template_used == f_template)
+    if f_game:
+        conds.append(ScanRecord.game_key == f_game.strip().lower())
+    if f_album:
+        conds.append(ScanRecord.album_key == f_album.strip().lower())
+    return conds
+
+
+def _render_inventory_fast(f_game, f_album, f_template, view_catalog,
+                           page, per_page, sort_col, sort_dir):
+    """
+    Fast Inventory path: de-duplicate and paginate entirely in SQL using the
+    dup_hash column and window functions, loading only the page's ~50 rows
+    instead of the whole filtered set. Used for the default (recency) view;
+    the caller falls back to the Python path for free-text search and arbitrary
+    field sorts. Raises on any DB error so the caller can fall back safely.
+    """
+    from sqlalchemy import select, func, cast, String, and_
+
+    conds = _inventory_base_conditions(f_game, f_album, f_template, view_catalog)
+
+    # Group key: dup_hash for finalized rows; a per-row token for the rest so
+    # unfinalized records never merge together.
+    grp = func.coalesce(ScanRecord.dup_hash,
+                        "solo:" + cast(ScanRecord.id, String)).label("grp")
+
+    windowed = (
+        select(
+            ScanRecord.id.label("id"),
+            ScanRecord.scan_date.label("scan_date"),
+            func.count().over(partition_by=grp).label("qty"),
+            func.row_number().over(
+                partition_by=grp,
+                order_by=(ScanRecord.scan_date.desc(), ScanRecord.id.desc()),
+            ).label("rn"),
+        )
+        .where(and_(*conds))
+        .subquery()
+    )
+
+    reps = (
+        select(windowed.c.id, windowed.c.qty)
+        .where(windowed.c.rn == 1)
+        .order_by(windowed.c.scan_date.desc(), windowed.c.id.desc())
+    )
+
+    total_groups = db.session.execute(
+        select(func.count()).select_from(reps.subquery())
+    ).scalar() or 0
+
+    start = (page - 1) * per_page
+    page_rows = db.session.execute(reps.limit(per_page).offset(start)).all()
+    rep_ids  = [r.id for r in page_rows]
+    qty_by_id = {r.id: r.qty for r in page_rows}
+
+    # Load the representative ORM objects, preserving page order.
+    rep_records = []
+    if rep_ids:
+        by_id = {r.id: r for r in ScanRecord.query.filter(ScanRecord.id.in_(rep_ids)).all()}
+        rep_records = [by_id[i] for i in rep_ids if i in by_id]
+
+    # Build group_info only for this page's reps (count + all_ids + duplicate
+    # locations), fetching members of finalized groups in one query.
+    from collections import defaultdict
+    members_by_hash = defaultdict(list)
+    hashes = [r.dup_hash for r in rep_records if r.dup_hash]
+    if hashes:
+        member_rows = (ScanRecord.query
+                       .filter(ScanRecord.dup_hash.in_(hashes), and_(*conds))
+                       .all())
+        for m in member_rows:
+            members_by_hash[m.dup_hash].append(m)
+
+    group_info = {}
+    for rep in rep_records:
+        if rep.dup_hash and members_by_hash.get(rep.dup_hash):
+            members = sorted(members_by_hash[rep.dup_hash],
+                             key=lambda r: (r.scan_date or datetime.min, r.id), reverse=True)
+            all_ids = [m.id for m in members]
+            locations = [
+                "{}/{}".format((m.extracted_data or {}).get("page", "?"),
+                               (m.extracted_data or {}).get("slot", "?"))
+                for m in members if m.id != rep.id
+            ]
+            group_info[rep.id] = {"count": qty_by_id.get(rep.id, len(members)),
+                                  "all_ids": all_ids, "locations": locations}
+        else:
+            group_info[rep.id] = {"count": 1, "all_ids": [rep.id], "locations": []}
+
+    pagination = _InvPagination(rep_records, total_groups, page, per_page, start)
+
+    # Entry-field discovery from a bounded sample of the filtered set.
+    sample = ScanRecord.query.filter(and_(*conds)).limit(500).all()
+    entry_fields = discover_entry_fields(sample)
+
+    template_fields_config = _template_fields_config()
+
+    return render_template(
+        "inventory.html",
+        records=pagination.items,
+        pagination=pagination,
+        search="",
+        f_game=f_game,
+        f_album=f_album,
+        f_template=f_template,
+        per_page=per_page,
+        entry_fields=entry_fields,
+        group_info=group_info,
+        sort_col=sort_col,
+        sort_dir=sort_dir,
+        template_fields_config=template_fields_config,
+        catalog_view=view_catalog,
+    )
+
+
+def _template_fields_config():
+    """Aggregate field-type config across all templates (shared by both paths)."""
+    cfg = {}
+    for tpl_name in get_template_names():
+        try:
+            tpl = load_template(tpl_name)
+            for fk, fv in (tpl.get("fields") or {}).items():
+                if fk not in cfg and isinstance(fv, dict):
+                    cfg[fk] = {
+                        "field_type":       fv.get("field_type", "text"),
+                        "dropdown_options": fv.get("dropdown_options", []),
+                        "hidden":           bool(fv.get("hidden", False)),
+                    }
+        except Exception:
+            pass
+    return cfg
+
+
 @app.route("/inventory")
 def inventory():
     page       = request.args.get("page", 1, type=int)
@@ -1610,6 +1849,19 @@ def inventory():
         sort_dir = "asc"
 
     per_page = min(per_page, 200)
+
+    # ---- Fast path: default (recency) view with no free-text search ----------
+    # De-dup + paginate in SQL so only the page's rows load. Any arbitrary field
+    # sort or search falls through to the Python path below (which handles the
+    # full range of sort keys). The fast path is guarded: if the denormalized
+    # columns aren't present yet (e.g. mid-upgrade), we fall back transparently.
+    effective_sort_early = sort_col[len("entry_"):] if sort_col.startswith("entry_") else sort_col
+    if not search and not effective_sort_early:
+        try:
+            return _render_inventory_fast(
+                f_game, f_album, f_template, view_catalog, page, per_page, sort_col, sort_dir)
+        except Exception:
+            db.session.rollback()  # fall back to the proven Python grouping path
 
     # Base query. game/album live inside the extracted_data JSON; we filter them
     # in SQL with json_extract so the matching expression indexes are used and we
@@ -1645,6 +1897,10 @@ def inventory():
 
     # game/album already filtered in SQL above.
     all_records = all_records_raw
+
+    # Archived rows (cold storage) are hidden from the normal Inventory list.
+    if not view_catalog:
+        all_records = [r for r in all_records if not _bool_from(r.extracted_data or {}, "archived")]
 
     # Build groups across the full filtered set so duplicates on other pages
     # are still counted in the quantity badge.
@@ -4754,6 +5010,141 @@ def _orb_descriptors_cached(record):
     return desc
 
 
+# ---------------------------------------------------------------------------- #
+# Approximate nearest-neighbour shortlist for photo search (optional).
+#
+# Brute-force ORB matching is O(n) per search. For large collections we first use
+# a cheap per-image "global descriptor" (a normalized 32x32 thumbnail vector) in
+# an hnswlib index to shortlist the most visually similar candidates, then run
+# the SAME ORB matcher on just that shortlist to produce the final ranking — so
+# ranking quality is unchanged, only the candidate set shrinks. Everything here
+# is optional and degrades safely: no hnswlib, no/stale index, or a small
+# collection all fall back to full brute force. Recent records are always folded
+# in so cards added since the last index rebuild are never missed.
+# ---------------------------------------------------------------------------- #
+ANN_DIM = 32 * 32
+ANN_MIN_RECORDS = 3000      # below this, brute force is fast enough — skip ANN
+ANN_SHORTLIST   = 400       # candidates pulled from the index per search
+ANN_RECENT_TOPUP = 500      # newest records always considered (may post-date index)
+
+
+def _try_import_hnswlib():
+    try:
+        import hnswlib
+        return hnswlib
+    except Exception:
+        return None
+
+
+def _global_descriptor(img_bgr, size=32):
+    """Cheap, L2-normalized thumbnail feature vector for coarse similarity."""
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    small = cv2.resize(gray, (size, size), interpolation=cv2.INTER_AREA).astype(np.float32).ravel()
+    small -= float(small.mean())
+    norm = float(np.linalg.norm(small))
+    if norm > 1e-6:
+        small /= norm
+    return small
+
+
+def _global_descriptor_cached(record):
+    """Per-record global descriptor, cached next to the ORB cache."""
+    rel = normalize_to_upload_relative(record.image_path)
+    if not rel or rel == "__blank__" or rel.startswith(("http://", "https://")):
+        return None
+    img_path = os.path.join(app.config["UPLOAD_FOLDER"], rel)
+    if not os.path.exists(img_path):
+        return None
+    cache_path = os.path.join(app.config["ORB_CACHE_FOLDER"], f"{record.id}.gvec.npy")
+    try:
+        if os.path.exists(cache_path) and os.path.getmtime(cache_path) >= os.path.getmtime(img_path):
+            v = np.load(cache_path, allow_pickle=False)
+            return v if getattr(v, "size", 0) == ANN_DIM else None
+    except Exception:
+        pass
+    img = cv2.imread(img_path)
+    if img is None:
+        return None
+    v = _global_descriptor(img)
+    try:
+        os.makedirs(app.config["ORB_CACHE_FOLDER"], exist_ok=True)
+        np.save(cache_path, v)
+    except Exception:
+        pass
+    return v
+
+
+def _ann_paths():
+    folder = app.config["ORB_CACHE_FOLDER"]
+    return os.path.join(folder, "ann_index.bin"), os.path.join(folder, "ann_ids.npy")
+
+
+def _active_inventory_query():
+    """Owned, active records only (exclude archived + catalog)."""
+    return ScanRecord.query.filter(
+        db.func.coalesce(ScanRecord.is_archived, False) == False,   # noqa: E712
+        db.func.coalesce(ScanRecord.is_catalog, False) == False,    # noqa: E712
+    )
+
+
+def rebuild_ann_index():
+    """(Re)build the hnswlib global-descriptor index over active records.
+    Returns a status dict. Safe no-op (ok=False) if hnswlib isn't installed."""
+    hnswlib = _try_import_hnswlib()
+    if hnswlib is None:
+        return {"ok": False, "message": "hnswlib is not installed (pip install hnswlib)."}
+
+    ensure_dirs()
+    ids, vecs = [], []
+    for r in _active_inventory_query().all():
+        v = _global_descriptor_cached(r)
+        if v is not None:
+            ids.append(r.id)
+            vecs.append(v)
+    if not ids:
+        return {"ok": False, "message": "No images available to index."}
+
+    mat = np.vstack(vecs).astype(np.float32)
+    index = hnswlib.Index(space="cosine", dim=ANN_DIM)
+    index.init_index(max_elements=len(ids), ef_construction=200, M=16)
+    index.add_items(mat, np.arange(len(ids)))
+    index.set_ef(max(64, ANN_SHORTLIST))
+
+    index_path, ids_path = _ann_paths()
+    index.save_index(index_path)
+    np.save(ids_path, np.array(ids, dtype=np.int64))
+    return {"ok": True, "count": len(ids), "message": f"Indexed {len(ids)} images."}
+
+
+def _ann_candidate_ids(query_vec, k):
+    """Return up to k candidate record ids from the ANN index, or None if the
+    index is unavailable/unusable (caller then falls back to brute force)."""
+    hnswlib = _try_import_hnswlib()
+    if hnswlib is None or query_vec is None:
+        return None
+    index_path, ids_path = _ann_paths()
+    if not (os.path.exists(index_path) and os.path.exists(ids_path)):
+        return None
+    try:
+        ids = np.load(ids_path, allow_pickle=False)
+        n = int(ids.shape[0])
+        if n == 0:
+            return None
+        index = hnswlib.Index(space="cosine", dim=ANN_DIM)
+        index.load_index(index_path, max_elements=n)
+        index.set_ef(max(64, min(k * 2, n)))
+        labels, _dist = index.knn_query(np.asarray(query_vec, dtype=np.float32), k=min(k, n))
+        return [int(ids[lbl]) for lbl in labels[0]]
+    except Exception:
+        return None
+
+
+@app.route("/search_by_image/rebuild_index", methods=["POST"])
+def search_by_image_rebuild_index():
+    result = rebuild_ann_index()
+    return jsonify({"status": "success" if result.get("ok") else "error", **result})
+
+
 def _match_score(desc_query, desc_ref):
     """BFMatcher Hamming ratio-test score: 0.0–1.0 (higher = better match)."""
     if desc_query is None or desc_ref is None:
@@ -4780,6 +5171,51 @@ def settings_page():
     former top-level tabs (Templates, Type Icons, Shops, Search by Image,
     Duplicates) are reached from the sidebar on these pages."""
     return render_template("settings.html")
+
+
+# ============================================================================ #
+# Archiving — move cold records out of the hot working set
+# ============================================================================ #
+def _set_archived(ids, value):
+    """Set archived=value on the given record ids. Writing through
+    extracted_data keeps it the source of truth; the mapper event resyncs the
+    is_archived column so hot queries (Inventory, photo search) skip these rows."""
+    ids = [int(i) for i in ids if str(i).strip().isdigit()]
+    if not ids:
+        return 0
+    changed = 0
+    for r in ScanRecord.query.filter(ScanRecord.id.in_(ids)).all():
+        data = dict(r.extracted_data or {})
+        if bool(_bool_from(data, "archived")) == bool(value):
+            continue
+        data["archived"] = bool(value)
+        r.extracted_data = data   # reassign -> row dirty -> before_update resyncs column
+        changed += 1
+    if changed:
+        db.session.commit()
+    return changed
+
+
+def _archive_ids_from_request():
+    body = request.get_json(silent=True) or {}
+    ids = body.get("record_ids") or body.get("ids") or []
+    if not ids:
+        ids = request.form.getlist("record_ids") or request.form.getlist("ids")
+    return ids
+
+
+@app.route("/inventory/archive", methods=["POST"])
+def inventory_archive():
+    n = _set_archived(_archive_ids_from_request(), True)
+    return jsonify({"status": "success", "archived": n,
+                    "message": f"Archived {n} record(s)."})
+
+
+@app.route("/inventory/unarchive", methods=["POST"])
+def inventory_unarchive():
+    n = _set_archived(_archive_ids_from_request(), False)
+    return jsonify({"status": "success", "unarchived": n,
+                    "message": f"Restored {n} record(s) from the archive."})
 
 
 # ============================================================================ #
@@ -5079,7 +5515,30 @@ def search_by_image():
 
     query_desc = _orb_descriptors(query_img)
 
-    records = ScanRecord.query.all()
+    # Owned, active inventory only — skip archived (cold) and catalog rows.
+    active_q = _active_inventory_query()
+
+    # For large collections, shortlist visually-similar candidates via the ANN
+    # index instead of scanning everything. Falls back to the full set when the
+    # index is unavailable or the collection is small. Newly-added records (which
+    # may post-date the last index build) are always folded in so nothing is
+    # missed, and the final ranking still comes from the ORB matcher below.
+    records = None
+    try:
+        total_active = active_q.count()
+        if total_active >= ANN_MIN_RECORDS:
+            cand_ids = _ann_candidate_ids(_global_descriptor(query_img), ANN_SHORTLIST)
+            if cand_ids:
+                id_set = set(cand_ids)
+                recent = (active_q.order_by(ScanRecord.scan_date.desc())
+                          .limit(ANN_RECENT_TOPUP).with_entities(ScanRecord.id).all())
+                id_set.update(rid for (rid,) in recent)
+                records = active_q.filter(ScanRecord.id.in_(id_set)).all()
+    except Exception:
+        records = None  # any trouble -> brute force
+
+    if records is None:
+        records = active_q.all()
     scored  = []
 
     for record in records:
@@ -6793,6 +7252,76 @@ def optimize_database():
         pass
 
 
+def _backfill_scan_columns(batch=1000):
+    """One-time population of the denormalized columns for pre-existing rows,
+    using keyset iteration so it stays O(n) even on very large tables."""
+    last_id = 0
+    while True:
+        rows = (ScanRecord.query
+                .filter(ScanRecord.id > last_id)
+                .order_by(ScanRecord.id)
+                .limit(batch).all())
+        if not rows:
+            break
+        for r in rows:
+            _derive_scan_columns(r)   # marks the row dirty -> written on commit
+        db.session.commit()
+        last_id = rows[-1].id
+
+
+def migrate_add_scan_scaling_columns():
+    """
+    Add the denormalized scaling columns (game_key, album_key, name_key,
+    card_type_key, dup_hash, is_finalized, is_catalog, is_archived) plus their
+    indexes to installs whose scan_records table predates them, then backfill
+    existing rows once. No-op on every start afterwards. Fresh databases get
+    the columns straight from db.create_all(), so nothing is backfilled there.
+    """
+    from sqlalchemy import inspect
+
+    inspector = inspect(db.engine)
+    if "scan_records" not in inspector.get_table_names():
+        return  # fresh DB — create_all() already made the columns
+
+    existing = {c["name"] for c in inspector.get_columns("scan_records")}
+    new_cols = {
+        "game_key":      "VARCHAR(120)",
+        "album_key":     "VARCHAR(200)",
+        "name_key":      "VARCHAR(300)",
+        "card_type_key": "VARCHAR(80)",
+        "dup_hash":      "VARCHAR(64)",
+        "is_finalized":  "BOOLEAN",
+        "is_catalog":    "BOOLEAN",
+        "is_archived":   "BOOLEAN",
+    }
+    added = []
+    with db.engine.begin() as conn:
+        for name, decl in new_cols.items():
+            if name not in existing:
+                conn.exec_driver_sql(f"ALTER TABLE scan_records ADD COLUMN {name} {decl}")
+                added.append(name)
+
+    # Indexes (names match SQLAlchemy's so a fresh DB's create_all doesn't dupe).
+    index_sql = [
+        "CREATE INDEX IF NOT EXISTS ix_scan_records_game_key ON scan_records(game_key)",
+        "CREATE INDEX IF NOT EXISTS ix_scan_records_album_key ON scan_records(album_key)",
+        "CREATE INDEX IF NOT EXISTS ix_scan_records_name_key ON scan_records(name_key)",
+        "CREATE INDEX IF NOT EXISTS ix_scan_records_card_type_key ON scan_records(card_type_key)",
+        "CREATE INDEX IF NOT EXISTS ix_scan_records_dup_hash ON scan_records(dup_hash)",
+        "CREATE INDEX IF NOT EXISTS ix_scan_records_is_finalized ON scan_records(is_finalized)",
+        "CREATE INDEX IF NOT EXISTS ix_scan_records_is_catalog ON scan_records(is_catalog)",
+        "CREATE INDEX IF NOT EXISTS ix_scan_records_is_archived ON scan_records(is_archived)",
+        "CREATE INDEX IF NOT EXISTS idx_scan_hot ON scan_records(game_key, is_catalog, is_archived, scan_date)",
+        "CREATE INDEX IF NOT EXISTS idx_scan_album_hot ON scan_records(album_key, is_catalog, is_archived)",
+    ]
+    with db.engine.begin() as conn:
+        for sql in index_sql:
+            conn.exec_driver_sql(sql)
+
+    if added:
+        _backfill_scan_columns()
+
+
 if __name__ == "__main__":
     # Complete any deferred cleanup from a previous DB relocation now that we're
     # (re)starting on the current configured database.
@@ -6803,6 +7332,7 @@ if __name__ == "__main__":
         migrate_add_image_path_back_column()
         migrate_add_display_image_path_column()
         migrate_add_type_reference_region_column()
+        migrate_add_scan_scaling_columns()
         migrate_add_performance_indexes()
         optimize_database()
 
