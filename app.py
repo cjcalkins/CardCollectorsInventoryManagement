@@ -4,6 +4,7 @@ import re as _re
 import cv2
 import json
 import shutil
+import tempfile
 import numpy as np
 from datetime import datetime
 from PIL import Image
@@ -43,18 +44,142 @@ except Exception:
 app = Flask(__name__, template_folder="templates")
 
 # ====================== CONFIG ======================
-app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///inventory.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["UPLOAD_FOLDER"] = "uploads"
-app.config["ROI_TEMPLATE_FOLDER"] = "templates/roi"
-app.config["TEMP_IMPORT_FOLDER"] = os.path.join(app.config["UPLOAD_FOLDER"], "import_pages")
-app.config["TEMP_SPLIT_FOLDER"] = os.path.join(app.config["UPLOAD_FOLDER"], "temp_split")
-app.config["TEMP_CARD_FOLDER"] = os.path.join(app.config["UPLOAD_FOLDER"], "temp_cards")
-app.config["INVENTORY_IMAGE_FOLDER"] = os.path.join(app.config["UPLOAD_FOLDER"], "inventory_cards")
-app.config["TEMP_PDF_FOLDER"] = os.path.join(app.config["UPLOAD_FOLDER"], "temp_pdf_pages")
-app.config["TYPE_REF_FOLDER"] = os.path.join(app.config["UPLOAD_FOLDER"], "type_refs")
+
+# ---------------------------------------------------------------------------- #
+# Dynamic storage locations
+# ----------------------------------------------------------------------------
+# All sizable file/folder locations (image store, temp working area, ROI
+# templates, and the SQLite DB) are user-relocatable at runtime from
+# Settings → Storage. The chosen roots are persisted in storage_config.json
+# next to this file — the ONE bootstrap anchor — and every other path in the
+# program is derived from them here and read from app.config at call time, so
+# nothing else hardcodes a location. See the storage routes below for the
+# move-and-cleanup logic.
+# ---------------------------------------------------------------------------- #
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STORAGE_CONFIG_PATH = os.path.join(BASE_DIR, "storage_config.json")
+
+# Subfolders each movable root "owns" — used both to derive app.config paths and
+# to know exactly what to migrate when a root is relocated.
+STORAGE_UPLOAD_SUBDIRS = ["inventory_cards", "type_refs", "debug", "orb_cache"]
+STORAGE_TEMP_SUBDIRS   = ["import_pages", "temp_split", "temp_cards", "temp_pdf_pages"]
+
+# Defaults reproduce the original on-disk layout exactly: images and temp both
+# live under ./uploads, ROI under ./templates/roi, DB at ./inventory.db. `temp`
+# and `uploads` may share a directory (the default) because each move only
+# touches its own owned subfolders, so they never collide.
+DEFAULT_STORAGE = {
+    "uploads": "uploads",
+    "temp":    "uploads",
+    "roi":     os.path.join("templates", "roi"),
+    "db":      "inventory.db",
+}
+STORAGE_SLOTS = ("uploads", "temp", "roi", "db")
+
+
+def _resolve_storage_path(p):
+    """Resolve a stored location. Relative paths are anchored to the program
+    directory (BASE_DIR), so behaviour doesn't depend on the current working
+    directory. Absolute paths are used as-is."""
+    p = str(p or "").strip()
+    return p if os.path.isabs(p) else os.path.join(BASE_DIR, p)
+
+
+def _path_to_sqlite_uri(path):
+    return "sqlite:///" + os.path.abspath(path)
+
+
+def _sqlite_uri_to_path(uri):
+    uri = str(uri or "")
+    if uri.startswith("sqlite:///"):
+        return uri[len("sqlite:///"):]
+    return uri
+
+
+def load_storage_config():
+    """Read storage_config.json, falling back to defaults for any missing key."""
+    cfg = dict(DEFAULT_STORAGE)
+    pending = []
+    try:
+        with open(STORAGE_CONFIG_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh) or {}
+        for k in DEFAULT_STORAGE:
+            v = data.get(k)
+            if isinstance(v, str) and v.strip():
+                cfg[k] = v.strip()
+        pending = [p for p in (data.get("pending_deletions") or []) if isinstance(p, str)]
+    except (OSError, ValueError):
+        pass
+    cfg["pending_deletions"] = pending
+    return cfg
+
+
+def save_storage_config(cfg):
+    """Persist the storage config atomically."""
+    out = {k: cfg.get(k, DEFAULT_STORAGE[k]) for k in DEFAULT_STORAGE}
+    out["pending_deletions"] = list(cfg.get("pending_deletions") or [])
+    tmp = STORAGE_CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(out, fh, indent=2)
+    os.replace(tmp, STORAGE_CONFIG_PATH)
+
+
+def apply_storage_config(cfg):
+    """Derive every concrete path in the program from the storage roots and push
+    them into app.config. Called once at startup and again after any move."""
+    uploads = _resolve_storage_path(cfg["uploads"])
+    temp    = _resolve_storage_path(cfg["temp"])
+    roi     = _resolve_storage_path(cfg["roi"])
+    db_path = _resolve_storage_path(cfg["db"])
+
+    app.config["UPLOAD_FOLDER"]           = uploads
+    app.config["INVENTORY_IMAGE_FOLDER"]  = os.path.join(uploads, "inventory_cards")
+    app.config["TYPE_REF_FOLDER"]         = os.path.join(uploads, "type_refs")
+    app.config["ORB_CACHE_FOLDER"]        = os.path.join(uploads, "orb_cache")
+    app.config["ROI_TEMPLATE_FOLDER"]     = roi
+    app.config["TEMP_IMPORT_FOLDER"]      = os.path.join(temp, "import_pages")
+    app.config["TEMP_SPLIT_FOLDER"]       = os.path.join(temp, "temp_split")
+    app.config["TEMP_CARD_FOLDER"]        = os.path.join(temp, "temp_cards")
+    app.config["TEMP_PDF_FOLDER"]         = os.path.join(temp, "temp_pdf_pages")
+    app.config["SQLALCHEMY_DATABASE_URI"] = _path_to_sqlite_uri(db_path)
+    # Resolved roots, handy for the Storage settings UI.
+    app.config["STORAGE_ROOTS"] = {"uploads": uploads, "temp": temp, "roi": roi, "db": db_path}
+
+
+# Module-level handle to the active storage config (routes read/update this).
+STORAGE = load_storage_config()
+apply_storage_config(STORAGE)
 
 db.init_app(app)
+
+
+# SQLite performance tuning: applied to every new connection. WAL gives far
+# better read/write concurrency and speed at scale; the rest trade a little
+# durability margin for throughput (safe for a personal, single-writer tool).
+# Guarded so it only ever touches SQLite connections.
+import sqlite3
+from sqlalchemy import event as _sa_event
+from sqlalchemy.engine import Engine as _SA_Engine
+
+
+@_sa_event.listens_for(_SA_Engine, "connect")
+def _apply_sqlite_pragmas(dbapi_conn, _conn_record):
+    if not isinstance(dbapi_conn, sqlite3.Connection):
+        return
+    cur = dbapi_conn.cursor()
+    try:
+        cur.execute("PRAGMA journal_mode=WAL")       # concurrent reads while writing
+        cur.execute("PRAGMA synchronous=NORMAL")     # safe with WAL, much faster writes
+        cur.execute("PRAGMA busy_timeout=5000")      # wait instead of erroring on locks
+        cur.execute("PRAGMA temp_store=MEMORY")      # temp b-trees in RAM
+        cur.execute("PRAGMA cache_size=-16000")      # ~16 MB page cache per connection
+        cur.execute("PRAGMA mmap_size=134217728")    # 128 MB memory-mapped I/O
+        cur.execute("PRAGMA foreign_keys=ON")
+    except Exception:
+        pass
+    finally:
+        cur.close()
 
 
 # ====================== DIRECTORY SETUP ======================
@@ -62,12 +187,14 @@ def ensure_dirs():
     os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
     os.makedirs(app.config["ROI_TEMPLATE_FOLDER"], exist_ok=True)
     os.makedirs(os.path.join(app.config["UPLOAD_FOLDER"], "debug"), exist_ok=True)
+    os.makedirs(app.config["ORB_CACHE_FOLDER"], exist_ok=True)
     os.makedirs(app.config["TEMP_IMPORT_FOLDER"], exist_ok=True)
     os.makedirs(app.config["TEMP_SPLIT_FOLDER"], exist_ok=True)
     os.makedirs(app.config["TEMP_CARD_FOLDER"], exist_ok=True)
     os.makedirs(app.config["INVENTORY_IMAGE_FOLDER"], exist_ok=True)
     os.makedirs(app.config["TEMP_PDF_FOLDER"], exist_ok=True)
     os.makedirs(app.config["TYPE_REF_FOLDER"], exist_ok=True)
+
 
 
 # ====================== PATH HELPERS ======================
@@ -1484,14 +1611,21 @@ def inventory():
 
     per_page = min(per_page, 200)
 
-    # Fetch base query — JSON key filters are done in Python for SQLite compatibility
-    # (.astext is PostgreSQL-only; SQLite stores JSON as plain text)
+    # Base query. game/album live inside the extracted_data JSON; we filter them
+    # in SQL with json_extract so the matching expression indexes are used and we
+    # only load the relevant rows (huge win once one game has tens of thousands
+    # of records). template_used and the JSON text search are handled in SQL as
+    # before.
     query = ScanRecord.query.order_by(ScanRecord.scan_date.desc())
 
     if f_template:
         query = query.filter(ScanRecord.template_used == f_template)
     if search:
         query = query.filter(ScanRecord.extracted_data.cast(db.Text).ilike(f"%{search}%"))
+    if f_game:
+        query = query.filter(db.func.json_extract(ScanRecord.extracted_data, "$.game") == f_game)
+    if f_album:
+        query = query.filter(db.func.json_extract(ScanRecord.extracted_data, "$.album") == f_album)
 
     all_records_raw = query.all()
 
@@ -1509,18 +1643,8 @@ def inventory():
             if not _is_catalog_only(r.extracted_data or {})
         ]
 
-    # Python-side filtering for game / album (SQLite-safe)
+    # game/album already filtered in SQL above.
     all_records = all_records_raw
-    if f_game:
-        all_records = [
-            r for r in all_records
-            if str((r.extracted_data or {}).get("game", "")).strip() == f_game
-        ]
-    if f_album:
-        all_records = [
-            r for r in all_records
-            if str((r.extracted_data or {}).get("album", "")).strip() == f_album
-        ]
 
     # Build groups across the full filtered set so duplicates on other pages
     # are still counted in the quantity badge.
@@ -2065,31 +2189,120 @@ def import_page():
 
 
 # ====================== SINGLE CARD IMPORT ======================
-def _pdf_bytes_to_bgr_pages(pdf_bytes, zoom=2.0):
+# Above this uploaded-PDF size, don't keep the document buffered in RAM: spill
+# it to a temp directory on disk and rasterize a single page at a time (see
+# _iter_pdf_bgr_pages). Small PDFs are still handled entirely in memory.
+PDF_SPILL_THRESHOLD = 500 * 1024 * 1024  # 500 MB
+
+
+def _pdf_page_to_bgr(page, matrix):
+    """Rasterize one already-loaded PyMuPDF page into a standalone BGR array.
+
+    cv2.cvtColor allocates a fresh array, so the result does not reference the
+    pixmap's buffer — once the caller drops `pix`/`page`, that memory is freed."""
+    pix = page.get_pixmap(matrix=matrix)
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+    if pix.n == 4:
+        return cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+    if pix.n == 3:
+        return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    return cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+
+
+def _iter_pdf_bgr_pages(pdf_bytes, zoom=2.0):
     """
-    Rasterize each page of a PDF (given as bytes) into a BGR image, returned in
-    page order. Used by the single-card importer to treat a PDF as front/back
-    pairs. Raises RuntimeError if PyMuPDF isn't installed.
+    Yield each PDF page as a BGR image, in page order, one at a time.
+
+    Only a single page is materialized in RAM at any moment — pages are never
+    accumulated into a list — so peak memory stays flat regardless of page count.
+
+    For PDFs larger than PDF_SPILL_THRESHOLD (500 MB) the file is first written
+    to a private temp directory and opened from disk, so PyMuPDF reads pages
+    lazily off the filesystem instead of us holding the whole document in RAM.
+    That temp file and its directory are removed as soon as the final page has
+    been consumed — or immediately if iteration is stopped early or errors out
+    (the generator's finally block runs on .close()/GC too).
+
+    Raises RuntimeError if PyMuPDF isn't installed.
     """
     if fitz is None:
         raise RuntimeError("PDF support isn't installed on the server. Run: pip install PyMuPDF")
-    pages = []
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    matrix = fitz.Matrix(zoom, zoom)
+    spill = len(pdf_bytes) > PDF_SPILL_THRESHOLD
+
+    doc = None
+    tmp_dir = None
+    tmp_path = None
     try:
-        matrix = fitz.Matrix(zoom, zoom)
+        if spill:
+            ensure_dirs()
+            tmp_dir = tempfile.mkdtemp(prefix="pdf_spill_", dir=app.config["TEMP_PDF_FOLDER"])
+            tmp_path = os.path.join(tmp_dir, "source.pdf")
+            with open(tmp_path, "wb") as fh:
+                fh.write(pdf_bytes)
+            # Drop this function's reference to the large in-RAM buffer now that
+            # it lives on disk; the file is read a page at a time from here on.
+            pdf_bytes = None
+            doc = fitz.open(tmp_path)
+        else:
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
         for i in range(doc.page_count):
-            pix = doc.load_page(i).get_pixmap(matrix=matrix)
-            arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-            if pix.n == 4:
-                bgr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
-            elif pix.n == 3:
-                bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-            else:
-                bgr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
-            pages.append(bgr)
+            page = doc.load_page(i)
+            bgr = _pdf_page_to_bgr(page, matrix)
+            yield bgr
+            # Release this page before loading the next one.
+            del bgr, page
     finally:
-        doc.close()
-    return pages
+        if doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass
+        # Clean up the spilled file + its temp directory once the last page has
+        # been processed (or on early close / error).
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        if tmp_dir:
+            try:
+                os.rmdir(tmp_dir)
+            except OSError:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _iter_pdf_bgr_pages_from_path(pdf_path, zoom=2.0):
+    """
+    Yield each page of an on-disk PDF as a BGR image, one at a time.
+
+    The PDF is opened directly from `pdf_path`, so PyMuPDF reads pages lazily
+    off the filesystem and the whole document is never buffered in RAM — peak
+    memory is a single rasterized page regardless of file size or page count.
+    The caller owns `pdf_path` and is responsible for deleting it afterwards.
+
+    Raises RuntimeError if PyMuPDF isn't installed.
+    """
+    if fitz is None:
+        raise RuntimeError("PDF support isn't installed on the server. Run: pip install PyMuPDF")
+
+    matrix = fitz.Matrix(zoom, zoom)
+    doc = None
+    try:
+        doc = fitz.open(pdf_path)
+        for i in range(doc.page_count):
+            page = doc.load_page(i)
+            bgr = _pdf_page_to_bgr(page, matrix)
+            yield bgr
+            del bgr, page
+    finally:
+        if doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass
 
 
 def _save_single_card_image(bgr, suffix, edge_type):
@@ -2135,42 +2348,90 @@ def _create_single_card(front_path, back_path, game, album, template):
     return record, ident
 
 
+def _finalize_pdf_pair(front_path, back_path, front_page, back_page, game, album, template):
+    """Create one inventory record from an already-saved front (+ optional back)
+    image pair pulled from a PDF, and return the card dict the UI expects."""
+    record, ident = _create_single_card(front_path, back_path, game, album, template)
+    return {
+        "record_id":       record.id,
+        "front_page":      front_page,
+        "back_page":       back_page,
+        "identified":      bool(ident.get("identified")),
+        "identified_name": (ident.get("applied") or {}).get("name", "") if ident.get("identified") else "",
+        "card_type":       (ident.get("type_applied") or {}).get("value", ""),
+        "image_url":       build_uploaded_file_url(record.image_path),
+        "detail_url":      url_for("inventory_detail", record_id=record.id),
+    }
+
+
 def _import_single_card_pdf(pdf_bytes, game, album, edge_type, template):
     """
-    Import a PDF as front/back pairs: odd pages (1, 3, 5, ...) are card FRONTS
-    and even pages (2, 4, 6, ...) are the matching BACKS. Each pair becomes one
-    inventory record. Only the front of each pair is OCR name/serial-checked.
+    Import a PDF (given as raw bytes) as front/back pairs. Suitable for smaller
+    uploads; inputs over 500 MB are spilled to a temp file automatically (see
+    _iter_pdf_bgr_pages). Prefer _import_single_card_pdf_path when the upload has
+    already been streamed to disk, to avoid ever holding the file in RAM.
     """
+    return _import_pdf_pages(_iter_pdf_bgr_pages(pdf_bytes), game, album, edge_type, template)
+
+
+def _import_single_card_pdf_path(pdf_path, game, album, edge_type, template):
+    """
+    Import an already-on-disk PDF as front/back pairs, rasterizing one page at a
+    time straight from the file. The document is never loaded into RAM, so this
+    keeps the process's memory well under the 500 MB cap no matter how large the
+    PDF is. The caller owns and cleans up `pdf_path`.
+    """
+    return _import_pdf_pages(_iter_pdf_bgr_pages_from_path(pdf_path), game, album, edge_type, template)
+
+
+def _import_pdf_pages(page_iter, game, album, edge_type, template):
+    """
+    Shared front/back-pair importer: consume a stream of BGR pages (odd pages
+    are FRONTS, even pages BACKS), build one inventory record per pair, and
+    return the JSON response. Only the front of each pair is OCR-checked.
+
+    Pages are pulled one at a time; the first page of a pair is saved to disk
+    immediately so we never hold more than a single decoded page in RAM while
+    waiting for its partner. `page_iter` is always closed, so any temp file the
+    generator spilled (or opened) is cleaned up even on early exit or error.
+    """
+    cards = []
+    pending_front = None  # dict: {path, page_no} for a front awaiting its back
     try:
-        pages = _pdf_bytes_to_bgr_pages(pdf_bytes)
+        page_no = 0
+        for bgr in page_iter:
+            page_no += 1
+            if pending_front is None:
+                # Front of a new pair — persist it now and drop the pixels.
+                front_path, _ = _save_single_card_image(bgr, "front", edge_type)
+                pending_front = {"path": front_path, "page_no": page_no}
+                del bgr
+                continue
+
+            # We now have the back for the pending front.
+            back_path, _ = _save_single_card_image(bgr, "back", edge_type)
+            del bgr
+            cards.append(_finalize_pdf_pair(
+                pending_front["path"], back_path, pending_front["page_no"],
+                page_no, game, album, template))
+            pending_front = None
+
+        # A trailing odd page: a front with no back.
+        if pending_front is not None:
+            cards.append(_finalize_pdf_pair(
+                pending_front["path"], None, pending_front["page_no"],
+                None, game, album, template))
     except RuntimeError as exc:
         return jsonify({"status": "error", "message": str(exc)}), 500
     except Exception as exc:
         return jsonify({"status": "error", "message": f"Could not read PDF: {exc}"}), 500
-    if not pages:
+    finally:
+        # Closes the generator, running its cleanup (closing the PDF doc and
+        # deleting any spilled temp file/dir) even if we stopped early or errored.
+        page_iter.close()
+
+    if not cards:
         return jsonify({"status": "error", "message": "PDF has no pages"}), 400
-
-    cards = []
-    for i in range(0, len(pages), 2):
-        front_img = pages[i]
-        back_img  = pages[i + 1] if i + 1 < len(pages) else None
-
-        front_path, _ = _save_single_card_image(front_img, "front", edge_type)
-        back_path = None
-        if back_img is not None:
-            back_path, _ = _save_single_card_image(back_img, "back", edge_type)
-
-        record, ident = _create_single_card(front_path, back_path, game, album, template)
-        cards.append({
-            "record_id":       record.id,
-            "front_page":      i + 1,
-            "back_page":       (i + 2) if back_img is not None else None,
-            "identified":      bool(ident.get("identified")),
-            "identified_name": (ident.get("applied") or {}).get("name", "") if ident.get("identified") else "",
-            "card_type":       (ident.get("type_applied") or {}).get("value", ""),
-            "image_url":       build_uploaded_file_url(record.image_path),
-            "detail_url":      url_for("inventory_detail", record_id=record.id),
-        })
 
     id_count = sum(1 for c in cards if c["identified"])
     message = (f"Imported {len(cards)} card(s) from PDF — odd pages as fronts, even pages as backs. "
@@ -2221,34 +2482,63 @@ def import_single_card():
     except Exception as exc:
         return jsonify({"status": "error", "message": f"Could not load game '{game}': {exc}"}), 400
 
-    # Read the primary upload once, then sniff whether it's a PDF.
-    front_bytes = front.read()
-    is_pdf = (
-        (getattr(front, "mimetype", "") or "").lower() == "application/pdf"
-        or os.path.splitext(front.filename)[1].lower() == ".pdf"
-        or front_bytes[:5] == b"%PDF-"
-    )
-
-    if is_pdf:
-        return _import_single_card_pdf(front_bytes, game, album, edge_type, template)
-
-    # ---- Single image: front (required) + optional back ----
-    aligned_flags = {}
+    # Stream the primary upload straight to a temp file instead of front.read().
+    # A PDF may be very large, and reading it into memory here would blow the
+    # RAM budget before the page-at-a-time importer ever runs. FileStorage.save
+    # copies in chunks (and big uploads are already spooled to disk by Werkzeug),
+    # so the whole file never sits in RAM. We then sniff the type from the header.
+    upload_dir = tempfile.mkdtemp(prefix="upload_", dir=app.config["TEMP_PDF_FOLDER"])
+    front_tmp = os.path.join(upload_dir, "front_upload")
     try:
-        front_img = cv2.imdecode(np.frombuffer(front_bytes, np.uint8), cv2.IMREAD_COLOR)
-        if front_img is None:
-            return jsonify({"status": "error", "message": "Could not read the front image"}), 400
-        front_path, front_cropped = _save_single_card_image(front_img, "front", edge_type)
-        aligned_flags["front"] = front_cropped
+        front.save(front_tmp)
 
-        back_path = None
-        if back and back.filename:
-            back_img = cv2.imdecode(np.frombuffer(back.read(), np.uint8), cv2.IMREAD_COLOR)
-            if back_img is not None:
-                back_path, back_cropped = _save_single_card_image(back_img, "back", edge_type)
-                aligned_flags["back"] = back_cropped
-    except Exception as exc:
-        return jsonify({"status": "error", "message": f"Could not process image: {exc}"}), 500
+        head = b""
+        try:
+            with open(front_tmp, "rb") as fh:
+                head = fh.read(5)
+        except OSError:
+            head = b""
+        is_pdf = (
+            (getattr(front, "mimetype", "") or "").lower() == "application/pdf"
+            or os.path.splitext(front.filename)[1].lower() == ".pdf"
+            or head == b"%PDF-"
+        )
+
+        if is_pdf:
+            if fitz is None:
+                return jsonify({"status": "error",
+                                "message": "PDF support isn't installed on the server. Run: pip install PyMuPDF"}), 500
+            # Rasterized one page at a time straight from disk — RAM stays capped
+            # regardless of file size. Returns before the finally cleans up the
+            # temp PDF (all pages are read by then).
+            return _import_single_card_pdf_path(front_tmp, game, album, edge_type, template)
+
+        # ---- Single image: front (required) + optional back ----
+        # Card photos are small, so decoding one from disk is well within budget.
+        aligned_flags = {}
+        try:
+            front_img = cv2.imread(front_tmp, cv2.IMREAD_COLOR)
+            if front_img is None:
+                return jsonify({"status": "error", "message": "Could not read the front image"}), 400
+            front_path, front_cropped = _save_single_card_image(front_img, "front", edge_type)
+            aligned_flags["front"] = front_cropped
+            del front_img
+
+            back_path = None
+            if back and back.filename:
+                back_tmp = os.path.join(upload_dir, "back_upload")
+                back.save(back_tmp)
+                back_img = cv2.imread(back_tmp, cv2.IMREAD_COLOR)
+                if back_img is not None:
+                    back_path, back_cropped = _save_single_card_image(back_img, "back", edge_type)
+                    aligned_flags["back"] = back_cropped
+                    del back_img
+        except Exception as exc:
+            return jsonify({"status": "error", "message": f"Could not process image: {exc}"}), 500
+    finally:
+        # The inventory copies are already written by _save_single_card_image,
+        # so the raw uploads can go regardless of which branch ran.
+        shutil.rmtree(upload_dir, ignore_errors=True)
 
     record, ident = _create_single_card(front_path, back_path, game, album, template)
 
@@ -4428,6 +4718,42 @@ def _orb_descriptors(img_bgr):
     return desc
 
 
+def _orb_descriptors_cached(record):
+    """
+    ORB descriptors for a record's stored front image, cached to disk so the
+    photo search doesn't re-decode every image and recompute features on every
+    query. The cache is a small per-record .npy under ORB_CACHE_FOLDER and is
+    transparently rebuilt whenever the source image is newer than the cache
+    (or the cache is missing). Returns a uint8 (N, 32) array, or None.
+    """
+    rel = normalize_to_upload_relative(record.image_path)
+    if not rel or rel == "__blank__" or rel.startswith(("http://", "https://")):
+        return None
+    img_path = os.path.join(app.config["UPLOAD_FOLDER"], rel)
+    if not os.path.exists(img_path):
+        return None
+
+    cache_path = os.path.join(app.config["ORB_CACHE_FOLDER"], f"{record.id}.npy")
+    try:
+        if os.path.exists(cache_path) and os.path.getmtime(cache_path) >= os.path.getmtime(img_path):
+            desc = np.load(cache_path, allow_pickle=False)
+            return desc if getattr(desc, "size", 0) else None
+    except Exception:
+        pass  # unreadable/stale cache — fall through and recompute
+
+    img = cv2.imread(img_path)
+    if img is None:
+        return None
+    desc = _orb_descriptors(img)
+    try:
+        os.makedirs(app.config["ORB_CACHE_FOLDER"], exist_ok=True)
+        # Store an empty array for "no features" so we still hit the cache next time.
+        np.save(cache_path, desc if desc is not None else np.empty((0, 32), dtype=np.uint8))
+    except Exception:
+        pass
+    return desc
+
+
 def _match_score(desc_query, desc_ref):
     """BFMatcher Hamming ratio-test score: 0.0–1.0 (higher = better match)."""
     if desc_query is None or desc_ref is None:
@@ -4446,6 +4772,285 @@ def _match_score(desc_query, desc_ref):
 @app.route("/search_by_image_page")
 def search_by_image_page():
     return render_template("search_by_image.html")
+
+
+@app.route("/settings")
+def settings_page():
+    """Settings landing page. The gear icon in the top nav points here; the
+    former top-level tabs (Templates, Type Icons, Shops, Search by Image,
+    Duplicates) are reached from the sidebar on these pages."""
+    return render_template("settings.html")
+
+
+# ============================================================================ #
+# Storage settings — relocate sizable files/folders at runtime
+# ============================================================================ #
+def _dir_size_bytes(path):
+    """Total size of everything under `path` (0 if it doesn't exist)."""
+    total = 0
+    if not path or not os.path.exists(path):
+        return 0
+    if os.path.isfile(path):
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+def _human_size(n):
+    step = 1024.0
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < step:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= step
+    return f"{n:.1f} PB"
+
+
+def _slot_owned_paths(slot, root):
+    """Concrete paths a slot occupies under `root` (for sizing + migration)."""
+    if slot == "uploads":
+        return [os.path.join(root, s) for s in STORAGE_UPLOAD_SUBDIRS]
+    if slot == "temp":
+        return [os.path.join(root, s) for s in STORAGE_TEMP_SUBDIRS]
+    if slot == "roi":
+        return [root]                       # the ROI root IS the owned folder
+    if slot == "db":
+        return [root + sfx for sfx in ("", "-wal", "-shm")]
+    return []
+
+
+def _free_bytes(path):
+    """Free space on the filesystem that would host `path`."""
+    probe = path
+    while probe and not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    try:
+        return shutil.disk_usage(probe or BASE_DIR).free
+    except OSError:
+        return 0
+
+
+STORAGE_SLOT_META = {
+    "uploads": ("Image & upload storage",
+                "Inventory card images, type-icon library, and import staging."),
+    "temp":    ("Temporary working directory",
+                "Scratch space for PDF rasterization, splitting, and imports. Safe to place on fast/scratch storage."),
+    "roi":     ("ROI template folder",
+                "Small per-game region-of-interest template files."),
+    "db":      ("Database file (inventory.db)",
+                "The SQLite database holding all records, listings, and settings."),
+}
+
+
+def _storage_status():
+    """Build the per-slot status list the Storage page renders."""
+    roots = app.config.get("STORAGE_ROOTS", {})
+    slots = []
+    for key in STORAGE_SLOTS:
+        root = roots.get(key, "")
+        size = sum(_dir_size_bytes(p) for p in _slot_owned_paths(key, root))
+        title, desc = STORAGE_SLOT_META[key]
+        slots.append({
+            "key": key,
+            "title": title,
+            "description": desc,
+            "path": root,
+            "is_file": key == "db",
+            "size_bytes": size,
+            "size_human": _human_size(size),
+            "free_human": _human_size(_free_bytes(root)),
+            "shared_with_images": key == "temp" and os.path.abspath(root) == os.path.abspath(roots.get("uploads", "")),
+        })
+    return slots
+
+
+@app.route("/settings/storage")
+def storage_page():
+    ensure_dirs()
+    return render_template("storage.html", slots=_storage_status(),
+                           config_path=STORAGE_CONFIG_PATH)
+
+
+@app.route("/settings/storage/status")
+def storage_status():
+    return jsonify({"status": "success", "slots": _storage_status()})
+
+
+def _migrate_tree(src, dst):
+    """Copy directory `src` into `dst` (merging), then remove `src`. No-op if
+    src is missing. Raises on copy failure (caller reports it)."""
+    if not os.path.exists(src):
+        return
+    if os.path.abspath(src) == os.path.abspath(dst):
+        return
+    os.makedirs(os.path.dirname(dst.rstrip(os.sep)) or dst, exist_ok=True)
+    shutil.copytree(src, dst, dirs_exist_ok=True)
+    shutil.rmtree(src, ignore_errors=True)
+
+
+def _move_folder_slot(slot, new_path):
+    """Relocate a folder slot (uploads/temp/roi): copy its owned subfolders to
+    the new root, delete the originals, then repoint the live + persisted
+    config. Applies immediately — every path is read from app.config."""
+    roots = app.config.get("STORAGE_ROOTS", {})
+    old_root = roots.get(slot, "")
+    new_root = _resolve_storage_path(new_path)
+
+    if os.path.abspath(old_root) == os.path.abspath(new_root):
+        return {"status": "success", "message": "Location unchanged.", "needs_restart": False}
+
+    os.makedirs(new_root, exist_ok=True)
+    if not os.access(new_root, os.W_OK):
+        return {"status": "error", "message": f"New location isn't writable: {new_root}"}
+
+    moved = 0
+    if slot == "roi":
+        # The root itself is the owned folder.
+        if os.path.exists(old_root):
+            _migrate_tree(old_root, new_root)
+            moved += 1
+    else:
+        subdirs = STORAGE_UPLOAD_SUBDIRS if slot == "uploads" else STORAGE_TEMP_SUBDIRS
+        for name in subdirs:
+            src = os.path.join(old_root, name)
+            if os.path.exists(src):
+                _migrate_tree(src, os.path.join(new_root, name))
+                moved += 1
+
+    STORAGE[slot] = new_path
+    save_storage_config(STORAGE)
+    apply_storage_config(STORAGE)
+    ensure_dirs()
+    return {"status": "success",
+            "message": f"Moved {moved} folder(s) to {new_root}. New location is live.",
+            "needs_restart": False}
+
+
+def _move_db_slot(new_path):
+    """Relocate the SQLite database. Because the SQLAlchemy engine already holds
+    the current file open, the copy is made now and the switch completes on the
+    next app start (the old file is removed then, once we're safely running on
+    the new one). Reads keep working in the meantime."""
+    roots = app.config.get("STORAGE_ROOTS", {})
+    old_path = os.path.abspath(roots.get("db", ""))
+
+    new_path_resolved = _resolve_storage_path(new_path)
+    # Allow pointing at a directory: keep the inventory.db filename inside it.
+    if os.path.isdir(new_path_resolved) or new_path.endswith(("/", os.sep)):
+        new_path_resolved = os.path.join(new_path_resolved, "inventory.db")
+        new_path = new_path_resolved
+    new_abs = os.path.abspath(new_path_resolved)
+
+    if new_abs == old_path:
+        return {"status": "success", "message": "Location unchanged.", "needs_restart": False}
+
+    new_dir = os.path.dirname(new_abs) or BASE_DIR
+    os.makedirs(new_dir, exist_ok=True)
+    if not os.access(new_dir, os.W_OK):
+        return {"status": "error", "message": f"New location isn't writable: {new_dir}"}
+    if os.path.exists(new_abs):
+        return {"status": "error", "message": f"A file already exists there: {new_abs}"}
+
+    # Release file locks so the copy is clean. Checkpoint first so the WAL is
+    # folded into the main .db file and the copy is self-consistent.
+    try:
+        with app.app_context():
+            with db.engine.begin() as conn:
+                conn.exec_driver_sql("PRAGMA wal_checkpoint(TRUNCATE)")
+    except Exception:
+        pass
+    try:
+        db.session.remove()
+    except Exception:
+        pass
+    try:
+        with app.app_context():
+            db.engine.dispose()
+    except Exception:
+        pass
+
+    # Copy the DB and any SQLite sidecar files.
+    try:
+        for sfx in ("", "-wal", "-shm"):
+            s = old_path + sfx
+            if os.path.exists(s):
+                shutil.copy2(s, new_abs + sfx)
+    except OSError as exc:
+        return {"status": "error", "message": f"Copy failed: {exc}"}
+
+    # Persist the new location and queue the old files for deletion on next
+    # start (safe once we're provably running on the new copy).
+    STORAGE["db"] = new_path
+    pend = list(STORAGE.get("pending_deletions") or [])
+    for sfx in ("", "-wal", "-shm"):
+        s = old_path + sfx
+        if os.path.exists(s):
+            pend.append(s)
+    STORAGE["pending_deletions"] = pend
+    save_storage_config(STORAGE)
+    apply_storage_config(STORAGE)  # updates the URI for the next start
+
+    return {"status": "success", "needs_restart": True,
+            "message": (f"Database copied to {new_abs}. Restart the app to switch to it — "
+                        "until you restart, changes still write to the old file, which is "
+                        "removed automatically on the next start.")}
+
+
+@app.route("/settings/storage/update", methods=["POST"])
+def storage_update():
+    slot = (request.form.get("slot") or "").strip()
+    new_path = (request.form.get("path") or "").strip()
+    if slot not in STORAGE_SLOTS:
+        return jsonify({"status": "error", "message": "Unknown storage slot."}), 400
+    if not new_path:
+        return jsonify({"status": "error", "message": "A new path is required."}), 400
+
+    try:
+        if slot == "db":
+            result = _move_db_slot(new_path)
+        else:
+            result = _move_folder_slot(slot, new_path)
+    except Exception as exc:
+        return jsonify({"status": "error", "message": f"Move failed: {exc}"}), 500
+
+    code = 200 if result.get("status") == "success" else 400
+    if result.get("status") == "success":
+        result["slots"] = _storage_status()
+    return jsonify(result), code
+
+
+def process_pending_deletions():
+    """Remove files queued for deletion by a previous DB move, now that we're
+    running on the new location. Called once at startup."""
+    pend = list(STORAGE.get("pending_deletions") or [])
+    if not pend:
+        return
+    current_db = os.path.abspath(_sqlite_uri_to_path(app.config["SQLALCHEMY_DATABASE_URI"]))
+    remaining = []
+    for p in pend:
+        # Never delete the file we're currently using.
+        if os.path.abspath(p) == current_db:
+            continue
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except OSError:
+            remaining.append(p)  # try again next start
+    STORAGE["pending_deletions"] = remaining
+    try:
+        save_storage_config(STORAGE)
+    except OSError:
+        pass
 
 
 @app.route("/search_by_image", methods=["POST"])
@@ -4480,16 +5085,12 @@ def search_by_image():
     for record in records:
         if not record.image_path or record.image_path == "__blank__":
             continue
-        img_path = os.path.join(
-            app.config["UPLOAD_FOLDER"],
-            normalize_to_upload_relative(record.image_path),
-        )
-        if not os.path.exists(img_path):
+        # Cached descriptors: computed once per image and reused across searches,
+        # so this loop no longer re-reads and re-featurizes every card each time.
+        ref_desc = _orb_descriptors_cached(record)
+        if ref_desc is None:
             continue
-        ref_img = cv2.imread(img_path)
-        if ref_img is None:
-            continue
-        score = _match_score(query_desc, _orb_descriptors(ref_img))
+        score = _match_score(query_desc, ref_desc)
         if score > 0:
             scored.append((score, record))
 
@@ -6153,12 +6754,57 @@ def migrate_add_type_reference_region_column():
                 "ALTER TABLE type_references ADD COLUMN region VARCHAR(20) DEFAULT 'top_right'"))
 
 
+def migrate_add_performance_indexes():
+    """
+    Create indexes that keep reads fast as the collection grows into the tens of
+    thousands. This is the scalable alternative to splitting the DB per game:
+      • scan_date / template_used / matched_product_id — ordering & direct filters
+      • expression indexes on json_extract(extracted_data,'$.game'|'$.album') so
+        the Inventory game/album filters (now pushed into SQL) are index-served
+      • a composite reference_cards(game, number) for card identification lookups
+    All are IF NOT EXISTS, so this is a cheap no-op on every start after the first.
+    A final PRAGMA optimize lets SQLite refresh stats only when worthwhile.
+    """
+    from sqlalchemy import text
+
+    statements = [
+        "CREATE INDEX IF NOT EXISTS idx_scan_scan_date ON scan_records(scan_date)",
+        "CREATE INDEX IF NOT EXISTS idx_scan_template ON scan_records(template_used)",
+        "CREATE INDEX IF NOT EXISTS idx_scan_matched_product ON scan_records(matched_product_id)",
+        "CREATE INDEX IF NOT EXISTS idx_scan_game ON scan_records(json_extract(extracted_data, '$.game'))",
+        "CREATE INDEX IF NOT EXISTS idx_scan_album ON scan_records(json_extract(extracted_data, '$.album'))",
+        "CREATE INDEX IF NOT EXISTS idx_refcard_game_number ON reference_cards(game, number)",
+        "CREATE INDEX IF NOT EXISTS idx_listing_marketplace_status ON listings(marketplace, status)",
+    ]
+    try:
+        with db.engine.begin() as conn:
+            for sql in statements:
+                conn.exec_driver_sql(sql)
+    except Exception:
+        pass  # never block startup on index creation
+
+
+def optimize_database():
+    """Ask SQLite to update planner statistics where beneficial (cheap)."""
+    try:
+        with db.engine.begin() as conn:
+            conn.exec_driver_sql("PRAGMA optimize")
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
+    # Complete any deferred cleanup from a previous DB relocation now that we're
+    # (re)starting on the current configured database.
+    process_pending_deletions()
+
     with app.app_context():
         db.create_all()
         migrate_add_image_path_back_column()
         migrate_add_display_image_path_column()
         migrate_add_type_reference_region_column()
+        migrate_add_performance_indexes()
+        optimize_database()
 
     ensure_dirs()
 
@@ -6166,7 +6812,13 @@ if __name__ == "__main__":
     if os.environ.get("EMAIL_MONITOR_BACKGROUND") == "1":
         start_email_poller()
 
+    _roots = app.config.get("STORAGE_ROOTS", {})
     print("Card Collector Inventory Manager")
+    print(" • Storage (editable in Settings → Storage):")
+    print(f"     images/uploads : {_roots.get('uploads')}")
+    print(f"     temp           : {_roots.get('temp')}")
+    print(f"     roi templates  : {_roots.get('roi')}")
+    print(f"     database       : {_roots.get('db')}")
     print(" • /             — Create/edit Game templates (name + blank field list)")
     print(" • /inventory    — Inventory list with server-side pagination and filters")
     print(" • /inventory/<id> — Record detail with edit, TCGPlayer link, copy-from, edition")

@@ -845,13 +845,11 @@
               <img src="{{ url_for('static', filename='favicon.jpg') }}" alt="logo" width="24" height="24" style="object-fit:cover;border-radius:4px;margin-right:0.5rem;" class="me-2">Card Collector Inventory Manager
           </a>
           <div class="nav-tabs-minimal">
-              <a href="{{ url_for('import_page') }}" class="nav-tab active">Import</a>
-              <a href="{{ url_for('index') }}"        class="nav-tab">Templates</a>
-              <a href="{{ url_for('inventory') }}"    class="nav-tab">Inventory</a>
-              <a href="{{ url_for('albums_list') }}"  class="nav-tab">Album</a>
-              <a href="{{ url_for('shops_page') }}"   class="nav-tab">Shops</a>
-              <a href="{{ url_for('search_by_image_page') }}" class="nav-tab" title="Search by photo"><i class="fas fa-camera"></i></a>
-</div>
+                <a href="{{ url_for('import_page') }}" class="nav-tab active">Import</a>
+                <a href="{{ url_for('inventory') }}" class="nav-tab">Inventory</a>
+                <a href="{{ url_for('albums_list') }}" class="nav-tab">Album</a>
+                <a href="{{ url_for('settings_page') }}" class="nav-tab" title="Settings"><i class="fas fa-gear"></i></a>
+            </div>
       </div>
   </nav>
 

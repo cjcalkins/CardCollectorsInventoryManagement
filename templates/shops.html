@@ -74,6 +74,40 @@
             .nav-tab { flex: 1; text-align: center; }
         }
     </style>
+<style>
+        /* ── Settings sidebar layout (added) ── */
+        .settings-layout { display: flex; align-items: flex-start; }
+        .settings-sidebar {
+            flex: 0 0 240px; align-self: stretch;
+            position: sticky; top: 0;
+            min-height: calc(100vh - 56px);
+            background: #fff; border-right: 1px solid #dee2e6;
+            padding: 1rem .75rem; z-index: 1000;
+        }
+        .settings-sidebar .ss-title {
+            font-size: .72rem; text-transform: uppercase; letter-spacing: .06em;
+            color: #6c757d; padding: .4rem .75rem .6rem; font-weight: 700;
+        }
+        .settings-sidebar a.ss-link {
+            display: flex; align-items: center; gap: .65rem;
+            padding: .6rem .75rem; margin-bottom: 3px; border-radius: 8px;
+            color: #343a40; text-decoration: none; font-weight: 600; font-size: .92rem;
+        }
+        .settings-sidebar a.ss-link:hover { background: #f1f3f5; color: #212529; }
+        .settings-sidebar a.ss-link.active { background: #212529; color: #fff; }
+        .settings-sidebar a.ss-link i { width: 18px; text-align: center; font-size: .95rem; }
+        .settings-content { flex: 1 1 auto; min-width: 0; }
+        @media (max-width: 991px) {
+            .settings-layout { flex-direction: column; }
+            .settings-sidebar {
+                position: static; flex: none; width: 100%; min-height: 0;
+                border-right: none; border-bottom: 1px solid #dee2e6;
+                display: flex; gap: 6px; overflow-x: auto; padding: .5rem;
+            }
+            .settings-sidebar .ss-title { display: none; }
+            .settings-sidebar a.ss-link { white-space: nowrap; margin-bottom: 0; }
+        }
+    </style>
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
@@ -84,14 +118,16 @@
             </a>
             <div class="nav-tabs-minimal">
                 <a href="{{ url_for('import_page') }}" class="nav-tab">Import</a>
-                <a href="{{ url_for('index') }}"        class="nav-tab">Templates</a>
-                <a href="{{ url_for('inventory') }}"    class="nav-tab">Inventory</a>
-                <a href="{{ url_for('albums_list') }}"  class="nav-tab">Album</a>
-                <a href="{{ url_for('shops_page') }}"   class="nav-tab active">Shops</a>
-                <a href="{{ url_for('search_by_image_page') }}" class="nav-tab" title="Search by photo"><i class="fas fa-camera"></i></a>
+                <a href="{{ url_for('inventory') }}" class="nav-tab">Inventory</a>
+                <a href="{{ url_for('albums_list') }}" class="nav-tab">Album</a>
+                <a href="{{ url_for('settings_page') }}" class="nav-tab active" title="Settings"><i class="fas fa-gear"></i></a>
             </div>
         </div>
     </nav>
+
+    <div class="settings-layout">
+        {% set ss_active = 'shops' %}{% include '_settings_sidebar.html' %}
+        <main class="settings-content">
 
     <div class="container py-4">
         <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
@@ -1039,5 +1075,7 @@
 
         loadListings();
     </script>
+    </main>
+    </div>
 </body>
 </html>
