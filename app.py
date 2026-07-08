@@ -736,7 +736,56 @@ def find_existing_record_for_key(game, album, page, slot):
     return None
 
 
+# ====================== INVENTORY CAP ======================
+# This SQLite-backed build is capped so it never grows past what a small machine
+# (e.g. a Raspberry Pi) can serve well. Beyond this, the data belongs on the
+# desktop build (PostgreSQL + partitioning + object storage); Settings → Upgrade
+# exports a migration bundle for it. Cap is overridable via env for testing.
+INVENTORY_MAX_RECORDS = int(os.environ.get("INVENTORY_MAX_RECORDS", "1000000"))
+
+UPGRADE_MESSAGE = (
+    f"Inventory cap reached ({INVENTORY_MAX_RECORDS:,} entries). To grow further, connect a "
+    "dedicated computer and migrate to the desktop version, which uses PostgreSQL, table "
+    "partitioning, and object storage for images. Open Settings \u2192 Upgrade to export your "
+    "migration bundle."
+)
+
+
+class InventoryCapError(Exception):
+    """Raised by create_scan_record when the hard record cap is reached."""
+    def __init__(self, count):
+        self.count = count
+        self.limit = INVENTORY_MAX_RECORDS
+        super().__init__(UPGRADE_MESSAGE)
+
+
+# Cached row count so the per-record cap check during large imports is O(1)
+# instead of a COUNT(*) per insert. Refreshed from the DB at the start of each
+# import operation (which also picks up any deletions since last time).
+_inv_count_cache = {"n": None}
+
+
+def _inventory_count(refresh=False):
+    if refresh or _inv_count_cache["n"] is None:
+        _inv_count_cache["n"] = ScanRecord.query.count()
+    return _inv_count_cache["n"]
+
+
+def _inventory_count_bump(delta):
+    if _inv_count_cache["n"] is not None:
+        _inv_count_cache["n"] = max(0, _inv_count_cache["n"] + delta)
+
+
+def _inventory_remaining():
+    return max(0, INVENTORY_MAX_RECORDS - _inventory_count(refresh=True))
+
+
 def create_scan_record(image_path, template_name, extracted, image_path_back=None):
+    # Hard cap — the single choke point every import path passes through, so no
+    # route can ever push the database past the limit.
+    if _inventory_count() >= INVENTORY_MAX_RECORDS:
+        raise InventoryCapError(_inventory_count())
+
     matched_product = match_product_from_extracted(extracted)
 
     record = ScanRecord(
@@ -748,6 +797,7 @@ def create_scan_record(image_path, template_name, extracted, image_path_back=Non
     )
     db.session.add(record)
     db.session.commit()
+    _inventory_count_bump(1)
 
     return matched_product, record
 
@@ -2652,6 +2702,7 @@ def _import_pdf_pages(page_iter, game, album, edge_type, template):
     generator spilled (or opened) is cleaned up even on early exit or error.
     """
     cards = []
+    cap_hit = False
     pending_front = None  # dict: {path, page_no} for a front awaiting its back
     try:
         page_no = 0
@@ -2677,6 +2728,8 @@ def _import_pdf_pages(page_iter, game, album, edge_type, template):
             cards.append(_finalize_pdf_pair(
                 pending_front["path"], None, pending_front["page_no"],
                 None, game, album, template))
+    except InventoryCapError:
+        cap_hit = True   # keep what imported; report the cap below
     except RuntimeError as exc:
         return jsonify({"status": "error", "message": str(exc)}), 500
     except Exception as exc:
@@ -2687,17 +2740,22 @@ def _import_pdf_pages(page_iter, game, album, edge_type, template):
         page_iter.close()
 
     if not cards:
+        if cap_hit:
+            return jsonify({"status": "error", "cap_reached": True, "message": UPGRADE_MESSAGE}), 507
         return jsonify({"status": "error", "message": "PDF has no pages"}), 400
 
     id_count = sum(1 for c in cards if c["identified"])
     message = (f"Imported {len(cards)} card(s) from PDF — odd pages as fronts, even pages as backs. "
                f"{id_count} auto-identified, {len(cards) - id_count} left blank for manual entry.")
+    if cap_hit:
+        message += " " + UPGRADE_MESSAGE
     return jsonify({
         "status":           "success",
         "mode":             "pdf",
         "message":          message,
         "count":            len(cards),
         "identified_count": id_count,
+        "cap_reached":      cap_hit,
         "cards":            cards,
     })
 
@@ -2732,6 +2790,11 @@ def import_single_card():
     if not front or not front.filename:
         return jsonify({"status": "error", "message": "A front image or PDF is required"}), 400
     back = request.files.get("back_image")
+
+    # Refuse up front if the inventory is already full. (PDF batches can still
+    # partially import up to the cap and report it — see _import_pdf_pages.)
+    if _inventory_remaining() <= 0:
+        return jsonify({"status": "error", "cap_reached": True, "message": UPGRADE_MESSAGE}), 507
 
     try:
         template = load_template(game)
@@ -4766,6 +4829,11 @@ def import_finalize_batch():
             yield sse("error", {"message": f"Could not load game '{template_name}': {e}"})
             return
 
+        # Refuse if the inventory is already at the cap.
+        if _inventory_remaining() <= 0:
+            yield sse("error", {"cap_reached": True, "message": UPGRADE_MESSAGE})
+            return
+
         # Blank starting values for every field this Game defines.
         blank_fields = {field_key: "" for field_key in (template.get("fields", {}) or {}).keys()}
         results = []
@@ -4866,6 +4934,17 @@ def import_finalize_batch():
                     "identified_name": (ident.get("applied") or {}).get("name", "") if ident.get("identified") else "",
                     "card_type":       (ident.get("type_applied") or {}).get("value", ""),
                 }
+            except InventoryCapError:
+                # Hit the cap partway through — stop, keeping everything filed so
+                # far, and tell the browser to show the upgrade path.
+                yield sse("done", {
+                    "status":      "cap_reached",
+                    "cap_reached": True,
+                    "message":     (f"Import stopped at the {INVENTORY_MAX_RECORDS:,}-entry cap. "
+                                    + UPGRADE_MESSAGE),
+                    "results":     results,
+                })
+                return
             except Exception as e:
                 result = {"filename": filename, "status": "error", "message": str(e)}
 
@@ -5216,6 +5295,540 @@ def inventory_unarchive():
     n = _set_archived(_archive_ids_from_request(), False)
     return jsonify({"status": "success", "unarchived": n,
                     "message": f"Restored {n} record(s) from the archive."})
+
+
+# ---------------------------------------------------------------------------- #
+# Embedded target-side artifacts shipped inside every migration bundle so the
+# desktop (PostgreSQL) build has a self-contained on-ramp.
+# ---------------------------------------------------------------------------- #
+POSTGRES_SCHEMA_SQL = r"""-- PostgreSQL schema for the desktop Card Collector build.
+-- Range-partitioned scan_records + JSONB + object-storage image keys. Designed
+-- for tens/hundreds of millions of rows. Run once before importing.
+
+CREATE TABLE IF NOT EXISTS products (
+    id            BIGINT PRIMARY KEY,
+    brand         TEXT NOT NULL,
+    product_name  TEXT NOT NULL,
+    sku           TEXT UNIQUE,
+    price         DOUBLE PRECISION,
+    stock         INTEGER DEFAULT 0
+);
+
+-- Partitioned by scan_date. The partition key must be part of the PK.
+CREATE TABLE IF NOT EXISTS scan_records (
+    id                    BIGINT NOT NULL,
+    image_path            TEXT,
+    image_path_back       TEXT,
+    display_image_path    TEXT,
+    scan_date             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    template_used         TEXT,
+    extracted_data        JSONB,
+    matched_product_id    BIGINT,
+    game_key              TEXT,
+    album_key             TEXT,
+    name_key              TEXT,
+    card_type_key         TEXT,
+    dup_hash              TEXT,
+    is_finalized          BOOLEAN DEFAULT FALSE,
+    is_catalog            BOOLEAN DEFAULT FALSE,
+    is_archived           BOOLEAN DEFAULT FALSE,
+    image_object_key      TEXT,
+    image_object_key_back TEXT,
+    PRIMARY KEY (id, scan_date)
+) PARTITION BY RANGE (scan_date);
+
+-- Catch-all partition; the importer also creates per-year partitions.
+CREATE TABLE IF NOT EXISTS scan_records_default PARTITION OF scan_records DEFAULT;
+
+-- Indexes (created on the parent -> propagate to partitions).
+CREATE INDEX IF NOT EXISTS idx_scan_extracted_gin ON scan_records USING GIN (extracted_data jsonb_path_ops);
+CREATE INDEX IF NOT EXISTS idx_scan_hot   ON scan_records (game_key, is_catalog, is_archived, scan_date DESC);
+CREATE INDEX IF NOT EXISTS idx_scan_dup   ON scan_records (dup_hash);
+CREATE INDEX IF NOT EXISTS idx_scan_album ON scan_records (album_key);
+CREATE INDEX IF NOT EXISTS idx_scan_name  ON scan_records (name_key);
+
+CREATE TABLE IF NOT EXISTS listings (
+    id           BIGINT PRIMARY KEY,
+    record_id    BIGINT,
+    marketplace  TEXT NOT NULL,
+    sku          TEXT,
+    external_id  TEXT,
+    external_url TEXT,
+    title        TEXT,
+    price        DOUBLE PRECISION,
+    currency     TEXT DEFAULT 'USD',
+    quantity     INTEGER DEFAULT 0,
+    status       TEXT DEFAULT 'not_listed',
+    last_error   TEXT,
+    last_synced  TIMESTAMPTZ,
+    extra        JSONB
+);
+CREATE INDEX IF NOT EXISTS idx_listing_record ON listings (record_id);
+CREATE INDEX IF NOT EXISTS idx_listing_mkt_status ON listings (marketplace, status);
+
+CREATE TABLE IF NOT EXISTS sale_events (
+    id            BIGINT PRIMARY KEY,
+    source        TEXT DEFAULT 'tcgplayer',
+    order_id      TEXT,
+    item_title    TEXT,
+    qty           INTEGER DEFAULT 1,
+    price         DOUBLE PRECISION,
+    record_id     BIGINT,
+    status        TEXT DEFAULT 'unmatched',
+    detail        TEXT,
+    email_subject TEXT,
+    created_at    TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS type_references (
+    id         BIGINT PRIMARY KEY,
+    game       TEXT NOT NULL,
+    type_name  TEXT NOT NULL,
+    region     TEXT DEFAULT 'top_right',
+    image_path TEXT NOT NULL,
+    source     TEXT DEFAULT 'upload',
+    note       TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS shop_connections (
+    id            BIGINT PRIMARY KEY,
+    marketplace   TEXT UNIQUE NOT NULL,
+    enabled       BOOLEAN DEFAULT FALSE,
+    config        JSONB,
+    status        TEXT DEFAULT 'disconnected',
+    status_detail TEXT,
+    connected_at  TIMESTAMPTZ,
+    updated_at    TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS email_monitors (
+    id             BIGINT PRIMARY KEY,
+    enabled        BOOLEAN DEFAULT FALSE,
+    host TEXT, port INTEGER DEFAULT 993, use_ssl BOOLEAN DEFAULT TRUE,
+    username TEXT, password TEXT, folder TEXT DEFAULT 'INBOX',
+    sender_filter TEXT, subject_filter TEXT, source TEXT DEFAULT 'tcgplayer',
+    mark_seen BOOLEAN DEFAULT TRUE, poll_interval INTEGER DEFAULT 0,
+    last_uid BIGINT DEFAULT 0, last_checked TIMESTAMPTZ,
+    status TEXT DEFAULT 'disconnected', status_detail TEXT, updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS reference_syncs (
+    id             BIGINT PRIMARY KEY,
+    category_id    BIGINT UNIQUE NOT NULL,
+    game           TEXT, product_count INTEGER DEFAULT 0, group_count INTEGER DEFAULT 0,
+    remote_updated TEXT, last_synced TIMESTAMPTZ DEFAULT now(),
+    status TEXT DEFAULT 'idle', status_detail TEXT
+);
+
+CREATE TABLE IF NOT EXISTS reference_cards (
+    id BIGINT PRIMARY KEY,
+    category_id BIGINT NOT NULL, group_id BIGINT NOT NULL, product_id BIGINT UNIQUE NOT NULL,
+    game TEXT, set_name TEXT, name TEXT, clean_name TEXT, number TEXT, rarity TEXT,
+    image_url TEXT, url TEXT, market_price DOUBLE PRECISION, extended JSONB, updated_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_refcard_game_number ON reference_cards (game, number);
+"""
+
+
+POSTGRES_IMPORTER_PY = r'''#!/usr/bin/env python3
+"""
+import_to_postgres.py — load a Card Collector migration bundle into PostgreSQL.
+
+Usage:
+    pip install psycopg2-binary
+    python import_to_postgres.py --dsn "postgresql://user:pass@host/db" --bundle .
+
+Optional image sync to object storage (S3/MinIO), rewriting object keys:
+    pip install boto3
+    python import_to_postgres.py --dsn ... --bundle . \
+        --images-dir /path/to/uploads \
+        --s3-endpoint http://localhost:9000 --s3-bucket cards \
+        --s3-key AKIA... --s3-secret ...
+
+The bundle is the extracted migration folder (contains manifest.json,
+schema_postgres.sql, *.jsonl). Rows preserve their original ids.
+"""
+import argparse, json, os, sys
+
+LOAD_ORDER = [
+    "products", "scan_records", "listings", "sale_events", "type_references",
+    "shop_connections", "email_monitors", "reference_syncs", "reference_cards",
+]
+JSONB_COLUMNS = {
+    "scan_records": {"extracted_data"}, "listings": {"extra"},
+    "shop_connections": {"config"}, "reference_cards": {"extended"},
+}
+
+
+def iter_jsonl(path):
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                yield json.loads(line)
+
+
+def ensure_year_partitions(cur, bundle):
+    """Create per-year partitions of scan_records for the years present."""
+    years = set()
+    p = os.path.join(bundle, "scan_records.jsonl")
+    if not os.path.exists(p):
+        return
+    for row in iter_jsonl(p):
+        sd = (row.get("scan_date") or "")[:4]
+        if sd.isdigit():
+            years.add(int(sd))
+    for y in sorted(years):
+        name = f"scan_records_{y}"
+        cur.execute(
+            f"CREATE TABLE IF NOT EXISTS {name} PARTITION OF scan_records "
+            f"FOR VALUES FROM ('{y}-01-01') TO ('{y + 1}-01-01')"
+        )
+
+
+def load_table(cur, bundle, table):
+    import psycopg2.extras as extras
+    path = os.path.join(bundle, table + ".jsonl")
+    if not os.path.exists(path):
+        print(f"  - {table}: no file, skipped")
+        return 0
+    rows = list(iter_jsonl(path))
+    if not rows:
+        print(f"  - {table}: empty")
+        return 0
+    cols = list(rows[0].keys())
+    jsonb = JSONB_COLUMNS.get(table, set())
+
+    def coerce(row):
+        vals = []
+        for c in cols:
+            v = row.get(c)
+            if c in jsonb and v is not None and not isinstance(v, str):
+                v = json.dumps(v)
+            vals.append(v)
+        return vals
+
+    collist = ", ".join('"%s"' % c for c in cols)
+    template = "(" + ", ".join("%s" for _ in cols) + ")"
+    sql = f'INSERT INTO {table} ({collist}) VALUES %s ON CONFLICT DO NOTHING'
+    extras.execute_values(cur, sql, [coerce(r) for r in rows], template=template, page_size=1000)
+    print(f"  - {table}: {len(rows)} rows")
+    return len(rows)
+
+
+def sync_images(bundle, images_dir, s3):
+    manifest = os.path.join(bundle, "images_manifest.jsonl")
+    if not (s3 and os.path.exists(manifest)):
+        return
+    bucket = s3["bucket"]
+    import boto3
+    client = boto3.client("s3", endpoint_url=s3.get("endpoint"),
+                          aws_access_key_id=s3.get("key"), aws_secret_access_key=s3.get("secret"))
+    n = 0
+    for row in iter_jsonl(manifest):
+        for side in ("front", "back"):
+            rel, key = row.get(side + "_path"), row.get(side + "_key")
+            if rel and key:
+                src = os.path.join(images_dir, rel)
+                if os.path.exists(src):
+                    client.upload_file(src, bucket, key)
+                    n += 1
+    print(f"  - images uploaded: {n}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dsn", required=True)
+    ap.add_argument("--bundle", default=".")
+    ap.add_argument("--images-dir")
+    ap.add_argument("--s3-endpoint"); ap.add_argument("--s3-bucket")
+    ap.add_argument("--s3-key"); ap.add_argument("--s3-secret")
+    args = ap.parse_args()
+
+    import psycopg2
+    conn = psycopg2.connect(args.dsn)
+    conn.autocommit = False
+    cur = conn.cursor()
+
+    print("Applying schema...")
+    with open(os.path.join(args.bundle, "schema_postgres.sql"), "r", encoding="utf-8") as fh:
+        cur.execute(fh.read())
+
+    print("Creating year partitions...")
+    ensure_year_partitions(cur, args.bundle)
+
+    print("Loading tables...")
+    for table in LOAD_ORDER:
+        load_table(cur, args.bundle, table)
+
+    conn.commit()
+    print("Analyzing...")
+    cur.execute("ANALYZE")
+    conn.commit()
+
+    if args.images_dir and args.s3_bucket:
+        print("Syncing images to object storage...")
+        sync_images(args.bundle, args.images_dir, {
+            "endpoint": args.s3_endpoint, "bucket": args.s3_bucket,
+            "key": args.s3_key, "secret": args.s3_secret,
+        })
+
+    cur.close(); conn.close()
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+MIGRATION_README_MD = """# Migrating to the desktop (PostgreSQL) build
+
+This bundle is a complete, portable export of your SQLite inventory, ready to
+load into the desktop build that uses PostgreSQL + table partitioning + object
+storage for images.
+
+## Contents
+- `manifest.json` — versions, row counts, capacity, notes.
+- `*.jsonl` — one file per table, one JSON object per line (streamed, so large
+  tables export without high memory use).
+- `images_manifest.jsonl` — maps each record's image file path to a suggested
+  object-storage key. Image **bytes are not included** (they can be terabytes);
+  sync them from your image folder during import.
+- `schema_postgres.sql` — the partitioned PostgreSQL schema.
+- `import_to_postgres.py` — loader script.
+
+## Steps
+1. Provision PostgreSQL (14+ recommended) on the dedicated machine and create a
+   database.
+2. (Optional) Stand up object storage (S3 or MinIO) and a bucket for images.
+3. Extract this bundle, then run:
+
+       pip install psycopg2-binary
+       python import_to_postgres.py --dsn "postgresql://user:pass@host/db" --bundle .
+
+   To also upload images to object storage:
+
+       pip install boto3
+       python import_to_postgres.py --dsn "postgresql://user:pass@host/db" --bundle . \\
+           --images-dir /path/to/your/uploads \\
+           --s3-endpoint http://localhost:9000 --s3-bucket cards \\
+           --s3-key KEY --s3-secret SECRET
+
+4. Point the desktop application at the same DSN and bucket.
+
+## Notes
+- Record ids are preserved, and the loader uses `ON CONFLICT DO NOTHING`, so it
+  is safe to re-run.
+- `reference_cards` is rebuildable from tcgcsv.com and is skipped unless you
+  chose to include it.
+- **This bundle can contain marketplace and mailbox credentials**
+  (`shop_connections`, `email_monitors`). Store and transfer it securely.
+"""
+
+
+# ============================================================================ #
+# Upgrade / migration workflow to the desktop (PostgreSQL) build
+# ============================================================================ #
+# The SQLite build is capped (see INVENTORY_MAX_RECORDS). When a collection
+# outgrows it, this exports a self-contained migration bundle — every table as
+# streamed JSONL (memory-safe), an image manifest (keys, not bytes), plus the
+# PostgreSQL schema, an importer script, and a README — for the desktop build
+# that uses PostgreSQL + partitioning + object storage.
+MIGRATION_BUNDLE_VERSION = "1.0"
+
+# Models included in the export: (filename_stem, ORM class, rebuildable?)
+def _migration_tables():
+    return [
+        ("products",         Product,        False),
+        ("scan_records",     ScanRecord,     False),
+        ("listings",         Listing,        False),
+        ("sale_events",      SaleEvent,      False),
+        ("type_references",  TypeReference,  False),
+        ("shop_connections", ShopConnection, False),
+        ("email_monitors",   EmailMonitor,   False),
+        ("reference_syncs",  ReferenceSync,  False),
+        # Large and rebuildable from tcgcsv.com — skipped by default.
+        ("reference_cards",  ReferenceCard,  True),
+    ]
+
+
+def _row_to_dict(row):
+    """Serialize an ORM row to a JSON-safe dict using its table columns."""
+    out = {}
+    for col in row.__table__.columns:
+        val = getattr(row, col.name)
+        if isinstance(val, datetime):
+            val = val.isoformat()
+        out[col.name] = val
+    return out
+
+
+def _capacity_status():
+    count = _inventory_count(refresh=True)
+    remaining = max(0, INVENTORY_MAX_RECORDS - count)
+    pct = (count / INVENTORY_MAX_RECORDS * 100.0) if INVENTORY_MAX_RECORDS else 0.0
+    return {
+        "count": count,
+        "limit": INVENTORY_MAX_RECORDS,
+        "remaining": remaining,
+        "percent": round(min(pct, 100.0), 2),
+        "at_cap": remaining <= 0,
+        "near_cap": pct >= 90.0,
+    }
+
+
+def _stream_table_jsonl(model, fh, batch=2000):
+    """Write every row of `model` to an open text file as JSON lines, using
+    keyset iteration so memory stays flat for very large tables."""
+    n = 0
+    last_id = 0
+    has_int_pk = hasattr(model, "id")
+    if has_int_pk:
+        while True:
+            rows = (model.query.filter(model.id > last_id)
+                    .order_by(model.id).limit(batch).all())
+            if not rows:
+                break
+            for r in rows:
+                fh.write(json.dumps(_row_to_dict(r), default=str) + "\n")
+            n += len(rows)
+            last_id = rows[-1].id
+            db.session.expunge_all()   # release hydrated objects
+    else:
+        for r in model.query.all():
+            fh.write(json.dumps(_row_to_dict(r), default=str) + "\n")
+            n += 1
+    return n
+
+
+def _object_key_for(record_id, relpath, side):
+    ext = os.path.splitext(relpath or "")[1] or ".png"
+    return f"cards/{record_id}/{side}{ext}"
+
+
+def _write_images_manifest(fh):
+    """One JSON line per record that has local image files, mapping the current
+    upload-relative paths to suggested object-storage keys."""
+    n = 0
+    last_id = 0
+    while True:
+        rows = (ScanRecord.query.filter(ScanRecord.id > last_id)
+                .order_by(ScanRecord.id).limit(2000).all())
+        if not rows:
+            break
+        for r in rows:
+            entry = {"record_id": r.id}
+            fp = normalize_to_upload_relative(r.image_path)
+            bp = normalize_to_upload_relative(r.image_path_back) if r.image_path_back else ""
+            wrote = False
+            if fp and fp != "__blank__" and not fp.startswith(("http://", "https://")):
+                entry["front_path"] = fp
+                entry["front_key"] = _object_key_for(r.id, fp, "front")
+                wrote = True
+            if bp and bp != "__blank__" and not bp.startswith(("http://", "https://")):
+                entry["back_path"] = bp
+                entry["back_key"] = _object_key_for(r.id, bp, "back")
+                wrote = True
+            if wrote:
+                fh.write(json.dumps(entry, default=str) + "\n")
+                n += 1
+        last_id = rows[-1].id
+        db.session.expunge_all()
+    return n
+
+
+def _build_migration_bundle(include_reference=False, include_images_manifest=True):
+    """Assemble the migration bundle as a .tar.gz on disk and return its path."""
+    import tarfile
+    ensure_dirs()
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    work = tempfile.mkdtemp(prefix="migration_", dir=app.config["TEMP_PDF_FOLDER"])
+    bundle_dir = os.path.join(work, f"ccim_migration_{stamp}")
+    os.makedirs(bundle_dir, exist_ok=True)
+
+    counts = {}
+    for stem, model, rebuildable in _migration_tables():
+        if rebuildable and not include_reference:
+            counts[stem] = "skipped (rebuildable from tcgcsv.com)"
+            continue
+        with open(os.path.join(bundle_dir, f"{stem}.jsonl"), "w", encoding="utf-8") as fh:
+            counts[stem] = _stream_table_jsonl(model, fh)
+
+    image_count = 0
+    if include_images_manifest:
+        with open(os.path.join(bundle_dir, "images_manifest.jsonl"), "w", encoding="utf-8") as fh:
+            image_count = _write_images_manifest(fh)
+
+    # Static target-side artifacts.
+    with open(os.path.join(bundle_dir, "schema_postgres.sql"), "w", encoding="utf-8") as fh:
+        fh.write(POSTGRES_SCHEMA_SQL)
+    with open(os.path.join(bundle_dir, "import_to_postgres.py"), "w", encoding="utf-8") as fh:
+        fh.write(POSTGRES_IMPORTER_PY)
+    with open(os.path.join(bundle_dir, "README_MIGRATION.md"), "w", encoding="utf-8") as fh:
+        fh.write(MIGRATION_README_MD)
+
+    roots = app.config.get("STORAGE_ROOTS", {})
+    manifest = {
+        "bundle_version": MIGRATION_BUNDLE_VERSION,
+        "created_utc": datetime.utcnow().isoformat(),
+        "source": "Card Collector Inventory Manager (SQLite build)",
+        "source_cap": INVENTORY_MAX_RECORDS,
+        "capacity": _capacity_status(),
+        "row_counts": counts,
+        "image_manifest_rows": image_count,
+        "images_source_dir": roots.get("uploads", ""),
+        "reference_cards_included": bool(include_reference),
+        "notes": [
+            "Load order: products, scan_records, listings, sale_events, type_references, "
+            "shop_connections, email_monitors, reference_syncs, reference_cards.",
+            "extracted_data is JSON per line; load into a jsonb column.",
+            "Image bytes are NOT in this bundle. images_manifest.jsonl maps each record's "
+            "current file path to a suggested object-storage key; run the importer's image "
+            "sync against images_source_dir.",
+            "shop_connections and email_monitors may contain credentials — treat this bundle as a secret.",
+        ],
+    }
+    with open(os.path.join(bundle_dir, "manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=2)
+
+    out_dir = os.path.join(app.config["UPLOAD_FOLDER"], "migration_exports")
+    os.makedirs(out_dir, exist_ok=True)
+    tar_path = os.path.join(out_dir, f"ccim_migration_{stamp}.tar.gz")
+    with tarfile.open(tar_path, "w:gz") as tar:
+        tar.add(bundle_dir, arcname=os.path.basename(bundle_dir))
+    shutil.rmtree(work, ignore_errors=True)
+    return tar_path, manifest
+
+
+@app.route("/settings/upgrade")
+def upgrade_page():
+    return render_template("upgrade.html", capacity=_capacity_status())
+
+
+@app.route("/settings/upgrade/status")
+def upgrade_status():
+    return jsonify({"status": "success", "capacity": _capacity_status()})
+
+
+@app.route("/settings/upgrade/export", methods=["POST"])
+def upgrade_export():
+    include_reference = str(request.form.get("include_reference", "")).lower() in ("1", "true", "yes", "on")
+    try:
+        tar_path, manifest = _build_migration_bundle(include_reference=include_reference)
+    except Exception as exc:
+        return jsonify({"status": "error", "message": f"Export failed: {exc}"}), 500
+    size = os.path.getsize(tar_path)
+    return jsonify({
+        "status": "success",
+        "message": "Migration bundle created.",
+        "download_url": url_for("uploaded_file", filename="migration_exports/" + os.path.basename(tar_path)),
+        "filename": os.path.basename(tar_path),
+        "size_bytes": size,
+        "size_human": _human_size(size),
+        "manifest": manifest,
+    })
 
 
 # ============================================================================ #

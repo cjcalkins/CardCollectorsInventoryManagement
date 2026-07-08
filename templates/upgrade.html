@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <link rel="icon" type="image/jpeg" href="{{ url_for('static', filename='favicon.jpg') }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Upgrade - Card Collector Inventory Manager</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <style>
+        body { background-color: #f8f9fa; }
+        .nav-tabs-minimal { display: flex; gap: 10px; margin-left: auto; }
+        .nav-tab { padding: 8px 14px; text-decoration: none; border-radius: 8px;
+            background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.85); font-weight: 600; transition: 0.2s ease; }
+        .nav-tab:hover { background: rgba(255,255,255,0.18); color: #fff; }
+        .nav-tab.active { background: #fff; color: #212529; }
+        @media (max-width: 768px) {
+            .nav-tabs-minimal { margin-left: 0; margin-top: 12px; width: 100%; }
+            .nav-tab { flex: 1; text-align: center; }
+        }
+        .settings-layout { display: flex; align-items: flex-start; }
+        .settings-sidebar { flex: 0 0 240px; align-self: stretch; position: sticky; top: 0;
+            min-height: calc(100vh - 56px); background: #fff; border-right: 1px solid #dee2e6; padding: 1rem .75rem; z-index: 1000; }
+        .settings-sidebar .ss-title { font-size: .72rem; text-transform: uppercase; letter-spacing: .06em; color: #6c757d; padding: .4rem .75rem .6rem; font-weight: 700; }
+        .settings-sidebar a.ss-link { display: flex; align-items: center; gap: .65rem; padding: .6rem .75rem; margin-bottom: 3px; border-radius: 8px; color: #343a40; text-decoration: none; font-weight: 600; font-size: .92rem; }
+        .settings-sidebar a.ss-link:hover { background: #f1f3f5; color: #212529; }
+        .settings-sidebar a.ss-link.active { background: #212529; color: #fff; }
+        .settings-sidebar a.ss-link i { width: 18px; text-align: center; font-size: .95rem; }
+        .settings-content { flex: 1 1 auto; min-width: 0; }
+        @media (max-width: 991px) {
+            .settings-layout { flex-direction: column; }
+            .settings-sidebar { position: static; flex: none; width: 100%; min-height: 0; border-right: none; border-bottom: 1px solid #dee2e6; display: flex; gap: 6px; overflow-x: auto; padding: .5rem; }
+            .settings-sidebar .ss-title { display: none; }
+            .settings-sidebar a.ss-link { white-space: nowrap; margin-bottom: 0; }
+        }
+        .cap-card { background:#fff; border:1px solid #e9ecef; border-radius:14px; padding:1.5rem; box-shadow:0 3px 14px rgba(0,0,0,.05); margin-bottom:1.25rem; }
+        .cap-count { font-size:2rem; font-weight:800; }
+        .cap-sub { color:#6c757d; font-size:.9rem; }
+        .progress { height:14px; border-radius:8px; }
+        .step-card { background:#fff; border:1px solid #e9ecef; border-radius:12px; padding:1rem 1.15rem; margin-bottom:.75rem; display:flex; gap:.9rem; align-items:flex-start; }
+        .step-num { flex:0 0 28px; height:28px; width:28px; border-radius:50%; background:#212529; color:#fff; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:.85rem; }
+        code { background:#f1f3f5; padding:.1rem .35rem; border-radius:5px; }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+        <div class="container d-flex flex-wrap align-items-center">
+            <a class="navbar-brand" href="{{ url_for('index') }}">
+                <img src="{{ url_for('static', filename='favicon.jpg') }}" alt="logo" width="24" height="24" style="object-fit:cover;border-radius:4px;margin-right:0.5rem;" class="me-2">Card Collector Inventory Manager
+            </a>
+            <div class="nav-tabs-minimal">
+                <a href="{{ url_for('import_page') }}" class="nav-tab">Import</a>
+                <a href="{{ url_for('inventory') }}" class="nav-tab">Inventory</a>
+                <a href="{{ url_for('albums_list') }}" class="nav-tab">Album</a>
+                <a href="{{ url_for('settings_page') }}" class="nav-tab active" title="Settings"><i class="fas fa-gear"></i></a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="settings-layout">
+        {% set ss_active = 'upgrade' %}{% include '_settings_sidebar.html' %}
+        <main class="settings-content">
+            <div class="container py-5">
+                <div class="mb-4">
+                    <h2 class="mb-1"><i class="fas fa-arrow-up-right-dots me-2"></i>Upgrade</h2>
+                    <div class="text-muted">This build is capped at {{ "{:,}".format(capacity.limit) }} entries. Beyond that, move to the desktop build.</div>
+                </div>
+
+                <div class="cap-card">
+                    <div class="d-flex justify-content-between align-items-end flex-wrap gap-2">
+                        <div>
+                            <div class="cap-count" id="capCount">{{ "{:,}".format(capacity.count) }}</div>
+                            <div class="cap-sub">of {{ "{:,}".format(capacity.limit) }} entries used
+                                · <span id="capRemaining">{{ "{:,}".format(capacity.remaining) }}</span> remaining</div>
+                        </div>
+                        <div class="text-end cap-sub"><span id="capPercent">{{ capacity.percent }}</span>% full</div>
+                    </div>
+                    <div class="progress mt-3">
+                        <div class="progress-bar {{ 'bg-danger' if capacity.at_cap else ('bg-warning' if capacity.near_cap else 'bg-success') }}"
+                             id="capBar" role="progressbar" style="width: {{ capacity.percent }}%;"></div>
+                    </div>
+                    {% if capacity.at_cap %}
+                    <div class="alert alert-danger mt-3 mb-0">
+                        <i class="fas fa-triangle-exclamation me-1"></i>
+                        The inventory is full. New imports are blocked. Connect a dedicated computer and migrate to the
+                        desktop build (PostgreSQL + partitioning + object storage) to keep adding cards.
+                    </div>
+                    {% elif capacity.near_cap %}
+                    <div class="alert alert-warning mt-3 mb-0">
+                        <i class="fas fa-circle-exclamation me-1"></i>
+                        You're approaching the cap. It's a good time to prepare a dedicated machine and export your migration bundle.
+                    </div>
+                    {% endif %}
+                </div>
+
+                <div class="cap-card">
+                    <h5 class="fw-bold mb-2"><i class="fas fa-box-archive me-2"></i>Export migration bundle</h5>
+                    <p class="cap-sub mb-3">
+                        Creates a portable <code>.tar.gz</code> containing every table (streamed, memory-safe), an image
+                        manifest, the PostgreSQL schema, an importer script, and a README — everything the desktop build
+                        needs. Image files aren't included (they can be huge); the importer syncs them to object storage
+                        from your image folder.
+                    </p>
+                    <div class="form-check mb-3">
+                        <input class="form-check-input" type="checkbox" id="includeReference">
+                        <label class="form-check-label cap-sub" for="includeReference">
+                            Include the reference catalog (large; otherwise rebuildable from tcgcsv.com)
+                        </label>
+                    </div>
+                    <button class="btn btn-dark" id="exportBtn" onclick="exportBundle()">
+                        <i class="fas fa-download me-1"></i>Create migration bundle
+                    </button>
+                    <div class="mt-3" id="exportResult" style="font-size:.9rem;"></div>
+                    <div class="alert alert-light border mt-3 mb-0" style="font-size:.82rem;">
+                        <i class="fas fa-key me-1 text-secondary"></i>
+                        The bundle can contain marketplace and mailbox credentials. Store and transfer it securely.
+                    </div>
+                </div>
+
+                <div class="cap-card">
+                    <h5 class="fw-bold mb-3"><i class="fas fa-list-ol me-2"></i>Migration steps</h5>
+                    <div class="step-card"><div class="step-num">1</div><div>Provision <strong>PostgreSQL 14+</strong> on a dedicated machine (and optionally S3/MinIO object storage for images).</div></div>
+                    <div class="step-card"><div class="step-num">2</div><div>Export the bundle above and copy it to that machine, then extract it.</div></div>
+                    <div class="step-card"><div class="step-num">3</div><div>Run <code>pip install psycopg2-binary</code> then <code>python import_to_postgres.py --dsn "postgresql://user:pass@host/db" --bundle .</code></div></div>
+                    <div class="step-card"><div class="step-num">4</div><div>To move images too, add <code>--images-dir</code>, <code>--s3-endpoint</code>, and <code>--s3-bucket</code> (needs <code>boto3</code>).</div></div>
+                    <div class="step-card"><div class="step-num">5</div><div>Point the desktop application at the same database and bucket. Full details are in <code>README_MIGRATION.md</code> inside the bundle.</div></div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        function exportBundle() {
+            const btn = document.getElementById('exportBtn');
+            const out = document.getElementById('exportResult');
+            const original = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-circle-notch fa-spin me-1"></i>Building bundle…';
+            out.textContent = 'This can take a while for large collections…';
+
+            const body = new FormData();
+            body.append('include_reference', document.getElementById('includeReference').checked ? '1' : '0');
+
+            fetch('{{ url_for("upgrade_export") }}', { method: 'POST', body })
+                .then(r => r.json())
+                .then(d => {
+                    btn.disabled = false;
+                    btn.innerHTML = original;
+                    if (d.status !== 'success') {
+                        out.innerHTML = '<span class="text-danger">' + (d.message || 'Export failed.') + '</span>';
+                        return;
+                    }
+                    out.innerHTML = '<div class="alert alert-success mb-0">Bundle ready (' + d.size_human + '). '
+                        + '<a href="' + d.download_url + '" class="alert-link" download>Download ' + d.filename + '</a></div>';
+                })
+                .catch(err => {
+                    btn.disabled = false;
+                    btn.innerHTML = original;
+                    out.innerHTML = '<span class="text-danger">Request failed: ' + err + '</span>';
+                });
+        }
+    </script>
+</body>
+</html>
