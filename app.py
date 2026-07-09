@@ -1336,11 +1336,13 @@ def _get_serial(data: dict) -> str:
 
 
 # ====================== AUTO-IDENTIFY (used at end of import) ======================
-# "100% match" for auto-apply. match_ocr_to_records caps its score at 1.0, and a
-# score of 1.0 requires an exact collector-number match plus a strong name match
-# — a confident, unambiguous identification. Anything less is left for the person
-# to check by hand.
-AUTO_IDENTIFY_MIN_SCORE = 1.0
+# Minimum match score to auto-apply the top OCR identification on import. Scores
+# come from match_ocr_to_records (capped at 1.0): an exact collector-number (N/M)
+# match contributes +0.5 and the card-name similarity contributes up to +0.65, so
+# 0.60 means "a confident combined name + number match" — e.g. an exact number
+# plus even a partial name read, or a near-exact name on its own. Below this the
+# entry is left blank for the person to check by hand. Overridable via env.
+AUTO_IDENTIFY_MIN_SCORE = float(os.environ.get("AUTO_IDENTIFY_MIN_SCORE", "0.60"))
 
 # ── Card "type" field (e.g. Pokemon energy type) ──
 # Minimum confidence for a VISUAL type guess to auto-fill a record's type field.
@@ -1521,9 +1523,10 @@ def _apply_ocr_candidate(record, cand):
 
 def auto_identify_record(record, min_score=AUTO_IDENTIFY_MIN_SCORE):
     """
-    OCR a record's front image and, only if a candidate matches with full
-    confidence (score >= min_score — a 100% match), apply that identity to the
-    record. Otherwise the record is left untouched (blank) for manual entry.
+    OCR a record's front image and, if a candidate matches with sufficient
+    confidence (score >= min_score, default 60% — a strong combined name + N/M
+    match), apply that identity to the record. Otherwise the record is left
+    untouched (blank) for manual entry.
 
     This is the same identification the inventory-detail page runs, invoked
     automatically at the end of an import. It never raises and never commits: any
@@ -1533,7 +1536,7 @@ def auto_identify_record(record, min_score=AUTO_IDENTIFY_MIN_SCORE):
     Separately from the name/serial identity, it also fills the Game's "type"
     field (e.g. Pokemon energy type) when the card provides one — from the
     matched reference card if identified, otherwise from a confident VISUAL
-    reading of the type icon. This runs even when there's no 100% identity match,
+    reading of the type icon. This runs even when there's no identity match,
     so cards can still be sorted by type.
 
     Returns: { identified, reason, score, name, applied: {..},
@@ -1586,7 +1589,7 @@ def auto_identify_record(record, min_score=AUTO_IDENTIFY_MIN_SCORE):
         out["score"] = top.get("score")
         out["name"] = top.get("name", "")
 
-    # 1) Identity fields — only on a 100% match (unchanged rule).
+    # 1) Identity fields — applied when the top match clears min_score (60%).
     if top is not None and float(top.get("score", 0) or 0) >= float(min_score) - 1e-9:
         applied = _apply_ocr_candidate(record, top)
         if applied:
@@ -3427,8 +3430,9 @@ def _create_single_card(front_path, back_path, game, album, template, collection
     """
     Create a blank inventory record for `game` (+optional album/collection) with
     the given front (required) and back (optional) image paths, then OCR-identify
-    the FRONT ONLY — the back is never name/serial-checked. A 100% match is
-    applied and saved; anything less leaves the entry blank for manual entry.
+    the FRONT ONLY — the back is never name/serial-checked. A match at or above the
+    auto-identify threshold (60%) is applied and saved; anything less leaves the
+    entry blank for manual entry.
 
     Returns (record, ident_dict).
     """
