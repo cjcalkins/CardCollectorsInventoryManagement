@@ -107,6 +107,15 @@
 
                 <div class="row g-4">
                     <div class="col-12 col-md-6 col-xl-4">
+                        <a href="{{ url_for('general_page') }}" class="setting-card">
+                            <div class="sc-icon"><i class="fas fa-sliders"></i></div>
+                            <div>
+                                <h5>General</h5>
+                                <p>App-wide options, including full native-resolution scan import.</p>
+                            </div>
+                        </a>
+                    </div>
+                    <div class="col-12 col-md-6 col-xl-4">
                         <a href="{{ url_for('templates_page') }}" class="setting-card">
                             <div class="sc-icon"><i class="fas fa-layer-group"></i></div>
                             <div>
@@ -130,6 +139,15 @@
                             <div>
                                 <h5>Shops</h5>
                                 <p>Connect marketplaces (TCGplayer, eBay, Shopify), manage listings, and watch sale emails.</p>
+                            </div>
+                        </a>
+                    </div>
+                    <div class="col-12 col-md-6 col-xl-4">
+                        <a href="{{ url_for('api_keys_page') }}" class="setting-card">
+                            <div class="sc-icon"><i class="fas fa-key"></i></div>
+                            <div>
+                                <h5>API Keys</h5>
+                                <p>Store and update service API keys (JustTCG, Ximilar) securely in the database.</p>
                             </div>
                         </a>
                     </div>

@@ -48,9 +48,33 @@ _NAME_WL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 _NUM_WL  = "0123456789/"
 _NUMBER_RE  = re.compile(r"(\d{1,4})\s*/\s*(\d{1,4})")
 _SETCODE_RE = re.compile(r"\b(?=[A-Z0-9]{2,6}\b)[A-Z0-9]*[A-Z][A-Z0-9]*\b")
-# Words that appear in the name zone but are never the name.
-_NAME_NOISE = {"hp", "stage", "basic", "evolves", "from", "pokemon", "pokmon",
-               "illus", "no", "the", "ex", "gx", "restored"}
+# Words that appear in the name zone but are never the card name: evolution stage
+# badges, rarity/mechanic tags, HP, and other UI text. The evolution badge sits
+# just left of the name and is high-contrast (white-on-dark), so OCR often reads
+# it *before* the name and mangles it (e.g. "BASIC" -> "SIC"). We therefore reject
+# not only exact matches but close fuzzy matches, so a garbled badge token is
+# dropped instead of being mistaken for the name.
+_NAME_NOISE = {"hp", "stage", "stage1", "stage2", "basic", "evolves", "from",
+               "pokemon", "pokmon", "illus", "no", "the", "ex", "gx", "restored",
+               "mega", "break", "vmax", "vstar", "vunion", "tag", "team", "lv",
+               "item", "supporter", "stadium", "energy", "legend"}
+
+
+def _is_name_noise(token):
+    """True if `token` is (or closely resembles) a non-name UI/stage/rarity word.
+    Fuzzy so OCR-mangled badges are caught: 'sic'~'basic', '1g'~'gx', etc."""
+    t = re.sub(r"[^a-z0-9]", "", str(token or "").lower())
+    if not t:
+        return True
+    if t in _NAME_NOISE:
+        return True
+    # Only fuzzy-reject short tokens (badges/tags are short); real names rarely
+    # collide, and requiring len>=3 avoids nuking single letters.
+    if len(t) <= 6:
+        for w in _NAME_NOISE:
+            if len(w) >= 3 and SequenceMatcher(None, t, w).ratio() >= 0.7:
+                return True
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -157,7 +181,7 @@ def _name_from_binary(im):
     words = []  # (text, height, left, width, center_y)
     for i, t in enumerate(d["text"]):
         t = (t or "").strip()
-        if len(t) >= 3 and t.lower() not in _NAME_NOISE:
+        if len(t) >= 3 and not _is_name_noise(t):
             h = d["height"][i]
             words.append((t, h, d["left"][i], d["width"][i], d["top"][i] + h / 2.0))
     if not words:
@@ -186,13 +210,25 @@ def _name_from_binary(im):
     return _clean_name(" ".join(w[0] for w in keep)), ref_h
 
 
-def _read_name(bgr, top=0.15, x0=0.10, x1=0.80):
-    """Read the card name from the top zone, trying two binarisations and
-    keeping whichever renders the name tallest (i.e. clearest)."""
+def _strip_name_noise(text):
+    """Drop stage/rarity/UI tokens (incl. OCR-mangled ones) from a raw name line,
+    e.g. 'sic Panpour' -> 'Panpour'."""
+    toks = [t for t in re.split(r"\s+", str(text or "").strip())
+            if t and not _is_name_noise(t)]
+    return _clean_name(" ".join(toks))
+
+
+def _read_name(bgr, top=0.14, x0=0.10, x1=0.80):
+    """Read the card name from the top zone. Two complementary passes over two
+    binarisations: (1) the tallest-word-on-its-line pass (clean on most cards),
+    and (2) a single-line pass with stage/UI tokens stripped, which recovers names
+    the sparse pass fragments and removes the evolution badge sitting to the left
+    of the name. The single-line result is preferred when present because it
+    respects the name's layout instead of picking isolated blobs."""
     if not _TESS_OK:
         return "", -1.0
     H, W = bgr.shape[:2]
-    crop = bgr[0:int(H * top), int(W * x0):int(W * x1)]
+    crop = bgr[int(H * 0.02):int(H * top), int(W * x0):int(W * x1)]
     g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     g = cv2.resize(g, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
     g = cv2.bilateralFilter(g, 5, 40, 40)
@@ -200,14 +236,29 @@ def _read_name(bgr, top=0.15, x0=0.10, x1=0.80):
     otsu = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
     adap = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                  cv2.THRESH_BINARY, 35, 10)
-    cands = []
+
+    cands = []  # (text, anchor_height, priority)  priority 1 = single-line pass
     for im in (otsu, adap):
         nm, h = _name_from_binary(im)
         if nm:
-            cands.append((nm, h))
+            cands.append((nm, h, 0))
+        try:
+            line = pytesseract.image_to_string(
+                im, config=f"--oem 3 --psm 7 -c tessedit_char_whitelist={_NAME_WL}")
+        except Exception:
+            line = ""
+        stripped = _strip_name_noise(line)
+        if len(re.sub(r"[^A-Za-z]", "", stripped)) >= 3:
+            cands.append((stripped, 0.0, 1))
+
     if not cands:
         return "", 0.0
-    cands.sort(key=lambda c: (c[1], -len(c[0].split())), reverse=True)
+
+    def alpha_len(s):
+        return len(re.sub(r"[^A-Za-z]", "", s))
+    # Prefer the single-line stripped name, then the one with more real letters,
+    # then the tallest anchor.
+    cands.sort(key=lambda c: (c[2], alpha_len(c[0]), c[1]), reverse=True)
     return cands[0][0], 0.0
 
 
@@ -218,43 +269,63 @@ def _plausible_number(n, m):
     return 1 <= n <= m <= 2000
 
 
-def _read_number(bgr, band_frac=0.13):
-    """Return (normalized 'N/M', raw_text). Scans the full-width bottom band with
-    several preprocessings/PSMs and returns the most frequently seen plausible
-    N/M (robust to a single bad read). '' when nothing plausible is found."""
+def _best_number(hits):
+    """Vote for the most-seen N/M, folding trailing-zero artifacts (a rarity dot
+    or set symbol read as a '0'): 'N/M0' votes merge into 'N/M' when both appear."""
+    c = Counter(hits)
+    for cand in list(c):
+        n, m = cand.split("/")
+        if m.endswith("0") and len(m) > 1 and f"{n}/{m[:-1]}" in c:
+            c[f"{n}/{m[:-1]}"] += c.pop(cand)
+    return c.most_common(1)[0][0]
+
+
+def _read_number(bgr, band_top=0.90, band_bottom=0.965, corner_frac=0.34):
+    """Return (normalized 'N/M', raw_text). The collector number lives in a bottom
+    CORNER — bottom-left on modern sets, bottom-right on older ones — so we scan
+    only the two corners and skip the centre of the bottom band (where the flavour
+    text and the weakness/resistance/retreat row live). Scanning the full width is
+    what let that central text inject spurious digits. Each corner is read with
+    several upscales/binarisations/PSMs and the most-voted plausible N/M wins."""
     if not _TESS_OK:
         return "", ""
-    H = bgr.shape[0]
-    band = bgr[int(H * (1.0 - band_frac)):H, :]
-    g = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
+    H, W = bgr.shape[:2]
+    y0, y1 = int(H * band_top), int(H * band_bottom)
+    xL, xR = int(W * corner_frac), int(W * (1.0 - corner_frac))
+    regions = (bgr[y0:y1, 0:xL], bgr[y0:y1, xR:W])   # bottom-left, bottom-right
 
     hits, last_raw = [], ""
-    for up in (2, 3):
-        gg = cv2.resize(g, None, fx=up, fy=up, interpolation=cv2.INTER_CUBIC)
-        gg = cv2.bilateralFilter(gg, 5, 40, 40)
-        variants = (
-            cv2.adaptiveThreshold(gg, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 10),
-            cv2.threshold(gg, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
-        )
-        for im in variants:
-            for psm in (11, 7):
-                cfg = f"--oem 3 --psm {psm} -c tessedit_char_whitelist={_NUM_WL}"
-                try:
-                    txt = pytesseract.image_to_string(im, config=cfg)
-                except Exception:
-                    continue
-                last_raw = txt.strip() or last_raw
-                for mm in _NUMBER_RE.finditer(txt.replace(" ", "")):
-                    n, m = int(mm.group(1)), int(mm.group(2))
-                    if _plausible_number(n, m):
-                        hits.append(f"{n}/{m}")
-        # Early exit once a clear winner has emerged (seen >=3 times).
+    for band in regions:
+        if band.size == 0:
+            continue
+        g = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
+        for up in (3, 4):
+            gg = cv2.resize(g, None, fx=up, fy=up, interpolation=cv2.INTER_CUBIC)
+            gg = cv2.bilateralFilter(gg, 7, 50, 50)
+            variants = (
+                cv2.threshold(gg, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
+                cv2.adaptiveThreshold(gg, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 41, 15),
+                cv2.adaptiveThreshold(gg, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 41, 15),
+            )
+            for im in variants:
+                for psm in (7, 11, 6):
+                    cfg = f"--oem 3 --psm {psm} -c tessedit_char_whitelist={_NUM_WL}"
+                    try:
+                        txt = pytesseract.image_to_string(im, config=cfg)
+                    except Exception:
+                        continue
+                    last_raw = txt.strip() or last_raw
+                    for mm in _NUMBER_RE.finditer(txt.replace(" ", "")):
+                        n, m = int(mm.group(1)), int(mm.group(2))
+                        if _plausible_number(n, m):
+                            hits.append(f"{n}/{m}")
+        # A corner that already produced a clear winner ends the search.
         if hits:
-            top, cnt = Counter(hits).most_common(1)[0]
-            if cnt >= 3:
-                return top, last_raw
+            _, cnt = Counter(hits).most_common(1)[0]
+            if cnt >= 4:
+                return _best_number(hits), last_raw
     if hits:
-        return Counter(hits).most_common(1)[0][0], last_raw
+        return _best_number(hits), last_raw
     return "", last_raw
 
 

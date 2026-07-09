@@ -1,3 +1,4 @@
 {
-  "mode": "sorting_machine"
+  "mode": "sorting_machine",
+  "unlimited_native_import": true
 }

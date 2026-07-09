@@ -1,6 +1,12 @@
 from flask import Flask, request, jsonify, render_template, send_from_directory, url_for, redirect, Response
 import os
 import re as _re
+# OpenCV enforces a max decoded-image size (OPENCV_IO_MAX_IMAGE_PIXELS, default
+# ~1.07 G px) at import time. Very high-DPI card scans (a 2400-DPI letter page is
+# ~0.54 G px, larger for bigger pages) can approach it, so raise the ceiling
+# before cv2 is imported. Tunable via env; the memory budget below is the real
+# safety limit.
+os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", str(1 << 40))
 import cv2
 import json
 import shutil
@@ -8,6 +14,12 @@ import tempfile
 import numpy as np
 from datetime import datetime
 from PIL import Image
+# Pillow raises DecompressionBombError above ~89 MP by default; legitimate
+# high-DPI card scans exceed that, so lift the ceiling. None disables the check;
+# a finite value can be set via MAX_IMAGE_MEGAPIXELS. The per-page memory budget
+# (PDF_MAX_MEGAPIXELS) is what actually protects RAM.
+_max_img_mp = os.environ.get("MAX_IMAGE_MEGAPIXELS", "").strip()
+Image.MAX_IMAGE_PIXELS = int(float(_max_img_mp) * 1_000_000) if _max_img_mp else None
 from werkzeug.utils import secure_filename
 from models import (db, Product, ScanRecord, ShopConnection, Listing, EmailMonitor,
                     SaleEvent, ReferenceCard, ReferenceSync, TypeReference, AppSetting)
@@ -169,7 +181,11 @@ apply_storage_config(STORAGE)
 # ---------------------------------------------------------------------------- #
 SYSTEM_CONFIG_PATH = os.path.join(BASE_DIR, "system_config.json")
 VALID_MODES = ("sorting_machine", "dedicated_server")
-SYSTEM = {"mode": None}
+SYSTEM = {"mode": None, "unlimited_native_import": False}
+
+# Minimum swap required before the operator may enable unlimited-native import
+# (rendering full-resolution scans can need multiple GB per page).
+REQUIRED_SWAP_BYTES = 8 * 1000 ** 3   # ~8 GB
 
 
 def load_system_config():
@@ -177,15 +193,21 @@ def load_system_config():
         with open(SYSTEM_CONFIG_PATH, "r", encoding="utf-8") as fh:
             data = json.load(fh) or {}
         mode = data.get("mode")
-        return {"mode": mode if mode in VALID_MODES else None}
+        return {
+            "mode": mode if mode in VALID_MODES else None,
+            "unlimited_native_import": bool(data.get("unlimited_native_import", False)),
+        }
     except (OSError, ValueError):
-        return {"mode": None}
+        return {"mode": None, "unlimited_native_import": False}
 
 
 def save_system_config():
     tmp = SYSTEM_CONFIG_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump({"mode": SYSTEM["mode"]}, fh, indent=2)
+        json.dump({
+            "mode": SYSTEM["mode"],
+            "unlimited_native_import": bool(SYSTEM.get("unlimited_native_import", False)),
+        }, fh, indent=2)
     os.replace(tmp, SYSTEM_CONFIG_PATH)
 
 
@@ -197,6 +219,42 @@ def set_system_mode(mode):
     if mode not in VALID_MODES:
         raise ValueError("invalid mode")
     SYSTEM["mode"] = mode
+    save_system_config()
+
+
+def _system_swap_bytes():
+    """Total configured swap in bytes (0 if unknown/none). Reads /proc/meminfo."""
+    try:
+        with open("/proc/meminfo", "r") as fh:
+            for line in fh:
+                if line.startswith("SwapTotal:"):
+                    return int(line.split()[1]) * 1024   # value is in kB
+    except Exception:
+        pass
+    return 0
+
+
+def _native_import_unlimited():
+    # An explicit env override wins (headless / Dedicated Server deployments).
+    env = os.environ.get("PDF_UNLIMITED_NATIVE")
+    if env is not None:
+        return env.strip().lower() in ("1", "true", "yes", "on")
+    return bool(SYSTEM.get("unlimited_native_import", False))
+
+
+def set_native_import_unlimited(enabled):
+    """Enable/disable unlimited native-resolution import. Enabling REQUIRES at
+    least REQUIRED_SWAP_BYTES of swap; raises ValueError otherwise."""
+    enabled = bool(enabled)
+    if enabled:
+        swap = _system_swap_bytes()
+        if swap < REQUIRED_SWAP_BYTES:
+            raise ValueError(
+                f"At least {REQUIRED_SWAP_BYTES / 1000**3:.0f} GB of swap is required to enable "
+                f"unlimited native-resolution import; this system has "
+                f"{swap / 1000**3:.1f} GB. Add swap (e.g. an 8 GB swapfile on the NVMe) and retry."
+            )
+    SYSTEM["unlimited_native_import"] = enabled
     save_system_config()
 
 
@@ -770,8 +828,16 @@ def detect_and_crop_card(bgr, edge_type=CARD_EDGE_DEFAULT, margin_frac=0.008, mi
             quad = cv2.boxPoints(inflated).astype("float32")
 
         warped = four_point_transform(bgr, quad)
-        if warped.shape[1] > warped.shape[0]:       # ensure portrait
-            warped = cv2.rotate(warped, cv2.ROTATE_90_CLOCKWISE)
+        # A card is always portrait on import (taller than it is wide). If the
+        # detected region is landscape, it is NOT the card outline — almost always
+        # an internal horizontal rectangle such as the artwork window or the
+        # "NO. / Pokémon" info bar — so reject it rather than accept or rotate a
+        # wrong crop. The caller then falls back to a plain deskew of the whole
+        # tile, which is safe. (We never rotate a landscape result into portrait:
+        # that would turn a wrong horizontal detection into a convincing-looking
+        # but incorrect card.)
+        if warped.shape[1] >= warped.shape[0]:
+            return bgr, False
         warped = sharpen_image(warped)
         return warped, True
     except Exception:
@@ -1144,19 +1210,54 @@ def _canonical_collector_number(num_str):
     return f"{n:0{len(str(tot))}d}/{tot}"
 
 
+# Evolution-stage / rarity / UI tokens that show up in the name zone but are
+# never the card name. The evolution badge sits just left of the name and OCRs
+# before it (often mangled, e.g. "BASIC" -> "SIC"), so we strip these — with a
+# little fuzz for OCR errors — before using the name to narrow/score candidates.
+_OCR_NAME_NOISE = frozenset({
+    "hp", "stage", "stage1", "stage2", "basic", "evolves", "from", "pokemon",
+    "pokmon", "illus", "no", "the", "ex", "gx", "restored", "mega", "break",
+    "vmax", "vstar", "vunion", "tag", "team", "lv", "item", "supporter",
+    "stadium", "energy", "legend",
+})
+
+
+def _strip_ocr_name_noise(name):
+    """Drop stage/rarity/UI tokens (incl. lightly OCR-mangled ones) from an OCR'd
+    name so 'BASIC Panpour' / 'sic Panpour' narrows and scores as 'Panpour'."""
+    import difflib
+    out = []
+    for tok in _re.split(r"\s+", str(name or "").strip()):
+        t = _re.sub(r"[^a-z0-9]", "", tok.lower())
+        if not t or t.isdigit() or t in _OCR_NAME_NOISE:
+            continue
+        if len(t) <= 6 and any(
+            len(w) >= 3 and difflib.SequenceMatcher(None, t, w).ratio() >= 0.7
+            for w in _OCR_NAME_NOISE
+        ):
+            continue
+        out.append(tok)
+    return " ".join(out).strip()
+
+
 def _reference_candidates_for_ocr(category_id, ocr_result, limit=8):
     """
     Build scored reference-card candidates for an OCR result within one game.
     Pre-narrows by collector number (then name) so we never fuzzy-score an entire
     game, then reuses card_ocr's scorer. Each candidate is tagged source
     "reference" and carries product_id + rich fields for auto-fill.
+
+    Identification is NUMBER-FIRST: the collector number (N/M) is the reliable
+    key, so we narrow by it before falling back to the name. The name is also
+    stripped of stage/rarity noise so a stray badge token never derails the match.
     """
     if not category_id or card_ocr is None:
         return []
 
-    number = (ocr_result.get("number_guess") or "").strip()
-    name   = (ocr_result.get("name_guess") or "").strip()
-    base   = ReferenceCard.query.filter(ReferenceCard.category_id == category_id)
+    number   = (ocr_result.get("number_guess") or "").strip()
+    raw_name = (ocr_result.get("name_guess") or "").strip()
+    name     = _strip_ocr_name_noise(raw_name) or raw_name
+    base     = ReferenceCard.query.filter(ReferenceCard.category_id == category_id)
 
     narrowed = None
     if number:
@@ -1167,6 +1268,9 @@ def _reference_candidates_for_ocr(category_id, ocr_result, limit=8):
         narrowed = base.filter(ReferenceCard.name.ilike(f"%{first}%")).limit(500).all()
     if not narrowed:
         narrowed = base.limit(500).all()
+
+    # Score with the cleaned name so the badge scrap doesn't drag the ratio down.
+    ocr_result = {**ocr_result, "name_guess": name}
 
     candidates = [{
         "source":       "reference",
@@ -3135,11 +3239,51 @@ PDF_SPILL_THRESHOLD = 500 * 1024 * 1024  # 500 MB
 
 
 # PDF rasterization resolution for card imports. PyMuPDF zoom multiplies the
-# PDF's native 72 DPI, so 4.0 ≈ 288 DPI. At the old 2.0 (≈144 DPI) a 2.5" card
-# came out only ~360 px wide (visibly soft); 288 DPI yields ~720 px, preserving
-# the fine detail needed for identification. Tunable — higher = sharper but
-# larger page images and more processing time/RAM per page.
-PDF_RASTER_ZOOM = float(os.environ.get("PDF_RASTER_ZOOM", "4.0"))
+# PDF's native 72 DPI. Scanned PDFs embed the scan at its own resolution, so we
+# render each page at that native pixel density instead of a fixed DPI — this
+# keeps a scanned card at full scanner resolution instead of down-sampling it.
+# PDF_RASTER_ZOOM is the FLOOR (used for vector/low-DPI pages, ≈288 DPI) and
+# PDF_RASTER_ZOOM_MAX is the CEILING that protects memory on small machines
+# (≈576 DPI). Both are tunable via env.
+PDF_RASTER_ZOOM  = float(os.environ.get("PDF_RASTER_ZOOM", "4.0"))    # floor ≈288 DPI
+PDF_CAPPED_DPI   = float(os.environ.get("PDF_CAPPED_DPI", "600"))     # cap when unlimited is OFF
+PDF_SANITY_DPI   = float(os.environ.get("PDF_SANITY_DPI", "4800"))    # absolute guard even when ON
+
+
+def _pdf_native_zoom(page):
+    """Zoom that renders `page` at its embedded image's native pixel density (so
+    a scan is captured at full scanner resolution). Policy:
+      • unlimited native import OFF -> capped at PDF_CAPPED_DPI (600 DPI);
+      • unlimited native import ON  -> true native (only a high sanity cap).
+    The toggle lives in Settings → General and requires ≥8 GB swap to enable.
+    Pages with no raster image fall back to the floor."""
+    try:
+        rect = page.rect
+        page_w_pt = float(getattr(rect, "width", 0) or 612)   # noqa: F841 (kept for clarity)
+        page_h_pt = float(getattr(rect, "height", 0) or 792)  # noqa: F841
+
+        best_dpi = 0.0
+        for info in page.get_image_info():
+            iw = info.get("width") or 0
+            ih = info.get("height") or 0
+            bbox = info.get("bbox")
+            if iw and ih and bbox:
+                bw_in = max(1e-6, (bbox[2] - bbox[0]) / 72.0)
+                bh_in = max(1e-6, (bbox[3] - bbox[1]) / 72.0)
+                best_dpi = max(best_dpi, iw / bw_in, ih / bh_in)
+
+        native = max(PDF_RASTER_ZOOM, (best_dpi / 72.0) if best_dpi > 0 else PDF_RASTER_ZOOM)
+        ceiling = (PDF_SANITY_DPI if _native_import_unlimited() else PDF_CAPPED_DPI) / 72.0
+        return min(native, ceiling)
+    except Exception:
+        return PDF_RASTER_ZOOM
+
+
+def _pdf_render_matrix(page, zoom=None):
+    """fitz.Matrix for a page. zoom=None -> render at native resolution
+    (clamped); a explicit number forces that fixed zoom."""
+    z = float(zoom) if zoom else _pdf_native_zoom(page)
+    return fitz.Matrix(z, z)
 
 
 def _pdf_page_to_bgr(page, matrix):
@@ -3156,7 +3300,7 @@ def _pdf_page_to_bgr(page, matrix):
     return cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
 
 
-def _iter_pdf_bgr_pages(pdf_bytes, zoom=PDF_RASTER_ZOOM):
+def _iter_pdf_bgr_pages(pdf_bytes, zoom=None):
     """
     Yield each PDF page as a BGR image, in page order, one at a time.
 
@@ -3175,7 +3319,6 @@ def _iter_pdf_bgr_pages(pdf_bytes, zoom=PDF_RASTER_ZOOM):
     if fitz is None:
         raise RuntimeError("PDF support isn't installed on the server. Run: pip install PyMuPDF")
 
-    matrix = fitz.Matrix(zoom, zoom)
     spill = len(pdf_bytes) > PDF_SPILL_THRESHOLD
 
     doc = None
@@ -3197,7 +3340,7 @@ def _iter_pdf_bgr_pages(pdf_bytes, zoom=PDF_RASTER_ZOOM):
 
         for i in range(doc.page_count):
             page = doc.load_page(i)
-            bgr = _pdf_page_to_bgr(page, matrix)
+            bgr = _pdf_page_to_bgr(page, _pdf_render_matrix(page, zoom))
             yield bgr
             # Release this page before loading the next one.
             del bgr, page
@@ -3221,7 +3364,7 @@ def _iter_pdf_bgr_pages(pdf_bytes, zoom=PDF_RASTER_ZOOM):
                 shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _iter_pdf_bgr_pages_from_path(pdf_path, zoom=PDF_RASTER_ZOOM):
+def _iter_pdf_bgr_pages_from_path(pdf_path, zoom=None):
     """
     Yield each page of an on-disk PDF as a BGR image, one at a time.
 
@@ -3235,13 +3378,12 @@ def _iter_pdf_bgr_pages_from_path(pdf_path, zoom=PDF_RASTER_ZOOM):
     if fitz is None:
         raise RuntimeError("PDF support isn't installed on the server. Run: pip install PyMuPDF")
 
-    matrix = fitz.Matrix(zoom, zoom)
     doc = None
     try:
         doc = fitz.open(pdf_path)
         for i in range(doc.page_count):
             page = doc.load_page(i)
-            bgr = _pdf_page_to_bgr(page, matrix)
+            bgr = _pdf_page_to_bgr(page, _pdf_render_matrix(page, zoom))
             yield bgr
             del bgr, page
     finally:
@@ -3271,6 +3413,16 @@ def _clean_collection(v):
     return v[:100].strip()
 
 
+def _normalize_game_name(g):
+    """Store game names with a capitalized first character (e.g. 'pokemon' ->
+    'Pokemon'). Underscores become spaces; the rest of the string is preserved so
+    multi-word or specially-cased names (e.g. 'Magic the Gathering') aren't
+    mangled. Used only for the stored/displayed value — the template key that the
+    game maps to is left untouched."""
+    g = str(g or "").replace("_", " ").strip()
+    return (g[:1].upper() + g[1:]) if g else g
+
+
 def _create_single_card(front_path, back_path, game, album, template, collection=""):
     """
     Create a blank inventory record for `game` (+optional album/collection) with
@@ -3281,7 +3433,7 @@ def _create_single_card(front_path, back_path, game, album, template, collection
     Returns (record, ident_dict).
     """
     blank_fields = {k: "" for k in (template.get("fields", {}) or {}).keys()}
-    extracted = {**blank_fields, "game": game.replace("_", " ")}
+    extracted = {**blank_fields, "game": _normalize_game_name(game)}
     if album:
         extracted["album"] = album
     if collection:
@@ -5253,20 +5405,19 @@ def pdf_extract_pages():
             if doc.page_count < 1:
                 return jsonify({"status": "error", "message": "PDF has no pages"}), 400
 
-            # Rasterize at PDF_RASTER_ZOOM (≈288 DPI by default) so each ~2.5"
-            # card comes out ~720 px wide — enough to keep the fine print/artwork
-            # crisp through the split + align/crop. One page is rendered and saved
-            # at a time, so peak memory stays to a single page's pixmap.
-            zoom = PDF_RASTER_ZOOM
-            matrix = fitz.Matrix(zoom, zoom)
-
+            # Render each page at its embedded scan's NATIVE resolution (clamped
+            # between PDF_RASTER_ZOOM and PDF_RASTER_ZOOM_MAX) so scanned cards
+            # keep full scanner detail instead of being re-sampled to a fixed DPI.
+            # One page is rendered and saved at a time, so peak memory is a single
+            # page's pixmap.
             pages = []
             for page_index in range(doc.page_count):
                 page = doc.load_page(page_index)
-                pix = page.get_pixmap(matrix=matrix)
+                pix = page.get_pixmap(matrix=_pdf_render_matrix(page))
                 page_filename = f"pdfpage_{batch_id}_{page_index + 1:03d}.png"
                 page_path = os.path.join(app.config["TEMP_PDF_FOLDER"], page_filename)
                 pix.save(page_path)
+                del pix, page
 
                 pages.append({
                     "index":    page_index + 1,
@@ -5508,6 +5659,11 @@ def import_finalize_batch():
 
             filename_fields = parse_card_filename(filename)
             extracted = {**blank_fields, **filename_fields}
+            if extracted.get("game"):
+                # Capitalize the stored game (e.g. 'pokemon' -> 'Pokemon'). Done
+                # here, before the pocket lookup below, so a normalized front and
+                # its back still resolve to the same key and merge (not duplicate).
+                extracted["game"] = _normalize_game_name(extracted["game"])
             if collection:
                 extracted["collection"] = collection
             side = filename_fields.get("side", "front")
@@ -5911,6 +6067,46 @@ def settings_page():
     former top-level tabs (Templates, Type Icons, Shops, Search by Image,
     Duplicates) are reached from the sidebar on these pages."""
     return render_template("settings.html")
+
+
+# ============================================================================ #
+# General settings
+# ============================================================================ #
+def _general_status():
+    swap = _system_swap_bytes()
+    return {
+        "unlimited_native_import": _native_import_unlimited(),
+        "capped_dpi": int(PDF_CAPPED_DPI),
+        "swap_bytes": swap,
+        "swap_gb": round(swap / 1000 ** 3, 1),
+        "required_swap_gb": int(REQUIRED_SWAP_BYTES / 1000 ** 3),
+        "swap_ok": swap >= REQUIRED_SWAP_BYTES,
+        "env_forced": os.environ.get("PDF_UNLIMITED_NATIVE") is not None,
+    }
+
+
+@app.route("/settings/general")
+def general_page():
+    return render_template("general.html", general=_general_status())
+
+
+@app.route("/settings/general/native_import", methods=["POST"])
+def general_native_import():
+    body = request.get_json(silent=True) or request.form
+    enabled = str(body.get("enabled", "")).lower() in ("1", "true", "yes", "on")
+    try:
+        set_native_import_unlimited(enabled)
+    except ValueError as exc:
+        # Precondition failed (not enough swap) — report it, leave setting off.
+        return jsonify({"status": "error", "message": str(exc),
+                        "general": _general_status()}), 400
+    return jsonify({
+        "status": "success",
+        "message": ("Unlimited native-resolution import enabled."
+                    if enabled else
+                    f"Native import capped at {int(PDF_CAPPED_DPI)} DPI."),
+        "general": _general_status(),
+    })
 
 
 # ============================================================================ #
@@ -7014,14 +7210,20 @@ XIMILAR_POLL_MAX_WAIT   = 120     # seconds to wait for a single job to finish
 XIMILAR_CONDITION_MODES = {"ebay", "tcgplayer", "cardmarket", "ximilar"}
 
 
-def _image_source_for_grading(path_value):
+def _image_source_for_grading(path_value, max_side=1600, jpeg_quality=90):
     """
     Turn a stored image_path into a Ximilar record source dict.
 
     Returns:
       {"_url": "https://..."}  for images stored as external URLs (Ximilar fetches them)
-      {"_base64": "..."}       for local files (encoded from disk)
+      {"_base64": "..."}       for local files (downscaled + JPEG-encoded from disk)
       None                     when there is no usable image on this side
+
+    Local files are downscaled to `max_side` px on the long edge and re-encoded as
+    JPEG before base64 so the request body stays small. With native-resolution
+    imports a full-size page can be tens of MB; sending that raw overruns Ximilar's
+    request-size limit / upload timeout and surfaces as a 502. The condition model
+    downsamples internally, so ~1600 px is ample and keeps the upload fast.
     """
     relative = normalize_to_upload_relative(path_value)
     if not relative or relative == "__blank__":
@@ -7033,12 +7235,28 @@ def _image_source_for_grading(path_value):
     abs_path = os.path.join(app.config["UPLOAD_FOLDER"], relative)
     if not os.path.exists(abs_path):
         return None
+
+    # Preferred path: decode, downscale, JPEG-encode (small payload).
+    try:
+        img = cv2.imread(abs_path)
+        if img is not None:
+            h, w = img.shape[:2]
+            scale = max_side / float(max(h, w)) if max(h, w) > max_side else 1.0
+            if scale < 1.0:
+                img = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))),
+                                 interpolation=cv2.INTER_AREA)
+            ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
+            if ok:
+                return {"_base64": base64.b64encode(buf.tobytes()).decode("ascii")}
+    except Exception:
+        pass
+
+    # Fallback: send the raw file bytes (e.g. an exotic format cv2 can't decode).
     try:
         with open(abs_path, "rb") as fh:
-            encoded = base64.b64encode(fh.read()).decode("ascii")
+            return {"_base64": base64.b64encode(fh.read()).decode("ascii")}
     except OSError:
         return None
-    return {"_base64": encoded}
 
 
 def _ximilar_http(method, url, payload=None):
