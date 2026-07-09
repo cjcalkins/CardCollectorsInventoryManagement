@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, render_template, send_from_directory, url_for, redirect
+from flask import Flask, request, jsonify, render_template, send_from_directory, url_for, redirect, Response
 import os
 import re as _re
 import cv2
@@ -10,7 +10,7 @@ from datetime import datetime
 from PIL import Image
 from werkzeug.utils import secure_filename
 from models import (db, Product, ScanRecord, ShopConnection, Listing, EmailMonitor,
-                    SaleEvent, ReferenceCard, ReferenceSync, TypeReference)
+                    SaleEvent, ReferenceCard, ReferenceSync, TypeReference, AppSetting)
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -151,6 +151,87 @@ def apply_storage_config(cfg):
 STORAGE = load_storage_config()
 apply_storage_config(STORAGE)
 
+
+# ---------------------------------------------------------------------------- #
+# System mode: "Sorting Machine" vs "Dedicated Server"
+# ----------------------------------------------------------------------------
+# Chosen once on first run (or after a Reset). "sorting_machine" enforces the
+# 1M-entry cap and is the only choice on a Raspberry Pi. "dedicated_server"
+# lifts the cap and is intended for the higher-capability PostgreSQL backend;
+# when DATABASE_URL is set it is used as the database (SQLAlchemy handles the
+# rest, and the SQLite-only tuning/indexes below are guarded).
+# ---------------------------------------------------------------------------- #
+SYSTEM_CONFIG_PATH = os.path.join(BASE_DIR, "system_config.json")
+VALID_MODES = ("sorting_machine", "dedicated_server")
+SYSTEM = {"mode": None}
+
+
+def load_system_config():
+    try:
+        with open(SYSTEM_CONFIG_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh) or {}
+        mode = data.get("mode")
+        return {"mode": mode if mode in VALID_MODES else None}
+    except (OSError, ValueError):
+        return {"mode": None}
+
+
+def save_system_config():
+    tmp = SYSTEM_CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"mode": SYSTEM["mode"]}, fh, indent=2)
+    os.replace(tmp, SYSTEM_CONFIG_PATH)
+
+
+def _system_mode():
+    return SYSTEM["mode"]
+
+
+def set_system_mode(mode):
+    if mode not in VALID_MODES:
+        raise ValueError("invalid mode")
+    SYSTEM["mode"] = mode
+    save_system_config()
+
+
+_pi_cache = {"v": None}
+
+
+def _is_raspberry_pi():
+    """Best-effort Raspberry Pi detection. Env overrides FORCE_PI / FORCE_NOT_PI
+    make this testable and let operators correct a misdetection."""
+    if os.environ.get("FORCE_NOT_PI") == "1":
+        return False
+    if os.environ.get("FORCE_PI") == "1":
+        return True
+    if _pi_cache["v"] is not None:
+        return _pi_cache["v"]
+    found = False
+    try:
+        for path in ("/sys/firmware/devicetree/base/model", "/proc/device-tree/model"):
+            if os.path.exists(path):
+                with open(path, "rb") as fh:
+                    if b"raspberry pi" in fh.read().lower():
+                        found = True
+                        break
+        if not found and os.path.exists("/proc/cpuinfo"):
+            with open("/proc/cpuinfo", "r", errors="ignore") as fh:
+                txt = fh.read().lower()
+            if "raspberry pi" in txt or "bcm2" in txt:
+                found = True
+    except Exception:
+        found = False
+    _pi_cache["v"] = found
+    return found
+
+
+SYSTEM = load_system_config()
+
+# In Dedicated Server mode, use PostgreSQL if a connection URL is provided.
+_DATABASE_URL = os.environ.get("DATABASE_URL")
+if SYSTEM["mode"] == "dedicated_server" and _DATABASE_URL:
+    app.config["SQLALCHEMY_DATABASE_URI"] = _DATABASE_URL
+
 db.init_app(app)
 
 
@@ -194,6 +275,90 @@ def ensure_dirs():
     os.makedirs(app.config["INVENTORY_IMAGE_FOLDER"], exist_ok=True)
     os.makedirs(app.config["TEMP_PDF_FOLDER"], exist_ok=True)
     os.makedirs(app.config["TYPE_REF_FOLDER"], exist_ok=True)
+
+
+# ====================== APP SETTINGS / API KEYS ======================
+# API keys (and similar secrets) live in the app_settings DB table instead of a
+# root .env file: editable at runtime from Settings → API Keys, effective
+# immediately, and backed up / migrated with the database. get_api_key() reads
+# the DB-backed cache first and falls back to the environment (.env) so nothing
+# breaks before the one-time seed runs.
+KNOWN_API_KEYS = [
+    {
+        "key": "JUSTTCG_API_KEY",
+        "label": "JustTCG API Key",
+        "description": "Card price and manual search lookups via JustTCG.",
+        "docs": "https://justtcg.com",
+    },
+    {
+        "key": "XIMILAR_API_TOKEN",
+        "label": "Ximilar API Token",
+        "description": "Image-based card recognition (Search by Image / photo ID).",
+        "docs": "https://www.ximilar.com",
+    },
+]
+_KNOWN_KEY_NAMES = {k["key"] for k in KNOWN_API_KEYS}
+
+_settings_cache = {}   # key -> value (populated at startup and on save)
+
+
+def get_setting(key, default=""):
+    if key in _settings_cache:
+        v = _settings_cache[key]
+        return v if v is not None else default
+    return os.environ.get(key, default)
+
+
+# API keys are just settings; a clearer name for call sites.
+get_api_key = get_setting
+
+
+def set_setting(key, value):
+    key = (key or "").strip()
+    if not key:
+        return
+    row = AppSetting.query.filter_by(key=key).first()
+    if row is None:
+        db.session.add(AppSetting(key=key, value=value))
+    else:
+        row.value = value
+    db.session.commit()
+    _settings_cache[key] = value
+    if value is None:
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = value
+
+
+def delete_setting(key):
+    row = AppSetting.query.filter_by(key=key).first()
+    if row:
+        db.session.delete(row)
+        db.session.commit()
+    _settings_cache.pop(key, None)
+    os.environ.pop(key, None)
+
+
+def load_settings():
+    """Load settings into the in-memory cache and mirror them into the
+    environment (DB wins). One-time: seed known keys from an existing .env so
+    upgrades keep working, after which the DB is the source of truth."""
+    try:
+        rows = AppSetting.query.all()
+    except Exception:
+        return
+    for r in rows:
+        _settings_cache[r.key] = r.value
+        if r.value is not None:
+            os.environ[r.key] = r.value
+    for name in _KNOWN_KEY_NAMES:
+        if name not in _settings_cache:
+            envv = os.environ.get(name)
+            if envv:
+                try:
+                    set_setting(name, envv)
+                except Exception:
+                    _settings_cache[name] = envv
 
 
 
@@ -776,14 +941,28 @@ def _inventory_count_bump(delta):
         _inv_count_cache["n"] = max(0, _inv_count_cache["n"] + delta)
 
 
+def _effective_cap():
+    """The active record cap: the 1M limit in Sorting Machine mode, or None
+    (uncapped) in Dedicated Server mode. Unset mode defaults to the cap so a
+    fresh, not-yet-configured system can never be pushed past it before setup."""
+    if _system_mode() == "dedicated_server":
+        return None
+    return INVENTORY_MAX_RECORDS
+
+
 def _inventory_remaining():
-    return max(0, INVENTORY_MAX_RECORDS - _inventory_count(refresh=True))
+    cap = _effective_cap()
+    if cap is None:
+        return float("inf")
+    return max(0, cap - _inventory_count(refresh=True))
 
 
 def create_scan_record(image_path, template_name, extracted, image_path_back=None):
     # Hard cap — the single choke point every import path passes through, so no
-    # route can ever push the database past the limit.
-    if _inventory_count() >= INVENTORY_MAX_RECORDS:
+    # route can ever push the database past the limit (Sorting Machine mode only;
+    # Dedicated Server is uncapped).
+    cap = _effective_cap()
+    if cap is not None and _inventory_count() >= cap:
         raise InventoryCapError(_inventory_count())
 
     matched_product = match_product_from_extracted(extracted)
@@ -1449,9 +1628,99 @@ def utility_functions():
     )
 
 
+# ====================== FIRST-RUN SETUP GATE ======================
+# Until a system mode is chosen (first run, or after a Reset), every page is
+# redirected to /setup so the operator picks Sorting Machine vs Dedicated Server.
+_SETUP_ALLOWED_PREFIXES = ("/setup", "/static")
+
+
+@app.before_request
+def _require_system_mode():
+    if _system_mode() is not None:
+        return  # already configured
+    path = request.path or "/"
+    if path == "/favicon.ico" or any(path.startswith(p) for p in _SETUP_ALLOWED_PREFIXES):
+        return
+    # Non-page (API/fetch) callers get a clear JSON signal; pages get redirected.
+    if request.method != "GET" or request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        return jsonify({"status": "error", "needs_setup": True,
+                        "message": "System not configured. Open the app to choose an implementation."}), 409
+    return redirect(url_for("setup_page"))
+
+
+@app.route("/setup")
+def setup_page():
+    # Already configured? Send them home.
+    if _system_mode() is not None:
+        return redirect(url_for("index"))
+    return render_template("setup.html", is_pi=_is_raspberry_pi(),
+                           pi_model=_pi_model_string())
+
+
+@app.route("/setup/select", methods=["POST"])
+def setup_select():
+    mode = (request.form.get("mode") or (request.get_json(silent=True) or {}).get("mode") or "").strip()
+    if mode not in VALID_MODES:
+        return jsonify({"status": "error", "message": "Choose Sorting Machine or Dedicated Server."}), 400
+    # A Raspberry Pi can only run the Sorting Machine build.
+    if mode == "dedicated_server" and _is_raspberry_pi():
+        return jsonify({"status": "error",
+                        "message": "This device is a Raspberry Pi, which can only run the Sorting Machine "
+                                   "implementation (1,000,000-entry cap). Use a more capable server or PC "
+                                   "for the Dedicated Server implementation."}), 400
+    set_system_mode(mode)
+    return jsonify({"status": "success", "mode": mode, "redirect": url_for("index")})
+
+
+def _pi_model_string():
+    for path in ("/sys/firmware/devicetree/base/model", "/proc/device-tree/model"):
+        try:
+            if os.path.exists(path):
+                with open(path, "rb") as fh:
+                    return fh.read().decode("utf-8", "ignore").replace("\x00", "").strip()
+        except Exception:
+            pass
+    return "Raspberry Pi" if _is_raspberry_pi() else ""
+
+
 # ====================== PAGE ROUTES ======================
+def _welcome_stats():
+    """Headline logistics for the welcome page. Uses the denormalized columns so
+    these counts stay cheap as the collection grows."""
+    from sqlalchemy import func, distinct
+    coalesce = db.func.coalesce
+
+    total = _inventory_count(refresh=True)
+    catalog = ScanRecord.query.filter(coalesce(ScanRecord.is_catalog, False) == True).count()   # noqa: E712
+    archived = ScanRecord.query.filter(coalesce(ScanRecord.is_archived, False) == True).count()  # noqa: E712
+    in_inventory = max(0, total - catalog)
+
+    games = (db.session.query(func.count(distinct(ScanRecord.game_key)))
+             .filter(ScanRecord.game_key.isnot(None),
+                     coalesce(ScanRecord.is_catalog, False) == False).scalar()) or 0     # noqa: E712
+    albums = (db.session.query(func.count(distinct(ScanRecord.album_key)))
+              .filter(ScanRecord.album_key.isnot(None),
+                      coalesce(ScanRecord.is_catalog, False) == False).scalar()) or 0    # noqa: E712
+
+    return {
+        "cards_in_inventory": in_inventory,
+        "archived": archived,
+        "catalog": catalog,
+        "games": int(games),
+        "albums": int(albums),
+    }
+
+
 @app.route("/")
 def index():
+    """Welcome / landing page — the logo and the root URL both come here."""
+    ensure_dirs()
+    return render_template("welcome.html", stats=_welcome_stats(),
+                           capacity=_capacity_status())
+
+
+@app.route("/templates")
+def templates_page():
     ensure_dirs()
     games = []
     for name in get_template_names():
@@ -1479,7 +1748,7 @@ def index():
 # Keys that are rendered as dedicated static columns or are internal/OCR metadata.
 # They are excluded from the dynamic entry-field columns.
 _STATIC_ENTRY_KEYS = frozenset({
-    "game", "album", "page", "slot",
+    "game", "album", "collection", "page", "slot",
     "__roi_fields_used",
     # Dedicated static columns and legacy/superseded keys that must never
     # surface as dynamic ad-hoc text columns.
@@ -1873,6 +2142,351 @@ def _template_fields_config():
         except Exception:
             pass
     return cfg
+
+
+# ============================================================================ #
+# Builder — assemble packs / sets / sets-of-packs from a game's inventory
+# ============================================================================ #
+import builder as _builder
+
+
+def _bf_field(data, keys):
+    """Read the first non-empty value among candidate keys (case-insensitive)."""
+    low = {str(k).strip().lower(): v for k, v in (data or {}).items()}
+    for k in keys:
+        v = low.get(k)
+        if v not in (None, ""):
+            return str(v).strip()
+    return ""
+
+
+def _builder_card_attrs(rec):
+    data = rec.extracted_data or {}
+    name = _get_name(data) or "Unnamed"
+    cset = _bf_field(data, ["set", "set_name", "setname", "expansion", "series"])
+    rarity = _bf_field(data, ["rarity"])
+    holo = _bf_field(data, ["holographic", "holo", "foil", "finish"])
+    ctype = _derive_card_type(data) or _bf_field(data, ["type", "card_type", "supertype"])
+    number = _bf_field(data, ["number", "collector_number", "card_number", "set_number", "serial"])
+    identity = (name.lower(), cset.lower(), number.lower())
+    return {"id": rec.id, "identity": identity, "name": name, "set": cset,
+            "rarity": rarity, "holo": holo, "type": ctype, "number": number}
+
+
+def _builder_load(game):
+    """Owned, active records for a game -> (attr pool, {id: record})."""
+    recs = (_active_inventory_query()
+            .filter(ScanRecord.game_key == (game or "").strip().lower())
+            .all())
+    pool = [_builder_card_attrs(r) for r in recs]
+    return pool, {r.id: r for r in recs}
+
+
+def _builder_options(pool):
+    def distinct(field):
+        return sorted({c[field] for c in pool if c.get(field)}, key=str.lower)
+    return {
+        "sets": distinct("set"),
+        "rarities": distinct("rarity"),
+        "types": distinct("type"),
+        "holos": distinct("holo") or list(_HOLOGRAPHIC_OPTIONS),
+        "total": len(pool),
+    }
+
+
+def _builder_result_card(attr, by_id):
+    rec = by_id.get(attr["id"])
+    return {
+        "id": attr["id"], "name": attr["name"], "set": attr["set"],
+        "rarity": attr["rarity"], "holo": attr["holo"], "type": attr["type"],
+        "number": attr["number"],
+        "image_url": build_uploaded_file_url(rec.image_path) if rec else "",
+        "detail_url": url_for("inventory_detail", record_id=attr["id"]) if rec else "",
+    }
+
+
+def _card_identity(c):
+    return ((c.get("name") or "").strip().lower(),
+            (c.get("set") or "").strip().lower(),
+            (c.get("number") or "").strip().lower())
+
+
+def _dup_stats_flat(cards):
+    """Duplicate identities within a single flat list of picked cards."""
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for c in cards:
+        groups[_card_identity(c)].append(c)
+    items = []
+    for _ident, group in groups.items():
+        if len(group) > 1:
+            rep = group[0]
+            items.append({"name": rep["name"], "set": rep["set"],
+                          "number": rep["number"], "count": len(group)})
+    items.sort(key=lambda x: (-x["count"], x["name"].lower()))
+    return {
+        "total_duplicate_cards": len(items),
+        "total_extra_copies": sum(i["count"] - 1 for i in items),
+        "items": items,
+    }
+
+
+def _dup_stats_packs(packs):
+    """Cards that appear across more than one pack (within a pack they're already
+    distinct), with which packs each shows up in."""
+    from collections import defaultdict
+    where = defaultdict(list)
+    rep = {}
+    for pi, pk in enumerate(packs):
+        for c in pk["cards"]:
+            ident = _card_identity(c)
+            where[ident].append(pi + 1)
+            rep.setdefault(ident, c)
+    items = []
+    for ident, pack_nums in where.items():
+        if len(pack_nums) > 1:
+            r = rep[ident]
+            items.append({"name": r["name"], "set": r["set"], "number": r["number"],
+                          "count": len(pack_nums), "packs": pack_nums})
+    items.sort(key=lambda x: (-x["count"], x["name"].lower()))
+    return {
+        "total_duplicate_cards": len(items),
+        "total_extra_copies": sum(i["count"] - 1 for i in items),
+        "items": items,
+    }
+
+
+def _builder_games():
+    """Games that have owned inventory, with counts (for the picker)."""
+    from sqlalchemy import func
+    rows = (db.session.query(ScanRecord.game_key, func.count())
+            .filter(ScanRecord.game_key.isnot(None),
+                    db.func.coalesce(ScanRecord.is_catalog, False) == False,   # noqa: E712
+                    db.func.coalesce(ScanRecord.is_archived, False) == False)  # noqa: E712
+            .group_by(ScanRecord.game_key).all())
+    return sorted(({"name": g, "count": n} for g, n in rows if g), key=lambda x: x["name"])
+
+
+@app.route("/inventory/builder")
+def builder_page():
+    game = (request.args.get("game") or "").strip()
+    if not game:
+        return render_template("builder.html", game="", options=None, games=_builder_games())
+    pool, _ = _builder_load(game)
+    return render_template("builder.html", game=game, options=_builder_options(pool), games=None)
+
+
+@app.route("/inventory/builder/build", methods=["POST"])
+def builder_build():
+    body = request.get_json(silent=True) or {}
+    game = (body.get("game") or "").strip()
+    mode = (body.get("mode") or "").strip()
+    if not game:
+        return jsonify({"status": "error", "message": "No game specified."}), 400
+
+    pool, by_id = _builder_load(game)
+    if not pool:
+        return jsonify({"status": "error", "message": "This game has no owned inventory to build from."}), 400
+
+    def _counts(raw):
+        out = {}
+        for row in raw or []:
+            key = str(row.get("value", "")).strip()
+            try:
+                n = int(row.get("count", 0))
+            except (TypeError, ValueError):
+                n = 0
+            if key and n > 0:
+                out[key] = out.get(key, 0) + n
+        return out
+
+    try:
+        if mode == "pack":
+            spec = {
+                "size": int(body.get("size") or 0),
+                "rarities": _counts(body.get("rarities")),
+                "holos": _counts(body.get("holos")),
+                "sets": body.get("sets") or [],
+            }
+            res = _builder.build_pack(pool, spec)
+            cards = [_builder_result_card(c, by_id) for c in res["selected"]]
+            out = {
+                "cards": cards,
+                "filled": res["filled"], "size": res["size"],
+                "shortfalls": res["shortfalls"], "complete": res["complete"],
+                "over_specified": res["over_specified"],
+                "duplicates": _dup_stats_flat(cards),
+            }
+        elif mode == "set":
+            spec = {
+                "size": int(body.get("size") or 0),
+                "allow_duplicates": bool(body.get("allow_duplicates")),
+                "types": body.get("types") or [],
+                "rarities": body.get("rarities") or [],
+                "sets": body.get("sets") or [],
+            }
+            res = _builder.build_set(pool, spec)
+            cards = [_builder_result_card(c, by_id) for c in res["selected"]]
+            out = {
+                "cards": cards,
+                "filled": res["filled"], "size": res["size"],
+                "shortfall": res["shortfall"], "complete": res["complete"],
+                "duplicates": _dup_stats_flat(cards),
+            }
+        elif mode == "set_of_packs":
+            pack = body.get("pack") or {}
+            spec = {
+                "size": int(pack.get("size") or 0),
+                "rarities": _counts(pack.get("rarities")),
+                "holos": _counts(pack.get("holos")),
+                "sets": pack.get("sets") or [],
+            }
+            count = max(1, int(body.get("count") or 1))
+            res = _builder.build_set_of_packs(pool, spec, count)
+            packs_out = [
+                {
+                    "cards": [_builder_result_card(c, by_id) for c in pk["selected"]],
+                    "filled": pk["filled"], "size": pk["size"],
+                    "shortfalls": pk["shortfalls"], "complete": pk["complete"],
+                } for pk in res["packs"]
+            ]
+            out = {
+                "packs": packs_out,
+                "count": res["count"],
+                "duplicate_identities": res["duplicate_identities"],
+                "duplicate_slots": res["duplicate_slots"],
+                "all_complete": res["all_complete"],
+                "duplicates": _dup_stats_packs(packs_out),
+            }
+        else:
+            return jsonify({"status": "error", "message": "Unknown build mode."}), 400
+    except (TypeError, ValueError) as exc:
+        return jsonify({"status": "error", "message": f"Invalid criteria: {exc}"}), 400
+
+    return jsonify({"status": "success", "mode": mode, "result": out})
+
+
+# --- Builder: export picks to CSV, and "pull" (export + delete) --------------
+def _builder_flatten(groups):
+    """[(label, record_id), ...] from the client's group structure, in order."""
+    flat = []
+    for g in groups or []:
+        label = str(g.get("label", "")).strip()
+        for i in g.get("ids", []):
+            try:
+                flat.append((label, int(i)))
+            except (TypeError, ValueError):
+                pass
+    return flat
+
+
+def _builder_csv(groups):
+    """Full per-card detail CSV (all inventory_detail fields), grouped by
+    pack/set. Returns (csv_text, ids)."""
+    import csv as _csv
+    import io as _io
+
+    flat = _builder_flatten(groups)
+    ids = [i for _label, i in flat]
+    recs = {r.id: r for r in ScanRecord.query.filter(ScanRecord.id.in_(ids)).all()}
+
+    # Union of visible (non-internal) extracted_data fields, common ones first.
+    common = ["name", "game", "set", "number", "rarity", "holographic", "type",
+              "edition", "condition", "price", "collection", "album", "page", "slot"]
+    present = set()
+    for _label, i in flat:
+        r = recs.get(i)
+        if r:
+            for k in (r.extracted_data or {}).keys():
+                if not str(k).startswith("__"):
+                    present.add(k)
+    ordered = [k for k in common if k in present] + sorted(k for k in present if k not in common)
+    header = ["group", "record_id"] + ordered + ["template_used", "scan_date",
+                                                 "matched_product", "matched_sku", "image_path"]
+
+    buf = _io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow(header)
+    for label, i in flat:
+        r = recs.get(i)
+        if not r:
+            w.writerow([label, i] + [""] * (len(header) - 2))
+            continue
+        data = r.extracted_data or {}
+        mp = r.matched_product
+        row = [label, r.id] + [data.get(k, "") for k in ordered] + [
+            r.template_used or "",
+            r.scan_date.isoformat() if r.scan_date else "",
+            (mp.product_name if mp else ""),
+            (mp.sku if mp else ""),
+            r.image_path or "",
+        ]
+        w.writerow(row)
+    return buf.getvalue(), ids
+
+
+def _delete_record_files(rec):
+    """Best-effort removal of a record's image files + descriptor caches."""
+    for rel in (rec.image_path, rec.image_path_back, rec.display_image_path):
+        if not rel or rel == "__blank__" or str(rel).startswith(("http://", "https://")):
+            continue
+        p = os.path.join(app.config["UPLOAD_FOLDER"], normalize_to_upload_relative(rel))
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except OSError:
+            pass
+    for suffix in (".npy", ".gvec.npy"):
+        c = os.path.join(app.config["ORB_CACHE_FOLDER"], f"{rec.id}{suffix}")
+        try:
+            if os.path.exists(c):
+                os.remove(c)
+        except OSError:
+            pass
+
+
+@app.route("/inventory/builder/export", methods=["POST"])
+def builder_export():
+    body = request.get_json(silent=True) or {}
+    groups = body.get("groups") or []
+    game = (body.get("game") or "build").strip() or "build"
+    mode = (body.get("mode") or "build").strip()
+    if not groups:
+        return jsonify({"status": "error", "message": "Nothing to export."}), 400
+    csv_text, _ids = _builder_csv(groups)
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    safe_game = _re.sub(r"[^A-Za-z0-9_-]+", "_", game)
+    fname = f"{safe_game}_{mode}_{stamp}.csv"
+    return Response(csv_text, mimetype="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+
+@app.route("/inventory/builder/pull", methods=["POST"])
+def builder_pull():
+    """Delete the picked records (they've been physically pulled). Idempotent-ish:
+    only records that still exist are removed."""
+    body = request.get_json(silent=True) or {}
+    groups = body.get("groups") or []
+    ids = [i for _l, i in _builder_flatten(groups)]
+    if not ids:
+        return jsonify({"status": "error", "message": "No cards to pull."}), 400
+
+    recs = ScanRecord.query.filter(ScanRecord.id.in_(ids)).all()
+    if not recs:
+        return jsonify({"status": "success", "deleted": 0, "message": "Nothing to remove."})
+
+    del_ids = [r.id for r in recs]
+    # Detach any sale-event references so FK constraints don't block deletion.
+    SaleEvent.query.filter(SaleEvent.record_id.in_(del_ids)).update(
+        {SaleEvent.record_id: None}, synchronize_session=False)
+    for r in recs:
+        _delete_record_files(r)
+        db.session.delete(r)   # Listings cascade-delete with the record
+    db.session.commit()
+    _inventory_count_bump(-len(recs))
+
+    return jsonify({"status": "success", "deleted": len(recs),
+                    "message": f"Pulled {len(recs)} card(s) — removed from inventory."})
 
 
 @app.route("/inventory")
@@ -2622,12 +3236,20 @@ def _save_single_card_image(bgr, suffix, edge_type):
     return relative_path, cropped
 
 
-def _create_single_card(front_path, back_path, game, album, template):
+def _clean_collection(v):
+    """Normalize the optional Collection tag: alphanumeric plus space/dash/
+    underscore, trimmed, capped. Blank stays blank."""
+    v = str(v or "").strip()
+    v = _re.sub(r"[^A-Za-z0-9 _-]", "", v)
+    return v[:100].strip()
+
+
+def _create_single_card(front_path, back_path, game, album, template, collection=""):
     """
-    Create a blank inventory record for `game` (+optional album) with the given
-    front (required) and back (optional) image paths, then OCR-identify the
-    FRONT ONLY — the back is never name/serial-checked. A 100% match is applied
-    and saved; anything less leaves the entry blank for manual entry.
+    Create a blank inventory record for `game` (+optional album/collection) with
+    the given front (required) and back (optional) image paths, then OCR-identify
+    the FRONT ONLY — the back is never name/serial-checked. A 100% match is
+    applied and saved; anything less leaves the entry blank for manual entry.
 
     Returns (record, ident_dict).
     """
@@ -2635,6 +3257,8 @@ def _create_single_card(front_path, back_path, game, album, template):
     extracted = {**blank_fields, "game": game.replace("_", " ")}
     if album:
         extracted["album"] = album
+    if collection:
+        extracted["collection"] = collection
 
     _, record = create_scan_record(
         image_path=front_path,
@@ -2654,10 +3278,10 @@ def _create_single_card(front_path, back_path, game, album, template):
     return record, ident
 
 
-def _finalize_pdf_pair(front_path, back_path, front_page, back_page, game, album, template):
+def _finalize_pdf_pair(front_path, back_path, front_page, back_page, game, album, template, collection=""):
     """Create one inventory record from an already-saved front (+ optional back)
     image pair pulled from a PDF, and return the card dict the UI expects."""
-    record, ident = _create_single_card(front_path, back_path, game, album, template)
+    record, ident = _create_single_card(front_path, back_path, game, album, template, collection)
     return {
         "record_id":       record.id,
         "front_page":      front_page,
@@ -2670,27 +3294,27 @@ def _finalize_pdf_pair(front_path, back_path, front_page, back_page, game, album
     }
 
 
-def _import_single_card_pdf(pdf_bytes, game, album, edge_type, template):
+def _import_single_card_pdf(pdf_bytes, game, album, edge_type, template, collection=""):
     """
     Import a PDF (given as raw bytes) as front/back pairs. Suitable for smaller
     uploads; inputs over 500 MB are spilled to a temp file automatically (see
     _iter_pdf_bgr_pages). Prefer _import_single_card_pdf_path when the upload has
     already been streamed to disk, to avoid ever holding the file in RAM.
     """
-    return _import_pdf_pages(_iter_pdf_bgr_pages(pdf_bytes), game, album, edge_type, template)
+    return _import_pdf_pages(_iter_pdf_bgr_pages(pdf_bytes), game, album, edge_type, template, collection)
 
 
-def _import_single_card_pdf_path(pdf_path, game, album, edge_type, template):
+def _import_single_card_pdf_path(pdf_path, game, album, edge_type, template, collection=""):
     """
     Import an already-on-disk PDF as front/back pairs, rasterizing one page at a
     time straight from the file. The document is never loaded into RAM, so this
     keeps the process's memory well under the 500 MB cap no matter how large the
     PDF is. The caller owns and cleans up `pdf_path`.
     """
-    return _import_pdf_pages(_iter_pdf_bgr_pages_from_path(pdf_path), game, album, edge_type, template)
+    return _import_pdf_pages(_iter_pdf_bgr_pages_from_path(pdf_path), game, album, edge_type, template, collection)
 
 
-def _import_pdf_pages(page_iter, game, album, edge_type, template):
+def _import_pdf_pages(page_iter, game, album, edge_type, template, collection=""):
     """
     Shared front/back-pair importer: consume a stream of BGR pages (odd pages
     are FRONTS, even pages BACKS), build one inventory record per pair, and
@@ -2720,14 +3344,14 @@ def _import_pdf_pages(page_iter, game, album, edge_type, template):
             del bgr
             cards.append(_finalize_pdf_pair(
                 pending_front["path"], back_path, pending_front["page_no"],
-                page_no, game, album, template))
+                page_no, game, album, template, collection))
             pending_front = None
 
         # A trailing odd page: a front with no back.
         if pending_front is not None:
             cards.append(_finalize_pdf_pair(
                 pending_front["path"], None, pending_front["page_no"],
-                None, game, album, template))
+                None, game, album, template, collection))
     except InventoryCapError:
         cap_hit = True   # keep what imported; report the cap below
     except RuntimeError as exc:
@@ -2782,6 +3406,7 @@ def import_single_card():
 
     game  = (request.form.get("game")  or "").strip()
     album = (request.form.get("album") or "").strip()
+    collection = _clean_collection(request.form.get("collection"))
     edge_type = normalize_card_edge_type(request.form.get("card_edge_type"))
     if not game:
         return jsonify({"status": "error", "message": "Game is required"}), 400
@@ -2830,7 +3455,7 @@ def import_single_card():
             # Rasterized one page at a time straight from disk — RAM stays capped
             # regardless of file size. Returns before the finally cleans up the
             # temp PDF (all pages are read by then).
-            return _import_single_card_pdf_path(front_tmp, game, album, edge_type, template)
+            return _import_single_card_pdf_path(front_tmp, game, album, edge_type, template, collection)
 
         # ---- Single image: front (required) + optional back ----
         # Card photos are small, so decoding one from disk is well within budget.
@@ -2859,7 +3484,7 @@ def import_single_card():
         # so the raw uploads can go regardless of which branch ran.
         shutil.rmtree(upload_dir, ignore_errors=True)
 
-    record, ident = _create_single_card(front_path, back_path, game, album, template)
+    record, ident = _create_single_card(front_path, back_path, game, album, template, collection)
 
     # Let the UI mention when a card outline couldn't be found and the raw
     # photo was kept instead (so the user can retry or crop manually later).
@@ -3568,7 +4193,8 @@ import urllib.error
 
 JUSTTCG_SEARCH_URL = "https://api.justtcg.com/v1/cards"
 JUSTTCG_TIMEOUT    = 10  # seconds
-JUSTTCG_API_KEY    = os.environ.get("JUSTTCG_API_KEY", "")
+# JUSTTCG_API_KEY is read at call time via get_api_key() so edits in
+# Settings → API Keys take effect immediately (no restart).
 
 # Maps human-readable / OCR'd game names to the slug values accepted by the
 # JustTCG API.  An unrecognised value causes HTTP 400, so anything not listed
@@ -3613,7 +4239,7 @@ def _justtcg_search(name: str, number: str = "", game: str = "") -> dict:
     headers = {
         "Accept":     "application/json",
         "User-Agent": "CardCollectorInventoryManager/1.0",
-        "x-api-key":  JUSTTCG_API_KEY,
+        "x-api-key":  get_api_key("JUSTTCG_API_KEY"),
     }
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=JUSTTCG_TIMEOUT) as resp:
@@ -3848,7 +4474,7 @@ def justtcg_fetch(record_id):
         headers = {
             "Accept":     "application/json",
             "User-Agent": "CardCollectorInventoryManager/1.0",
-            "x-api-key":  JUSTTCG_API_KEY,
+            "x-api-key":  get_api_key("JUSTTCG_API_KEY"),
         }
         try:
             req = urllib.request.Request(url, headers=headers)
@@ -4814,6 +5440,7 @@ def import_finalize_batch():
     data          = request.get_json() or {}
     template_name = data.get("template_name", "product_label")
     filenames     = data.get("filenames", [])
+    collection    = _clean_collection(data.get("collection"))
 
     def sse(event, payload):
         return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
@@ -4849,6 +5476,8 @@ def import_finalize_batch():
 
             filename_fields = parse_card_filename(filename)
             extracted = {**blank_fields, **filename_fields}
+            if collection:
+                extracted["collection"] = collection
             side = filename_fields.get("side", "front")
 
             game  = extracted.get("game",  "")
@@ -5253,6 +5882,67 @@ def settings_page():
 
 
 # ============================================================================ #
+# API keys (stored in the DB, editable at runtime)
+# ============================================================================ #
+def _mask_secret(val):
+    if not val:
+        return ""
+    val = str(val)
+    if len(val) <= 8:
+        return "•" * len(val)
+    return f"{val[:4]}{'•' * 6}{val[-4:]}"
+
+
+def _api_keys_status():
+    out = []
+    for spec in KNOWN_API_KEYS:
+        val = get_api_key(spec["key"])
+        out.append({
+            "key": spec["key"],
+            "label": spec["label"],
+            "description": spec["description"],
+            "docs": spec.get("docs", ""),
+            "is_set": bool(val),
+            "masked": _mask_secret(val),
+        })
+    return out
+
+
+@app.route("/settings/api")
+def api_keys_page():
+    return render_template("api.html", api_keys=_api_keys_status())
+
+
+@app.route("/settings/api/save", methods=["POST"])
+def api_keys_save():
+    """Update known API keys. Only fields the user actually typed into are
+    changed; a per-key clear flag removes one. Values are never echoed back."""
+    payload = request.get_json(silent=True) or request.form
+    changed, cleared = [], []
+    for spec in KNOWN_API_KEYS:
+        name = spec["key"]
+        if str(payload.get(f"clear_{name}", "")).lower() in ("1", "true", "on", "yes"):
+            delete_setting(name)
+            cleared.append(name)
+            continue
+        new_val = payload.get(name)
+        if new_val is None:
+            continue
+        new_val = str(new_val).strip()
+        if new_val:                       # blank input = leave unchanged
+            set_setting(name, new_val)
+            changed.append(name)
+    msg_parts = []
+    if changed:
+        msg_parts.append(f"Updated {len(changed)} key(s)")
+    if cleared:
+        msg_parts.append(f"cleared {len(cleared)}")
+    message = (", ".join(msg_parts) + ".") if msg_parts else "No changes."
+    return jsonify({"status": "success", "message": message,
+                    "api_keys": _api_keys_status()})
+
+
+# ============================================================================ #
 # Archiving — move cold records out of the hot working set
 # ============================================================================ #
 def _set_archived(ids, value):
@@ -5413,6 +6103,13 @@ CREATE TABLE IF NOT EXISTS email_monitors (
     status TEXT DEFAULT 'disconnected', status_detail TEXT, updated_at TIMESTAMPTZ DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS app_settings (
+    id BIGINT PRIMARY KEY,
+    key TEXT UNIQUE NOT NULL,
+    value TEXT,
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS reference_syncs (
     id             BIGINT PRIMARY KEY,
     category_id    BIGINT UNIQUE NOT NULL,
@@ -5453,7 +6150,7 @@ import argparse, json, os, sys
 
 LOAD_ORDER = [
     "products", "scan_records", "listings", "sale_events", "type_references",
-    "shop_connections", "email_monitors", "reference_syncs", "reference_cards",
+    "shop_connections", "email_monitors", "app_settings", "reference_syncs", "reference_cards",
 ]
 JSONB_COLUMNS = {
     "scan_records": {"extracted_data"}, "listings": {"extra"},
@@ -5648,6 +6345,7 @@ def _migration_tables():
         ("type_references",  TypeReference,  False),
         ("shop_connections", ShopConnection, False),
         ("email_monitors",   EmailMonitor,   False),
+        ("app_settings",     AppSetting,     False),
         ("reference_syncs",  ReferenceSync,  False),
         # Large and rebuildable from tcgcsv.com — skipped by default.
         ("reference_cards",  ReferenceCard,  True),
@@ -5666,16 +6364,22 @@ def _row_to_dict(row):
 
 
 def _capacity_status():
+    mode = _system_mode()
     count = _inventory_count(refresh=True)
-    remaining = max(0, INVENTORY_MAX_RECORDS - count)
-    pct = (count / INVENTORY_MAX_RECORDS * 100.0) if INVENTORY_MAX_RECORDS else 0.0
+    cap = _effective_cap()
+    if cap is None:  # Dedicated Server — uncapped
+        return {
+            "mode": mode, "uncapped": True, "count": count, "limit": None,
+            "remaining": None, "percent": 0.0, "at_cap": False, "near_cap": False,
+            "is_pi": _is_raspberry_pi(),
+        }
+    remaining = max(0, cap - count)
+    pct = (count / cap * 100.0) if cap else 0.0
     return {
-        "count": count,
-        "limit": INVENTORY_MAX_RECORDS,
-        "remaining": remaining,
-        "percent": round(min(pct, 100.0), 2),
-        "at_cap": remaining <= 0,
-        "near_cap": pct >= 90.0,
+        "mode": mode, "uncapped": False, "count": count, "limit": cap,
+        "remaining": remaining, "percent": round(min(pct, 100.0), 2),
+        "at_cap": remaining <= 0, "near_cap": pct >= 90.0,
+        "is_pi": _is_raspberry_pi(),
     }
 
 
@@ -5829,6 +6533,67 @@ def upgrade_export():
         "size_human": _human_size(size),
         "manifest": manifest,
     })
+
+
+# ============================================================================ #
+# Reset system — wipe database + storage, return to first-run setup
+# ============================================================================ #
+RESET_CONFIRM_PHRASE = "RESET"
+
+
+def _wipe_storage_contents():
+    """Delete all managed data files (images, caches, temp, exports) but keep
+    the directories. The database itself is emptied separately."""
+    roots = app.config.get("STORAGE_ROOTS", {})
+    targets = []
+    up = roots.get("uploads", "")
+    if up:
+        targets += [os.path.join(up, s) for s in STORAGE_UPLOAD_SUBDIRS]
+        targets += [os.path.join(up, "migration_exports"), os.path.join(up, "game_icons"),
+                    os.path.join(up, "album_covers")]
+    tmp = roots.get("temp", "")
+    if tmp:
+        targets += [os.path.join(tmp, s) for s in STORAGE_TEMP_SUBDIRS]
+    for path in targets:
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
+    ensure_dirs()
+
+
+@app.route("/settings/reset")
+def reset_page():
+    return render_template("reset.html", capacity=_capacity_status(),
+                           confirm_phrase=RESET_CONFIRM_PHRASE)
+
+
+@app.route("/settings/reset/confirm", methods=["POST"])
+def reset_confirm():
+    phrase = (request.form.get("confirm") or (request.get_json(silent=True) or {}).get("confirm") or "").strip()
+    if phrase != RESET_CONFIRM_PHRASE:
+        return jsonify({"status": "error",
+                        "message": f'Type "{RESET_CONFIRM_PHRASE}" to confirm the wipe.'}), 400
+    try:
+        # Empty every table, then recreate the fresh schema (all columns present).
+        db.session.remove()
+        db.drop_all()
+        db.create_all()
+        _inv_count_cache["n"] = 0
+
+        # Delete stored images, caches, temp files, and exports.
+        _wipe_storage_contents()
+
+        # Return to first-run: next request will hit the setup gate.
+        SYSTEM["mode"] = None
+        save_system_config()
+    except Exception as exc:
+        return jsonify({"status": "error", "message": f"Reset failed: {exc}"}), 500
+
+    return jsonify({"status": "success",
+                    "message": "System wiped. Choose an implementation to start over.",
+                    "redirect": url_for("setup_page")})
 
 
 # ============================================================================ #
@@ -6207,7 +6972,7 @@ def search_by_image():
 import base64
 import time
 
-XIMILAR_API_TOKEN       = os.environ.get("XIMILAR_API_TOKEN", "")
+XIMILAR_API_TOKEN       = None  # read at call time via get_api_key("XIMILAR_API_TOKEN")
 XIMILAR_REQUEST_URL     = "https://api.ximilar.com/account/v2/request/"
 XIMILAR_CONNECT_TIMEOUT = 40      # seconds per individual HTTP call
 XIMILAR_POLL_INTERVAL   = 2.0     # seconds between status polls
@@ -6248,7 +7013,7 @@ def _ximilar_http(method, url, payload=None):
     """Small JSON HTTP helper for the Ximilar async request API."""
     data = None
     headers = {
-        "Authorization": f"Token {XIMILAR_API_TOKEN}",
+        "Authorization": f"Token {get_api_key('XIMILAR_API_TOKEN')}",
         "Accept":        "application/json",
         "User-Agent":    "CardCollectorInventoryManager/1.0",
     }
@@ -6272,9 +7037,9 @@ def _ximilar_condition_records(records, mode="ebay"):
     Returns response.records (order + `_id` preserved). Raises RuntimeError with a
     human-readable message on any failure.
     """
-    if not XIMILAR_API_TOKEN:
+    if not get_api_key("XIMILAR_API_TOKEN"):
         raise RuntimeError(
-            "XIMILAR_API_TOKEN is not set. Add it to your environment (or .env file) "
+            "XIMILAR_API_TOKEN is not set. Add it in Settings \u2192 API Keys "
             "to enable card condition grading."
         )
     if not records:
@@ -7948,6 +8713,18 @@ if __name__ == "__main__":
         migrate_add_scan_scaling_columns()
         migrate_add_performance_indexes()
         optimize_database()
+        load_settings()   # load API keys/settings; one-time seed from .env
+
+        # First-run vs existing install: if the mode was never chosen but the
+        # database already has records, adopt Sorting Machine (backward-compatible,
+        # capped) so upgrades aren't forced through setup. A genuinely fresh,
+        # empty install stays unconfigured and lands on the setup gate.
+        if _system_mode() is None:
+            try:
+                if ScanRecord.query.count() > 0:
+                    set_system_mode("sorting_machine")
+            except Exception:
+                pass
 
     ensure_dirs()
 
@@ -7962,6 +8739,9 @@ if __name__ == "__main__":
     print(f"     temp           : {_roots.get('temp')}")
     print(f"     roi templates  : {_roots.get('roi')}")
     print(f"     database       : {_roots.get('db')}")
+    _mode = _system_mode() or "(unset — first-run setup pending)"
+    print(f" • Implementation : {_mode}"
+          + ("  [Raspberry Pi detected]" if _is_raspberry_pi() else ""))
     print(" • /             — Create/edit Game templates (name + blank field list)")
     print(" • /inventory    — Inventory list with server-side pagination and filters")
     print(" • /inventory/<id> — Record detail with edit, TCGPlayer link, copy-from, edition")

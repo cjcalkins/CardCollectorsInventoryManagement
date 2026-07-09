@@ -1,1 +1,0 @@
-This is the temporary page storage for the import tab, when uploading a full page of cards to split and recognize.

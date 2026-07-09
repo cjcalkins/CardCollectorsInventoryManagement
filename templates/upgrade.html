@@ -63,9 +63,29 @@
             <div class="container py-5">
                 <div class="mb-4">
                     <h2 class="mb-1"><i class="fas fa-arrow-up-right-dots me-2"></i>Upgrade</h2>
+                    {% if capacity.uncapped %}
+                    <div class="text-muted">Running the <strong>Dedicated Server</strong> implementation — no entry cap.</div>
+                    {% else %}
                     <div class="text-muted">This build is capped at {{ "{:,}".format(capacity.limit) }} entries. Beyond that, move to the desktop build.</div>
+                    {% endif %}
                 </div>
 
+                {% if capacity.uncapped %}
+                <div class="cap-card">
+                    <div class="d-flex justify-content-between align-items-end flex-wrap gap-2">
+                        <div>
+                            <div class="cap-count" id="capCount">{{ "{:,}".format(capacity.count) }}</div>
+                            <div class="cap-sub">entries · no cap (Dedicated Server)</div>
+                        </div>
+                        <div class="text-end"><span class="badge bg-success">Uncapped</span></div>
+                    </div>
+                    <div class="alert alert-success mt-3 mb-0" style="font-size:.88rem;">
+                        <i class="fas fa-server me-1"></i>
+                        This system is configured for the higher-capability backend. Point <code>DATABASE_URL</code> at
+                        PostgreSQL to use the partitioned, object-storage inventory method. The export below can seed it.
+                    </div>
+                </div>
+                {% else %}
                 <div class="cap-card">
                     <div class="d-flex justify-content-between align-items-end flex-wrap gap-2">
                         <div>
@@ -92,6 +112,7 @@
                     </div>
                     {% endif %}
                 </div>
+                {% endif %}
 
                 <div class="cap-card">
                     <h5 class="fw-bold mb-2"><i class="fas fa-box-archive me-2"></i>Export migration bundle</h5>

@@ -258,3 +258,22 @@ class TypeReference(db.Model):
 
     def __repr__(self):
         return f"<TypeReference {self.game} {self.type_name} [{self.region}] #{self.id}>"
+
+
+class AppSetting(db.Model):
+    """
+    Simple key/value store for application settings and secrets — most notably
+    API keys that used to live in a root .env file. Kept in the local DB so they
+    are editable at runtime from Settings → API Keys, take effect immediately,
+    and are backed up / migrated with the rest of the data. Like the shop tokens
+    and mailbox password, this means inventory.db holds live credentials, so
+    treat the database file as a secret.
+    """
+    __tablename__ = 'app_settings'
+    id         = db.Column(db.Integer, primary_key=True)
+    key        = db.Column(db.String(120), unique=True, nullable=False)
+    value      = db.Column(db.Text, nullable=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<AppSetting {self.key}>"

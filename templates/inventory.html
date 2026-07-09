@@ -385,6 +385,11 @@
             </div>
 
             <div class="d-flex gap-2 flex-wrap">
+                {% if not catalog_view and f_game %}
+                <a href="{{ url_for('builder_page', game=f_game) }}" class="btn btn-dark">
+                    <i class="fas fa-wand-magic-sparkles me-1"></i>Builder
+                </a>
+                {% endif %}
                 {% if not catalog_view %}
                 <a href="{{ url_for('duplicates') }}" class="btn btn-outline-warning">
                     <i class="fas fa-clone me-1"></i>Find Duplicates

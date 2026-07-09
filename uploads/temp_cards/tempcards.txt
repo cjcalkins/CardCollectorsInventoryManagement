@@ -1,1 +1,0 @@
-This is where the temporary card images after 4 point edge detection tries to clean up and realign the card image before final approval and import into the inventory

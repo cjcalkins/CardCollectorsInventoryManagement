@@ -892,12 +892,16 @@
                 {% endfor %}
               </select>
               {% if not templates %}
-              <div class="hint">No games defined yet — <a href="{{ url_for('index') }}">create one</a> first.</div>
+              <div class="hint">No games defined yet — <a href="{{ url_for('templates_page') }}">create one</a> first.</div>
               {% endif %}
             </div>
             <div class="field">
               <label for="singleAlbum">Album <span style="font-weight:400;color:var(--muted);">(optional)</span></label>
               <input type="text" id="singleAlbum" name="album" placeholder="binder1">
+            </div>
+            <div class="field">
+              <label for="singleCollection">Collection <span style="font-weight:400;color:var(--muted);">(optional — tags cards bought together)</span></label>
+              <input type="text" id="singleCollection" name="collection" placeholder="e.g. LOT-2024-07" pattern="[A-Za-z0-9 _-]*" maxlength="100">
             </div>
           </div>
 
@@ -988,12 +992,19 @@
                   {% endfor %}
                 </select>
                 {% if not templates %}
-                <div class="hint">No games defined yet — <a href="{{ url_for('index') }}">create one</a> first.</div>
+                <div class="hint">No games defined yet — <a href="{{ url_for('templates_page') }}">create one</a> first.</div>
                 {% endif %}
               </div>
               <div class="field">
                 <label for="album">Album</label>
                 <input type="text" id="album" name="album" placeholder="binder1" required>
+              </div>
+            </div>
+
+            <div class="grid-2">
+              <div class="field">
+                <label for="batchCollection">Collection <span style="font-weight:400;color:var(--muted);">(optional — tags this lot bought together)</span></label>
+                <input type="text" id="batchCollection" name="collection" placeholder="e.g. LOT-2024-07" pattern="[A-Za-z0-9 _-]*" maxlength="100">
               </div>
             </div>
 
@@ -2095,7 +2106,11 @@
         const response = await fetch('/import_finalize_batch', {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify({ template_name: templateName, filenames }),
+          body:    JSON.stringify({
+            template_name: templateName,
+            filenames,
+            collection: (document.getElementById('batchCollection')?.value || '').trim(),
+          }),
         });
 
         if (!response.ok) {
