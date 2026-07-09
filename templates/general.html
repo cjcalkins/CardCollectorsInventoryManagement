@@ -95,6 +95,49 @@
 
                     <div id="nativeStatus" class="mt-3" style="font-size:.9rem;"></div>
                 </div>
+
+                <!-- Ximilar identification fallback -->
+                <div class="panel">
+                    <div class="d-flex justify-content-between align-items-start flex-wrap gap-2">
+                        <div>
+                            <h5 class="fw-bold mb-1"><i class="fas fa-robot me-2"></i>Ximilar identification fallback</h5>
+                            <p class="text-muted mb-2" style="max-width:560px;">
+                                When the local reader can't confidently identify a card (glossy/foil nameplates,
+                                numbers lost in foil or halftone noise), send the front image to
+                                <strong>Ximilar's card-ID API</strong> to read the name, number, set and rarity.
+                                It runs only on cards the local reader misses, and uses Ximilar API credits.
+                            </p>
+                            <div>
+                                <span class="swap-pill {{ 'swap-ok' if general.ximilar_key_set else 'swap-bad' }}">
+                                    <i class="fas {{ 'fa-circle-check' if general.ximilar_key_set else 'fa-triangle-exclamation' }} me-1"></i>
+                                    API key: {{ 'set' if general.ximilar_key_set else 'missing' }}
+                                </span>
+                                <a href="{{ url_for('api_keys_page') }}" class="ms-2" style="font-size:.82rem;">Manage API keys</a>
+                            </div>
+                        </div>
+                        <div class="form-check form-switch" style="transform:scale(1.4); transform-origin:right center;">
+                            <input class="form-check-input" type="checkbox" role="switch" id="ximilarToggle"
+                                   {% if general.ximilar_fallback_enabled %}checked{% endif %}
+                                   {% if general.ximilar_env_forced %}disabled{% endif %}
+                                   onchange="toggleXimilar(this)">
+                        </div>
+                    </div>
+
+                    {% if general.ximilar_env_forced %}
+                    <div class="alert alert-secondary mt-3 mb-0" style="font-size:.85rem;">
+                        <i class="fas fa-lock me-1"></i>Currently forced by the <code>XIMILAR_IDENTIFY_FALLBACK</code>
+                        environment variable and can't be changed here.
+                    </div>
+                    {% elif general.ximilar_fallback_enabled and not general.ximilar_key_set %}
+                    <div class="alert alert-warning mt-3 mb-0" style="font-size:.85rem;">
+                        <i class="fas fa-triangle-exclamation me-1"></i>Fallback is on but <strong>no Ximilar API key is set</strong>.
+                        Imports that fall back to it will report the missing key until you add a token in
+                        <a href="{{ url_for('api_keys_page') }}">Settings → API Keys</a>.
+                    </div>
+                    {% endif %}
+
+                    <div id="ximilarStatus" class="mt-3" style="font-size:.9rem;"></div>
+                </div>
             </div>
         </main>
     </div>
@@ -121,6 +164,38 @@
                 } else {
                     // Enable failed (e.g. insufficient swap) — revert the switch.
                     el.checked = false;
+                    status.className = 'mt-3 text-danger';
+                    status.innerHTML = '<i class="fas fa-triangle-exclamation me-1"></i>' + (d.message || 'Could not save.');
+                }
+            })
+            .catch(err => {
+                el.disabled = false; el.checked = !enabled;
+                status.className = 'mt-3 text-danger';
+                status.textContent = 'Request failed: ' + err;
+            });
+        }
+
+        function toggleXimilar(el) {
+            const enabled = el.checked;
+            const status = document.getElementById('ximilarStatus');
+            el.disabled = true;
+            status.className = 'mt-3 text-muted';
+            status.textContent = 'Saving…';
+            fetch('{{ url_for("general_ximilar_fallback") }}', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled })
+            })
+            .then(r => r.json())
+            .then(d => {
+                el.disabled = false;
+                if (d.status === 'success') {
+                    // Warn (not error) when enabled without a key.
+                    const noKey = d.general && d.general.ximilar_fallback_enabled && !d.general.ximilar_key_set;
+                    status.className = 'mt-3 ' + (noKey ? 'text-warning' : 'text-success');
+                    status.innerHTML = '<i class="fas ' + (noKey ? 'fa-triangle-exclamation' : 'fa-check') + ' me-1"></i>' + d.message;
+                } else {
+                    el.checked = !enabled;
                     status.className = 'mt-3 text-danger';
                     status.innerHTML = '<i class="fas fa-triangle-exclamation me-1"></i>' + (d.message || 'Could not save.');
                 }

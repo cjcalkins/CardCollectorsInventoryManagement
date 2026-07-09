@@ -181,7 +181,7 @@ apply_storage_config(STORAGE)
 # ---------------------------------------------------------------------------- #
 SYSTEM_CONFIG_PATH = os.path.join(BASE_DIR, "system_config.json")
 VALID_MODES = ("sorting_machine", "dedicated_server")
-SYSTEM = {"mode": None, "unlimited_native_import": False}
+SYSTEM = {"mode": None, "unlimited_native_import": False, "ximilar_fallback_enabled": True}
 
 # Minimum swap required before the operator may enable unlimited-native import
 # (rendering full-resolution scans can need multiple GB per page).
@@ -196,9 +196,10 @@ def load_system_config():
         return {
             "mode": mode if mode in VALID_MODES else None,
             "unlimited_native_import": bool(data.get("unlimited_native_import", False)),
+            "ximilar_fallback_enabled": bool(data.get("ximilar_fallback_enabled", True)),
         }
     except (OSError, ValueError):
-        return {"mode": None, "unlimited_native_import": False}
+        return {"mode": None, "unlimited_native_import": False, "ximilar_fallback_enabled": True}
 
 
 def save_system_config():
@@ -207,6 +208,7 @@ def save_system_config():
         json.dump({
             "mode": SYSTEM["mode"],
             "unlimited_native_import": bool(SYSTEM.get("unlimited_native_import", False)),
+            "ximilar_fallback_enabled": bool(SYSTEM.get("ximilar_fallback_enabled", True)),
         }, fh, indent=2)
     os.replace(tmp, SYSTEM_CONFIG_PATH)
 
@@ -255,6 +257,21 @@ def set_native_import_unlimited(enabled):
                 f"{swap / 1000**3:.1f} GB. Add swap (e.g. an 8 GB swapfile on the NVMe) and retry."
             )
     SYSTEM["unlimited_native_import"] = enabled
+    save_system_config()
+
+
+def _ximilar_fallback_on():
+    """Whether the Ximilar card-ID fallback toggle is ON — independent of whether
+    an API key is configured (so we can surface a 'key missing' error when it's on
+    but unusable). Env XIMILAR_IDENTIFY_FALLBACK overrides the stored setting."""
+    env = os.environ.get("XIMILAR_IDENTIFY_FALLBACK")
+    if env is not None:
+        return env.strip().lower() in ("1", "true", "yes", "on")
+    return bool(SYSTEM.get("ximilar_fallback_enabled", True))
+
+
+def set_ximilar_fallback(enabled):
+    SYSTEM["ximilar_fallback_enabled"] = bool(enabled)
     save_system_config()
 
 
@@ -1543,7 +1560,8 @@ def auto_identify_record(record, min_score=AUTO_IDENTIFY_MIN_SCORE):
                type_guess, type_confidence, type_applied: {field, value}|None }
     """
     out = {"identified": False, "reason": "", "score": None, "name": "",
-           "applied": {}, "type_guess": "", "type_confidence": 0.0, "type_applied": None}
+           "applied": {}, "type_guess": "", "type_confidence": 0.0, "type_applied": None,
+           "source": "", "error": ""}
 
     if card_ocr is None:
         out["reason"] = "ocr_unavailable"
@@ -1606,19 +1624,27 @@ def auto_identify_record(record, min_score=AUTO_IDENTIFY_MIN_SCORE):
     #     send the FRONT image to Ximilar's card-ID API and fill the fields from
     #     its result. Best-effort and credit-gated: only runs when a token is set
     #     and only after the local attempt has already failed.
-    if not out["identified"] and _ximilar_identify_enabled():
-        try:
-            xi = _ximilar_identify_card(record.image_path)
-        except Exception:
-            xi = None
-        if xi:
-            applied = _apply_ximilar_identification(record, xi, category_id)
-            if applied:
-                out["identified"] = True
-                out["reason"] = "applied_ximilar"
-                out["applied"] = applied
-                out["source"] = "ximilar"
-                out["name"] = applied.get("name") or xi.get("name") or out["name"]
+    if not out["identified"] and _ximilar_fallback_on():
+        if not get_api_key("XIMILAR_API_TOKEN"):
+            # Toggle is on but there's no key to use — surface a clear error
+            # rather than silently doing nothing.
+            out["reason"] = "ximilar_no_key"
+            out["error"] = ("Ximilar fallback is enabled but no API key is set. "
+                            "Add your Ximilar API token in Settings \u2192 API Keys, "
+                            "or turn the fallback off in Settings \u2192 General.")
+        else:
+            try:
+                xi = _ximilar_identify_card(record.image_path)
+            except Exception:
+                xi = None
+            if xi:
+                applied = _apply_ximilar_identification(record, xi, category_id)
+                if applied:
+                    out["identified"] = True
+                    out["reason"] = "applied_ximilar"
+                    out["applied"] = applied
+                    out["source"] = "ximilar"
+                    out["name"] = applied.get("name") or xi.get("name") or out["name"]
 
     # 2) Type field — independent of the identity match. Prefer the catalog value
     #    (authoritative) when we identified a reference card; otherwise use a
@@ -3490,6 +3516,7 @@ def _finalize_pdf_pair(front_path, back_path, front_page, back_page, game, album
         "back_page":       back_page,
         "identified":      bool(ident.get("identified")),
         "identified_name": (ident.get("applied") or {}).get("name", "") if ident.get("identified") else "",
+        "ident_error":     ident.get("error", ""),
         "card_type":       (ident.get("type_applied") or {}).get("value", ""),
         "image_url":       build_uploaded_file_url(record.image_path),
         "detail_url":      url_for("inventory_detail", record_id=record.id),
@@ -3700,10 +3727,14 @@ def import_single_card():
 
     if ident.get("identified"):
         ident_name = (ident.get("applied") or {}).get("name", "")
-        message += (f" Identified as “{ident_name}” and filled in automatically."
-                    if ident_name else " Identified and filled in automatically.")
+        via = " via Ximilar" if ident.get("source") == "ximilar" else ""
+        message += (f" Identified as \u201c{ident_name}\u201d{via} and filled in automatically."
+                    if ident_name else f" Identified{via} and filled in automatically.")
     else:
         message += " Left blank for manual entry (no confident match)."
+
+    if ident.get("error"):
+        message += f" \u26a0 {ident['error']}"
 
     card_type = (ident.get("type_applied") or {}).get("value", "")
     if card_type:
@@ -3719,6 +3750,7 @@ def import_single_card():
         "back_aligned":    aligned_flags.get("back", False) if back_path else None,
         "identified":      bool(ident.get("identified")),
         "identified_name": (ident.get("applied") or {}).get("name", "") if ident.get("identified") else "",
+        "ident_error":     ident.get("error", ""),
         "card_type":       card_type,
         "image_url":       build_uploaded_file_url(record.image_path),
         "image_url_back":  build_uploaded_file_url(record.image_path_back) if record.image_path_back else None,
@@ -5772,6 +5804,8 @@ def import_finalize_batch():
                     "matched_product": matched_product.product_name if matched_product else "No match",
                     "identified":      bool(ident.get("identified")),
                     "identified_name": (ident.get("applied") or {}).get("name", "") if ident.get("identified") else "",
+                    "ident_error":     ident.get("error", ""),
+                    "ident_source":    ident.get("source", ""),
                     "card_type":       (ident.get("type_applied") or {}).get("value", ""),
                 }
             except InventoryCapError:
@@ -6105,6 +6139,9 @@ def _general_status():
         "required_swap_gb": int(REQUIRED_SWAP_BYTES / 1000 ** 3),
         "swap_ok": swap >= REQUIRED_SWAP_BYTES,
         "env_forced": os.environ.get("PDF_UNLIMITED_NATIVE") is not None,
+        "ximilar_fallback_enabled": _ximilar_fallback_on(),
+        "ximilar_key_set": bool(get_api_key("XIMILAR_API_TOKEN")),
+        "ximilar_env_forced": os.environ.get("XIMILAR_IDENTIFY_FALLBACK") is not None,
     }
 
 
@@ -6130,6 +6167,23 @@ def general_native_import():
                     f"Native import capped at {int(PDF_CAPPED_DPI)} DPI."),
         "general": _general_status(),
     })
+
+
+@app.route("/settings/general/ximilar_fallback", methods=["POST"])
+def general_ximilar_fallback():
+    body = request.get_json(silent=True) or request.form
+    enabled = str(body.get("enabled", "")).lower() in ("1", "true", "yes", "on")
+    set_ximilar_fallback(enabled)
+    if enabled and not get_api_key("XIMILAR_API_TOKEN"):
+        # Allowed, but warn: it won't do anything (and imports will report the
+        # missing key) until a token is added.
+        msg = ("Ximilar fallback enabled, but no API key is set — add your Ximilar "
+               "API token in Settings \u2192 API Keys for it to work.")
+    elif enabled:
+        msg = "Ximilar identification fallback enabled."
+    else:
+        msg = "Ximilar identification fallback disabled."
+    return jsonify({"status": "success", "message": msg, "general": _general_status()})
 
 
 # ============================================================================ #
@@ -7303,12 +7357,9 @@ def _ximilar_http(method, url, payload=None):
 
 
 def _ximilar_identify_enabled():
-    """Ximilar card-ID fallback is active whenever a token is set, unless the
-    person turned it off with XIMILAR_IDENTIFY_FALLBACK=0."""
-    flag = os.environ.get("XIMILAR_IDENTIFY_FALLBACK", "").strip().lower()
-    if flag in ("0", "false", "no", "off"):
-        return False
-    return bool(get_api_key("XIMILAR_API_TOKEN"))
+    """The fallback will actually run only when its toggle is on AND a token is
+    set. Use _ximilar_fallback_on() alone to detect the on-but-no-key case."""
+    return _ximilar_fallback_on() and bool(get_api_key("XIMILAR_API_TOKEN"))
 
 
 def _ximilar_identify_card(image_path):
