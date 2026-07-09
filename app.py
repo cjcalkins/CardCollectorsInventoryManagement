@@ -4894,6 +4894,19 @@ def ocr_identify(record_id):
     # regardless of which source they came from.
     combined = sorted(ref_matches + matches, key=lambda c: c.get("score", 0), reverse=True)
 
+    # Ximilar fallback — if no local candidate clears 60% confidence, ask Ximilar's
+    # card-ID API to read the front image and offer its result in the picker (rich
+    # reference candidate when the set is synced, else a raw name/number/set/rarity
+    # candidate). Only when the fallback toggle is on; surfaces a clear error if
+    # it's on but no API key is set.
+    ximilar_error = ""
+    top_score = float(combined[0].get("score", 0) or 0) if combined else 0.0
+    if top_score < 0.60 and _ximilar_fallback_on():
+        xi_cands, xi_err = _ximilar_identify_candidates(record, category_id)
+        ximilar_error = xi_err or ""
+        if xi_cands:
+            combined = sorted(xi_cands + combined, key=lambda c: c.get("score", 0), reverse=True)
+
     return jsonify({
         "status": "ok",
         "ocr": {
@@ -4912,6 +4925,7 @@ def ocr_identify(record_id):
             "synced":       bool(category_id),
             "match_count":  len(ref_matches),
         },
+        "ximilar_error": ximilar_error,
         # Whether this record already has an identity (name or set number). The
         # UI uses this to decide between auto-applying a confident match on a
         # fresh record vs. opening the picker for manual correction.
@@ -4985,12 +4999,18 @@ def ocr_apply(record_id):
     else:
         name   = str(body.get("name", "")).strip()
         number = str(body.get("number", "")).strip()
+        set_v  = str(body.get("set", "")).strip()
+        rarity = str(body.get("rarity", "")).strip()
         if name:
             updates["name"] = name
         if number:
             # pad to the CSV convention (N to M's digit width) so it lines up
             # with the reference catalog's format, e.g. 24/112 -> 024/112.
             updates["set_number"] = _canonical_collector_number(number)
+        if set_v:
+            updates["set"] = set_v
+        if rarity:
+            updates["rarity"] = rarity
 
     if not updates:
         return jsonify({
@@ -7456,6 +7476,55 @@ def _apply_ximilar_identification(record, xi, category_id):
     if matched:
         record.matched_product_id = matched.id
     return updates
+
+
+def _ximilar_identify_candidates(record, category_id):
+    """(candidates, error) for the manual-identify picker when local OCR is weak.
+
+    Returns reference candidates (rich: set/rarity/price, applied via
+    reference_product_id) when Ximilar's read resolves a synced catalog card;
+    otherwise a single raw candidate (source="ximilar") carrying name/number/set/
+    rarity so it can still be applied. `error` is set only when the fallback is on
+    but unusable (no API key)."""
+    if not get_api_key("XIMILAR_API_TOKEN"):
+        return [], ("Ximilar fallback is enabled but no API key is set. "
+                    "Add your Ximilar API token in Settings \u2192 API Keys, "
+                    "or turn the fallback off in Settings \u2192 General.")
+    try:
+        xi = _ximilar_identify_card(record.image_path)
+    except Exception:
+        xi = None
+    if not xi:
+        return [], None
+
+    cands = []
+    if category_id and card_ocr is not None:
+        try:
+            refs = _reference_candidates_for_ocr(
+                category_id,
+                {"name_guess": xi.get("name", ""), "number_guess": xi.get("number", "")},
+                limit=3,
+            )
+        except Exception:
+            refs = []
+        for r in refs:
+            if float(r.get("score", 0) or 0) >= 0.60:
+                cands.append({**r, "via": "ximilar"})
+
+    if not cands:
+        cands.append({
+            "source":          "ximilar",
+            "via":             "ximilar",
+            "name":            xi.get("name", ""),
+            "serial":          xi.get("number", ""),
+            "set":             xi.get("set", ""),
+            "rarity":          xi.get("rarity", ""),
+            "game":            (record.extracted_data or {}).get("game", ""),
+            "score":           0.95,
+            "serial_match":    False,
+            "name_similarity": 1.0,
+        })
+    return cands, None
 
 
 def _ximilar_condition_records(records, mode="ebay"):

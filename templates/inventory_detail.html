@@ -2256,7 +2256,8 @@
             row.classList.add('selected');
             row.querySelector('.jtcg-picker-radio').checked = true;
             if (row.dataset.raw === '1') {
-                selected = { name: row.dataset.rawName || '', number: row.dataset.rawNumber || '' };
+                selected = { name: row.dataset.rawName || '', number: row.dataset.rawNumber || '',
+                             set: row.dataset.rawSet || '', rarity: row.dataset.rawRarity || '' };
             } else if (row.dataset.refId) {
                 selected = { reference_product_id: parseInt(row.dataset.refId, 10) };
             } else {
@@ -2270,6 +2271,8 @@
             if (!c) return null;
             if (c.source === 'reference' && c.product_id != null) return { reference_product_id: c.product_id };
             if (c.record_id != null) return { source_record_id: c.record_id };
+            // Ximilar fallback candidate — apply its raw fields (name/number/set/rarity).
+            if (c.source === 'ximilar') return { name: c.name, number: c.serial, set: c.set, rarity: c.rarity };
             return null;
         }
 
@@ -2355,6 +2358,9 @@
                 }
                 subtitle.innerHTML = `Read ${readBits.length ? readBits.join(' · ') : '<em>nothing legible</em>'}`
                     + ` — ${candidates.length} match${candidates.length !== 1 ? 'es' : ''}${refNote}.`;
+                if (data.ximilar_error) {
+                    subtitle.innerHTML += `<br><span class="text-warning"><i class="fas fa-triangle-exclamation me-1"></i>${esc(data.ximilar_error)}</span>`;
+                }
 
                 let rows = '';
                 // Special first row: accept the raw OCR reading as-is.
@@ -2375,6 +2381,22 @@
                     const pct     = Math.round((c.score || 0) * 100);
                     const numPill = c.serial_match
                         ? `<span class="ocr-num-pill"><i class="fas fa-hashtag me-1"></i>number match</span>` : '';
+                    if (c.source === 'ximilar') {
+                        // Ximilar fallback read — applied via its raw name/number/set/rarity.
+                        const meta = [c.set, c.rarity, c.serial].filter(Boolean).map(esc).join(' · ');
+                        return `
+                            <div class="jtcg-picker-item" data-raw="1"
+                                 data-raw-name="${esc(c.name)}" data-raw-number="${esc(c.serial)}"
+                                 data-raw-set="${esc(c.set)}" data-raw-rarity="${esc(c.rarity)}">
+                                <input type="radio" class="jtcg-picker-radio" name="ocrPick">
+                                <div>
+                                    <div class="jtcg-picker-name">${esc(c.name || '(unnamed)')}
+                                        <span class="ocr-src-pill ocr-src-ref"><i class="fas fa-robot me-1"></i>via Ximilar</span> ${numPill}</div>
+                                    <div class="jtcg-picker-meta">${meta || '&nbsp;'}</div>
+                                </div>
+                                <span class="jtcg-picker-price">${pct}%</span>
+                            </div>`;
+                    }
                     if (c.source === 'reference') {
                         const meta = [c.set, c.rarity, c.serial].filter(Boolean).map(esc).join(' · ');
                         const price = (c.market_price != null)
