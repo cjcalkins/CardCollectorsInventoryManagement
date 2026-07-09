@@ -1601,6 +1601,25 @@ def auto_identify_record(record, min_score=AUTO_IDENTIFY_MIN_SCORE):
     else:
         out["reason"] = "below_threshold" if top is not None else "no_candidates"
 
+    # 1b) Ximilar fallback — if the local OCR couldn't confidently identify the
+    #     card (glossy/foil nameplates, numbers lost in foil/halftone noise, etc.),
+    #     send the FRONT image to Ximilar's card-ID API and fill the fields from
+    #     its result. Best-effort and credit-gated: only runs when a token is set
+    #     and only after the local attempt has already failed.
+    if not out["identified"] and _ximilar_identify_enabled():
+        try:
+            xi = _ximilar_identify_card(record.image_path)
+        except Exception:
+            xi = None
+        if xi:
+            applied = _apply_ximilar_identification(record, xi, category_id)
+            if applied:
+                out["identified"] = True
+                out["reason"] = "applied_ximilar"
+                out["applied"] = applied
+                out["source"] = "ximilar"
+                out["name"] = applied.get("name") or xi.get("name") or out["name"]
+
     # 2) Type field — independent of the identity match. Prefer the catalog value
     #    (authoritative) when we identified a reference card; otherwise use a
     #    confident visual guess. _apply_ocr_candidate may already have filled it
@@ -7206,6 +7225,9 @@ import time
 
 XIMILAR_API_TOKEN       = None  # read at call time via get_api_key("XIMILAR_API_TOKEN")
 XIMILAR_REQUEST_URL     = "https://api.ximilar.com/account/v2/request/"
+# Synchronous card-identification endpoint (returns name/number/set directly),
+# used as a fallback when the local OCR can't confidently identify a card.
+XIMILAR_TCG_ID_URL      = "https://api.ximilar.com/collectibles/v2/tcg_id"
 XIMILAR_CONNECT_TIMEOUT = 40      # seconds per individual HTTP call
 XIMILAR_POLL_INTERVAL   = 2.0     # seconds between status polls
 XIMILAR_POLL_MAX_WAIT   = 120     # seconds to wait for a single job to finish
@@ -7278,6 +7300,111 @@ def _ximilar_http(method, url, payload=None):
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     with urllib.request.urlopen(req, timeout=XIMILAR_CONNECT_TIMEOUT) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def _ximilar_identify_enabled():
+    """Ximilar card-ID fallback is active whenever a token is set, unless the
+    person turned it off with XIMILAR_IDENTIFY_FALLBACK=0."""
+    flag = os.environ.get("XIMILAR_IDENTIFY_FALLBACK", "").strip().lower()
+    if flag in ("0", "false", "no", "off"):
+        return False
+    return bool(get_api_key("XIMILAR_API_TOKEN"))
+
+
+def _ximilar_identify_card(image_path):
+    """Send one front image to Ximilar's TCG identification endpoint and return a
+    normalized {name, number, set, set_code, rarity, series, year, subcategory}
+    dict — or None on any failure. Best-effort: never raises.
+
+    Ximilar returns records[].​_objects[].​_identification.best_match with the card
+    fields (name, card_number, set, ...); we defensively also accept an
+    _identification directly on the record.
+    """
+    if not get_api_key("XIMILAR_API_TOKEN"):
+        return None
+    src = _image_source_for_grading(image_path)   # downscaled base64 (small payload)
+    if not src:
+        return None
+    try:
+        resp = _ximilar_http("POST", XIMILAR_TCG_ID_URL, {"records": [src]})
+    except Exception:
+        return None
+
+    records = (resp or {}).get("records") or []
+    if not records:
+        return None
+    rec = records[0] if isinstance(records[0], dict) else {}
+
+    ident = None
+    for obj in (rec.get("_objects") or []):
+        if isinstance(obj, dict) and isinstance(obj.get("_identification"), dict):
+            ident = obj["_identification"]
+            break
+    if ident is None and isinstance(rec.get("_identification"), dict):
+        ident = rec["_identification"]
+    if not isinstance(ident, dict):
+        return None
+
+    best = ident.get("best_match")
+    if not isinstance(best, dict) or not best:
+        return None
+
+    name   = str(best.get("name") or "").strip()
+    number = str(best.get("card_number") or "").strip()
+    if not name and not number:
+        return None
+
+    return {
+        "name":        name,
+        "number":      number,
+        "set":         str(best.get("set") or "").strip(),
+        "set_code":    str(best.get("set_code") or "").strip(),
+        "rarity":      str(best.get("rarity") or "").strip(),
+        "series":      str(best.get("series") or "").strip(),
+        "year":        best.get("year"),
+        "subcategory": str(best.get("subcategory") or best.get("Subcategory") or "").strip(),
+    }
+
+
+def _apply_ximilar_identification(record, xi, category_id):
+    """Apply a Ximilar identification onto `record` (in memory; caller commits).
+
+    Prefers a local reference-catalog match seeded by Ximilar's accurate name +
+    number — that path fills canonical fields plus market price and type via the
+    normal apply. If the card's set isn't synced (or isn't in the catalog), it
+    falls back to writing Ximilar's own fields directly. Returns applied updates
+    or {}.
+    """
+    # 1) Rich path: reuse the reference matcher/apply with Ximilar's clean read.
+    if category_id and card_ocr is not None:
+        xi_ocr = {"name_guess": xi.get("name", ""), "number_guess": xi.get("number", "")}
+        try:
+            cands = _reference_candidates_for_ocr(category_id, xi_ocr, limit=3)
+        except Exception:
+            cands = []
+        top = cands[0] if cands else None
+        if top is not None and float(top.get("score", 0) or 0) >= 0.60:
+            applied = _apply_ocr_candidate(record, top)
+            if applied:
+                return applied
+
+    # 2) Direct fill from Ximilar's fields (accurate identity even without a
+    #    catalog hit). Underscores/casing on game are left to import normalization.
+    updates = {}
+    for key, val in (("name",       xi.get("name")),
+                     ("set_number", xi.get("number")),
+                     ("set",        xi.get("set")),
+                     ("rarity",     xi.get("rarity"))):
+        if str(val or "").strip():
+            updates[key] = str(val).strip()
+    if not updates:
+        return {}
+    merged = {**(record.extracted_data or {}), **updates}
+    record.extracted_data = merged
+    matched = match_product_from_extracted(merged)
+    if matched:
+        record.matched_product_id = matched.id
+    return updates
 
 
 def _ximilar_condition_records(records, mode="ebay"):
