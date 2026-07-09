@@ -32,14 +32,20 @@ try:
 except Exception:
     card_ocr = None
 
-# tcgcsv_sync downloads a game's catalog from tcgcsv.com into ReferenceCard rows
-# so OCR results can be matched to a real card and used to auto-fill entry data.
-# Imported optionally so the app still boots if the module/urllib access is
-# unavailable; the /reference routes report a clear error instead of crashing.
+# Reference-catalog provider: downloads a game's card catalog into ReferenceCard
+# rows so OCR results can be matched to a real card and auto-fill entry data. The
+# active source is pokemontcg.io (v2) — it covers the vintage WOTC sets tcgcsv is
+# missing (Base, Jungle, Fossil, Gym, Neo, ...). tcgcsv_sync is kept as a fallback
+# if the pokemontcg adapter isn't importable. Imported optionally so the app still
+# boots without network/module access; the /reference routes report a clear error.
+ref_sync = None
 try:
-    import tcgcsv_sync
+    import pokemontcg_sync as ref_sync
 except Exception:
-    tcgcsv_sync = None
+    try:
+        import tcgcsv_sync as ref_sync
+    except Exception:
+        ref_sync = None
 
 app = Flask(__name__, template_folder="templates")
 
@@ -295,6 +301,12 @@ KNOWN_API_KEYS = [
         "label": "Ximilar API Token",
         "description": "Image-based card recognition (Search by Image / photo ID).",
         "docs": "https://www.ximilar.com",
+    },
+    {
+        "key": "POKEMONTCG_API_KEY",
+        "label": "Pokémon TCG API Key",
+        "description": "Reference catalog sync from pokemontcg.io (optional — raises rate limits).",
+        "docs": "https://dev.pokemontcg.io",
     },
 ]
 _KNOWN_KEY_NAMES = {k["key"] for k in KNOWN_API_KEYS}
@@ -571,7 +583,7 @@ def four_point_transform(image, pts):
     )
 
     m = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(image, m, (max_width, max_height))
+    warped = cv2.warpPerspective(image, m, (max_width, max_height), flags=cv2.INTER_CUBIC)
     return warped
 
 
@@ -1048,7 +1060,7 @@ _REFERENCE_APPLY_MAP = {
 
 def _reference_upsert(rec):
     """Insert or update a ReferenceCard from a normalized tcgcsv product dict
-    (see tcgcsv_sync.normalize_product). Keyed on the upstream productId."""
+    (see ref_sync.normalize_product). Keyed on the upstream productId."""
     existing = ReferenceCard.query.filter_by(product_id=rec["product_id"]).first()
     if existing is None:
         existing = ReferenceCard(product_id=rec["product_id"])
@@ -1367,6 +1379,11 @@ def _apply_ocr_candidate(record, cand):
                 "set_number":   ref.number or "",
                 "prices":       {"market": ref.market_price} if ref.market_price is not None else {},
             }
+        # Current market value on identification — fill only if not already set,
+        # so a value the user entered by hand is never overwritten.
+        if getattr(ref, "market_price", None) is not None and \
+           not str((record.extracted_data or {}).get("current_value") or "").strip():
+            updates["current_value"] = ref.market_price
         # Catalog type/colour (authoritative), if the game has a type field and
         # the reference data carries it.
         cat_type = _reference_type_value(ref.product_id)
@@ -1749,6 +1766,7 @@ def templates_page():
 # They are excluded from the dynamic entry-field columns.
 _STATIC_ENTRY_KEYS = frozenset({
     "game", "album", "collection", "page", "slot",
+    "intake_price", "current_value", "sold_price",
     "__roi_fields_used",
     # Dedicated static columns and legacy/superseded keys that must never
     # surface as dynamic ad-hoc text columns.
@@ -2392,7 +2410,8 @@ def _builder_csv(groups):
 
     # Union of visible (non-internal) extracted_data fields, common ones first.
     common = ["name", "game", "set", "number", "rarity", "holographic", "type",
-              "edition", "condition", "price", "collection", "album", "page", "slot"]
+              "edition", "condition", "intake_price", "current_value", "sold_price",
+              "price", "collection", "album", "page", "slot"]
     present = set()
     for _label, i in flat:
         r = recs.get(i)
@@ -3115,6 +3134,14 @@ def import_page():
 PDF_SPILL_THRESHOLD = 500 * 1024 * 1024  # 500 MB
 
 
+# PDF rasterization resolution for card imports. PyMuPDF zoom multiplies the
+# PDF's native 72 DPI, so 4.0 ≈ 288 DPI. At the old 2.0 (≈144 DPI) a 2.5" card
+# came out only ~360 px wide (visibly soft); 288 DPI yields ~720 px, preserving
+# the fine detail needed for identification. Tunable — higher = sharper but
+# larger page images and more processing time/RAM per page.
+PDF_RASTER_ZOOM = float(os.environ.get("PDF_RASTER_ZOOM", "4.0"))
+
+
 def _pdf_page_to_bgr(page, matrix):
     """Rasterize one already-loaded PyMuPDF page into a standalone BGR array.
 
@@ -3129,7 +3156,7 @@ def _pdf_page_to_bgr(page, matrix):
     return cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
 
 
-def _iter_pdf_bgr_pages(pdf_bytes, zoom=2.0):
+def _iter_pdf_bgr_pages(pdf_bytes, zoom=PDF_RASTER_ZOOM):
     """
     Yield each PDF page as a BGR image, in page order, one at a time.
 
@@ -3194,7 +3221,7 @@ def _iter_pdf_bgr_pages(pdf_bytes, zoom=2.0):
                 shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _iter_pdf_bgr_pages_from_path(pdf_path, zoom=2.0):
+def _iter_pdf_bgr_pages_from_path(pdf_path, zoom=PDF_RASTER_ZOOM):
     """
     Yield each page of an on-disk PDF as a BGR image, one at a time.
 
@@ -4733,6 +4760,9 @@ def ocr_apply(record_id):
                 "set_number":   ref.number or "",
                 "prices":       {"market": ref.market_price} if ref.market_price is not None else {},
             }
+        if getattr(ref, "market_price", None) is not None and \
+           not str((record.extracted_data or {}).get("current_value") or "").strip():
+            updates["current_value"] = ref.market_price
     elif source_id:
         try:
             source = ScanRecord.query.get(int(source_id))
@@ -4801,7 +4831,7 @@ def reference_status():
     syncs = ReferenceSync.query.order_by(ReferenceSync.game).all()
     return jsonify({
         "status": "ok",
-        "available": tcgcsv_sync is not None,
+        "available": ref_sync is not None,
         "games": [{
             "category_id":   s.category_id,
             "game":          s.game,
@@ -4817,8 +4847,8 @@ def reference_status():
 @app.route("/reference/categories")
 def reference_categories():
     """List the games (categories) available on tcgcsv, for the sync picker."""
-    if tcgcsv_sync is None:
-        return jsonify({"status": "error", "message": "tcgcsv sync module unavailable."}), 503
+    if ref_sync is None:
+        return jsonify({"status": "error", "message": "Reference sync source unavailable."}), 503
 
     # Serve from cache if fetched within the last 30 minutes.
     now = datetime.utcnow()
@@ -4827,9 +4857,9 @@ def reference_categories():
         cats = cached["data"]
     else:
         try:
-            raw = tcgcsv_sync.get_categories()
+            raw = ref_sync.get_categories()
         except Exception as exc:
-            return jsonify({"status": "error", "message": f"Could not reach tcgcsv: {exc}"}), 502
+            return jsonify({"status": "error", "message": f"Could not reach reference source: {exc}"}), 502
         cats = sorted(
             [{"category_id": c.get("categoryId"),
               "name": c.get("displayName") or c.get("name") or "",
@@ -4840,18 +4870,18 @@ def reference_categories():
         _REF_CATEGORIES_CACHE["at"] = now
 
     return jsonify({"status": "ok", "categories": cats,
-                    "last_updated": tcgcsv_sync.get_last_updated()})
+                    "last_updated": ref_sync.get_last_updated()})
 
 
 @app.route("/reference/groups/<int:category_id>")
 def reference_groups(category_id):
     """List a category's groups (sets) — the work items the client loops over."""
-    if tcgcsv_sync is None:
-        return jsonify({"status": "error", "message": "tcgcsv sync module unavailable."}), 503
+    if ref_sync is None:
+        return jsonify({"status": "error", "message": "Reference sync source unavailable."}), 503
     try:
-        groups = tcgcsv_sync.get_groups(category_id)
+        groups = ref_sync.get_groups(category_id)
     except Exception as exc:
-        return jsonify({"status": "error", "message": f"Could not reach tcgcsv: {exc}"}), 502
+        return jsonify({"status": "error", "message": f"Could not reach reference source: {exc}"}), 502
     return jsonify({
         "status": "ok",
         "groups": [{"group_id": g.get("groupId"), "name": g.get("name") or ""} for g in groups],
@@ -4867,8 +4897,8 @@ def reference_sync_group():
 
     Body: { category_id, category_name, group_id, group_name }
     """
-    if tcgcsv_sync is None:
-        return jsonify({"status": "error", "message": "tcgcsv sync module unavailable."}), 503
+    if ref_sync is None:
+        return jsonify({"status": "error", "message": "Reference sync source unavailable."}), 503
 
     body = request.get_json() or {}
     try:
@@ -4880,9 +4910,9 @@ def reference_sync_group():
     group_name    = str(body.get("group_name") or "").strip()
 
     try:
-        cards = tcgcsv_sync.fetch_group_cards(category_id, category_name, group_id, group_name)
+        cards = ref_sync.fetch_group_cards(category_id, category_name, group_id, group_name)
     except Exception as exc:
-        return jsonify({"status": "error", "message": f"tcgcsv fetch failed: {exc}"}), 502
+        return jsonify({"status": "error", "message": f"Reference fetch failed: {exc}"}), 502
 
     for rec in cards:
         _reference_upsert(rec)
@@ -4894,7 +4924,7 @@ def reference_sync_group():
         db.session.add(rs)
     rs.game = category_name or rs.game
     rs.status = "ok"
-    rs.remote_updated = tcgcsv_sync.get_last_updated() or rs.remote_updated
+    rs.remote_updated = ref_sync.get_last_updated() or rs.remote_updated
     db.session.flush()
     _reference_recount(category_id)
     db.session.commit()
@@ -5223,9 +5253,11 @@ def pdf_extract_pages():
             if doc.page_count < 1:
                 return jsonify({"status": "error", "message": "PDF has no pages"}), 400
 
-            # Zoom of 2.0 ≈ 144 DPI, plenty of resolution for the 3x3 splitter
-            # while keeping file sizes and processing time reasonable.
-            zoom = 2.0
+            # Rasterize at PDF_RASTER_ZOOM (≈288 DPI by default) so each ~2.5"
+            # card comes out ~720 px wide — enough to keep the fine print/artwork
+            # crisp through the split + align/crop. One page is rendered and saved
+            # at a time, so peak memory stays to a single page's pixmap.
+            zoom = PDF_RASTER_ZOOM
             matrix = fitz.Matrix(zoom, zoom)
 
             pages = []
