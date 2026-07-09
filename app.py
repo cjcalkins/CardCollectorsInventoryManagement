@@ -4894,14 +4894,24 @@ def ocr_identify(record_id):
     # regardless of which source they came from.
     combined = sorted(ref_matches + matches, key=lambda c: c.get("score", 0), reverse=True)
 
-    # Ximilar fallback — if no local candidate clears 60% confidence, ask Ximilar's
-    # card-ID API to read the front image and offer its result in the picker (rich
-    # reference candidate when the set is synced, else a raw name/number/set/rarity
-    # candidate). Only when the fallback toggle is on; surfaces a clear error if
-    # it's on but no API key is set.
+    # Ximilar fallback — if the local CATALOG lookup couldn't identify the card at
+    # 60%+, ask Ximilar's card-ID API to read the front image and offer its result
+    # in the picker (rich reference candidate when the set is synced, else a raw
+    # name/number/set/rarity candidate). Only when the fallback toggle is on;
+    # surfaces a clear error if it's on but no API key is set.
+    #
+    # The decision is based on the reference-catalog match (ref_matches), NOT the
+    # combined list, on purpose: match_ocr_to_records grants a large collector-number
+    # bonus (serial_bonus), so a scanned card can score >=60% against an *unrelated*
+    # record in the user's own inventory that merely shares a collector number
+    # (e.g. "25/102"). Keying the fallback off the combined score let those
+    # coincidental self-inventory matches suppress Ximilar even though nothing was
+    # actually identified. Basing it on the catalog score mirrors how the import
+    # auto-identify decides "identified", so the manual check reaches out to Ximilar
+    # whenever the local catalog lookup fails the 60% bar.
     ximilar_error = ""
-    top_score = float(combined[0].get("score", 0) or 0) if combined else 0.0
-    if top_score < 0.60 and _ximilar_fallback_on():
+    ref_top_score = float(ref_matches[0].get("score", 0) or 0) if ref_matches else 0.0
+    if ref_top_score < 0.60 and _ximilar_fallback_on():
         xi_cands, xi_err = _ximilar_identify_candidates(record, category_id)
         ximilar_error = xi_err or ""
         if xi_cands:
