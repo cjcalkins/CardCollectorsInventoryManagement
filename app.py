@@ -3011,6 +3011,104 @@ def analytics_export():
                     headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
 
+@app.route("/analytics/overview")
+def analytics_overview():
+    """Landing chart data: per game, the combined recorded cost basis
+    (sum of intake_price) vs the current value (sum of current_value). The
+    client derives "expected proceeds at current market rate" from the current
+    value and an adjustable marketplace-fee %, so the fee slider updates live.
+    source=held (default) covers owned cards; source=all includes sold too."""
+    source = (request.args.get("source") or "held").strip().lower()
+    if source not in ("held", "all"):
+        source = "held"
+    records = _analytics_filtered_records(source, "", "", "")
+
+    by = {}
+    for r in records:
+        d = r.extracted_data or {}
+        g = (str(d.get("game") or "").strip() or "—")
+        b = by.get(g)
+        if b is None:
+            b = by[g] = {"game": g, "count": 0, "cost": 0.0, "value": 0.0}
+        b["count"] += 1
+        ip = _analytics_money(d.get("intake_price"))
+        cv = _analytics_money(d.get("current_value"))
+        if ip is not None: b["cost"] += ip
+        if cv is not None: b["value"] += cv
+
+    rows = sorted(by.values(), key=lambda x: x["value"], reverse=True)
+    for b in rows:
+        b["cost"] = round(b["cost"], 2)
+        b["value"] = round(b["value"], 2)
+    totals = {
+        "count": sum(b["count"] for b in rows),
+        "cost": round(sum(b["cost"] for b in rows), 2),
+        "value": round(sum(b["value"] for b in rows), 2),
+    }
+    return jsonify({"status": "success", "source": source, "rows": rows, "totals": totals})
+
+
+@app.route("/analytics/collections")
+def analytics_collections():
+    """Distinct collection names (with counts) for the collection dropdown."""
+    records = _analytics_filtered_records("all", "", "", "")
+    by = {}
+    for r in records:
+        c = str((r.extracted_data or {}).get("collection") or "").strip()
+        if c:
+            by[c] = by.get(c, 0) + 1
+    rows = sorted(({"name": k, "count": v} for k, v in by.items()),
+                  key=lambda x: x["name"].lower())
+    return jsonify({"status": "success", "collections": rows})
+
+
+@app.route("/analytics/collection")
+def analytics_collection():
+    """Per-game breakdown for one collection: what was paid (intake), the current
+    value of still-held cards (the client turns this into expected proceeds using
+    the market fee), and what was realized where a Sold Price is filled in. Held
+    cards feed 'value' and sold cards feed 'sold', so the two never double-count
+    the same card."""
+    name = (request.args.get("name") or "").strip()
+    if not name:
+        return jsonify({"status": "error", "message": "No collection specified."}), 400
+    target = name.lower()
+
+    records = _analytics_filtered_records("all", "", "", "")
+    by = {}
+    for r in records:
+        d = r.extracted_data or {}
+        if str(d.get("collection") or "").strip().lower() != target:
+            continue
+        g = str(d.get("game") or "").strip() or "—"
+        b = by.get(g)
+        if b is None:
+            b = by[g] = {"game": g, "count": 0, "cost": 0.0, "value": 0.0, "sold": 0.0}
+        b["count"] += 1
+        ip = _analytics_money(d.get("intake_price"))
+        cv = _analytics_money(d.get("current_value"))
+        sp = _analytics_money(d.get("sold_price"))
+        if ip is not None:
+            b["cost"] += ip
+        if cv is not None and _held_from(d):     # expected = still-owned cards only
+            b["value"] += cv
+        if sp is not None:                        # realized = cards with a Sold Price
+            b["sold"] += sp
+
+    rows = sorted(by.values(), key=lambda x: (x["cost"] + x["value"] + x["sold"]), reverse=True)
+    for b in rows:
+        b["cost"] = round(b["cost"], 2)
+        b["value"] = round(b["value"], 2)
+        b["sold"] = round(b["sold"], 2)
+    totals = {
+        "count": sum(b["count"] for b in rows),
+        "cost": round(sum(b["cost"] for b in rows), 2),
+        "value": round(sum(b["value"] for b in rows), 2),
+        "sold": round(sum(b["sold"] for b in rows), 2),
+    }
+    return jsonify({"status": "success", "name": name, "rows": rows, "totals": totals})
+
+
 @app.route("/inventory")
 @app.route("/sold", endpoint="sold")
 def inventory():
