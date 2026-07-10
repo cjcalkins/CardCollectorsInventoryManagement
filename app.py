@@ -607,33 +607,53 @@ def find_saved_image(subfolder, name):
     return None
 
 
-def build_album_index():
+def _record_storage_type(record):
+    """A record's storage container kind: 'box' or 'album' (default)."""
+    val = str((record.extracted_data or {}).get("storage_type", "") or "").strip().lower()
+    return "box" if val == "box" else "album"
+
+
+def build_storage_index():
+    """
+    Group owned records into their storage containers (Albums and Boxes).
+
+    A container is identified by its name (the extracted_data 'album' field, kept
+    for data continuity). Its kind comes from the records' 'storage_type': an
+    Album has pages + 9 slots, a Box is a flat 1..N run with no page numbers.
+    When records disagree, the majority kind wins (they share a kind at import).
+    """
     records = ScanRecord.query.order_by(ScanRecord.scan_date.desc()).all()
-    album_map = {}
+    storage_map = {}
 
     for record in records:
         data = record.extracted_data or {}
         if _is_catalog_only(data):
             continue
 
-        album_name = get_record_value(record, "album")
-        if not album_name:
+        name = get_record_value(record, "album")
+        if not name:
             continue
 
         game_name = get_record_value(record, "game")
 
-        info = album_map.setdefault(
-            album_name,
+        info = storage_map.setdefault(
+            name,
             {
-                "name": album_name,
+                "name": name,
                 "count": 0,
                 "latest_scan": record.scan_date,
                 "records": [],
                 "games": set(),
+                "box_votes": 0,
+                "album_votes": 0,
             },
         )
         info["count"] += 1
         info["records"].append(record)
+        if _record_storage_type(record) == "box":
+            info["box_votes"] += 1
+        else:
+            info["album_votes"] += 1
 
         if game_name:
             info["games"].add(game_name)
@@ -641,23 +661,30 @@ def build_album_index():
         if record.scan_date and (info["latest_scan"] is None or record.scan_date > info["latest_scan"]):
             info["latest_scan"] = record.scan_date
 
-    albums = []
-    for info in album_map.values():
-        albums.append(
+    containers = []
+    for info in storage_map.values():
+        stype = "box" if info["box_votes"] > info["album_votes"] else "album"
+        containers.append(
             {
                 "name": info["name"],
                 "count": info["count"],
                 "latest_scan": info["latest_scan"],
                 "records": info["records"],
                 "games": sorted(info["games"]),
+                "storage_type": stype,
+                "is_box": stype == "box",
             }
         )
 
     return sorted(
-        albums,
+        containers,
         key=lambda item: item["latest_scan"] or datetime.min,
         reverse=True,
     )
+
+
+# Backwards-compatible alias: older callers referenced build_album_index.
+build_album_index = build_storage_index
 
 
 # ====================== GAME TEMPLATES ======================
@@ -1109,6 +1136,12 @@ def create_scan_record(image_path, template_name, extracted, image_path_back=Non
         raise InventoryCapError(_inventory_count())
 
     matched_product = match_product_from_extracted(extracted)
+
+    extracted = dict(extracted)
+    # Every new entry starts "Held" (in your possession). Catalog/reference rows
+    # from CSV import are not owned inventory, so they don't get the flag.
+    if "held" not in extracted and not _is_catalog_only(extracted):
+        extracted["held"] = True
 
     record = ScanRecord(
         image_path=normalize_to_upload_relative(image_path),
@@ -1991,6 +2024,8 @@ _STATIC_ENTRY_KEYS = frozenset({
     "edition", "holographic", "finalized", "tcgplayer", "grading",
     "first_edition", "limited_edition",
     "empty", "catalog_only",
+    # System flags/values, never shown as ad-hoc text columns.
+    "held", "storage_type", "box_number",
 })
 _INTERNAL_KEY_PREFIXES = ("__ocr_", "__")
 _INTERNAL_KEY_SUFFIXES = ("__ocr_conf", "__ocr_variant")
@@ -2025,6 +2060,15 @@ from sqlalchemy import event as _sa_event2
 def _bool_from(data, key):
     v = (data or {}).get(key, False)
     return v is True or str(v).strip().lower() == "true"
+
+
+def _held_from(data):
+    """'Held' defaults to True: an entry is held unless explicitly marked sold
+    (held == False). Missing/None/anything-but-false reads as held."""
+    v = (data or {}).get("held", True)
+    if v is None:
+        return True
+    return not (v is False or str(v).strip().lower() == "false")
 
 
 def _derive_card_type(data):
@@ -2067,6 +2111,7 @@ def _derive_scan_columns(record):
     record.is_finalized  = _bool_from(data, "finalized")
     record.is_catalog    = _is_catalog_only(data)
     record.is_archived   = _bool_from(data, "archived")
+    record.is_held       = _held_from(data)
 
 
 @_sa_event2.listens_for(ScanRecord, "before_insert")
@@ -2237,15 +2282,21 @@ class _InvPagination:
                 yield None
 
 
-def _inventory_base_conditions(f_game, f_album, f_template, view_catalog):
+def _inventory_base_conditions(f_game, f_album, f_template, view_catalog, held_state=None):
     """WHERE conditions (on denormalized columns) shared by the fast-path
-    representative query, count, member lookup, and field sampling."""
+    representative query, count, member lookup, and field sampling.
+
+    held_state: None = don't filter by Held (e.g. catalog view);
+                True = only held (normal Inventory); False = only sold (Sold page).
+    NULL is_held is treated as held (True) for rows created before the column."""
     from sqlalchemy import func as _f
     conds = [
         _f.coalesce(ScanRecord.is_catalog, False) == bool(view_catalog),
     ]
     if not view_catalog:
         conds.append(_f.coalesce(ScanRecord.is_archived, False) == False)  # noqa: E712
+    if held_state is not None:
+        conds.append(_f.coalesce(ScanRecord.is_held, True) == bool(held_state))
     if f_template:
         conds.append(ScanRecord.template_used == f_template)
     if f_game:
@@ -2256,7 +2307,7 @@ def _inventory_base_conditions(f_game, f_album, f_template, view_catalog):
 
 
 def _render_inventory_fast(f_game, f_album, f_template, view_catalog,
-                           page, per_page, sort_col, sort_dir):
+                           page, per_page, sort_col, sort_dir, held_state=None):
     """
     Fast Inventory path: de-duplicate and paginate entirely in SQL using the
     dup_hash column and window functions, loading only the page's ~50 rows
@@ -2266,7 +2317,7 @@ def _render_inventory_fast(f_game, f_album, f_template, view_catalog,
     """
     from sqlalchemy import select, func, cast, String, and_
 
-    conds = _inventory_base_conditions(f_game, f_album, f_template, view_catalog)
+    conds = _inventory_base_conditions(f_game, f_album, f_template, view_catalog, held_state)
 
     # Group key: dup_hash for finalized rows; a per-row token for the rest so
     # unfinalized records never merge together.
@@ -2359,6 +2410,7 @@ def _render_inventory_fast(f_game, f_album, f_template, view_catalog,
         sort_dir=sort_dir,
         template_fields_config=template_fields_config,
         catalog_view=view_catalog,
+        sold_view=(held_state is False),
     )
 
 
@@ -2700,8 +2752,10 @@ def builder_export():
 
 @app.route("/inventory/builder/pull", methods=["POST"])
 def builder_pull():
-    """Delete the picked records (they've been physically pulled). Idempotent-ish:
-    only records that still exist are removed."""
+    """Mark the picked records as sold (Held -> False) rather than deleting them.
+    The cards have been physically pulled to build the pack/set, so they leave the
+    Inventory list and move to the Sold view, but the entries (and their images,
+    prices, sale history) are kept. Idempotent: records already sold are left as-is."""
     body = request.get_json(silent=True) or {}
     groups = body.get("groups") or []
     ids = [i for _l, i in _builder_flatten(groups)]
@@ -2710,23 +2764,255 @@ def builder_pull():
 
     recs = ScanRecord.query.filter(ScanRecord.id.in_(ids)).all()
     if not recs:
-        return jsonify({"status": "success", "deleted": 0, "message": "Nothing to remove."})
+        return jsonify({"status": "success", "moved": 0, "message": "Nothing to move."})
 
-    del_ids = [r.id for r in recs]
-    # Detach any sale-event references so FK constraints don't block deletion.
-    SaleEvent.query.filter(SaleEvent.record_id.in_(del_ids)).update(
-        {SaleEvent.record_id: None}, synchronize_session=False)
-    for r in recs:
-        _delete_record_files(r)
-        db.session.delete(r)   # Listings cascade-delete with the record
-    db.session.commit()
-    _inventory_count_bump(-len(recs))
+    # Flip Held -> False (source of truth in extracted_data; the mapper event
+    # resyncs is_held so these drop off Inventory and appear under Sold).
+    _set_held([r.id for r in recs], False)
+    moved = len(recs)
 
-    return jsonify({"status": "success", "deleted": len(recs),
-                    "message": f"Pulled {len(recs)} card(s) — removed from inventory."})
+    return jsonify({"status": "success", "moved": moved,
+                    "message": f"Pulled {moved} card(s) — marked Sold and moved to the Sold view."})
+
+
+# ============================ ANALYTICS ============================
+# A cross-inventory analytics page: query the Held ("in stock") and/or Sold
+# entries, group by any field, aggregate counts + money fields, and view the
+# result as a dashboard (charts) or export it as a spreadsheet (CSV). Aggregation
+# runs in Python over the hot-column-filtered set (same approach as the inventory
+# Python path); the SQL pre-filter keeps only relevant rows in play.
+
+_ANALYTICS_MONEY_FIELDS = [
+    ("intake_price",  "Intake $"),
+    ("current_value", "Current $"),
+    ("sold_price",    "Sold $"),
+]
+
+# Always-offered group-by dimensions. "__status__" and "template" are synthetic
+# (derived), the rest are extracted_data keys. Dynamic entry fields discovered
+# from a live sample are appended to these.
+_ANALYTICS_BASE_DIMENSIONS = [
+    ("game", "Game"), ("album", "Storage"), ("__status__", "Held / Sold"),
+    ("storage_type", "Storage type"), ("rarity", "Rarity"),
+    ("edition", "Edition"), ("holographic", "Holo"), ("condition", "Condition"),
+]
+
+_ANALYTICS_METRIC_LABELS = {
+    "count":              "Count",
+    "sum_intake_price":   "Sum Intake $",
+    "avg_intake_price":   "Avg Intake $",
+    "sum_current_value":  "Sum Current $",
+    "avg_current_value":  "Avg Current $",
+    "sum_sold_price":     "Sum Sold $",
+    "avg_sold_price":     "Avg Sold $",
+    "sum_profit":         "Sum Profit $",
+    "avg_profit":         "Avg Profit $",
+}
+_ANALYTICS_ARR_BY_FIELD = {
+    "intake_price": "intake", "current_value": "current",
+    "sold_price": "sold", "profit": "profit",
+}
+
+
+def _analytics_money(v):
+    """Parse a money-ish value ('$1,234.50', '12', '') into a float or None."""
+    if v is None:
+        return None
+    s = str(v).strip().replace("$", "").replace(",", "")
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _analytics_group_value(rec, field):
+    data = rec.extracted_data or {}
+    if not field:
+        return "All"
+    if field == "__status__":
+        return "Held" if _held_from(data) else "Sold"
+    if field == "template":
+        return rec.template_used or "—"
+    v = data.get(field, "")
+    v = str(v).strip() if v is not None else ""
+    return v or "—"
+
+
+def _analytics_filtered_records(source, f_game, f_template, search):
+    """Records matching the source (held/sold/all) + optional game/template/search.
+    Catalog and archived rows are always excluded."""
+    from sqlalchemy import func as _f, and_
+    conds = [
+        _f.coalesce(ScanRecord.is_catalog, False) == False,   # noqa: E712
+        _f.coalesce(ScanRecord.is_archived, False) == False,  # noqa: E712
+    ]
+    if source == "held":
+        conds.append(_f.coalesce(ScanRecord.is_held, True) == True)   # noqa: E712
+    elif source == "sold":
+        conds.append(_f.coalesce(ScanRecord.is_held, True) == False)  # noqa: E712
+    # source == "all" -> both held and sold
+    if f_game:
+        conds.append(ScanRecord.game_key == f_game.strip().lower())
+    if f_template:
+        conds.append(ScanRecord.template_used == f_template)
+    q = ScanRecord.query.filter(and_(*conds))
+    if search:
+        q = q.filter(ScanRecord.extracted_data.cast(db.Text).ilike(f"%{search}%"))
+    return q.all()
+
+
+def _analytics_available_dimensions(sample):
+    dims, have = [], set()
+    for k, lbl in _ANALYTICS_BASE_DIMENSIONS:
+        dims.append({"key": k, "label": lbl}); have.add(k)
+    dims.append({"key": "template", "label": "Template"}); have.add("template")
+    for f in discover_entry_fields(sample):
+        if f not in have:
+            dims.append({"key": f, "label": f.replace("_", " ").title()})
+            have.add(f)
+    return dims
+
+
+def _analytics_metric_value(bucket, key):
+    if key == "count":
+        return bucket["count"]
+    op, _, rest = key.partition("_")           # "sum" / "avg", "intake_price"...
+    arr = bucket.get(_ANALYTICS_ARR_BY_FIELD.get(rest, ""), [])
+    if op == "sum":
+        return round(sum(arr), 2)
+    if op == "avg":
+        return round(sum(arr) / len(arr), 2) if arr else 0
+    return 0
+
+
+def _analytics_run(source, f_game, f_template, search, group_by, metrics):
+    """Core aggregation shared by the query API and CSV export. Returns a dict
+    with metric defs, per-group rows, grand totals, and record/group counts."""
+    valid = [m for m in (metrics or []) if m in _ANALYTICS_METRIC_LABELS]
+    if "count" not in valid:
+        valid = ["count"] + valid
+    records = _analytics_filtered_records(source, f_game, f_template, search)
+
+    buckets, order = {}, []
+    for rec in records:
+        g = _analytics_group_value(rec, group_by)
+        b = buckets.get(g)
+        if b is None:
+            b = buckets[g] = {"count": 0, "intake": [], "current": [], "sold": [], "profit": []}
+            order.append(g)
+        b["count"] += 1
+        data = rec.extracted_data or {}
+        ip = _analytics_money(data.get("intake_price"))
+        cv = _analytics_money(data.get("current_value"))
+        sp = _analytics_money(data.get("sold_price"))
+        if ip is not None: b["intake"].append(ip)
+        if cv is not None: b["current"].append(cv)
+        if sp is not None: b["sold"].append(sp)
+        if ip is not None and sp is not None: b["profit"].append(sp - ip)
+
+    rows = []
+    for g in order:
+        b = buckets[g]
+        rows.append({"group": g, "values": {m: _analytics_metric_value(b, m) for m in valid}})
+
+    # Sort by the first money metric if present, else by count — descending.
+    primary = next((m for m in valid if m != "count"), "count")
+    rows.sort(key=lambda r: r["values"].get(primary, 0), reverse=True)
+
+    # Grand totals across every matching record (one overall bucket).
+    total_b = {"count": 0, "intake": [], "current": [], "sold": [], "profit": []}
+    for b in buckets.values():
+        total_b["count"] += b["count"]
+        for k in ("intake", "current", "sold", "profit"):
+            total_b[k].extend(b[k])
+    totals = {m: _analytics_metric_value(total_b, m) for m in valid}
+
+    return {
+        "metrics": [{"key": m, "label": _ANALYTICS_METRIC_LABELS[m]} for m in valid],
+        "rows": rows,
+        "totals": totals,
+        "record_count": len(records),
+        "group_count": len(rows),
+        "group_by": group_by,
+    }
+
+
+def _analytics_params(src):
+    """Pull analytics params from a JSON body or form/query dict `src`."""
+    source = (src.get("source") or "all").strip().lower()
+    if source not in ("held", "sold", "all"):
+        source = "all"
+    group_by = (src.get("group_by") or "").strip()
+    metrics = src.get("metrics") or ["count"]
+    if isinstance(metrics, str):
+        metrics = [m for m in metrics.split(",") if m]
+    return {
+        "source": source,
+        "f_game": (src.get("game") or "").strip(),
+        "f_template": (src.get("template") or "").strip(),
+        "search": (src.get("search") or "").strip(),
+        "group_by": group_by,
+        "metrics": metrics,
+    }
+
+
+@app.route("/analytics")
+def analytics_page():
+    ensure_dirs()
+    from sqlalchemy import func as _f
+    games = _builder_games()
+    sample = (ScanRecord.query
+              .filter(_f.coalesce(ScanRecord.is_catalog, False) == False,    # noqa: E712
+                      _f.coalesce(ScanRecord.is_archived, False) == False)   # noqa: E712
+              .limit(500).all())
+    dimensions = _analytics_available_dimensions(sample)
+    return render_template(
+        "analytics.html",
+        games=games,
+        dimensions=dimensions,
+        money_fields=_ANALYTICS_MONEY_FIELDS,
+        metric_labels=_ANALYTICS_METRIC_LABELS,
+        templates=get_template_names(),
+    )
+
+
+@app.route("/analytics/query", methods=["POST"])
+def analytics_query():
+    p = _analytics_params(request.get_json(silent=True) or {})
+    result = _analytics_run(**p)
+    result["status"] = "success"
+    return jsonify(result)
+
+
+@app.route("/analytics/export", methods=["POST"])
+def analytics_export():
+    # Accept JSON or form so the button can post either way.
+    src = request.get_json(silent=True) or request.form.to_dict() or {}
+    p = _analytics_params(src)
+    result = _analytics_run(**p)
+
+    import csv as _csv
+    from io import StringIO
+    buf = StringIO()
+    w = _csv.writer(buf)
+    group_label = next((d["label"] for d in _analytics_available_dimensions([])
+                        if d["key"] == p["group_by"]), p["group_by"] or "All")
+    w.writerow([group_label] + [m["label"] for m in result["metrics"]])
+    for row in result["rows"]:
+        w.writerow([row["group"]] + [row["values"][m["key"]] for m in result["metrics"]])
+    w.writerow([])
+    w.writerow(["TOTAL"] + [result["totals"][m["key"]] for m in result["metrics"]])
+
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    fname = f"analytics_{p['source']}_{(p['group_by'] or 'all')}_{stamp}.csv"
+    return Response(buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
 
 @app.route("/inventory")
+@app.route("/sold", endpoint="sold")
 def inventory():
     page       = request.args.get("page", 1, type=int)
     per_page   = request.args.get("per_page", 50, type=int)
@@ -2742,8 +3028,17 @@ def inventory():
     # those hidden rows instead, so they can be found, edited, and deleted.
     view_catalog = request.args.get("catalog", "").strip() in ("1", "true", "yes")
 
-    # If no filter is active, show the game selection landing page.
-    if not f_game and not f_album and not f_template and not search and not view_catalog:
+    # Sold view: the /sold page (or ?sold=1) lists entries whose Held flag is
+    # False — the ones that have been sold. Catalog view is never "sold".
+    view_sold = (request.endpoint == "sold"
+                 or request.args.get("sold", "").strip() in ("1", "true", "yes"))
+    # held_state: None in catalog view (don't filter); False for Sold; True otherwise.
+    held_state = None if view_catalog else (False if view_sold else True)
+
+    # If no filter is active, show the game selection landing page — but the Sold
+    # page shows its full list directly (no per-game landing).
+    if (not view_sold and not f_game and not f_album and not f_template
+            and not search and not view_catalog):
         return _inventory_game_select()
 
     if sort_dir not in ("asc", "desc"):
@@ -2760,7 +3055,7 @@ def inventory():
     if not search and not effective_sort_early:
         try:
             return _render_inventory_fast(
-                f_game, f_album, f_template, view_catalog, page, per_page, sort_col, sort_dir)
+                f_game, f_album, f_template, view_catalog, page, per_page, sort_col, sort_dir, held_state)
         except Exception:
             db.session.rollback()  # fall back to the proven Python grouping path
 
@@ -2802,6 +3097,11 @@ def inventory():
     # Archived rows (cold storage) are hidden from the normal Inventory list.
     if not view_catalog:
         all_records = [r for r in all_records if not _bool_from(r.extracted_data or {}, "archived")]
+        # Held vs Sold split: Inventory shows held entries; the Sold page shows
+        # the rest. (Catalog view leaves held_state None and skips this.)
+        if held_state is not None:
+            all_records = [r for r in all_records
+                           if _held_from(r.extracted_data or {}) == held_state]
 
     # Build groups across the full filtered set so duplicates on other pages
     # are still counted in the quantity badge.
@@ -2895,6 +3195,7 @@ def inventory():
         sort_dir=sort_dir,
         template_fields_config=template_fields_config,
         catalog_view=view_catalog,
+        sold_view=view_sold,
     )
 
 
@@ -3217,41 +3518,71 @@ def inventory_detail(record_id):
     )
 
 
-@app.route("/albums")
-def albums():
-    album_list = build_album_index()
-    if album_list:
-        return redirect(url_for("album_detail", album_name=album_list[0]["name"]))
-    return render_template("albums.html", albums=[])
+@app.route("/storage")
+def storage_home():
+    containers = build_storage_index()
+    if containers:
+        return redirect(url_for("storage_detail", name=containers[0]["name"]))
+    return render_template("storage.html", containers=[])
 
 
-@app.route("/albums/list")
-def albums_list():
-    album_list = build_album_index()
-    for album in album_list:
-        album["image_url"] = find_saved_image("albums", album["name"])
-    return render_template("albums.html", albums=album_list)
+@app.route("/storage/list")
+def storage_list():
+    containers = build_storage_index()
+    for c in containers:
+        c["image_url"] = find_saved_image("albums", c["name"])
+    return render_template("storage.html", containers=containers)
 
 
-@app.route("/albums/upload_image", methods=["POST"])
-def album_upload_image():
-    album_name = request.form.get("album_name", "").strip()
+@app.route("/storage/next_index")
+def storage_next_index():
+    """Next 'sheet' index for a Box (or Album) container: max existing page + 1.
+
+    Boxes hide the page field, but the 9-pocket importer still keys each physical
+    pocket by (game, container, page, slot) so a card's front and back merge. The
+    client fetches this so successive box imports don't collide on page 1.
+    """
+    name = (request.args.get("name") or "").strip().lower()
+    nxt = 1
+    if name:
+        rows = (ScanRecord.query
+                .filter(ScanRecord.album_key == name)
+                .with_entities(ScanRecord.extracted_data)
+                .all())
+        max_page = 0
+        for (data,) in rows:
+            try:
+                p = int((data or {}).get("page") or 0)
+            except (TypeError, ValueError):
+                p = 0
+            if p > max_page:
+                max_page = p
+        nxt = max_page + 1
+    return jsonify({"next": nxt})
+
+
+@app.route("/storage/upload_image", methods=["POST"])
+def storage_upload_image():
+    # Accept the current 'storage_name' field and the legacy 'album_name'.
+    name = (request.form.get("storage_name") or request.form.get("album_name") or "").strip()
     file = request.files.get("image")
 
-    if not album_name or not file or not file.filename:
-        return jsonify({"status": "error", "message": "Album name and image file are required"}), 400
+    if not name or not file or not file.filename:
+        return jsonify({"status": "error", "message": "Storage name and image file are required"}), 400
 
-    album_img_folder = os.path.join(app.config["UPLOAD_FOLDER"], "albums")
-    os.makedirs(album_img_folder, exist_ok=True)
+    # Cover images continue to live under uploads/albums/ for continuity with
+    # any images uploaded before the Storage rename.
+    img_folder = os.path.join(app.config["UPLOAD_FOLDER"], "albums")
+    os.makedirs(img_folder, exist_ok=True)
 
     # Preserve original extension; fall back to .jpg
     _, ext = os.path.splitext(file.filename)
     if not ext:
         ext = ".jpg"
 
-    safe_album = secure_filename(album_name)
-    filename = f"{safe_album}{ext}"
-    save_path = os.path.join(album_img_folder, filename)
+    safe_name = secure_filename(name)
+    filename = f"{safe_name}{ext}"
+    save_path = os.path.join(img_folder, filename)
     file.save(save_path)
 
     relative_path = f"albums/{filename}"
@@ -3284,16 +3615,22 @@ def inventory_upload_game_image():
     return jsonify({"status": "success", "url": image_url})
 
 
-@app.route("/albums/<path:album_name>")
-def album_detail(album_name):
-    album_list = build_album_index()
+def _storage_item_name(record, fallback=""):
+    return (get_record_value(record, "product_name")
+            or get_record_value(record, "name")
+            or fallback)
+
+
+@app.route("/storage/<path:name>")
+def storage_detail(name):
+    containers = build_storage_index()
     selected = next(
-        (a for a in album_list if a["name"].lower() == album_name.strip().lower()),
+        (c for c in containers if c["name"].lower() == name.strip().lower()),
         None,
     )
 
     if not selected:
-        return redirect(url_for("albums_list"))
+        return redirect(url_for("storage_list"))
 
     def record_sort_key(record):
         page = get_record_value(record, "page")
@@ -3309,6 +3646,24 @@ def album_detail(album_name):
         return (page_num, slot_num, record.scan_date or datetime.min)
 
     records = sorted(selected["records"], key=record_sort_key)
+
+    # ── Box: one flat, continuously numbered run, no pages ──
+    if selected["is_box"]:
+        items = []
+        for i, record in enumerate(records, start=1):
+            items.append({
+                "number": i,
+                "record": record,
+                "name": _storage_item_name(record, f"Card {i}"),
+            })
+        return render_template(
+            "box_detail.html",
+            storage_name=selected["name"],
+            items=items,
+            total=len(items),
+        )
+
+    # ── Album: 3×3 pages keyed by slot (unchanged behavior) ──
     page_groups = [records[i:i + 9] for i in range(0, len(records), 9)] or [[]]
     current_page = request.args.get("page", 1, type=int)
     current_page = max(1, min(current_page, len(page_groups)))
@@ -3324,11 +3679,7 @@ def album_detail(album_name):
         if 1 <= slot_num <= 9 and slot_num not in grid:
             grid[slot_num] = {
                 "record": record,
-                "name": (
-                    get_record_value(record, "product_name")
-                    or get_record_value(record, "name")
-                    or f"Slot {slot_num}"
-                ),
+                "name": _storage_item_name(record, f"Slot {slot_num}"),
             }
 
     return render_template(
@@ -3338,6 +3689,22 @@ def album_detail(album_name):
         maxpage=len(page_groups),
         grid=grid,
     )
+
+
+# ── Legacy endpoint aliases ──────────────────────────────────────────────────
+# The Album section became Storage, but not every template references the new
+# endpoints yet (several partials/pages aren't touched by this change). Keep the
+# old endpoint *names* alive — pointing at the same views, preserving the old
+# `album_name` URL argument — so any lingering url_for('albums_list') /
+# url_for('album_detail', album_name=...) keeps building instead of raising
+# BuildError. Safe to delete once every template uses the storage_* endpoints.
+def _legacy_album_detail(album_name):
+    return storage_detail(album_name)
+
+app.add_url_rule("/albums",                   endpoint="albums",             view_func=storage_home)
+app.add_url_rule("/albums/list",              endpoint="albums_list",        view_func=storage_list)
+app.add_url_rule("/albums/upload_image",      endpoint="album_upload_image", view_func=storage_upload_image, methods=["POST"])
+app.add_url_rule("/albums/<path:album_name>", endpoint="album_detail",       view_func=_legacy_album_detail)
 
 
 @app.route("/import")
@@ -3537,7 +3904,33 @@ def _normalize_game_name(g):
     return (g[:1].upper() + g[1:]) if g else g
 
 
-def _create_single_card(front_path, back_path, game, album, template, collection=""):
+def _next_box_number(name):
+    """Next sequential card number for a Box container (max existing + 1).
+
+    Boxes number their cards 1..N in scan order with no page structure. Because
+    create_scan_record commits each record before the next, successive single /
+    PDF-pair imports into the same box see prior numbers and keep incrementing.
+    """
+    key = str(name or "").strip().lower()
+    if not key:
+        return 1
+    rows = (ScanRecord.query
+            .filter(ScanRecord.album_key == key)
+            .with_entities(ScanRecord.extracted_data)
+            .all())
+    max_n = 0
+    for (data,) in rows:
+        try:
+            n = int((data or {}).get("box_number") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n > max_n:
+            max_n = n
+    return max_n + 1
+
+
+def _create_single_card(front_path, back_path, game, album, template,
+                        collection="", storage_type="album"):
     """
     Create a blank inventory record for `game` (+optional album/collection) with
     the given front (required) and back (optional) image paths, then OCR-identify
@@ -3545,12 +3938,20 @@ def _create_single_card(front_path, back_path, game, album, template, collection
     auto-identify threshold (60%) is applied and saved; anything less leaves the
     entry blank for manual entry.
 
+    `storage_type` is 'album' (pages + slots) or 'box' (a flat 1..N run); for a
+    box the card is stamped with the next sequential box_number.
+
     Returns (record, ident_dict).
     """
     blank_fields = {k: "" for k in (template.get("fields", {}) or {}).keys()}
     extracted = {**blank_fields, "game": _normalize_game_name(game)}
     if album:
         extracted["album"] = album
+        if str(storage_type).strip().lower() == "box":
+            extracted["storage_type"] = "box"
+            extracted["box_number"] = _next_box_number(album)
+        else:
+            extracted["storage_type"] = "album"
     if collection:
         extracted["collection"] = collection
 
@@ -3572,10 +3973,12 @@ def _create_single_card(front_path, back_path, game, album, template, collection
     return record, ident
 
 
-def _finalize_pdf_pair(front_path, back_path, front_page, back_page, game, album, template, collection=""):
+def _finalize_pdf_pair(front_path, back_path, front_page, back_page, game, album, template,
+                       collection="", storage_type="album"):
     """Create one inventory record from an already-saved front (+ optional back)
     image pair pulled from a PDF, and return the card dict the UI expects."""
-    record, ident = _create_single_card(front_path, back_path, game, album, template, collection)
+    record, ident = _create_single_card(front_path, back_path, game, album, template,
+                                         collection, storage_type)
     return {
         "record_id":       record.id,
         "front_page":      front_page,
@@ -3589,27 +3992,27 @@ def _finalize_pdf_pair(front_path, back_path, front_page, back_page, game, album
     }
 
 
-def _import_single_card_pdf(pdf_bytes, game, album, edge_type, template, collection=""):
+def _import_single_card_pdf(pdf_bytes, game, album, edge_type, template, collection="", storage_type="album"):
     """
     Import a PDF (given as raw bytes) as front/back pairs. Suitable for smaller
     uploads; inputs over 500 MB are spilled to a temp file automatically (see
     _iter_pdf_bgr_pages). Prefer _import_single_card_pdf_path when the upload has
     already been streamed to disk, to avoid ever holding the file in RAM.
     """
-    return _import_pdf_pages(_iter_pdf_bgr_pages(pdf_bytes), game, album, edge_type, template, collection)
+    return _import_pdf_pages(_iter_pdf_bgr_pages(pdf_bytes), game, album, edge_type, template, collection, storage_type)
 
 
-def _import_single_card_pdf_path(pdf_path, game, album, edge_type, template, collection=""):
+def _import_single_card_pdf_path(pdf_path, game, album, edge_type, template, collection="", storage_type="album"):
     """
     Import an already-on-disk PDF as front/back pairs, rasterizing one page at a
     time straight from the file. The document is never loaded into RAM, so this
     keeps the process's memory well under the 500 MB cap no matter how large the
     PDF is. The caller owns and cleans up `pdf_path`.
     """
-    return _import_pdf_pages(_iter_pdf_bgr_pages_from_path(pdf_path), game, album, edge_type, template, collection)
+    return _import_pdf_pages(_iter_pdf_bgr_pages_from_path(pdf_path), game, album, edge_type, template, collection, storage_type)
 
 
-def _import_pdf_pages(page_iter, game, album, edge_type, template, collection=""):
+def _import_pdf_pages(page_iter, game, album, edge_type, template, collection="", storage_type="album"):
     """
     Shared front/back-pair importer: consume a stream of BGR pages (odd pages
     are FRONTS, even pages BACKS), build one inventory record per pair, and
@@ -3639,14 +4042,14 @@ def _import_pdf_pages(page_iter, game, album, edge_type, template, collection=""
             del bgr
             cards.append(_finalize_pdf_pair(
                 pending_front["path"], back_path, pending_front["page_no"],
-                page_no, game, album, template, collection))
+                page_no, game, album, template, collection, storage_type))
             pending_front = None
 
         # A trailing odd page: a front with no back.
         if pending_front is not None:
             cards.append(_finalize_pdf_pair(
                 pending_front["path"], None, pending_front["page_no"],
-                None, game, album, template, collection))
+                None, game, album, template, collection, storage_type))
     except InventoryCapError:
         cap_hit = True   # keep what imported; report the cap below
     except RuntimeError as exc:
@@ -3701,6 +4104,7 @@ def import_single_card():
 
     game  = (request.form.get("game")  or "").strip()
     album = (request.form.get("album") or "").strip()
+    storage_type = (request.form.get("storage_type") or "album").strip().lower()
     collection = _clean_collection(request.form.get("collection"))
     edge_type = normalize_card_edge_type(request.form.get("card_edge_type"))
     if not game:
@@ -3750,7 +4154,7 @@ def import_single_card():
             # Rasterized one page at a time straight from disk — RAM stays capped
             # regardless of file size. Returns before the finally cleans up the
             # temp PDF (all pages are read by then).
-            return _import_single_card_pdf_path(front_tmp, game, album, edge_type, template, collection)
+            return _import_single_card_pdf_path(front_tmp, game, album, edge_type, template, collection, storage_type)
 
         # ---- Single image: front (required) + optional back ----
         # Card photos are small, so decoding one from disk is well within budget.
@@ -3779,7 +4183,7 @@ def import_single_card():
         # so the raw uploads can go regardless of which branch ran.
         shutil.rmtree(upload_dir, ignore_errors=True)
 
-    record, ident = _create_single_card(front_path, back_path, game, album, template, collection)
+    record, ident = _create_single_card(front_path, back_path, game, album, template, collection, storage_type)
 
     # Let the UI mention when a card outline couldn't be found and the raw
     # photo was kept instead (so the user can retry or crop manually later).
@@ -3993,6 +4397,37 @@ def realign_record_image(record_id):
         "message":   f"{suffix.capitalize()} image re-aligned.",
         "side":      side,
         "image_url": build_uploaded_file_url(record.image_path_back if side == "back" else record.image_path),
+    })
+
+
+@app.route("/save_tcgplayer_link/<int:record_id>", methods=["POST"])
+def save_tcgplayer_link(record_id):
+    """
+    Save (or clear) a manual TCGplayer URL shown in the record's "TCGPlayer Link"
+    panel. Stored on extracted_data['tcgplayer_link']; an empty url removes it.
+    """
+    record = ScanRecord.query.get_or_404(record_id)
+    data = request.get_json(silent=True) or {}
+    url = str(data.get("url", "")).strip()
+
+    if url and not (url.lower().startswith("http://") or url.lower().startswith("https://")):
+        return jsonify({"status": "error",
+                        "message": "URL must start with http:// or https://"}), 400
+
+    ext = dict(record.extracted_data or {})
+    if url:
+        ext["tcgplayer_link"] = url
+    else:
+        ext.pop("tcgplayer_link", None)
+    # Reassign so SQLAlchemy marks the JSON column dirty (before_update resyncs the
+    # denormalized hot columns from it).
+    record.extracted_data = ext
+    db.session.commit()
+
+    return jsonify({
+        "status":  "success",
+        "url":     url,
+        "message": "TCGplayer link saved." if url else "TCGplayer link removed.",
     })
 
 
@@ -5053,26 +5488,11 @@ def ocr_identify(record_id):
     # regardless of which source they came from.
     combined = sorted(ref_matches + matches, key=lambda c: c.get("score", 0), reverse=True)
 
-    # Ximilar — controlled by the "Match against imported catalog only" checkbox:
-    #   * checked   (catalog_only=True)  -> stay fully local: catalog + the user's
-    #     own records only, never call the external service.
-    #   * unchecked (catalog_only=False) -> this is an explicit, per-card request to
-    #     read the FRONT image with the SELECTED provider (Settings → General:
-    #     Ximilar or CardSight) and offer its result.
-    #
-    # NOTE: unlike the automatic import path, this manual identify does NOT require
-    # the global fallback toggle — unchecking the box here IS the opt-in. It still
-    # needs the provider's API key, and _external_identify_candidates returns a
-    # clear message for every outcome (no provider selected, no key, image/network
-    # error, out of credits, or "couldn't identify"), so the picker never fails
-    # silently. `ximilar_error` is kept as the response field name for the existing
-    # front-end, but it carries whichever provider's message.
+    # Local-only: OCR + catalog/record matching. External (cloud) identification
+    # is a separate, explicit action now — see /cloud_identify. `ximilar_error`
+    # stays in the response (always empty here) for backward compatibility with
+    # any client that reads it.
     ximilar_error = ""
-    if not catalog_only:
-        xi_cands, xi_err = _external_identify_candidates(record, category_id)
-        ximilar_error = xi_err or ""
-        if xi_cands:
-            combined = sorted(xi_cands + combined, key=lambda c: c.get("score", 0), reverse=True)
 
     return jsonify({
         "status": "ok",
@@ -5099,6 +5519,65 @@ def ocr_identify(record_id):
         "already_populated": bool(_get_name(ext) or _get_serial(ext)),
         "candidates": combined,
     })
+
+
+@app.route("/cloud_identify/<int:record_id>", methods=["GET"])
+def cloud_identify(record_id):
+    """
+    Cloud-only identification: send this record's FRONT image straight to the
+    configured identification service (Settings → General: CardSight or Ximilar)
+    and return whatever it recognizes. It does NO local OCR and NO local database
+    matching — it's the deliberate "just ask the cloud" action.
+
+    The provider's read is enriched against the local catalog when possible (so
+    it can be applied with set/rarity/price/product_id), otherwise a raw
+    name/number/set/rarity candidate is returned. Always reports a clear message
+    for every non-success outcome (no provider selected, no key, network error,
+    out of credits, or "couldn't identify").
+    """
+    record = ScanRecord.query.get_or_404(record_id)
+    ext = record.extracted_data or {}
+
+    provider = _identify_provider()
+    if provider == "none":
+        return jsonify({
+            "status": "ok",
+            "provider": "none",
+            "provider_label": "None",
+            "candidates": [],
+            "error": "No cloud identification service is selected. Choose CardSight or Ximilar "
+                     "in Settings \u2192 General.",
+            "already_populated": bool(_get_name(ext) or _get_serial(ext)),
+        })
+
+    if not record.image_path or record.image_path == "__blank__":
+        return jsonify({
+            "status": "ok",
+            "provider": provider,
+            "provider_label": _identify_provider_label(provider),
+            "candidates": [],
+            "error": "This record has no front image to send to the cloud service.",
+            "already_populated": bool(_get_name(ext) or _get_serial(ext)),
+        })
+
+    # category_id (the game's catalog) is used only to enrich the cloud read with
+    # local catalog data — it does NOT gate the call.
+    category_id, _ref_game = _resolve_category_for_game(ext.get("game", ""))
+    cands, err = _external_identify_candidates(record, category_id)
+
+    resp = {
+        "status": "ok",
+        "provider": provider,
+        "provider_label": _identify_provider_label(provider),
+        "candidates": cands,
+        "error": err or "",
+        "already_populated": bool(_get_name(ext) or _get_serial(ext)),
+    }
+    # /cloud_identify/<id>?debug=1 attaches the raw provider exchange so you can see
+    # exactly what came back (HTTP status + JSON) when a result is unexpected.
+    if request.args.get("debug", "").strip().lower() in ("1", "true", "yes") and provider == "cardsight":
+        resp["debug"] = _cardsight_debug(record.image_path)
+    return jsonify(resp)
 
 
 @app.route("/ocr_apply/<int:record_id>", methods=["POST"])
@@ -5958,6 +6437,7 @@ def import_finalize_batch():
     template_name = data.get("template_name", "product_label")
     filenames     = data.get("filenames", [])
     collection    = _clean_collection(data.get("collection"))
+    storage_type  = str(data.get("storage_type", "album") or "album").strip().lower()
 
     def sse(event, payload):
         return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
@@ -6006,6 +6486,20 @@ def import_finalize_batch():
             album = extracted.get("album", "")
             page  = extracted.get("page",  "")
             slot  = extracted.get("slot",  "")
+
+            # Storage kind. A Box has no pages; its cards number continuously,
+            # so derive a stable box_number from the (sheet, slot) pocket key —
+            # deterministic, so a card's front and back land on the same number.
+            if storage_type == "box":
+                extracted["storage_type"] = "box"
+                try:
+                    pnum, snum = int(page or 0), int(slot or 0)
+                    if pnum and snum:
+                        extracted["box_number"] = (pnum - 1) * 9 + snum
+                except (TypeError, ValueError):
+                    pass
+            else:
+                extracted["storage_type"] = "album"
 
             try:
                 final_relative_image_path = move_temp_card_to_inventory(filename)
@@ -6854,6 +7348,42 @@ def inventory_unarchive():
                     "message": f"Restored {n} record(s) from the archive."})
 
 
+def _set_held(ids, value):
+    """Set held=value on the given record ids. Writing through extracted_data
+    keeps it the source of truth; the mapper event resyncs the is_held column so
+    the Inventory (held) and Sold (not held) lists update accordingly."""
+    ids = [int(i) for i in ids if str(i).strip().isdigit()]
+    if not ids:
+        return 0
+    changed = 0
+    for r in ScanRecord.query.filter(ScanRecord.id.in_(ids)).all():
+        data = dict(r.extracted_data or {})
+        if bool(_held_from(data)) == bool(value):
+            continue
+        data["held"] = bool(value)
+        r.extracted_data = data   # reassign -> row dirty -> before_update resyncs column
+        changed += 1
+    if changed:
+        db.session.commit()
+    return changed
+
+
+@app.route("/inventory/mark_sold", methods=["POST"])
+def inventory_mark_sold():
+    """Mark record(s) sold: held -> False, moving them to the Sold page."""
+    n = _set_held(_archive_ids_from_request(), False)
+    return jsonify({"status": "success", "sold": n,
+                    "message": f"Marked {n} record(s) sold."})
+
+
+@app.route("/inventory/mark_held", methods=["POST"])
+def inventory_mark_held():
+    """Restore record(s) to Held (unsold), moving them back to Inventory."""
+    n = _set_held(_archive_ids_from_request(), True)
+    return jsonify({"status": "success", "held": n,
+                    "message": f"Restored {n} record(s) to inventory."})
+
+
 # ---------------------------------------------------------------------------- #
 # Embedded target-side artifacts shipped inside every migration bundle so the
 # desktop (PostgreSQL) build has a self-contained on-ramp.
@@ -6889,6 +7419,7 @@ CREATE TABLE IF NOT EXISTS scan_records (
     is_finalized          BOOLEAN DEFAULT FALSE,
     is_catalog            BOOLEAN DEFAULT FALSE,
     is_archived           BOOLEAN DEFAULT FALSE,
+    is_held               BOOLEAN DEFAULT TRUE,
     image_object_key      TEXT,
     image_object_key_back TEXT,
     PRIMARY KEY (id, scan_date)
@@ -7558,7 +8089,7 @@ def _storage_status():
 @app.route("/settings/storage")
 def storage_page():
     ensure_dirs()
-    return render_template("storage.html", slots=_storage_status(),
+    return render_template("storage_settings.html", slots=_storage_status(),
                            config_path=STORAGE_CONFIG_PATH)
 
 
@@ -8215,8 +8746,11 @@ def _cardsight_identify_card_ex(image_path):
     except Exception as e:
         return None, f"Couldn't reach CardSight: {e}"
 
-    if not isinstance(payload, dict) or not payload.get("success"):
-        return None, None
+    if not isinstance(payload, dict):
+        return None, "CardSight returned an unexpected response."
+    # Some responses include an explicit error/message; surface it.
+    if payload.get("error"):
+        return None, f"CardSight: {payload.get('error')}"
     detections = payload.get("detections") or []
     if not detections:
         return None, None
@@ -8265,6 +8799,42 @@ def _cardsight_health_ok():
         return False, f"HTTP {e.code}: {e.reason}"
     except Exception as e:
         return False, str(e)
+
+
+def _cardsight_debug(image_path):
+    """Raw CardSight identify exchange for troubleshooting: returns the HTTP status
+    and the parsed JSON (or body text / error). Used by /cloud_identify?debug=1."""
+    key = _cardsight_auth_key()
+    if not key:
+        return {"error": "No CardSight API key is set."}
+    data = _downscaled_jpeg_bytes(image_path)
+    if not data:
+        return {"error": "No front-image bytes could be read for this record."}
+    out = {"sent_image_bytes": len(data), "key_fingerprint": (key[:4] + "…" + key[-4:]) if len(key) >= 10 else f"({len(key)} chars)"}
+    content_type, body = _multipart_encode("image", "card.jpg", "image/jpeg", data)
+    req = urllib.request.Request(
+        CARDSIGHT_IDENTIFY_URL, data=body, method="POST",
+        headers={"X-API-Key": key, "Content-Type": content_type, "Accept": "application/json",
+                 "User-Agent": "CardCollectorInventoryManager/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=CARDSIGHT_TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+        out["http_status"] = 200
+        try:
+            out["json"] = json.loads(raw)
+        except Exception:
+            out["text"] = raw[:3000]
+    except urllib.error.HTTPError as e:
+        out["http_status"] = e.code
+        out["reason"] = e.reason
+        try:
+            out["body"] = e.read().decode("utf-8", "replace")[:3000]
+        except Exception:
+            pass
+    except Exception as e:
+        out["error"] = str(e)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -9978,6 +10548,7 @@ def migrate_add_scan_scaling_columns():
         "is_finalized":  "BOOLEAN",
         "is_catalog":    "BOOLEAN",
         "is_archived":   "BOOLEAN",
+        "is_held":       "BOOLEAN",
     }
     added = []
     with db.engine.begin() as conn:
@@ -9986,6 +10557,13 @@ def migrate_add_scan_scaling_columns():
                 conn.exec_driver_sql(f"ALTER TABLE scan_records ADD COLUMN {name} {decl}")
                 added.append(name)
 
+    # Existing rows predate "Held"; they're all still held. Backfill NULLs to
+    # true so the column is accurate immediately (queries also coalesce NULL->held).
+    if "is_held" in added:
+        with db.engine.begin() as conn:
+            conn.exec_driver_sql(
+                "UPDATE scan_records SET is_held = 1 "
+                "WHERE is_held IS NULL AND COALESCE(is_catalog, 0) = 0")
     # Indexes (names match SQLAlchemy's so a fresh DB's create_all doesn't dupe).
     index_sql = [
         "CREATE INDEX IF NOT EXISTS ix_scan_records_game_key ON scan_records(game_key)",
@@ -9996,6 +10574,7 @@ def migrate_add_scan_scaling_columns():
         "CREATE INDEX IF NOT EXISTS ix_scan_records_is_finalized ON scan_records(is_finalized)",
         "CREATE INDEX IF NOT EXISTS ix_scan_records_is_catalog ON scan_records(is_catalog)",
         "CREATE INDEX IF NOT EXISTS ix_scan_records_is_archived ON scan_records(is_archived)",
+        "CREATE INDEX IF NOT EXISTS ix_scan_records_is_held ON scan_records(is_held)",
         "CREATE INDEX IF NOT EXISTS idx_scan_hot ON scan_records(game_key, is_catalog, is_archived, scan_date)",
         "CREATE INDEX IF NOT EXISTS idx_scan_album_hot ON scan_records(album_key, is_catalog, is_archived)",
     ]

@@ -47,7 +47,8 @@
             <div class="nav-tabs-minimal">
                 <a href="{{ url_for('import_page') }}" class="nav-tab">Import</a>
                 <a href="{{ url_for('inventory') }}" class="nav-tab">Inventory</a>
-                <a href="{{ url_for('albums_list') }}" class="nav-tab">Album</a>
+                <a href="{{ url_for('storage_list') }}" class="nav-tab">Storage</a>
+                <a href="{{ url_for('analytics_page') }}" class="nav-tab">Analytics</a>
                 <a href="{{ url_for('settings_page') }}" class="nav-tab" title="Settings"><i class="fas fa-gear"></i></a>
             </div>
         </div>
@@ -138,9 +139,9 @@
                 </a>
             </div>
             <div class="col-12 col-md-6">
-                <a href="{{ url_for('albums_list') }}" class="quick-link">
+                <a href="{{ url_for('storage_list') }}" class="quick-link">
                     <div class="ql-icon"><i class="fas fa-book"></i></div>
-                    <div><h6>Albums</h6><small>View cards by album page</small></div>
+                    <div><h6>Storage</h6><small>Albums and boxes</small></div>
                 </a>
             </div>
             <div class="col-12 col-md-6">

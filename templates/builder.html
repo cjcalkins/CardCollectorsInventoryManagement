@@ -39,7 +39,8 @@
             <div class="nav-tabs-minimal">
                 <a href="{{ url_for('import_page') }}" class="nav-tab">Import</a>
                 <a href="{{ url_for('inventory') }}" class="nav-tab">Inventory</a>
-                <a href="{{ url_for('albums_list') }}" class="nav-tab">Album</a>
+                <a href="{{ url_for('storage_list') }}" class="nav-tab">Storage</a>
+                <a href="{{ url_for('analytics_page') }}" class="nav-tab">Analytics</a>
                 <a href="{{ url_for('settings_page') }}" class="nav-tab"><i class="fas fa-gear"></i></a>
             </div>
         </div>
@@ -145,6 +146,7 @@
         const PULL_URL = '{{ url_for("builder_pull") }}';
         const INVENTORY_URL = '{{ url_for("inventory", game=game) }}';
         const BUILDER_URL = '{{ url_for("builder_page", game=game) }}';
+        const SOLD_URL = '{{ url_for("sold") }}';
         let MODE = 'pack';
         let LAST = { mode: null, result: null };
         let exported = false;
@@ -284,7 +286,7 @@
                 <div class="d-flex gap-2 flex-wrap">
                     <button class="btn btn-outline-primary" id="exportBtn" onclick="exportCsv()"><i class="fas fa-file-csv me-1"></i>Export CSV</button>
                     <button class="btn btn-outline-secondary" onclick="cancelPull()"><i class="fas fa-xmark me-1"></i>Cancel</button>
-                    <button class="btn btn-danger" id="pullBtn" onclick="confirmPull()"><i class="fas fa-hand-holding me-1"></i>Confirm pull</button>
+                    <button class="btn btn-warning" id="pullBtn" onclick="confirmPull()"><i class="fas fa-hand-holding me-1"></i>Confirm pull</button>
                 </div></div><div>${(badges||[]).join(' ')}</div>`;
         }
 
@@ -328,7 +330,7 @@
 
         function confirmPull() {
             const n = totalPicked();
-            if (!confirm(`Confirm pull?\n\nThis will permanently remove ${n} card(s) from your inventory (they've been pulled). This cannot be undone.` +
+            if (!confirm(`Confirm pull?\n\nThis marks ${n} card(s) as Sold and moves them to the Sold view. The entries are kept — nothing is deleted, and you can return them to Inventory from the Sold view.` +
                          (exported ? '' : '\n\nA CSV will be exported first.'))) return;
             const pullBtn = document.getElementById('pullBtn');
             pullBtn.disabled = true; pullBtn.innerHTML = '<i class="fas fa-circle-notch fa-spin me-1"></i>Pulling…';
@@ -336,7 +338,7 @@
                     body: JSON.stringify({ game: GAME, mode: LAST.mode, groups: buildGroups() }) })
                 .then(r => r.json())
                 .then(d => {
-                    if (d.status === 'success') showPulled(d.deleted);
+                    if (d.status === 'success') showPulled(d.moved);
                     else { alert(d.message || 'Pull failed.'); pullBtn.disabled=false; pullBtn.innerHTML='<i class="fas fa-hand-holding me-1"></i>Confirm pull'; }
                 });
             const chain = exported ? Promise.resolve() : exportCsv();
@@ -350,9 +352,10 @@
             confirmView.innerHTML = `<div class="panel text-center py-5">
                 <div style="font-size:2.5rem;color:#146c43;"><i class="fas fa-circle-check"></i></div>
                 <h3 class="mt-2">Pull complete</h3>
-                <p class="text-muted">${n} card(s) were exported and removed from inventory.</p>
+                <p class="text-muted">${n} card(s) were marked Sold and moved to the Sold view.</p>
                 <div class="d-flex gap-2 justify-content-center mt-3">
-                    <a href="${INVENTORY_URL}" class="btn btn-dark">Back to inventory</a>
+                    <a href="${SOLD_URL}" class="btn btn-dark">View Sold</a>
+                    <a href="${INVENTORY_URL}" class="btn btn-outline-secondary">Back to inventory</a>
                     <a href="${BUILDER_URL}" class="btn btn-outline-secondary">Build another</a>
                 </div></div>`;
         }

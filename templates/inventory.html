@@ -355,7 +355,8 @@
             <div class="nav-tabs-minimal">
                 <a href="{{ url_for('import_page') }}" class="nav-tab">Import</a>
                 <a href="{{ url_for('inventory') }}" class="nav-tab active">Inventory</a>
-                <a href="{{ url_for('albums_list') }}" class="nav-tab">Album</a>
+                <a href="{{ url_for('storage_list') }}" class="nav-tab">Storage</a>
+                <a href="{{ url_for('analytics_page') }}" class="nav-tab">Analytics</a>
                 <a href="{{ url_for('settings_page') }}" class="nav-tab" title="Settings"><i class="fas fa-gear"></i></a>
             </div>
         </div>
@@ -373,14 +374,24 @@
             </div>
         </div>
         {% endif %}
+        {% if sold_view %}
+        <div class="alert alert-secondary d-flex align-items-start gap-2 mb-3">
+            <i class="fas fa-hand-holding-dollar mt-1"></i>
+            <div>
+                <strong>Sold entries.</strong>
+                These are records whose <strong>Held</strong> flag is off — they've been sold and no longer
+                appear in your Inventory. Open one and toggle <strong>Held</strong> back on to return it to Inventory.
+            </div>
+        </div>
+        {% endif %}
         <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-3">
             <div>
                 <a href="{{ url_for('inventory') }}" class="text-muted small text-decoration-none d-inline-flex align-items-center mb-2">
-                    <i class="fas fa-chevron-left me-1" style="font-size:0.7rem;"></i>{{ 'Back to Inventory' if catalog_view else 'All Games' }}
+                    <i class="fas fa-chevron-left me-1" style="font-size:0.7rem;"></i>{{ 'Back to Inventory' if (catalog_view or sold_view) else 'All Games' }}
                 </a>
                 <h2 class="mb-0">
-                    <i class="fas {{ 'fa-box-archive' if catalog_view else 'fa-boxes-stacked' }} me-2"></i>
-                    {% if catalog_view %}Imported Catalog{% elif f_game %}{{ f_game }}{% else %}Inventory Records{% endif %}
+                    <i class="fas {{ 'fa-box-archive' if catalog_view else ('fa-hand-holding-dollar' if sold_view else 'fa-boxes-stacked') }} me-2"></i>
+                    {% if catalog_view %}Imported Catalog{% elif sold_view %}Sold{% elif f_game %}{{ f_game }}{% else %}Inventory Records{% endif %}
                 </h2>
             </div>
 
@@ -393,6 +404,11 @@
                 {% if not catalog_view %}
                 <a href="{{ url_for('duplicates') }}" class="btn btn-outline-warning">
                     <i class="fas fa-clone me-1"></i>Find Duplicates
+                </a>
+                {% endif %}
+                {% if not catalog_view and not sold_view %}
+                <a href="{{ url_for('sold') }}" class="btn btn-outline-secondary">
+                    <i class="fas fa-hand-holding-dollar me-1"></i>View Sold
                 </a>
                 {% endif %}
                 <button class="btn btn-outline-success" id="exportCsvBtn" type="button">
@@ -603,7 +619,10 @@
                                     {% endif %}
                                 </td>
                                 <td data-col-static="market_price" class="text-end">
-                                    {% set mp = record.extracted_data.get('tcgplayer', {}).get('prices', {}).get('market') %}
+                                    {# Same value as the detail page's "Current Value" (current_value):
+                                       auto-filled from the catalog market price on identification and
+                                       editable there, so the list and detail page always agree. #}
+                                    {% set mp = record.extracted_data.get('current_value') %}
                                     {% if mp is not none and mp != '' %}
                                     <span class="text-success fw-semibold">${{ "%.2f"|format(mp|float) }}</span>
                                     {% else %}

@@ -53,6 +53,10 @@ class ScanRecord(db.Model):
     is_finalized  = db.Column(db.Boolean, default=False, index=True)
     is_catalog    = db.Column(db.Boolean, default=False, index=True)
     is_archived   = db.Column(db.Boolean, default=False, index=True)
+    # "Held" = still in your possession (default). Cleared to False when an entry
+    # is sold, which moves it off the Inventory list and onto the Sold page.
+    # Mirrors extracted_data["held"]; NULL is treated as held (True) everywhere.
+    is_held       = db.Column(db.Boolean, default=True, index=True)
 
     __table_args__ = (
         # Serves the hot Inventory query: filter by game + owned/active, order by recency.

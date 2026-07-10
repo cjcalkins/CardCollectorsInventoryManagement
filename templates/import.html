@@ -896,7 +896,8 @@
           <div class="nav-tabs-minimal">
                 <a href="{{ url_for('import_page') }}" class="nav-tab active">Import</a>
                 <a href="{{ url_for('inventory') }}" class="nav-tab">Inventory</a>
-                <a href="{{ url_for('albums_list') }}" class="nav-tab">Album</a>
+                <a href="{{ url_for('storage_list') }}" class="nav-tab">Storage</a>
+                <a href="{{ url_for('analytics_page') }}" class="nav-tab">Analytics</a>
                 <a href="{{ url_for('settings_page') }}" class="nav-tab" title="Settings"><i class="fas fa-gear"></i></a>
             </div>
       </div>
@@ -945,8 +946,13 @@
               {% endif %}
             </div>
             <div class="field">
-              <label for="singleAlbum">Album <span style="font-weight:400;color:var(--muted);">(optional)</span></label>
+              <label for="singleAlbum">Storage <span style="font-weight:400;color:var(--muted);">(optional)</span></label>
               <input type="text" id="singleAlbum" name="album" placeholder="binder1">
+              <div class="edge-toggle" data-storage-group="single" style="margin-top:8px;">
+                <label class="active"><input type="radio" name="storage_type" value="album" checked><i class="fas fa-book"></i> Album</label>
+                <label><input type="radio" name="storage_type" value="box"><i class="fas fa-box-archive"></i> Box</label>
+              </div>
+              <div class="hint">Albums keep 3×3 pages; boxes number cards straight through with no pages.</div>
             </div>
             <div class="field">
               <label for="singleCollection">Collection <span style="font-weight:400;color:var(--muted);">(optional — tags cards bought together)</span></label>
@@ -1045,8 +1051,12 @@
                 {% endif %}
               </div>
               <div class="field">
-                <label for="album">Album</label>
+                <label for="album">Storage</label>
                 <input type="text" id="album" name="album" placeholder="binder1" required>
+                <div class="edge-toggle" data-storage-group="page" style="margin-top:8px;">
+                  <label class="active"><input type="radio" name="storage_type" value="album" checked><i class="fas fa-book"></i> Album</label>
+                  <label><input type="radio" name="storage_type" value="box"><i class="fas fa-box-archive"></i> Box</label>
+                </div>
               </div>
             </div>
 
@@ -1058,9 +1068,13 @@
             </div>
 
             <div class="grid-2">
-              <div class="field">
+              <div class="field" id="pageField">
                 <label for="page">Page</label>
                 <input type="number" id="page" name="page" min="1" step="1" placeholder="1" required>
+              </div>
+              <div class="field" id="boxNote" style="display:none;">
+                <label>Numbering</label>
+                <div class="hint" style="margin-top:0;">This is a <strong>box</strong> — cards are numbered straight through with no pages. Each scan continues from where the box left off.</div>
               </div>
               <div class="field">
                 <label>Card edges</label>
@@ -1246,6 +1260,43 @@
         });
       });
     });
+
+    // ── Storage type (Album vs Box) ──────────────────────────────────────────
+    // A Box hides the Page field and numbers cards straight through. The 9-pocket
+    // importer still keys each physical pocket by (game, storage, page, slot) so a
+    // card's front and back merge; for a box we quietly supply that "page" as the
+    // box's next sheet index (fetched from the server) instead of asking for it.
+    function storageTypeOf(groupName) {
+      const el = document.querySelector(`[data-storage-group="${groupName}"] input[type="radio"]:checked`);
+      return el ? el.value : 'album';
+    }
+    function batchStorageType()  { return storageTypeOf('page'); }
+    function singleStorageType() { return storageTypeOf('single'); }
+
+    function applyBatchStorageMode() {
+      const isBox     = batchStorageType() === 'box';
+      const pageField = document.getElementById('pageField');
+      const boxNote   = document.getElementById('boxNote');
+      const pageInput = document.getElementById('page');
+      if (pageField) pageField.style.display = isBox ? 'none' : '';
+      if (boxNote)   boxNote.style.display   = isBox ? '' : 'none';
+      if (pageInput) pageInput.required = !isBox;   // a hidden required field blocks submit
+    }
+    document.querySelectorAll('[data-storage-group="page"] input[type="radio"]')
+      .forEach(r => r.addEventListener('change', applyBatchStorageMode));
+    applyBatchStorageMode();
+
+    async function fetchNextStorageIndex(name) {
+      const clean = (name || '').trim();
+      if (!clean) return 1;
+      try {
+        const r = await fetch('/storage/next_index?name=' + encodeURIComponent(clean));
+        const d = await r.json();
+        return parseInt(d.next, 10) || 1;
+      } catch (e) {
+        return 1;   // safe fallback; server-side merge keys still hold within a batch
+      }
+    }
 
     // ====================== SINGLE CARD IMPORT ======================
     const singleCardForm     = document.getElementById('singleCardForm');
@@ -1687,7 +1738,13 @@
         }
         pdfPairIndex = 0;
         pdfSide = 'front';
-        pdfBasePage = parseInt(pageInput.value, 10) || 1;
+        // Box: start numbering from the box's next sheet index so a fresh PDF
+        // batch doesn't collide with sheets already scanned into this box.
+        if (batchStorageType() === 'box') {
+          pdfBasePage = await fetchNextStorageIndex(document.getElementById('album').value);
+        } else {
+          pdfBasePage = parseInt(pageInput.value, 10) || 1;
+        }
         pdfActive = true;
 
         setStatus(`Loaded a ${pageCount}-page PDF (${pdfPairs.length} pair(s)). Starting with page 1, front.`, 'success');
@@ -2353,6 +2410,7 @@
             template_name: templateName,
             filenames,
             collection: (document.getElementById('batchCollection')?.value || '').trim(),
+            storage_type: batchStorageType(),
           }),
         });
 
@@ -2479,6 +2537,13 @@
       // Once Auto-import starts on a PDF, keep chaining through every remaining
       // page automatically (see the img.onload handler).
       if (autoImport && pdfActive) autoImportChaining = true;
+
+      // Box + single image (not a PDF batch): supply the pocket page silently as
+      // the box's next sheet index, so front/back merge and successive imports
+      // keep incrementing rather than overwriting sheet 1.
+      if (!pdfActive && batchStorageType() === 'box') {
+        pageInput.value = await fetchNextStorageIndex(document.getElementById('album').value);
+      }
 
       const formData = new FormData(form);
       if (autoImport) {

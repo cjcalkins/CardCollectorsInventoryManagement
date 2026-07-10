@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <link rel="icon" type="image/jpeg" href="{{ url_for('static', filename='favicon.jpg') }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Analytics - Card Collector Inventory Manager</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+        body { background-color: #f8f9fa; }
+        .nav-tabs-minimal { display: flex; gap: 10px; margin-left: auto; }
+        .nav-tab {
+            padding: 8px 14px; text-decoration: none; border-radius: 8px;
+            background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.85);
+            font-weight: 600; transition: 0.2s ease;
+        }
+        .nav-tab:hover { background: rgba(255,255,255,0.18); color: #fff; }
+        .nav-tab.active { background: #fff; color: #212529; }
+        @media (max-width: 768px) {
+            .nav-tabs-minimal { margin-left: 0; margin-top: 12px; width: 100%; }
+            .nav-tab { flex: 1; text-align: center; }
+        }
+
+        .panel { background:#fff; border:1px solid #e9ecef; border-radius:14px; padding:1.25rem 1.4rem; box-shadow:0 3px 14px rgba(0,0,0,.05); margin-bottom:1.25rem; }
+        .panel h6.section { font-size:.72rem; text-transform:uppercase; letter-spacing:.06em; color:#6c757d; font-weight:700; margin-bottom:.6rem; }
+
+        .source-toggle { display:inline-flex; border:1px solid #ced4da; border-radius:10px; overflow:hidden; }
+        .source-toggle label { padding:.45rem .9rem; cursor:pointer; font-weight:600; font-size:.9rem; background:#fff; color:#495057; margin:0; }
+        .source-toggle label.active { background:#212529; color:#fff; }
+        .source-toggle input { display:none; }
+
+        .metric-grid { display:flex; flex-wrap:wrap; gap:.4rem .9rem; }
+        .metric-check { display:flex; align-items:center; gap:.35rem; font-size:.88rem; }
+
+        .stat-card { background:#fff; border:1px solid #e9ecef; border-radius:12px; padding:1rem 1.15rem; box-shadow:0 3px 14px rgba(0,0,0,.05); height:100%; }
+        .stat-num { font-size:1.5rem; font-weight:800; line-height:1.1; }
+        .stat-label { color:#6c757d; font-size:.8rem; }
+
+        .table-wrap { overflow-x:auto; }
+        table.analytics-table { width:100%; border-collapse:collapse; }
+        table.analytics-table th, table.analytics-table td { padding:.55rem .7rem; border-bottom:1px solid #eef1f4; font-size:.9rem; white-space:nowrap; }
+        table.analytics-table th { text-align:left; color:#495057; font-weight:700; background:#f8f9fa; position:sticky; top:0; }
+        table.analytics-table td.num, table.analytics-table th.num { text-align:right; font-variant-numeric:tabular-nums; }
+        table.analytics-table tr.total-row td { font-weight:800; border-top:2px solid #dee2e6; background:#f8f9fa; }
+        .muted-note { color:#6c757d; font-size:.82rem; }
+        .chart-box { position:relative; height:360px; }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+        <div class="container d-flex flex-wrap align-items-center">
+            <a class="navbar-brand" href="{{ url_for('index') }}">
+                <img src="{{ url_for('static', filename='favicon.jpg') }}" alt="logo" width="24" height="24" style="object-fit:cover;border-radius:4px;margin-right:0.5rem;" class="me-2">Card Collector Inventory Manager
+            </a>
+            <div class="nav-tabs-minimal">
+                <a href="{{ url_for('import_page') }}" class="nav-tab">Import</a>
+                <a href="{{ url_for('inventory') }}" class="nav-tab">Inventory</a>
+                <a href="{{ url_for('storage_list') }}" class="nav-tab">Storage</a>
+                <a href="{{ url_for('analytics_page') }}" class="nav-tab active">Analytics</a>
+                <a href="{{ url_for('settings_page') }}" class="nav-tab" title="Settings"><i class="fas fa-gear"></i></a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container py-5">
+        <div class="mb-4">
+            <h2 class="mb-1"><i class="fas fa-chart-line me-2"></i>Analytics</h2>
+            <div class="text-muted">Query your held and sold inventory, group by any field, and build dashboards and spreadsheets.</div>
+        </div>
+
+        <!-- ── Query builder ── -->
+        <div class="panel">
+            <div class="row g-4">
+                <div class="col-12 col-lg-3">
+                    <h6 class="section">Source</h6>
+                    <div class="source-toggle" id="sourceToggle">
+                        <label data-src="held"><input type="radio" name="src" value="held">Inventory</label>
+                        <label data-src="sold"><input type="radio" name="src" value="sold">Sold</label>
+                        <label data-src="all" class="active"><input type="radio" name="src" value="all" checked>Both</label>
+                    </div>
+                </div>
+                <div class="col-6 col-lg-3">
+                    <h6 class="section">Game</h6>
+                    <select id="gameSelect" class="form-select">
+                        <option value="">All games</option>
+                        {% for g in games %}
+                        <option value="{{ g.name }}">{{ g.name }} ({{ g.count }})</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="col-6 col-lg-3">
+                    <h6 class="section">Group by</h6>
+                    <select id="groupSelect" class="form-select">
+                        <option value="">— No grouping (totals) —</option>
+                        {% for d in dimensions %}
+                        <option value="{{ d.key }}" {% if d.key == 'game' %}selected{% endif %}>{{ d.label }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="col-12 col-lg-3">
+                    <h6 class="section">Search</h6>
+                    <input type="text" id="searchInput" class="form-control" placeholder="Filter by any text…">
+                </div>
+            </div>
+
+            <hr class="my-3">
+
+            <div class="row g-3 align-items-end">
+                <div class="col-12 col-lg-9">
+                    <h6 class="section mb-2">Metrics</h6>
+                    <div class="metric-grid" id="metricGrid">
+                        {% for key, label in metric_labels.items() %}
+                        <label class="metric-check">
+                            <input type="checkbox" value="{{ key }}"
+                                   {% if key == 'count' %}checked disabled{% endif %}
+                                   {% if key in ['sum_current_value','sum_sold_price'] %}checked{% endif %}>
+                            {{ label }}
+                        </label>
+                        {% endfor %}
+                    </div>
+                </div>
+                <div class="col-12 col-lg-3 d-flex gap-2 justify-content-lg-end">
+                    <button class="btn btn-dark" id="runBtn"><i class="fas fa-play me-1"></i>Run</button>
+                    <button class="btn btn-outline-success" id="exportBtn"><i class="fas fa-file-csv me-1"></i>Export CSV</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="statusLine" class="muted-note mb-3" style="display:none;"></div>
+
+        <!-- ── Summary stat cards ── -->
+        <div class="row g-3 mb-3" id="summaryCards" style="display:none;"></div>
+
+        <!-- ── Dashboard chart ── -->
+        <div class="panel" id="chartPanel" style="display:none;">
+            <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
+                <h6 class="section mb-0">Dashboard</h6>
+                <div class="d-flex gap-2">
+                    <select id="chartMetric" class="form-select form-select-sm" style="width:auto;"></select>
+                    <select id="chartType" class="form-select form-select-sm" style="width:auto;">
+                        <option value="bar">Bar</option>
+                        <option value="line">Line</option>
+                        <option value="doughnut">Doughnut</option>
+                    </select>
+                </div>
+            </div>
+            <div class="chart-box"><canvas id="mainChart"></canvas></div>
+            <div class="muted-note mt-2" id="chartNote"></div>
+        </div>
+
+        <!-- ── Data table (spreadsheet) ── -->
+        <div class="panel" id="tablePanel" style="display:none;">
+            <h6 class="section">Spreadsheet</h6>
+            <div class="table-wrap">
+                <table class="analytics-table" id="dataTable">
+                    <thead><tr id="tableHead"></tr></thead>
+                    <tbody id="tableBody"></tbody>
+                    <tfoot id="tableFoot"></tfoot>
+                </table>
+            </div>
+        </div>
+
+        <div class="alert alert-light border" id="emptyState" style="display:none;">
+            No matching entries. Try a different source, game, or search.
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        const QUERY_URL  = '{{ url_for("analytics_query") }}';
+        const EXPORT_URL = '{{ url_for("analytics_export") }}';
+        const MONEY_METRICS = new Set(Object.keys({{ metric_labels | tojson }}).filter(k => k !== 'count'));
+        const METRIC_LABELS = {{ metric_labels | tojson }};
+        let chart = null;
+        let LAST = null;
+
+        // Source toggle active state
+        document.querySelectorAll('#sourceToggle label').forEach(l => {
+            l.addEventListener('click', () => {
+                document.querySelectorAll('#sourceToggle label').forEach(x => x.classList.remove('active'));
+                l.classList.add('active');
+                l.querySelector('input').checked = true;
+            });
+        });
+
+        function selectedMetrics() {
+            const out = [];
+            document.querySelectorAll('#metricGrid input[type="checkbox"]').forEach(cb => {
+                if (cb.checked) out.push(cb.value);
+            });
+            if (!out.includes('count')) out.unshift('count');
+            return out;
+        }
+
+        function currentParams() {
+            const src = document.querySelector('#sourceToggle input:checked').value;
+            return {
+                source: src,
+                game: document.getElementById('gameSelect').value,
+                group_by: document.getElementById('groupSelect').value,
+                search: document.getElementById('searchInput').value.trim(),
+                metrics: selectedMetrics(),
+            };
+        }
+
+        function fmt(key, val) {
+            if (key === 'count') return (val || 0).toLocaleString();
+            return '$' + Number(val || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+        }
+
+        async function run() {
+            const btn = document.getElementById('runBtn');
+            btn.disabled = true; btn.innerHTML = '<i class="fas fa-circle-notch fa-spin me-1"></i>Running…';
+            const status = document.getElementById('statusLine');
+            try {
+                const res = await fetch(QUERY_URL, {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(currentParams())
+                });
+                const d = await res.json();
+                if (d.status !== 'success') throw new Error(d.message || 'Query failed.');
+                LAST = d;
+                render(d);
+            } catch (e) {
+                status.style.display = 'block';
+                status.textContent = 'Error: ' + e.message;
+            } finally {
+                btn.disabled = false; btn.innerHTML = '<i class="fas fa-play me-1"></i>Run';
+            }
+        }
+
+        function render(d) {
+            const groupBy = document.getElementById('groupSelect');
+            const groupLabel = groupBy.options[groupBy.selectedIndex].text.replace(/ —.*/, '') || 'Group';
+
+            document.getElementById('statusLine').style.display = 'block';
+            document.getElementById('statusLine').textContent =
+                d.record_count.toLocaleString() + ' matching entr' + (d.record_count === 1 ? 'y' : 'ies')
+                + ' · ' + d.group_count.toLocaleString() + ' group' + (d.group_count === 1 ? '' : 's');
+
+            const hasRows = d.rows.length > 0;
+            document.getElementById('emptyState').style.display = hasRows ? 'none' : 'block';
+            document.getElementById('chartPanel').style.display = hasRows ? 'block' : 'none';
+            document.getElementById('tablePanel').style.display = hasRows ? 'block' : 'none';
+
+            // Summary cards: record count + each selected metric's grand total
+            const cards = document.getElementById('summaryCards');
+            cards.style.display = hasRows ? 'flex' : 'none';
+            let cardHtml = statCard('Entries', d.record_count.toLocaleString(), 'fa-database');
+            d.metrics.forEach(m => {
+                if (m.key === 'count') return;
+                cardHtml += statCard(m.label, fmt(m.key, d.totals[m.key]), 'fa-coins');
+            });
+            cards.innerHTML = cardHtml;
+
+            if (!hasRows) { if (chart) { chart.destroy(); chart = null; } return; }
+
+            // Table
+            const head = document.getElementById('tableHead');
+            head.innerHTML = '<th>' + escapeHtml(groupLabel) + '</th>' +
+                d.metrics.map(m => '<th class="num">' + escapeHtml(m.label) + '</th>').join('');
+            document.getElementById('tableBody').innerHTML = d.rows.map(r =>
+                '<tr><td>' + escapeHtml(r.group) + '</td>' +
+                d.metrics.map(m => '<td class="num">' + fmt(m.key, r.values[m.key]) + '</td>').join('') +
+                '</tr>').join('');
+            document.getElementById('tableFoot').innerHTML =
+                '<tr class="total-row"><td>Total</td>' +
+                d.metrics.map(m => '<td class="num">' + fmt(m.key, d.totals[m.key]) + '</td>').join('') + '</tr>';
+
+            // Chart metric dropdown (only the metrics that are in this result)
+            const cm = document.getElementById('chartMetric');
+            const prevSel = cm.value;
+            cm.innerHTML = d.metrics.map(m => '<option value="' + m.key + '">' + escapeHtml(m.label) + '</option>').join('');
+            const defaultMetric = d.metrics.find(m => m.key !== 'count') || d.metrics[0];
+            cm.value = d.metrics.some(m => m.key === prevSel) ? prevSel : defaultMetric.key;
+
+            drawChart();
+        }
+
+        function drawChart() {
+            if (!LAST) return;
+            const metricKey = document.getElementById('chartMetric').value;
+            const type = document.getElementById('chartType').value;
+            const rows = LAST.rows.slice(0, 20);   // top 20 groups keep it readable
+            const labels = rows.map(r => r.group);
+            const data = rows.map(r => r.values[metricKey]);
+            const label = (LAST.metrics.find(m => m.key === metricKey) || {}).label || metricKey;
+
+            const palette = labels.map((_, i) => `hsl(${(i * 47) % 360} 62% 55%)`);
+            const isCircular = type === 'doughnut';
+
+            if (chart) chart.destroy();
+            chart = new Chart(document.getElementById('mainChart'), {
+                type,
+                data: {
+                    labels,
+                    datasets: [{
+                        label,
+                        data,
+                        backgroundColor: isCircular ? palette : 'rgba(33,37,41,0.85)',
+                        borderColor: isCircular ? '#fff' : 'rgba(33,37,41,1)',
+                        borderWidth: isCircular ? 2 : 1,
+                        fill: type === 'line' ? false : true,
+                        tension: 0.25,
+                    }]
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: { legend: { display: isCircular } },
+                    scales: isCircular ? {} : { y: { beginAtZero: true } }
+                }
+            });
+            document.getElementById('chartNote').textContent =
+                LAST.rows.length > 20 ? 'Showing the top 20 of ' + LAST.rows.length + ' groups.' : '';
+        }
+
+        function statCard(label, value, icon) {
+            return '<div class="col-6 col-md-3"><div class="stat-card">'
+                + '<div class="text-muted mb-1"><i class="fas ' + icon + ' me-1"></i></div>'
+                + '<div class="stat-num">' + value + '</div>'
+                + '<div class="stat-label">' + escapeHtml(label) + '</div></div></div>';
+        }
+
+        function escapeHtml(s) {
+            return String(s).replace(/[&<>"']/g, c => (
+                {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+        }
+
+        async function exportCsv() {
+            const btn = document.getElementById('exportBtn');
+            const original = btn.innerHTML;
+            btn.disabled = true; btn.innerHTML = '<i class="fas fa-circle-notch fa-spin me-1"></i>Exporting…';
+            try {
+                const res = await fetch(EXPORT_URL, {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(currentParams())
+                });
+                if (!res.ok) throw new Error('export failed');
+                const cd = res.headers.get('Content-Disposition') || '';
+                const m = cd.match(/filename="?([^"]+)"?/);
+                const blob = await res.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url; a.download = m ? m[1] : 'analytics.csv';
+                document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+            } catch (e) {
+                alert('Export failed: ' + e.message);
+            } finally {
+                btn.disabled = false; btn.innerHTML = original;
+            }
+        }
+
+        document.getElementById('runBtn').addEventListener('click', run);
+        document.getElementById('exportBtn').addEventListener('click', exportCsv);
+        document.getElementById('chartMetric').addEventListener('change', drawChart);
+        document.getElementById('chartType').addEventListener('change', drawChart);
+        // Run once on load with the defaults.
+        run();
+    </script>
+</body>
+</html>

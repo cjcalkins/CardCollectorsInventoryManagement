@@ -8,85 +8,208 @@
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <style>
-        body { background-color: #f8f9fa; }
-
-        .nav-tabs-minimal { display: flex; gap: 10px; margin-left: auto; }
-        .nav-tab {
-            padding: 8px 14px; text-decoration: none; border-radius: 8px;
-            background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.85);
-            font-weight: 600; transition: 0.2s ease;
+        body {
+            background: #f8f9fa;
         }
-        .nav-tab:hover { background: rgba(255,255,255,0.18); color: #fff; }
-        .nav-tab.active { background: #fff; color: #212529; }
+
+        /* ── Nav ── */
+        .nav-tabs-minimal {
+            display: flex;
+            gap: 10px;
+            margin-left: auto;
+        }
+        .nav-tab {
+            padding: 8px 14px;
+            text-decoration: none;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.08);
+            color: rgba(255, 255, 255, 0.85);
+            font-weight: 600;
+            transition: 0.2s ease;
+        }
+        .nav-tab:hover {
+            background: rgba(255, 255, 255, 0.18);
+            color: #fff;
+        }
+        .nav-tab.active {
+            background: #fff;
+            color: #212529;
+        }
         @media (max-width: 768px) {
             .nav-tabs-minimal { margin-left: 0; margin-top: 12px; width: 100%; }
             .nav-tab { flex: 1; text-align: center; }
         }
 
-        /* ── Settings sidebar layout ── */
-        .settings-layout { display: flex; align-items: flex-start; }
-        .settings-sidebar {
-            flex: 0 0 240px; align-self: stretch;
-            position: sticky; top: 0;
-            min-height: calc(100vh - 56px);
-            background: #fff; border-right: 1px solid #dee2e6;
-            padding: 1rem .75rem; z-index: 1000;
+        /* ── Section header (Albums / Boxes) ── */
+        .storage-section-head {
+            display: flex; align-items: center; gap: .6rem;
+            font-size: .78rem; font-weight: 700; text-transform: uppercase;
+            letter-spacing: .06em; color: #6c757d;
+            margin: 2rem 0 1rem;
         }
-        .settings-sidebar .ss-title {
-            font-size: .72rem; text-transform: uppercase; letter-spacing: .06em;
-            color: #6c757d; padding: .4rem .75rem .6rem; font-weight: 700;
-        }
-        .settings-sidebar a.ss-link {
-            display: flex; align-items: center; gap: .65rem;
-            padding: .6rem .75rem; margin-bottom: 3px; border-radius: 8px;
-            color: #343a40; text-decoration: none; font-weight: 600; font-size: .92rem;
-        }
-        .settings-sidebar a.ss-link:hover { background: #f1f3f5; color: #212529; }
-        .settings-sidebar a.ss-link.active { background: #212529; color: #fff; }
-        .settings-sidebar a.ss-link i { width: 18px; text-align: center; font-size: .95rem; }
-        .settings-content { flex: 1 1 auto; min-width: 0; }
-        @media (max-width: 991px) {
-            .settings-layout { flex-direction: column; }
-            .settings-sidebar {
-                position: static; flex: none; width: 100%; min-height: 0;
-                border-right: none; border-bottom: 1px solid #dee2e6;
-                display: flex; gap: 6px; overflow-x: auto; padding: .5rem;
-            }
-            .settings-sidebar .ss-title { display: none; }
-            .settings-sidebar a.ss-link { white-space: nowrap; margin-bottom: 0; }
+        .storage-section-head:first-of-type { margin-top: .5rem; }
+        .storage-section-head .count-pill {
+            font-size: .72rem; font-weight: 700; color: #495057;
+            background: #e9ecef; border-radius: 999px; padding: 1px 9px;
         }
 
-        /* ── Storage cards ── */
-        .storage-card {
-            background: #fff; border: 1px solid #e9ecef; border-radius: 14px;
-            padding: 1.25rem 1.35rem; margin-bottom: 1.1rem;
-            box-shadow: 0 3px 14px rgba(0,0,0,0.05);
+        /* ── Storage card wrapper ── */
+        .storage-card-wrap {
+            display: flex;
+            flex-direction: column;
+            text-decoration: none;
+            color: inherit;
+            border-radius: 14px;
+            box-shadow: 0 4px 18px rgba(0,0,0,0.08);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+            overflow: hidden;
+            position: relative;
         }
-        .storage-head { display: flex; align-items: flex-start; gap: 1rem; }
-        .storage-head .sc-icon {
-            flex-shrink: 0; width: 44px; height: 44px; border-radius: 11px;
-            display: flex; align-items: center; justify-content: center;
-            background: linear-gradient(135deg, #343a40 0%, #495057 100%);
-            color: #fff; font-size: 1.05rem;
+        .storage-card-wrap:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 24px rgba(0,0,0,0.14);
+            color: inherit;
         }
-        .storage-card h5 { font-size: 1.02rem; font-weight: 700; margin-bottom: .15rem; }
-        .storage-card .desc { font-size: .85rem; color: #6c757d; margin-bottom: 0; }
-        .path-line {
-            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-            font-size: .82rem; background: #f1f3f5; border-radius: 8px;
-            padding: .5rem .7rem; margin-top: .5rem; word-break: break-all; color: #212529;
+
+        /* ── Image area — 3:4 ratio ── */
+        .storage-img-area {
+            position: relative;
+            width: 100%;
+            aspect-ratio: 3 / 4;
+            background: #e9ecef;
+            overflow: hidden;
+            border-radius: 14px 14px 0 0;
         }
-        .meta-pills { display: flex; flex-wrap: wrap; gap: 6px; margin-top: .55rem; }
-        .meta-pill {
-            font-size: .74rem; font-weight: 600; border-radius: 20px;
-            padding: 3px 10px; background: #e9ecef; color: #495057;
+        .storage-img-area img.storage-bg {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
         }
-        .meta-pill.shared { background: #fff3cd; color: #7a5b00; }
-        .move-row { margin-top: .85rem; }
-        .move-status { font-size: .84rem; margin-top: .5rem; min-height: 1.1em; }
-        .move-status.err { color: #b02a37; }
-        .move-status.ok  { color: #146c43; }
-        .move-status.warn{ color: #7a5b00; }
+        /* Placeholder shown when no custom image */
+        .storage-placeholder {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: #212529;
+            color: #fff;
+            padding: 1.5rem;
+            gap: 0.75rem;
+        }
+        /* Boxes get a subtly different placeholder tone so the two kinds read
+           apart at a glance even before you notice the badge. */
+        .storage-placeholder.is-box {
+            background: #2b2f5c;
+        }
+        .storage-placeholder .storage-icon {
+            font-size: 2rem;
+            opacity: 0.7;
+        }
+        .storage-placeholder .storage-meta-inner {
+            text-align: center;
+        }
+        .storage-placeholder h5 {
+            font-size: 1rem;
+            font-weight: 700;
+            margin-bottom: 0.25rem;
+        }
+        .storage-placeholder p {
+            font-size: 0.8rem;
+            margin-bottom: 0.2rem;
+            opacity: 0.75;
+        }
+        .game-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 5px;
+            justify-content: center;
+            margin-top: 0.5rem;
+        }
+        .game-tag {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.2rem 0.55rem;
+            border-radius: 999px;
+            background: rgba(255,255,255,0.15);
+            color: #fff;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        /* ── Type badge (top-left over the image) ── */
+        .type-badge {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            z-index: 3;
+            display: inline-flex;
+            align-items: center;
+            gap: .35rem;
+            font-size: .72rem;
+            font-weight: 700;
+            letter-spacing: .02em;
+            padding: 4px 9px;
+            border-radius: 999px;
+            color: #fff;
+            background: rgba(0,0,0,0.55);
+            backdrop-filter: blur(2px);
+        }
+        .type-badge.box { background: rgba(58,64,140,0.85); }
+
+        /* ── Camera button (hover reveals) ── */
+        .storage-img-btn {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            width: 34px;
+            height: 34px;
+            border-radius: 50%;
+            background: rgba(0,0,0,0.55);
+            border: none;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            opacity: 0;
+            transition: opacity 0.18s ease, background 0.18s ease;
+            cursor: pointer;
+            z-index: 3;
+        }
+        .storage-img-btn i { font-size: 0.85rem; color: #fff; }
+        .storage-card-wrap:hover .storage-img-btn { opacity: 1; }
+        .storage-img-btn:hover { background: rgba(0,0,0,0.78); }
+        input.storage-img-input { display: none; }
+
+        /* ── Name label below the image ── */
+        .storage-name-label {
+            background: #fff;
+            border-top: 1px solid #dee2e6;
+            padding: 10px 14px;
+            font-size: 0.95rem;
+            font-weight: 700;
+            color: #212529;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            border-radius: 0 0 14px 14px;
+        }
+
+        /* ── Upload spinner overlay ── */
+        .upload-spinner {
+            display: none;
+            position: absolute;
+            inset: 0;
+            background: rgba(0,0,0,0.45);
+            align-items: center;
+            justify-content: center;
+            z-index: 4;
+            border-radius: 14px 14px 0 0;
+        }
+        .upload-spinner.active { display: flex; }
+        .upload-spinner i { font-size: 1.6rem; color: #fff; animation: spin 0.8s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
     </style>
 </head>
 <body>
@@ -99,128 +222,208 @@
             <div class="nav-tabs-minimal">
                 <a href="{{ url_for('import_page') }}" class="nav-tab">Import</a>
                 <a href="{{ url_for('inventory') }}" class="nav-tab">Inventory</a>
-                <a href="{{ url_for('albums_list') }}" class="nav-tab">Album</a>
-                <a href="{{ url_for('settings_page') }}" class="nav-tab active" title="Settings"><i class="fas fa-gear"></i></a>
+                <a href="{{ url_for('storage_list') }}" class="nav-tab active">Storage</a>
+                <a href="{{ url_for('analytics_page') }}" class="nav-tab">Analytics</a>
+                <a href="{{ url_for('settings_page') }}" class="nav-tab" title="Settings"><i class="fas fa-gear"></i></a>
             </div>
         </div>
     </nav>
 
-    <div class="settings-layout">
-        {% set ss_active = 'storage' %}{% include '_settings_sidebar.html' %}
-        <main class="settings-content">
-            <div class="container py-5">
-                <div class="mb-4">
-                    <h2 class="mb-1"><i class="fas fa-hard-drive me-2"></i>Storage locations</h2>
-                    <div class="text-muted">
-                        Move sizable files and folders to another drive or directory. Existing data is
-                        copied to the new location and the originals are removed. Paths may be absolute
-                        (e.g. <code>/mnt/usb/cards</code>) or relative to the program folder.
-                    </div>
-                </div>
+    <div class="container py-5">
+        <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-3">
+            <div>
+                <h2 class="mb-1"><i class="fas fa-box-open me-2"></i>Storage</h2>
+                <div class="text-muted">Your albums and boxes. Albums keep 3×3 pages; boxes number cards straight through.</div>
+            </div>
+            <a href="{{ url_for('import_page') }}" class="btn btn-primary">
+                <i class="fas fa-file-import me-1"></i>Import cards
+            </a>
+        </div>
 
-                <div class="alert alert-light border d-flex align-items-start gap-2" style="font-size:.85rem;">
-                    <i class="fas fa-circle-info mt-1 text-secondary"></i>
-                    <div>
-                        Locations are saved in <code>{{ config_path }}</code>. Make sure the target drive is
-                        mounted and stays connected — the app reads and writes these paths while running.
-                    </div>
-                </div>
+        {% set albums = containers | selectattr('is_box', 'equalto', false) | list %}
+        {% set boxes  = containers | selectattr('is_box', 'equalto', true)  | list %}
 
-                {% for slot in slots %}
-                <div class="storage-card" id="card-{{ slot.key }}">
-                    <div class="storage-head">
-                        <div class="sc-icon">
-                            <i class="fas {{ 'fa-database' if slot.key == 'db' else ('fa-clock' if slot.key == 'temp' else ('fa-vector-square' if slot.key == 'roi' else 'fa-images')) }}"></i>
-                        </div>
-                        <div class="flex-grow-1">
-                            <h5>{{ slot.title }}</h5>
-                            <p class="desc">{{ slot.description }}</p>
-                            <div class="path-line" id="path-{{ slot.key }}">{{ slot.path }}</div>
-                            <div class="meta-pills">
-                                <span class="meta-pill" id="size-{{ slot.key }}"><i class="fas fa-weight-hanging me-1"></i>{{ slot.size_human }}</span>
-                                <span class="meta-pill"><i class="fas fa-hdd me-1"></i>{{ slot.free_human }} free</span>
-                                {% if slot.shared_with_images %}
-                                <span class="meta-pill shared"><i class="fas fa-link me-1"></i>shares the image folder by default</span>
+        {% macro storage_card(item, loop_index) %}
+            <div class="col-6 col-md-4 col-lg-3">
+                <div class="storage-card-wrap"
+                     id="storage-card-{{ loop_index }}"
+                     data-storage="{{ item.name | e }}"
+                     data-index="{{ loop_index }}">
+
+                    <!-- Clickable image area -->
+                    <a href="{{ url_for('storage_detail', name=item.name) }}"
+                       class="storage-img-area" id="storage-img-area-{{ loop_index }}">
+
+                        <span class="type-badge {{ 'box' if item.is_box else 'album' }}">
+                            <i class="fas {{ 'fa-box-archive' if item.is_box else 'fa-book' }}"></i>
+                            {{ 'Box' if item.is_box else 'Album' }}
+                        </span>
+
+                        <!-- Placeholder (shown by default, hidden when image loaded) -->
+                        <div class="storage-placeholder {{ 'is-box' if item.is_box else '' }}"
+                             id="storage-placeholder-{{ loop_index }}"
+                             {% if item.image_url %}style="display:none;"{% endif %}>
+                            <div class="storage-icon">
+                                <i class="fas {{ 'fa-box-archive' if item.is_box else 'fa-book-open' }}"></i>
+                            </div>
+                            <div class="storage-meta-inner">
+                                <h5>{{ item.name }}</h5>
+                                <p>{{ item.count }} card{{ '' if item.count == 1 else 's' }}</p>
+                                <p>
+                                    {% if item.latest_scan %}
+                                        {{ item.latest_scan.strftime('%Y-%m-%d') }}
+                                    {% else %}
+                                        No scans yet
+                                    {% endif %}
+                                </p>
+                                {% if item.games %}
+                                    <div class="game-tags">
+                                        {% for game in item.games %}
+                                            <span class="game-tag">{{ game }}</span>
+                                        {% endfor %}
+                                    </div>
                                 {% endif %}
                             </div>
                         </div>
-                    </div>
 
-                    <div class="move-row">
-                        <label class="form-label small fw-semibold mb-1">New location</label>
-                        <div class="input-group">
-                            <input type="text" class="form-control" id="input-{{ slot.key }}"
-                                   value="{{ slot.path }}"
-                                   placeholder="{{ '/path/to/inventory.db' if slot.key == 'db' else '/path/to/folder' }}">
-                            <button class="btn btn-dark" type="button"
-                                    onclick="moveSlot('{{ slot.key }}')" id="btn-{{ slot.key }}">
-                                <i class="fas fa-arrow-right-arrow-left me-1"></i>Move
-                            </button>
+                        <!-- Custom image (hidden until set) -->
+                        <img src="{{ item.image_url or '' }}" alt="{{ item.name }}" class="storage-bg"
+                             id="storage-bg-{{ loop_index }}"
+                             {% if not item.image_url %}style="display:none;"{% endif %}>
+
+                        <!-- Upload spinner -->
+                        <div class="upload-spinner" id="storage-spinner-{{ loop_index }}">
+                            <i class="fas fa-circle-notch"></i>
                         </div>
-                        <div class="move-status" id="status-{{ slot.key }}"></div>
-                    </div>
+                    </a>
+
+                    <!-- Camera button sits over the image area -->
+                    <button class="storage-img-btn"
+                            onclick="triggerStorageImageUpload(event, '{{ item.name | e }}', {{ loop_index }})"
+                            title="Set custom image">
+                        <i class="fas fa-camera"></i>
+                    </button>
+
+                    <!-- File input — no accept restriction so any image type works -->
+                    <input type="file"
+                           class="storage-img-input"
+                           id="storage-img-input-{{ loop_index }}"
+                           onchange="handleStorageImageUpload(event, '{{ item.name | e }}', {{ loop_index }})">
+
+                    <!-- Name label always shown below image -->
+                    <a href="{{ url_for('storage_detail', name=item.name) }}"
+                       class="storage-name-label"
+                       style="text-decoration:none;">
+                        {{ item.name }}
+                    </a>
                 </div>
+            </div>
+        {% endmacro %}
+
+        {% if albums %}
+            <div class="storage-section-head">
+                <i class="fas fa-book"></i> Albums <span class="count-pill">{{ albums | length }}</span>
+            </div>
+            <div class="row g-4">
+                {% for item in albums %}
+                    {{ storage_card(item, loop.index) }}
                 {% endfor %}
             </div>
-        </main>
+        {% endif %}
+
+        {% if boxes %}
+            <div class="storage-section-head">
+                <i class="fas fa-box-archive"></i> Boxes <span class="count-pill">{{ boxes | length }}</span>
+            </div>
+            <div class="row g-4">
+                {% for item in boxes %}
+                    {{ storage_card(item, (albums | length) + loop.index) }}
+                {% endfor %}
+            </div>
+        {% endif %}
+
+        {% if not containers %}
+            <div class="alert alert-light border mt-4">
+                Nothing in storage yet. On the <a href="{{ url_for('import_page') }}">Import</a> page, give a card a
+                storage name and choose <strong>Album</strong> (3×3 pages) or <strong>Box</strong> (numbered straight through) —
+                it will show up here.
+            </div>
+        {% endif %}
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-        function setStatus(key, text, kind) {
-            const el = document.getElementById('status-' + key);
-            el.className = 'move-status' + (kind ? ' ' + kind : '');
-            el.textContent = text || '';
+        function storageKey(name) {
+            return 'storage_card_img_url__' + name;
         }
 
-        function moveSlot(key) {
-            const input = document.getElementById('input-' + key);
-            const btn   = document.getElementById('btn-' + key);
-            const path  = (input.value || '').trim();
-            if (!path) { setStatus(key, 'Enter a new path first.', 'err'); return; }
+        function showStorageImage(index, imageUrl) {
+            const placeholder = document.getElementById('storage-placeholder-' + index);
+            const bg          = document.getElementById('storage-bg-' + index);
+            if (!bg) return;
 
-            const confirmMsg = key === 'db'
-                ? 'Copy the database to the new location? You will need to restart the app to switch to it.'
-                : 'Move this data to the new location? Existing files are copied and the originals deleted.';
-            if (!confirm(confirmMsg)) return;
-
-            const original = btn.innerHTML;
-            btn.disabled = true;
-            btn.innerHTML = '<i class="fas fa-circle-notch fa-spin me-1"></i>Moving…';
-            setStatus(key, 'Working…', '');
-
-            const body = new FormData();
-            body.append('slot', key);
-            body.append('path', path);
-
-            fetch('{{ url_for("storage_update") }}', { method: 'POST', body })
-                .then(r => r.json().then(d => ({ ok: r.ok, d })))
-                .then(({ ok, d }) => {
-                    btn.disabled = false;
-                    btn.innerHTML = original;
-                    if (!ok || d.status !== 'success') {
-                        setStatus(key, d.message || 'Move failed.', 'err');
-                        return;
-                    }
-                    setStatus(key, d.message, d.needs_restart ? 'warn' : 'ok');
-                    // Refresh sizes/paths from the returned status.
-                    if (d.slots) {
-                        d.slots.forEach(s => {
-                            const p = document.getElementById('path-' + s.key);
-                            const z = document.getElementById('size-' + s.key);
-                            const i = document.getElementById('input-' + s.key);
-                            if (p) p.textContent = s.path;
-                            if (z) z.innerHTML = '<i class="fas fa-weight-hanging me-1"></i>' + s.size_human;
-                            if (i && s.key !== key) i.value = s.path;
-                        });
-                    }
-                })
-                .catch(err => {
-                    btn.disabled = false;
-                    btn.innerHTML = original;
-                    setStatus(key, 'Request failed: ' + err, 'err');
-                });
+            bg.src = imageUrl;
+            bg.style.display = 'block';
+            if (placeholder) placeholder.style.display = 'none';
         }
+
+        function triggerStorageImageUpload(e, name, index) {
+            e.preventDefault();
+            e.stopPropagation();
+            document.getElementById('storage-img-input-' + index).click();
+        }
+
+        function handleStorageImageUpload(e, name, index) {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const spinner = document.getElementById('storage-spinner-' + index);
+            if (spinner) spinner.classList.add('active');
+
+            const formData = new FormData();
+            formData.append('storage_name', name);
+            formData.append('image', file);
+
+            fetch('{{ url_for("storage_upload_image") }}', {
+                method: 'POST',
+                body: formData
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (spinner) spinner.classList.remove('active');
+                if (data.status === 'success') {
+                    // Cache the server URL — just a short string, safe on mobile.
+                    try { localStorage.setItem(storageKey(name), data.url); } catch(err) {}
+                    showStorageImage(index, data.url);
+                } else {
+                    alert('Upload failed: ' + (data.message || 'Unknown error'));
+                }
+            })
+            .catch(err => {
+                if (spinner) spinner.classList.remove('active');
+                console.error('Upload error:', err);
+                alert('Upload failed. Please try again.');
+            });
+
+            // Reset input so the same file can be re-selected if needed
+            e.target.value = '';
+        }
+
+        // On page load: the server already rendered images that exist on disk.
+        // localStorage is checked only as a fast-path cache for images the server
+        // might not know about yet (race condition edge case).
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('[data-storage]').forEach(function(card) {
+                const name  = card.getAttribute('data-storage');
+                const index = card.getAttribute('data-index');
+                const bg    = document.getElementById('storage-bg-' + index);
+                // If the server already provided an image src, nothing to do.
+                if (bg && bg.src && !bg.src.endsWith('/') && bg.style.display !== 'none') return;
+                // Otherwise try localStorage as a fallback cache.
+                const saved = localStorage.getItem(storageKey(name));
+                if (saved) showStorageImage(index, saved);
+            });
+        });
     </script>
 </body>
 </html>
