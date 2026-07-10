@@ -623,7 +623,9 @@
     }
 
     /* ── OCR Progress Overlay ── */
-    #ocrProgressOverlay {
+    #ocrProgressOverlay,
+    #pdfLoadOverlay,
+    #stepOverlay {
       display: none;
       position: fixed;
       inset: 0;
@@ -633,8 +635,55 @@
       justify-content: center;
     }
 
-    #ocrProgressOverlay.visible {
+    #ocrProgressOverlay.visible,
+    #pdfLoadOverlay.visible,
+    #stepOverlay.visible {
       display: flex;
+    }
+
+    /* Spinner for the per-step "what is happening now" window. */
+    .step-spinner {
+      width: 48px;
+      height: 48px;
+      border-radius: 50%;
+      border: 4px solid #dbeafe;
+      border-top-color: #2563eb;
+      animation: stepSpin 0.9s linear infinite;
+    }
+    @keyframes stepSpin { to { transform: rotate(360deg); } }
+
+    .step-list {
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      text-align: left;
+    }
+    .step-list-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .step-list-item .marker {
+      width: 16px;
+      text-align: center;
+      flex: none;
+    }
+    .step-list-item.active { color: var(--text); font-weight: 700; }
+    .step-list-item.done   { color: #16a34a; }
+
+    /* Indeterminate sweep for the "reading PDF" phase, before a page count /
+       per-page progress is known. */
+    .ocr-progress-fill.indeterminate {
+      width: 40% !important;
+      transition: none;
+      animation: pdfIndeterminate 1.1s ease-in-out infinite;
+    }
+    @keyframes pdfIndeterminate {
+      0%   { margin-left: -40%; }
+      100% { margin-left: 100%; }
     }
 
     .ocr-progress-dialog {
@@ -1109,6 +1158,38 @@
     </div>
   </div>
 
+  <!-- PDF Loading Overlay — shown while a PDF is opened and while each page is
+       rasterised on demand, one page at a time. -->
+  <div id="pdfLoadOverlay">
+    <div class="ocr-progress-dialog">
+      <div class="ocr-progress-icon">📄</div>
+      <div class="ocr-progress-title">Loading PDF</div>
+      <div id="pdfLoadSub" class="ocr-progress-sub">Reading PDF…</div>
+      <div class="ocr-progress-track">
+        <div id="pdfLoadFill" class="ocr-progress-fill indeterminate"></div>
+      </div>
+      <div id="pdfLoadCount" class="ocr-progress-count"></div>
+    </div>
+  </div>
+
+  <!-- Per-step Progress Window — tells the user which step of the (auto-)import
+       pipeline is running right now: loading the page into the preview, cutting
+       it into 9, and aligning/cropping. Filing to inventory uses the OCR overlay
+       below. -->
+  <div id="stepOverlay">
+    <div class="ocr-progress-dialog">
+      <div class="step-spinner"></div>
+      <div class="ocr-progress-title" id="stepTitle">Auto-Import</div>
+      <div id="stepSub" class="ocr-progress-sub">Working…</div>
+      <div class="step-list">
+        <div class="step-list-item" data-step="load"><span class="marker">•</span><span>Loading page into preview</span></div>
+        <div class="step-list-item" data-step="cut"><span class="marker">•</span><span>Cutting page into 9 cards</span></div>
+        <div class="step-list-item" data-step="align"><span class="marker">•</span><span>Aligning &amp; cropping cards</span></div>
+        <div class="step-list-item" data-step="file"><span class="marker">•</span><span>Identifying &amp; filing to inventory</span></div>
+      </div>
+    </div>
+  </div>
+
   <div id="manualModal" class="manual-modal">
     <div class="manual-dialog">
       <div class="manual-head">
@@ -1406,6 +1487,8 @@
     let pdfSide = 'front';   // 'front' or 'back' — which half of the pair is loaded
     let pdfBasePage = 1;     // page number assigned to pair 0
     let pdfActive = false;
+    let pdfBatchId = null;   // server batch id from /pdf_open (for on-demand render)
+    let pdfPageCount = 0;    // total pages in the opened PDF
 
     // Auto-import chaining: set true once the user presses "Split and Process"
     // while Auto-import is on and a PDF batch is active, so that each subsequent
@@ -1430,15 +1513,124 @@
       return new File([blob], filename, { type: mimeType || blob.type || 'image/png' });
     }
 
+    // ── PDF loading bar ─────────────────────────────────────────────────
+    const pdfLoadOverlay = document.getElementById('pdfLoadOverlay');
+    const pdfLoadSub     = document.getElementById('pdfLoadSub');
+    const pdfLoadFill    = document.getElementById('pdfLoadFill');
+    const pdfLoadCount   = document.getElementById('pdfLoadCount');
+
+    // done/total omitted -> indeterminate sweep (used while opening the PDF).
+    function showPdfLoad(message, done, total) {
+      pdfLoadSub.textContent = message || 'Loading PDF…';
+      if (typeof total === 'number' && total > 0) {
+        const pct = Math.max(0, Math.min(100, Math.round((done / total) * 100)));
+        pdfLoadFill.classList.remove('indeterminate');
+        pdfLoadFill.style.width = pct + '%';
+        pdfLoadCount.textContent = `Page ${done} / ${total}`;
+      } else {
+        pdfLoadFill.classList.add('indeterminate');
+        pdfLoadFill.style.width = '';
+        pdfLoadCount.textContent = '';
+      }
+      pdfLoadOverlay.classList.add('visible');
+    }
+
+    function hidePdfLoad() {
+      pdfLoadOverlay.classList.remove('visible');
+    }
+
+    // ── Per-step progress window ────────────────────────────────────────
+    // A single overlay that names the step currently running during import
+    // (loading the page into the preview, cutting, aligning/cropping). The
+    // filing step continues to use the OCR overlay. The little checklist
+    // highlights the active step and ticks off completed ones.
+    const stepOverlay = document.getElementById('stepOverlay');
+    const stepTitle   = document.getElementById('stepTitle');
+    const stepSub     = document.getElementById('stepSub');
+    const stepItems   = stepOverlay ? [...stepOverlay.querySelectorAll('.step-list-item')] : [];
+    // Pipeline order used to mark earlier steps done and the current one active.
+    const STEP_ORDER  = ['load', 'cut', 'align', 'file'];
+
+    function markStep(activeKey) {
+      const activeIdx = STEP_ORDER.indexOf(activeKey);
+      stepItems.forEach(item => {
+        const idx = STEP_ORDER.indexOf(item.dataset.step);
+        item.classList.remove('active', 'done');
+        const marker = item.querySelector('.marker');
+        if (activeIdx >= 0 && idx < activeIdx) {
+          item.classList.add('done');
+          if (marker) marker.textContent = '✓';
+        } else if (idx === activeIdx) {
+          item.classList.add('active');
+          if (marker) marker.textContent = '▶';
+        } else if (marker) {
+          marker.textContent = '•';
+        }
+      });
+    }
+
+    // Show the step window for `stepKey` with a sub-message. Seamlessly replaces
+    // the PDF loader overlay if it was up (no flash to the page behind).
+    function showStep(stepKey, sub, title) {
+      if (!stepOverlay) return;
+      if (title) stepTitle.textContent = title;
+      stepSub.textContent = sub || '';
+      markStep(stepKey);
+      pdfLoadOverlay.classList.remove('visible');
+      stepOverlay.classList.add('visible');
+    }
+
+    function hideStep() {
+      if (stepOverlay) stepOverlay.classList.remove('visible');
+    }
+
+    // Best-effort: tell the server to drop the saved upload when we're done.
+    function closePdfBatchOnServer() {
+      if (!pdfBatchId) return;
+      const id = pdfBatchId;
+      try {
+        fetch('/pdf_close', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ batch_id: id }),
+          keepalive: true,
+        });
+      } catch (e) { /* cleanup is best-effort */ }
+    }
+
+    // Rasterise one page on demand (front = odd page, back = even page). The
+    // page objects start life with only an `index`; this fills in filename/url.
+    async function ensurePageRendered(pageObj) {
+      if (!pageObj) return null;
+      if (pageObj.url) return pageObj;
+      const res = await fetch('/pdf_render_page', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ batch_id: pdfBatchId, index: pageObj.index }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.status !== 'success' || !data.page) {
+        throw new Error(data.message || `Could not render PDF page ${pageObj.index}.`);
+      }
+      pageObj.filename = data.page.filename;
+      pageObj.url = data.page.url;
+      return pageObj;
+    }
+
     function resetPdfBatchState() {
+      closePdfBatchOnServer();
       pdfPairs = [];
       pdfPairIndex = 0;
       pdfSide = 'front';
       pdfBasePage = 1;
       pdfActive = false;
+      pdfBatchId = null;
+      pdfPageCount = 0;
       autoImportChaining = false;
       sideField.value = 'front';
       pdfBatchBar.classList.remove('show');
+      hidePdfLoad();
+      hideStep();
     }
 
     function updatePdfBatchBar() {
@@ -1457,35 +1649,55 @@
       resultsGrid.innerHTML = '';
       ocrResults.innerHTML = '';
       runBatchOcrBtn.disabled = true;
-      setStatus('Extracting pages from PDF…', 'info');
+
+      // Clear any previous batch (also closes its server upload) before opening
+      // the new one, so pdfBatchId/pairs never leak between selections.
+      resetPdfBatchState();
+
+      // Loading bar while the PDF is opened. Opening only reads the page count —
+      // pages themselves are rendered one at a time, on demand, below.
+      showPdfLoad('Reading PDF…');
+      setStatus('Opening PDF…', 'info');
 
       const fd = new FormData();
       fd.append('pdf', file);
 
       try {
-        const res = await fetch('/pdf_extract_pages', { method: 'POST', body: fd });
+        const res = await fetch('/pdf_open', { method: 'POST', body: fd });
         const data = await res.json();
         if (!res.ok || data.status !== 'success') {
-          throw new Error(data.message || 'Could not extract PDF pages.');
+          throw new Error(data.message || 'Could not open PDF.');
         }
 
-        const pages = data.pages || [];
-        if (!pages.length) throw new Error('PDF had no pages.');
+        const pageCount = data.page_count || 0;
+        if (!pageCount) throw new Error('PDF had no pages.');
 
+        pdfBatchId   = data.batch_id;
+        pdfPageCount = pageCount;
+
+        // Odd pages are fronts, even pages are backs: pair up (1,2), (3,4), ...
+        // Pages carry only their index for now; each is rasterised the moment
+        // the batch reaches it (see loadPdfCurrentImage -> ensurePageRendered).
         pdfPairs = [];
-        for (let i = 0; i < pages.length; i += 2) {
-          pdfPairs.push({ front: pages[i], back: pages[i + 1] || null });
+        for (let p = 1; p <= pageCount; p += 2) {
+          pdfPairs.push({
+            front: { index: p, filename: null, url: null },
+            back:  (p + 1 <= pageCount) ? { index: p + 1, filename: null, url: null } : null,
+          });
         }
         pdfPairIndex = 0;
         pdfSide = 'front';
         pdfBasePage = parseInt(pageInput.value, 10) || 1;
         pdfActive = true;
 
-        setStatus(`Loaded ${pages.length} page(s) as ${pdfPairs.length} pair(s). Starting with pair 1, front.`, 'success');
+        setStatus(`Loaded a ${pageCount}-page PDF (${pdfPairs.length} pair(s)). Starting with page 1, front.`, 'success');
+        // loadPdfCurrentImage renders page 1 (updating this same loading bar),
+        // then hides it once the page is ready to process.
         await loadPdfCurrentImage();
       } catch (err) {
         console.error(err);
-        setStatus(err.message || 'PDF extraction failed.', 'error');
+        hidePdfLoad();
+        setStatus(err.message || 'PDF could not be opened.', 'error');
         resetPdfBatchState();
       }
     }
@@ -1494,7 +1706,8 @@
       if (!pdfActive) return;
 
       if (pdfPairIndex >= pdfPairs.length) {
-        setStatus('PDF batch complete — all pairs processed.', 'success');
+        hidePdfLoad();
+        setStatus('PDF batch complete — all pages processed.', 'success');
         resetPdfBatchState();
         window.location.reload();
         return;
@@ -1520,14 +1733,38 @@
       runBatchOcrBtn.disabled = true;
       document.querySelector('.canvas-panel').style.display = '';
 
-      setStatus(`Loading pair ${pdfPairIndex + 1} of ${pdfPairs.length} — ${pdfSide} (PDF page ${pageObj.index})…`, 'info');
+      // Rasterise THIS page on demand (one page at a time) with a loading bar,
+      // then load it into the splitter. Cached pages return instantly.
+      try {
+        if (!pageObj.url) {
+          showPdfLoad(`Rendering page ${pageObj.index} of ${pdfPageCount}…`, pageObj.index, pdfPageCount);
+          await ensurePageRendered(pageObj);
+        }
+      } catch (err) {
+        console.error(err);
+        hidePdfLoad();
+        setStatus(err.message || 'Could not render PDF page.', 'error');
+        return;
+      }
+
+      setStatus(`Loading page ${pdfBasePage + pdfPairIndex} — ${pdfSide} (PDF page ${pageObj.index} of ${pdfPageCount})…`, 'info');
 
       try {
         const file = await urlToFile(pageObj.url, pageObj.filename, 'image/png');
         setImageInputFile(file);
+        // Auto-import chains straight into cutting, so keep a progress window up
+        // (seamlessly replacing the PDF render bar) telling the user what's
+        // happening. Manual mode instead reveals the preview for review.
+        if (autoImportCheckbox.checked && autoImportChaining) {
+          showStep('load', `Loading PDF page ${pageObj.index} into preview…`, 'Auto-Import');
+        } else {
+          hidePdfLoad();
+        }
         loadSelectedImage();
       } catch (err) {
         console.error(err);
+        hidePdfLoad();
+        hideStep();
         setStatus('Could not load page image from PDF.', 'error');
       }
     }
@@ -1754,6 +1991,10 @@
         const img = new Image();
         img.onload = function () {
           loadedImage = img;
+          const autoChaining = pdfActive && autoImportChaining && autoImportCheckbox.checked;
+          // Keep the progress window visible while the page paints into the
+          // preview so the user always sees the current step.
+          if (autoChaining) showStep('load', 'Loading page into preview…', 'Auto-Import');
           // Automatically place the cut lines on the white gaps between the
           // cards. This sets the sliders and redraws the preview; the user can
           // still fine-tune afterwards. autoDetectCutLines sets its own status.
@@ -1764,7 +2005,7 @@
           // very first page never auto-fires — the user starts the run by
           // pressing "Split and Process" — because autoImportChaining is only
           // set once that button has been pressed.)
-          if (pdfActive && autoImportChaining && autoImportCheckbox.checked) {
+          if (autoChaining) {
             runSplitAndProcess();
           }
         };
@@ -2051,6 +2292,8 @@
       ocrProgressFill.style.width  = '0%';
       ocrProgressSub.textContent   = '';
       ocrProgressCount.textContent = '0 / 9';
+      // Hand off from the per-step window to the filing progress bar.
+      hideStep();
       ocrProgressOverlay.classList.add('visible');
     }
 
@@ -2256,6 +2499,8 @@
           : 'Step 1/2 — Uploading and splitting page into 9 images...',
         'info'
       );
+      // In auto-import, keep the step window up so the user sees the phase.
+      if (autoImport) showStep('cut', 'Cutting page into 9 cards…', 'Auto-Import');
 
       const canvasPanel = document.querySelector('.canvas-panel');
 
@@ -2274,6 +2519,7 @@
             : 'Step 2/2 — Running edge detection and card alignment...',
           'info'
         );
+        if (autoImport) showStep('align', 'Aligning & cropping cards…', 'Auto-Import');
 
         const data = await response.json();
         if (!response.ok || data.status !== 'success') {
@@ -2323,10 +2569,12 @@
         }
 
         setStatus(data.message || 'Import completed successfully.', 'success');
+        hideStep();
       } catch (err) {
         console.error(err);
         // Ensure canvas is restored so the user can adjust cut lines and retry.
         canvasPanel.style.display = '';
+        hideStep();
         setStatus(err.message || 'Something went wrong during import.', 'error');
       }
     }

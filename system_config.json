@@ -1,4 +1,6 @@
 {
   "mode": "sorting_machine",
-  "unlimited_native_import": true
+  "unlimited_native_import": true,
+  "ximilar_fallback_enabled": true,
+  "identify_provider": "cardsight"
 }

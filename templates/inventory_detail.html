@@ -433,6 +433,64 @@
             z-index: 9999;
         }
         .layout-saved-toast.show { opacity: 1; transform: translateY(0); }
+        /* ── Manual re-align (four-point) modal ── */
+        .realign-modal {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(15, 23, 42, 0.78);
+            z-index: 12000;
+            padding: 24px;
+        }
+        .realign-modal.open { display: block; }
+        .realign-dialog {
+            background: #fff;
+            max-width: 1000px;
+            height: 90vh;
+            margin: 0 auto;
+            border-radius: 16px;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            box-shadow: 0 20px 60px rgba(0,0,0,.35);
+        }
+        .realign-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+        .realign-title { font-size: 20px; font-weight: 700; }
+        .realign-legend {
+            display: flex;
+            gap: 14px;
+            flex-wrap: wrap;
+            font-size: 13px;
+            color: #6c757d;
+        }
+        .realign-legend .dot {
+            display: inline-block;
+            width: 11px; height: 11px;
+            border-radius: 50%;
+            margin-right: 5px;
+            vertical-align: middle;
+        }
+        .realign-shell {
+            flex: 1;
+            min-height: 0;
+            overflow: auto;
+            border: 1px solid #dee2e6;
+            border-radius: 14px;
+            background: #eef3f8;
+            padding: 14px;
+            display: flex;
+            align-items: flex-start;
+            justify-content: center;
+        }
+        #realignCanvas { cursor: crosshair; max-width: 100%; touch-action: none; }
+        .realign-actions { display: flex; gap: 10px; flex-wrap: wrap; }
     </style>
 </head>
 <body>
@@ -518,6 +576,11 @@
                                         <i class="fas fa-image me-1"></i>{{ 'Update' if record.image_path and record.image_path != '__blank__' else 'Add' }} Front
                                     </button>
                                 </form>
+                                {% if record.image_path and record.image_path != '__blank__' %}
+                                <button type="button" class="btn btn-sm btn-outline-secondary w-100 mt-2 realign-btn" data-side="front">
+                                    <i class="fas fa-crop-simple me-1"></i>Realign Front
+                                </button>
+                                {% endif %}
                             </div>
                             <div class="col-6">
                                 <div class="fw-semibold small text-muted mb-2">Back</div>
@@ -537,6 +600,11 @@
                                         <i class="fas fa-image me-1"></i>{{ 'Update' if record.image_path_back else 'Add' }} Back
                                     </button>
                                 </form>
+                                {% if record.image_path_back %}
+                                <button type="button" class="btn btn-sm btn-outline-secondary w-100 mt-2 realign-btn" data-side="back">
+                                    <i class="fas fa-crop-simple me-1"></i>Realign Back
+                                </button>
+                                {% endif %}
                             </div>
                         </div>
 
@@ -933,10 +1001,16 @@
                             correction.
                         </p>
                         <div class="form-check mb-3">
-                            <input class="form-check-input" type="checkbox" id="ocrCatalogOnly" checked>
+                            <input class="form-check-input" type="checkbox" id="ocrCatalogOnly">
                             <label class="form-check-label small" for="ocrCatalogOnly">
-                                Match against imported catalog only
+                                Match against imported catalog only (skip online identification)
                             </label>
+                            <div class="form-text small mt-1">
+                                Left unchecked (default), when the local catalog can’t match the card the front
+                                image is sent to your selected identification service (Settings → General:
+                                CardSight or Ximilar) to read it. Check this to stay fully local and never call
+                                the online service.
+                            </div>
                         </div>
                         <button class="jtcg-fetch-btn" id="ocrIdentifyBtn">
                             <i class="fas fa-crosshairs me-1"></i>Read Card &amp; Find Matches
@@ -1100,6 +1174,35 @@
             <span class="img-lightbox-zoom-pct" id="imgLightboxZoomPct">100%</span>
             <button type="button" id="imgLightboxZoomIn" title="Zoom in"><i class="fas fa-plus"></i></button>
             <button type="button" id="imgLightboxReset" title="Reset"><i class="fas fa-compress"></i></button>
+        </div>
+    </div>
+
+    <!-- Manual re-align (four-point corner) modal — mirrors the import page. -->
+    <div id="realignModal" class="realign-modal">
+        <div class="realign-dialog">
+            <div class="realign-head">
+                <div class="realign-title"><i class="fas fa-crop-simple me-2"></i><span id="realignTitleText">Re-align Image</span></div>
+                <button type="button" class="btn btn-sm btn-outline-secondary" id="realignCloseBtn">Close</button>
+            </div>
+            <div class="text-muted small">
+                Click the four corners of the card in any order (top-left, top-right, bottom-right, bottom-left),
+                then press <strong>Apply Re-alignment</strong>. The image is straightened and cropped to those corners.
+            </div>
+            <div class="realign-legend">
+                <span><span class="dot" style="background:red"></span>1</span>
+                <span><span class="dot" style="background:orange"></span>2</span>
+                <span><span class="dot" style="background:green"></span>3</span>
+                <span><span class="dot" style="background:blue"></span>4</span>
+            </div>
+            <div class="realign-shell">
+                <canvas id="realignCanvas"></canvas>
+            </div>
+            <div id="realignStatus"></div>
+            <div class="realign-actions">
+                <button type="button" class="btn btn-primary" id="realignApplyBtn"><i class="fas fa-check me-1"></i>Apply Re-alignment</button>
+                <button type="button" class="btn btn-outline-secondary" id="realignClearBtn">Clear Points</button>
+                <button type="button" class="btn btn-outline-danger" id="realignCancelBtn">Cancel</button>
+            </div>
         </div>
     </div>
 
@@ -2271,8 +2374,10 @@
             if (!c) return null;
             if (c.source === 'reference' && c.product_id != null) return { reference_product_id: c.product_id };
             if (c.record_id != null) return { source_record_id: c.record_id };
-            // Ximilar fallback candidate — apply its raw fields (name/number/set/rarity).
-            if (c.source === 'ximilar') return { name: c.name, number: c.serial, set: c.set, rarity: c.rarity };
+            // External provider candidate (Ximilar / CardSight) — apply its raw
+            // fields (name/number/set/rarity).
+            if (c.source === 'ximilar' || c.source === 'cardsight')
+                return { name: c.name, number: c.serial, set: c.set, rarity: c.rarity };
             return null;
         }
 
@@ -2381,9 +2486,10 @@
                     const pct     = Math.round((c.score || 0) * 100);
                     const numPill = c.serial_match
                         ? `<span class="ocr-num-pill"><i class="fas fa-hashtag me-1"></i>number match</span>` : '';
-                    if (c.source === 'ximilar') {
-                        // Ximilar fallback read — applied via its raw name/number/set/rarity.
+                    if (c.source === 'ximilar' || c.source === 'cardsight') {
+                        // External provider read — applied via its raw name/number/set/rarity.
                         const meta = [c.set, c.rarity, c.serial].filter(Boolean).map(esc).join(' · ');
+                        const provLabel = esc(c.provider_label || (c.source === 'cardsight' ? 'CardSight' : 'Ximilar'));
                         return `
                             <div class="jtcg-picker-item" data-raw="1"
                                  data-raw-name="${esc(c.name)}" data-raw-number="${esc(c.serial)}"
@@ -2391,7 +2497,7 @@
                                 <input type="radio" class="jtcg-picker-radio" name="ocrPick">
                                 <div>
                                     <div class="jtcg-picker-name">${esc(c.name || '(unnamed)')}
-                                        <span class="ocr-src-pill ocr-src-ref"><i class="fas fa-robot me-1"></i>via Ximilar</span> ${numPill}</div>
+                                        <span class="ocr-src-pill ocr-src-ref"><i class="fas fa-robot me-1"></i>via ${provLabel}</span> ${numPill}</div>
                                     <div class="jtcg-picker-meta">${meta || '&nbsp;'}</div>
                                 </div>
                                 <span class="jtcg-picker-price">${pct}%</span>
@@ -2436,6 +2542,150 @@
                 resetBtn();
                 status.innerHTML = `<div class="alert alert-danger mb-0">Network error: ${esc(err.message)}</div>`;
             }
+        });
+    })();
+    </script>
+
+    <!-- ==================== MANUAL RE-ALIGN (four-point) ==================== -->
+    <script>
+    (function () {
+        const modal = document.getElementById('realignModal');
+        if (!modal) return;
+
+        const REALIGN_RECORD_ID = {{ record.id }};
+        const canvas    = document.getElementById('realignCanvas');
+        const ctx       = canvas.getContext('2d');
+        const titleText = document.getElementById('realignTitleText');
+        const statusEl  = document.getElementById('realignStatus');
+        const applyBtn  = document.getElementById('realignApplyBtn');
+        const clearBtn  = document.getElementById('realignClearBtn');
+        const closeBtn  = document.getElementById('realignCloseBtn');
+        const cancelBtn = document.getElementById('realignCancelBtn');
+
+        let img = null;      // full-res source image
+        let scale = 1;       // canvas px / image px
+        let points = [];     // corner points in IMAGE pixel coordinates
+        let side = 'front';
+
+        function baseSrc(el) {
+            // Drop any ?t= cache-buster so we load the stored file itself.
+            return (el.getAttribute('src') || '').split('?')[0];
+        }
+
+        function openRealign(sideName) {
+            side = sideName === 'back' ? 'back' : 'front';
+            const imgEl = document.getElementById(side === 'back' ? 'recordImageBack' : 'recordImageFront');
+            if (!imgEl) return;
+
+            points = [];
+            statusEl.innerHTML = '';
+            titleText.textContent = side === 'back' ? 'Re-align Back Image' : 'Re-align Front Image';
+
+            img = new Image();
+            img.onload = function () {
+                const maxW = 900, maxH = 600;
+                scale = Math.min(maxW / img.naturalWidth, maxH / img.naturalHeight, 1) || 1;
+                canvas.width  = Math.max(1, Math.round(img.naturalWidth  * scale));
+                canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+                redraw();
+                modal.classList.add('open');
+            };
+            img.onerror = function () {
+                statusEl.innerHTML = '<div class="alert alert-danger mb-0">Could not load the image to re-align.</div>';
+                modal.classList.add('open');
+            };
+            img.src = baseSrc(imgEl) + '?t=' + Date.now();
+        }
+
+        function closeRealign() {
+            modal.classList.remove('open');
+            img = null; points = []; scale = 1;
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+        }
+
+        function redraw() {
+            if (!img) return;
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+            if (points.length === 4) {
+                ctx.beginPath();
+                points.forEach((pt, i) => {
+                    const x = pt.x * scale, y = pt.y * scale;
+                    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+                });
+                ctx.closePath();
+                ctx.lineWidth = 2;
+                ctx.strokeStyle = 'rgba(37, 99, 235, 0.9)';
+                ctx.stroke();
+            }
+
+            points.forEach((pt, idx) => {
+                const x = pt.x * scale, y = pt.y * scale;
+                const color = ['red', 'orange', 'green', 'blue'][idx] || 'purple';
+                ctx.beginPath();
+                ctx.arc(x, y, 9, 0, Math.PI * 2);
+                ctx.fillStyle = color; ctx.fill();
+                ctx.lineWidth = 2; ctx.strokeStyle = 'white'; ctx.stroke();
+                ctx.fillStyle = 'white'; ctx.font = 'bold 12px Arial';
+                ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+                ctx.fillText(String(idx + 1), x, y);
+            });
+        }
+
+        canvas.addEventListener('click', function (e) {
+            if (!img || points.length >= 4) return;
+            // Map the click back to image pixels, accounting for any CSS scaling
+            // of the canvas (e.g. on narrow screens).
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width  / rect.width;
+            const scaleY = canvas.height / rect.height;
+            const cx = (e.clientX - rect.left) * scaleX;
+            const cy = (e.clientY - rect.top)  * scaleY;
+            points.push({ x: cx / scale, y: cy / scale });
+            redraw();
+        });
+
+        clearBtn.addEventListener('click', function () { points = []; redraw(); });
+        closeBtn.addEventListener('click', closeRealign);
+        cancelBtn.addEventListener('click', closeRealign);
+        modal.addEventListener('click', function (e) { if (e.target === modal) closeRealign(); });
+        document.addEventListener('keydown', function (e) {
+            if (modal.classList.contains('open') && e.key === 'Escape') closeRealign();
+        });
+
+        applyBtn.addEventListener('click', async function () {
+            if (points.length !== 4) {
+                statusEl.innerHTML = '<div class="alert alert-warning mb-0">Please click exactly 4 corners.</div>';
+                return;
+            }
+            applyBtn.disabled = true;
+            const prev = applyBtn.innerHTML;
+            applyBtn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Applying…';
+            statusEl.innerHTML = '';
+            try {
+                const res = await fetch(`/realign_record_image/${REALIGN_RECORD_ID}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ side, points }),
+                });
+                const data = await res.json();
+                if (!res.ok || data.status !== 'success') {
+                    throw new Error(data.message || 'Re-alignment failed.');
+                }
+                const imgEl = document.getElementById(side === 'back' ? 'recordImageBack' : 'recordImageFront');
+                if (imgEl && data.image_url) imgEl.src = data.image_url + '?t=' + Date.now();
+                statusEl.innerHTML = `<div class="alert alert-success mb-0">${data.message || 'Re-aligned.'} Reloading…</div>`;
+                setTimeout(() => window.location.reload(), 700);
+            } catch (err) {
+                statusEl.innerHTML = `<div class="alert alert-danger mb-0">${err.message || 'Re-alignment failed.'}</div>`;
+                applyBtn.disabled = false;
+                applyBtn.innerHTML = prev;
+            }
+        });
+
+        document.querySelectorAll('.realign-btn').forEach(function (btn) {
+            btn.addEventListener('click', function () { openRealign(btn.dataset.side); });
         });
     })();
     </script>

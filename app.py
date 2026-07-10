@@ -26,7 +26,7 @@ from models import (db, Product, ScanRecord, ShopConnection, Listing, EmailMonit
 from dotenv import load_dotenv
 load_dotenv()
 
-# PyMuPDF is used to rasterize uploaded PDF pages (see /pdf_extract_pages).
+# PyMuPDF is used to rasterize uploaded PDF pages (see /pdf_open + /pdf_render_page).
 # Import is optional at module load time so the rest of the app keeps working
 # even on installs that haven't run `pip install PyMuPDF` yet — the PDF
 # import route will just report a clear error instead of crashing the app.
@@ -181,7 +181,10 @@ apply_storage_config(STORAGE)
 # ---------------------------------------------------------------------------- #
 SYSTEM_CONFIG_PATH = os.path.join(BASE_DIR, "system_config.json")
 VALID_MODES = ("sorting_machine", "dedicated_server")
-SYSTEM = {"mode": None, "unlimited_native_import": False, "ximilar_fallback_enabled": True}
+# External card-identification providers used when local OCR/catalog lookup fails.
+VALID_IDENTIFY_PROVIDERS = ("none", "ximilar", "cardsight")
+SYSTEM = {"mode": None, "unlimited_native_import": False,
+          "ximilar_fallback_enabled": True, "identify_provider": "ximilar"}
 
 # Minimum swap required before the operator may enable unlimited-native import
 # (rendering full-resolution scans can need multiple GB per page).
@@ -193,13 +196,16 @@ def load_system_config():
         with open(SYSTEM_CONFIG_PATH, "r", encoding="utf-8") as fh:
             data = json.load(fh) or {}
         mode = data.get("mode")
+        prov = data.get("identify_provider")
         return {
             "mode": mode if mode in VALID_MODES else None,
             "unlimited_native_import": bool(data.get("unlimited_native_import", False)),
             "ximilar_fallback_enabled": bool(data.get("ximilar_fallback_enabled", True)),
+            "identify_provider": prov if prov in VALID_IDENTIFY_PROVIDERS else None,
         }
     except (OSError, ValueError):
-        return {"mode": None, "unlimited_native_import": False, "ximilar_fallback_enabled": True}
+        return {"mode": None, "unlimited_native_import": False,
+                "ximilar_fallback_enabled": True, "identify_provider": None}
 
 
 def save_system_config():
@@ -209,6 +215,7 @@ def save_system_config():
             "mode": SYSTEM["mode"],
             "unlimited_native_import": bool(SYSTEM.get("unlimited_native_import", False)),
             "ximilar_fallback_enabled": bool(SYSTEM.get("ximilar_fallback_enabled", True)),
+            "identify_provider": _identify_provider(),
         }, fh, indent=2)
     os.replace(tmp, SYSTEM_CONFIG_PATH)
 
@@ -273,6 +280,40 @@ def _ximilar_fallback_on():
 def set_ximilar_fallback(enabled):
     SYSTEM["ximilar_fallback_enabled"] = bool(enabled)
     save_system_config()
+
+
+def _identify_provider():
+    """Which external identification service to use when the local OCR/catalog
+    lookup fails: 'ximilar', 'cardsight', or 'none'. This is the single control
+    for both the import auto-identify and the manual inventory-detail identify.
+    Env IDENTIFY_PROVIDER overrides the stored setting. Falls back to the legacy
+    ximilar on/off toggle when no explicit provider has been chosen yet."""
+    env = os.environ.get("IDENTIFY_PROVIDER")
+    if env is not None:
+        env = env.strip().lower()
+        return env if env in VALID_IDENTIFY_PROVIDERS else "none"
+    val = SYSTEM.get("identify_provider")
+    if val in VALID_IDENTIFY_PROVIDERS:
+        return val
+    # Legacy config (before the provider selector existed): derive from the old
+    # Ximilar on/off toggle so existing installs keep their behaviour.
+    return "ximilar" if SYSTEM.get("ximilar_fallback_enabled", True) else "none"
+
+
+def set_identify_provider(provider):
+    provider = str(provider or "").strip().lower()
+    if provider not in VALID_IDENTIFY_PROVIDERS:
+        raise ValueError("invalid identification provider")
+    SYSTEM["identify_provider"] = provider
+    # Keep the legacy Ximilar toggle in sync so any old code/UI that still reads
+    # it stays consistent (on unless the provider is 'none').
+    SYSTEM["ximilar_fallback_enabled"] = (provider != "none")
+    save_system_config()
+
+
+def _identify_provider_label(provider=None):
+    return {"ximilar": "Ximilar", "cardsight": "CardSight", "none": "None"}.get(
+        provider or _identify_provider(), "None")
 
 
 _pi_cache = {"v": None}
@@ -376,6 +417,13 @@ KNOWN_API_KEYS = [
         "label": "Ximilar API Token",
         "description": "Image-based card recognition (Search by Image / photo ID).",
         "docs": "https://www.ximilar.com",
+    },
+    {
+        "key": "CARDSIGHT_API_KEY",
+        "label": "CardSight AI API Key",
+        "description": "Image-based card identification with a free tier (750 calls/month, no credit card). "
+                       "Used when 'CardSight' is the selected identification service.",
+        "docs": "https://cardsight.ai/documentation",
     },
     {
         "key": "POKEMONTCG_API_KEY",
@@ -1597,9 +1645,9 @@ def auto_identify_record(record, min_score=AUTO_IDENTIFY_MIN_SCORE):
     for m in rec_matches:
         m["source"] = "record"
 
-    # Best first; reference matches precede record matches on ties (listed first
-    # and Python's sort is stable), so a confident catalog hit wins — it carries
-    # set/rarity/TCGplayer data a bare record match can't.
+    # Best first; reference (catalog) matches precede record matches on ties
+    # (listed first and Python's sort is stable), so a confident catalog hit wins
+    # — it carries set/rarity/TCGplayer data a bare record match can't.
     combined = sorted(ref_matches + rec_matches, key=lambda c: c.get("score", 0), reverse=True)
     top = combined[0] if combined else None
 
@@ -1607,44 +1655,62 @@ def auto_identify_record(record, min_score=AUTO_IDENTIFY_MIN_SCORE):
         out["score"] = top.get("score")
         out["name"] = top.get("name", "")
 
-    # 1) Identity fields — applied when the top match clears min_score (60%).
-    if top is not None and float(top.get("score", 0) or 0) >= float(min_score) - 1e-9:
-        applied = _apply_ocr_candidate(record, top)
+    min_ok        = float(min_score) - 1e-9
+    ref_top       = ref_matches[0] if ref_matches else None   # already sorted desc
+    ref_top_score = float(ref_top.get("score", 0) or 0) if ref_top else 0.0
+
+    # 1) Prefer a confident CATALOG (reference) match — authoritative, and it
+    #    carries set/rarity/price/type. This is the "local identification" that
+    #    gates the Ximilar fallback in 1b.
+    if ref_top is not None and ref_top_score >= min_ok:
+        applied = _apply_ocr_candidate(record, ref_top)
         if applied:
             out["identified"] = True
             out["reason"] = "applied"
             out["applied"] = applied
+            top = ref_top
         else:
             out["reason"] = "apply_failed"
-    else:
-        out["reason"] = "below_threshold" if top is not None else "no_candidates"
 
-    # 1b) Ximilar fallback — if the local OCR couldn't confidently identify the
-    #     card (glossy/foil nameplates, numbers lost in foil/halftone noise, etc.),
-    #     send the FRONT image to Ximilar's card-ID API and fill the fields from
-    #     its result. Best-effort and credit-gated: only runs when a token is set
-    #     and only after the local attempt has already failed.
-    if not out["identified"] and _ximilar_fallback_on():
-        if not get_api_key("XIMILAR_API_TOKEN"):
-            # Toggle is on but there's no key to use — surface a clear error
-            # rather than silently doing nothing.
-            out["reason"] = "ximilar_no_key"
-            out["error"] = ("Ximilar fallback is enabled but no API key is set. "
-                            "Add your Ximilar API token in Settings \u2192 API Keys, "
-                            "or turn the fallback off in Settings \u2192 General.")
-        else:
-            try:
-                xi = _ximilar_identify_card(record.image_path)
-            except Exception:
-                xi = None
-            if xi:
-                applied = _apply_ximilar_identification(record, xi, category_id)
-                if applied:
-                    out["identified"] = True
-                    out["reason"] = "applied_ximilar"
-                    out["applied"] = applied
-                    out["source"] = "ximilar"
-                    out["name"] = applied.get("name") or xi.get("name") or out["name"]
+    # 1b) External identification fallback — runs whenever the local CATALOG
+    #     lookup didn't clear 60%, using the provider selected in Settings →
+    #     General (Ximilar or CardSight; 'none' disables it). Gated on the
+    #     reference-catalog score, NOT the combined list: match_ocr_to_records
+    #     grants a large collector-number bonus, so a scanned card can score >=60%
+    #     against an UNRELATED record in the user's own inventory that merely shares
+    #     a number (e.g. "25/102"); keying off that combined score used to mark the
+    #     card "identified" and silently skip the service. The provider helper
+    #     returns a clear error (missing key, network, out of credits, no match).
+    _provider = _identify_provider()
+    if not out["identified"] and ref_top_score < min_ok and _provider != "none":
+        xi, xi_err = _external_identify_card_ex(record.image_path)
+        if xi:
+            applied = _apply_external_identification(record, xi, category_id)
+            if applied:
+                out["identified"] = True
+                out["reason"] = f"applied_{_provider}"
+                out["applied"] = applied
+                out["source"] = _provider
+                out["name"] = applied.get("name") or xi.get("name") or out["name"]
+        elif xi_err:
+            out["reason"] = f"{_provider}_error"
+            out["error"] = xi_err
+
+    # 1c) Last resort — if neither the catalog nor the external service identified
+    #     the card,
+    #     fall back to a confident match against the user's OWN existing records
+    #     (e.g. a real duplicate already entered). Applied only if it clears 60%.
+    if not out["identified"]:
+        rec_top = rec_matches[0] if rec_matches else None   # already sorted desc
+        if rec_top is not None and float(rec_top.get("score", 0) or 0) >= min_ok:
+            applied = _apply_ocr_candidate(record, rec_top)
+            if applied:
+                out["identified"] = True
+                out["reason"] = "applied_record"
+                out["applied"] = applied
+                top = rec_top
+        if not out["identified"] and not out["reason"]:
+            out["reason"] = "below_threshold" if top is not None else "no_candidates"
 
     # 2) Type field — independent of the identity match. Prefer the catalog value
     #    (authoritative) when we identified a reference card; otherwise use a
@@ -3837,6 +3903,99 @@ def update_scan_image(record_id):
     })
 
 
+@app.route("/realign_record_image/<int:record_id>", methods=["POST"])
+def realign_record_image(record_id):
+    """
+    Manually re-align one side of a saved record's image using four corner
+    points, exactly like the import page's "Manual Corner Selection" — but
+    operating on the record's own stored front/back photo instead of a temp
+    split tile.
+
+    Body (JSON): { "side": "front"|"back",
+                   "points": [ {"x":.., "y":..} x4 ] }
+
+    The points are in the pixel coordinates of the currently-stored image (the
+    front-end canvas already converts click positions back to full-res image
+    coordinates). We perspective-warp + sharpen that image, save the result as a
+    new inventory_cards file, point the record at it, and delete the old file —
+    mirroring update_scan_image so paths/cleanup stay consistent.
+    """
+    record = ScanRecord.query.get_or_404(record_id)
+
+    data   = request.get_json(silent=True) or {}
+    side   = str(data.get("side", "front")).strip().lower()
+    points = data.get("points", [])
+    if side not in ("front", "back"):
+        side = "front"
+
+    if not isinstance(points, list) or len(points) != 4:
+        return jsonify({"status": "error", "message": "Exactly 4 points are required"}), 400
+
+    current_path = record.image_path_back if side == "back" else record.image_path
+    if not current_path or current_path == "__blank__":
+        return jsonify({
+            "status":  "error",
+            "message": f"This record has no {side} image to re-align.",
+        }), 400
+
+    relative_current = normalize_to_upload_relative(current_path)
+    if relative_current.startswith("http://") or relative_current.startswith("https://"):
+        return jsonify({
+            "status":  "error",
+            "message": "This image is stored as an external URL and can't be re-aligned.",
+        }), 400
+
+    abs_path = _abs_record_image_path(current_path)
+    if not abs_path or not os.path.exists(abs_path):
+        return jsonify({"status": "error", "message": "The image file could not be found on disk."}), 404
+
+    image = cv2.imread(abs_path)
+    if image is None:
+        return jsonify({"status": "error", "message": "Could not read the image for re-alignment."}), 400
+
+    try:
+        pts = np.array([[float(p["x"]), float(p["y"])] for p in points], dtype="float32")
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"status": "error", "message": "Invalid point format"}), 400
+
+    ensure_dirs()
+    try:
+        # Straighten/crop to the four chosen corners ONLY. We deliberately do NOT
+        # run sharpen_image() here (unlike the import pipeline): this image is
+        # already a finished inventory photo, and the sharpening kernel visibly
+        # boosts edge contrast and shifts colour/tone — re-aligning would sharpen
+        # a second time and change how the card looks. The perspective warp keeps
+        # the original colours and pixel detail; only the geometry changes.
+        warped = four_point_transform(image, pts)
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Re-alignment failed: {e}"}), 500
+
+    suffix        = "back" if side == "back" else "front"
+    final_name    = f"record_{record_id}_{suffix}_realigned_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
+    relative_path = normalize_to_upload_relative(os.path.join("inventory_cards", final_name))
+    absolute_path = os.path.join(app.config["UPLOAD_FOLDER"], relative_path)
+
+    if not cv2.imwrite(absolute_path, warped):
+        return jsonify({"status": "error", "message": "Could not save the re-aligned image."}), 500
+
+    if side == "back":
+        record.image_path_back = relative_path
+    else:
+        record.image_path = relative_path
+    db.session.commit()
+
+    # Remove the previous file now that the record points at the new one.
+    if relative_current and relative_current != "__blank__" and relative_current != relative_path:
+        remove_file_if_exists(current_path)
+
+    return jsonify({
+        "status":    "success",
+        "message":   f"{suffix.capitalize()} image re-aligned.",
+        "side":      side,
+        "image_url": build_uploaded_file_url(record.image_path_back if side == "back" else record.image_path),
+    })
+
+
 @app.route("/delete_scan/<int:record_id>", methods=["POST"])
 def delete_scan(record_id):
     record = ScanRecord.query.get_or_404(record_id)
@@ -4894,25 +5053,23 @@ def ocr_identify(record_id):
     # regardless of which source they came from.
     combined = sorted(ref_matches + matches, key=lambda c: c.get("score", 0), reverse=True)
 
-    # Ximilar fallback — if the local CATALOG lookup couldn't identify the card at
-    # 60%+, ask Ximilar's card-ID API to read the front image and offer its result
-    # in the picker (rich reference candidate when the set is synced, else a raw
-    # name/number/set/rarity candidate). Only when the fallback toggle is on;
-    # surfaces a clear error if it's on but no API key is set.
+    # Ximilar — controlled by the "Match against imported catalog only" checkbox:
+    #   * checked   (catalog_only=True)  -> stay fully local: catalog + the user's
+    #     own records only, never call the external service.
+    #   * unchecked (catalog_only=False) -> this is an explicit, per-card request to
+    #     read the FRONT image with the SELECTED provider (Settings → General:
+    #     Ximilar or CardSight) and offer its result.
     #
-    # The decision is based on the reference-catalog match (ref_matches), NOT the
-    # combined list, on purpose: match_ocr_to_records grants a large collector-number
-    # bonus (serial_bonus), so a scanned card can score >=60% against an *unrelated*
-    # record in the user's own inventory that merely shares a collector number
-    # (e.g. "25/102"). Keying the fallback off the combined score let those
-    # coincidental self-inventory matches suppress Ximilar even though nothing was
-    # actually identified. Basing it on the catalog score mirrors how the import
-    # auto-identify decides "identified", so the manual check reaches out to Ximilar
-    # whenever the local catalog lookup fails the 60% bar.
+    # NOTE: unlike the automatic import path, this manual identify does NOT require
+    # the global fallback toggle — unchecking the box here IS the opt-in. It still
+    # needs the provider's API key, and _external_identify_candidates returns a
+    # clear message for every outcome (no provider selected, no key, image/network
+    # error, out of credits, or "couldn't identify"), so the picker never fails
+    # silently. `ximilar_error` is kept as the response field name for the existing
+    # front-end, but it carries whichever provider's message.
     ximilar_error = ""
-    ref_top_score = float(ref_matches[0].get("score", 0) or 0) if ref_matches else 0.0
-    if ref_top_score < 0.60 and _ximilar_fallback_on():
-        xi_cands, xi_err = _ximilar_identify_candidates(record, category_id)
+    if not catalog_only:
+        xi_cands, xi_err = _external_identify_candidates(record, category_id)
         ximilar_error = xi_err or ""
         if xi_cands:
             combined = sorted(xi_cands + combined, key=lambda c: c.get("score", 0), reverse=True)
@@ -5455,14 +5612,38 @@ def duplicates_resolve():
 
 
 # ====================== IMPORT SPLIT / ALIGN ROUTES ======================
-@app.route("/pdf_extract_pages", methods=["POST"])
-def pdf_extract_pages():
+# --------------------------------------------------------------------------- #
+# PDF import: on-demand, one-page-at-a-time rasterisation.
+#
+# A multi-page binder scan can be dozens of full-resolution pages, so rendering
+# the WHOLE PDF up front (the old /pdf_extract_pages) was slow, memory-heavy, and
+# gave the page no way to show progress — it looked like it hung, and effectively
+# never got past the first page on large files. Instead we now:
+#   * /pdf_open        — save the upload, return only the page COUNT (instant),
+#   * /pdf_render_page — rasterise exactly ONE page on demand (front = odd page,
+#                        back = even page), returned with a URL, and
+#   * /pdf_close       — drop the saved PDF when the batch finishes/exits.
+# The front-end walks every page in order, rendering each just before it needs
+# it and showing a loading bar while it does.
+# --------------------------------------------------------------------------- #
+_PDF_BATCH_ID_RE = _re.compile(r"^[0-9_]{1,40}$")
+
+
+def _pdf_batch_upload_path(batch_id):
+    """Absolute path to a saved PDF upload, or None if the batch id is invalid.
+    The id is generated server-side and matched against a strict pattern so it
+    can never be used to reach outside the temp PDF folder."""
+    if not batch_id or not _PDF_BATCH_ID_RE.match(str(batch_id)):
+        return None
+    return os.path.join(app.config["TEMP_PDF_FOLDER"], f"upload_{batch_id}.pdf")
+
+
+@app.route("/pdf_open", methods=["POST"])
+def pdf_open():
     """
-    Rasterizes every page of an uploaded PDF into a PNG image so the existing
-    single-image 9-pocket splitter can process it. Pages come back in order;
-    the front-end pairs them up two at a time (page 1 = front, page 2 = back,
-    page 3 = front, page 4 = back, ...) and feeds them into /run_import_split
-    one after another.
+    Accept a PDF upload, save it, and report how many pages it has — without
+    rendering anything yet. Rendering happens one page at a time via
+    /pdf_render_page so a large multi-page scan doesn't stall the UI.
     """
     ensure_dirs()
 
@@ -5487,43 +5668,111 @@ def pdf_extract_pages():
     try:
         doc = fitz.open(pdf_path)
         try:
-            if doc.page_count < 1:
-                return jsonify({"status": "error", "message": "PDF has no pages"}), 400
-
-            # Render each page at its embedded scan's NATIVE resolution (clamped
-            # between PDF_RASTER_ZOOM and PDF_RASTER_ZOOM_MAX) so scanned cards
-            # keep full scanner detail instead of being re-sampled to a fixed DPI.
-            # One page is rendered and saved at a time, so peak memory is a single
-            # page's pixmap.
-            pages = []
-            for page_index in range(doc.page_count):
-                page = doc.load_page(page_index)
-                pix = page.get_pixmap(matrix=_pdf_render_matrix(page))
-                page_filename = f"pdfpage_{batch_id}_{page_index + 1:03d}.png"
-                page_path = os.path.join(app.config["TEMP_PDF_FOLDER"], page_filename)
-                pix.save(page_path)
-                del pix, page
-
-                pages.append({
-                    "index":    page_index + 1,
-                    "filename": page_filename,
-                    "url":      url_for("temp_pdf_file", filename=page_filename),
-                })
+            page_count = doc.page_count
         finally:
             doc.close()
     except Exception as e:
-        return jsonify({"status": "error", "message": f"Could not read PDF: {e}"}), 500
-    finally:
         try:
             os.remove(pdf_path)
         except OSError:
             pass
+        return jsonify({"status": "error", "message": f"Could not read PDF: {e}"}), 500
+
+    if page_count < 1:
+        try:
+            os.remove(pdf_path)
+        except OSError:
+            pass
+        return jsonify({"status": "error", "message": "PDF has no pages"}), 400
 
     return jsonify({
-        "status":  "success",
-        "message": f"Extracted {len(pages)} page(s) from PDF.",
-        "pages":   pages,
+        "status":     "success",
+        "message":    f"PDF opened — {page_count} page(s).",
+        "batch_id":   batch_id,
+        "page_count": page_count,
     })
+
+
+@app.route("/pdf_render_page", methods=["POST"])
+def pdf_render_page():
+    """
+    Rasterise a single page (1-based `index`) of a previously opened PDF and
+    return its image URL. Rendered pages are cached on disk, so re-requesting a
+    page (e.g. front then back of the same pair) is cheap. Peak memory is a
+    single page's pixmap.
+    """
+    ensure_dirs()
+
+    if fitz is None:
+        return jsonify({
+            "status": "error",
+            "message": "PDF support isn't installed on the server. Run: pip install PyMuPDF"
+        }), 500
+
+    data     = request.get_json(silent=True) or {}
+    batch_id = str(data.get("batch_id") or "").strip()
+    try:
+        index = int(data.get("index"))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "A numeric page index is required"}), 400
+
+    pdf_path = _pdf_batch_upload_path(batch_id)
+    if not pdf_path or not os.path.exists(pdf_path):
+        return jsonify({
+            "status":  "error",
+            "message": "This PDF batch is no longer available — please re-select the PDF.",
+        }), 404
+
+    page_filename = f"pdfpage_{batch_id}_{index:03d}.png"
+    page_path     = os.path.join(app.config["TEMP_PDF_FOLDER"], page_filename)
+
+    # Serve the cached render if this page was already rasterised.
+    if not os.path.exists(page_path):
+        try:
+            doc = fitz.open(pdf_path)
+            try:
+                if index < 1 or index > doc.page_count:
+                    return jsonify({
+                        "status":  "error",
+                        "message": f"Page {index} is out of range (PDF has {doc.page_count}).",
+                    }), 400
+                page = doc.load_page(index - 1)
+                # Native embedded-scan resolution (clamped), matching the old
+                # whole-PDF path so cards keep full scanner detail.
+                pix = page.get_pixmap(matrix=_pdf_render_matrix(page))
+                pix.save(page_path)
+                del pix, page
+            finally:
+                doc.close()
+        except Exception as e:
+            return jsonify({"status": "error", "message": f"Could not render page {index}: {e}"}), 500
+
+    return jsonify({
+        "status": "success",
+        "page": {
+            "index":    index,
+            "filename": page_filename,
+            "url":      url_for("temp_pdf_file", filename=page_filename),
+        },
+    })
+
+
+@app.route("/pdf_close", methods=["POST"])
+def pdf_close():
+    """
+    Best-effort cleanup once a PDF batch finishes or is exited: remove the saved
+    upload so it doesn't linger in temp. Rendered page PNGs are left for the
+    normal temp-folder cleanup. Always reports success — cleanup never blocks.
+    """
+    data     = request.get_json(silent=True) or {}
+    batch_id = str(data.get("batch_id") or "").strip()
+    pdf_path = _pdf_batch_upload_path(batch_id)
+    if pdf_path:
+        try:
+            os.remove(pdf_path)
+        except OSError:
+            pass
+    return jsonify({"status": "success"})
 
 
 @app.route("/run_import_split", methods=["POST"])
@@ -6172,6 +6421,17 @@ def _general_status():
         "ximilar_fallback_enabled": _ximilar_fallback_on(),
         "ximilar_key_set": bool(get_api_key("XIMILAR_API_TOKEN")),
         "ximilar_env_forced": os.environ.get("XIMILAR_IDENTIFY_FALLBACK") is not None,
+        # External identification provider selection (used when local OCR/catalog
+        # lookup fails). One of: none | ximilar | cardsight.
+        "identify_provider": _identify_provider(),
+        "identify_provider_label": _identify_provider_label(),
+        "identify_provider_env_forced": os.environ.get("IDENTIFY_PROVIDER") is not None,
+        "cardsight_key_set": bool(get_api_key("CARDSIGHT_API_KEY")),
+        "identify_providers": [
+            {"value": "none",      "label": "None (local database only)", "key_set": True},
+            {"value": "ximilar",   "label": "Ximilar",   "key_set": bool(get_api_key("XIMILAR_API_TOKEN"))},
+            {"value": "cardsight", "label": "CardSight (free tier)", "key_set": bool(get_api_key("CARDSIGHT_API_KEY"))},
+        ],
     }
 
 
@@ -6203,17 +6463,289 @@ def general_native_import():
 def general_ximilar_fallback():
     body = request.get_json(silent=True) or request.form
     enabled = str(body.get("enabled", "")).lower() in ("1", "true", "yes", "on")
-    set_ximilar_fallback(enabled)
+    # The old on/off toggle now maps onto the provider selector so the two can't
+    # disagree: ON selects Ximilar, OFF selects None. (Use Settings → Identification
+    # to pick CardSight instead.)
+    set_identify_provider("ximilar" if enabled else "none")
     if enabled and not get_api_key("XIMILAR_API_TOKEN"):
         # Allowed, but warn: it won't do anything (and imports will report the
         # missing key) until a token is added.
-        msg = ("Ximilar fallback enabled, but no API key is set — add your Ximilar "
+        msg = ("Ximilar selected, but no API key is set — add your Ximilar "
                "API token in Settings \u2192 API Keys for it to work.")
     elif enabled:
-        msg = "Ximilar identification fallback enabled."
+        msg = "Ximilar identification enabled."
     else:
-        msg = "Ximilar identification fallback disabled."
+        msg = "External identification disabled (local database only)."
     return jsonify({"status": "success", "message": msg, "general": _general_status()})
+
+
+@app.route("/settings/general/identify_provider", methods=["POST"])
+def general_identify_provider():
+    """Choose which external identification service is used when the local OCR /
+    catalog lookup fails: 'none', 'ximilar', or 'cardsight'."""
+    body = request.get_json(silent=True) or request.form
+    provider = str(body.get("provider", "")).strip().lower()
+    try:
+        set_identify_provider(provider)
+    except ValueError:
+        return jsonify({"status": "error",
+                        "message": "Invalid provider. Choose none, ximilar, or cardsight.",
+                        "general": _general_status()}), 400
+
+    label = _identify_provider_label(provider)
+    if provider == "none":
+        msg = "External card identification disabled — using the local database only."
+    elif provider == "ximilar" and not get_api_key("XIMILAR_API_TOKEN"):
+        msg = (f"{label} selected, but no API key is set — add your Ximilar API token in "
+               "Settings \u2192 API Keys for it to work.")
+    elif provider == "cardsight" and not get_api_key("CARDSIGHT_API_KEY"):
+        msg = (f"{label} selected, but no API key is set — add your free CardSight API key in "
+               "Settings \u2192 API Keys for it to work.")
+    else:
+        msg = f"{label} selected for card identification when the local lookup fails."
+    return jsonify({"status": "success", "message": msg, "general": _general_status()})
+
+
+# Self-contained settings page for choosing the identification provider. Rendered
+# inline (no template file) so it works regardless of the theme templates, and is
+# reachable at /settings/identify. The main General settings page can also embed
+# the same control via /settings/general/identify_provider.
+_IDENTIFY_SETTINGS_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Card Identification Service</title>
+<style>
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:#f5f7fb; color:#1f2937; margin:0; padding:24px; }
+  .card { max-width:720px; margin:0 auto; background:#fff; border:1px solid #e5e7eb; border-radius:16px; padding:24px 28px; box-shadow:0 10px 30px rgba(0,0,0,.05); }
+  h1 { font-size:22px; margin:0 0 6px; }
+  p.sub { color:#6b7280; margin:0 0 20px; }
+  .opt { display:flex; align-items:flex-start; gap:12px; border:1px solid #e5e7eb; border-radius:12px; padding:14px 16px; margin-bottom:12px; cursor:pointer; }
+  .opt:hover { border-color:#c7d2fe; background:#fafbff; }
+  .opt.sel { border-color:#4f46e5; background:#f5f3ff; }
+  .opt input { margin-top:3px; }
+  .opt .body { flex:1; }
+  .opt .name { font-weight:700; }
+  .opt .desc { color:#6b7280; font-size:14px; margin-top:2px; }
+  .pill { display:inline-block; font-size:12px; font-weight:700; padding:2px 8px; border-radius:999px; margin-left:8px; }
+  .pill.ok { background:#dcfce7; color:#166534; }
+  .pill.no { background:#fee2e2; color:#991b1b; }
+  .row { display:flex; gap:10px; align-items:center; margin-top:18px; flex-wrap:wrap; }
+  button { background:#4f46e5; color:#fff; border:0; border-radius:10px; padding:10px 18px; font-weight:700; cursor:pointer; }
+  button:disabled { opacity:.6; cursor:default; }
+  a { color:#4f46e5; text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  .msg { margin-top:16px; padding:12px 14px; border-radius:10px; display:none; }
+  .msg.show { display:block; }
+  .msg.ok { background:#ecfdf5; color:#065f46; border:1px solid #a7f3d0; }
+  .msg.err { background:#fef2f2; color:#991b1b; border:1px solid #fecaca; }
+  .links { margin-top:20px; font-size:14px; color:#6b7280; }
+  .links a { margin-right:14px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Card Identification Service</h1>
+    <p class="sub">Choose which external service identifies a card from its front image when the
+       local OCR / catalog lookup can't match it (below 60%). This applies to both auto-import and
+       the manual &ldquo;Read Card &amp; Find Matches&rdquo; on a card's detail page.</p>
+
+    <label class="opt" data-value="none">
+      <input type="radio" name="provider" value="none">
+      <div class="body">
+        <div class="name">None &mdash; local database only</div>
+        <div class="desc">Never call an external service. Uses your imported catalog and existing records only.</div>
+      </div>
+    </label>
+
+    <label class="opt" data-value="cardsight">
+      <input type="radio" name="provider" value="cardsight">
+      <div class="body">
+        <div class="name">CardSight <span id="csPill" class="pill">&nbsp;</span></div>
+        <div class="desc">Free tier: 750 identifications/month, no credit card. Covers sports cards and Pok&eacute;mon.
+          Get a key at <a href="https://cardsight.ai" target="_blank" rel="noopener">cardsight.ai</a>.</div>
+      </div>
+    </label>
+
+    <label class="opt" data-value="ximilar">
+      <input type="radio" name="provider" value="ximilar">
+      <div class="body">
+        <div class="name">Ximilar <span id="xiPill" class="pill">&nbsp;</span></div>
+        <div class="desc">Paid credits (free plan ~3,000 credits/month once activated; ~10 per card).
+          Get a key at <a href="https://www.ximilar.com" target="_blank" rel="noopener">ximilar.com</a>.</div>
+      </div>
+    </label>
+
+    <div class="row">
+      <button id="saveBtn">Save selection</button>
+      <a href="/identify/diagnose" target="_blank" rel="noopener">Test connection &rarr;</a>
+    </div>
+
+    <div id="msg" class="msg"></div>
+
+    <div class="links">
+      <a href="/settings/api">API Keys</a>
+      <a href="/settings/general">General settings</a>
+      <a href="/settings">All settings</a>
+    </div>
+  </div>
+
+<script>
+  var CURRENT = "__PROVIDER__";
+  var XI_SET = ("__XIMILAR_SET__" === "yes");
+  var CS_SET = ("__CARDSIGHT_SET__" === "yes");
+
+  function pill(el, isSet) {
+    el.textContent = isSet ? "key set" : "no key";
+    el.className = "pill " + (isSet ? "ok" : "no");
+  }
+  pill(document.getElementById("xiPill"), XI_SET);
+  pill(document.getElementById("csPill"), CS_SET);
+
+  var radios = document.querySelectorAll('input[name="provider"]');
+  function syncSelected() {
+    document.querySelectorAll('.opt').forEach(function (o) {
+      var r = o.querySelector('input');
+      o.classList.toggle('sel', r.checked);
+    });
+  }
+  radios.forEach(function (r) {
+    if (r.value === CURRENT) r.checked = true;
+    r.addEventListener('change', syncSelected);
+  });
+  syncSelected();
+
+  var msg = document.getElementById('msg');
+  function showMsg(text, ok) {
+    msg.textContent = text;
+    msg.className = 'msg show ' + (ok ? 'ok' : 'err');
+  }
+
+  document.getElementById('saveBtn').addEventListener('click', async function () {
+    var sel = document.querySelector('input[name="provider"]:checked');
+    if (!sel) { showMsg('Pick a provider first.', false); return; }
+    var btn = this; btn.disabled = true;
+    try {
+      var res = await fetch('/settings/general/identify_provider', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider: sel.value })
+      });
+      var data = await res.json();
+      showMsg(data.message || (res.ok ? 'Saved.' : 'Save failed.'), res.ok && data.status === 'success');
+      CURRENT = sel.value;
+    } catch (e) {
+      showMsg('Network error: ' + e.message, false);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+</script>
+</body>
+</html>"""
+
+
+@app.route("/settings/identify")
+def identify_settings_page():
+    """Standalone page to pick the external identification provider. Self-contained
+    so it doesn't depend on the theme templates; reachable at /settings/identify."""
+    g = _general_status()
+    html = (_IDENTIFY_SETTINGS_HTML
+            .replace("__PROVIDER__", g["identify_provider"])
+            .replace("__XIMILAR_SET__", "yes" if g["ximilar_key_set"] else "no")
+            .replace("__CARDSIGHT_SET__", "yes" if g["cardsight_key_set"] else "no"))
+    return Response(html, mimetype="text/html")
+
+
+@app.route("/identify/diagnose", methods=["GET"])
+def identify_diagnose():
+    """Provider-aware self-test. Reports the selected provider and validates its
+    API key against the provider's lightweight endpoint (Ximilar account details
+    / CardSight health). Visit /identify/diagnose in the browser."""
+    provider = _identify_provider()
+    result = {
+        "selected_provider": provider,
+        "selected_provider_label": _identify_provider_label(provider),
+        "ximilar_key_set": bool(get_api_key("XIMILAR_API_TOKEN")),
+        "cardsight_key_set": bool(get_api_key("CARDSIGHT_API_KEY")),
+    }
+    if provider == "cardsight":
+        ok, detail = _cardsight_health_ok()
+        result["key_ok"] = ok
+        result["detail"] = detail
+    elif provider == "ximilar":
+        try:
+            data = _ximilar_http("GET", "https://api.ximilar.com/account/v2/details/")
+            result["key_ok"] = True
+            result["detail"] = "Ximilar token authenticates."
+            result["credits_counter"] = (data or {}).get("credits_counter")
+        except urllib.error.HTTPError as e:
+            result["key_ok"] = False
+            result["detail"] = f"HTTP {e.code}: {e.reason}"
+        except Exception as e:
+            result["key_ok"] = False
+            result["detail"] = str(e)
+    else:
+        result["key_ok"] = None
+        result["detail"] = "No external provider selected (local database only)."
+    return jsonify(result)
+    """
+    Self-test for the stored Ximilar API token. Visit /ximilar/diagnose in the
+    browser. It tests the app's *stored & sanitized* token against the SAME
+    endpoint your curl check uses (https://api.ximilar.com/account/v2/details/),
+    and reports a safe fingerprint so you can compare it to your real token
+    without exposing it. Purpose: when curl works but the app 401s, this shows
+    whether the app is actually using the same token (and whether hidden/zero-width
+    characters were stored).
+    """
+    raw   = get_api_key("XIMILAR_API_TOKEN") or ""
+    clean = _ximilar_auth_token()
+
+    def _fingerprint(s):
+        if not s:
+            return "(empty)"
+        return (s[:4] + "…" + s[-4:]) if len(s) >= 10 else f"({len(s)} chars)"
+
+    # Any characters in the RAW stored value that .strip() alone wouldn't remove.
+    hidden = sorted({f"U+{ord(c):04X}" for c in raw if (not c.isprintable()) or c.isspace()})
+
+    result = {
+        "token_present":             bool(clean),
+        "raw_length":                len(raw),
+        "clean_length":              len(clean),
+        "had_extra_or_hidden_chars": raw != clean,
+        "hidden_or_space_codepoints": hidden,
+        "clean_fingerprint":         _fingerprint(clean),
+        "auth_header_preview":       f"Token {_fingerprint(clean)}",
+    }
+
+    if not clean:
+        result["account_ok"] = False
+        result["account_error"] = "No API token stored. Add it in Settings \u2192 API Keys."
+        return jsonify(result)
+
+    try:
+        data = _ximilar_http("GET", "https://api.ximilar.com/account/v2/details/")
+        result["account_ok"]      = True
+        result["account_email"]   = (data or {}).get("email")
+        result["credits_counter"] = (data or {}).get("credits_counter")
+        result["message"] = ("The stored token authenticates correctly. If card "
+                             "identification still 401s, the issue is specific to the "
+                             "Collectibles/TCG endpoint access on this account, not the token.")
+    except urllib.error.HTTPError as e:
+        result["account_ok"]    = False
+        result["account_error"] = f"HTTP {e.code}: {e.reason}"
+        if e.code in (401, 403):
+            result["message"] = ("The stored token was REJECTED, even though your curl test "
+                                 "passed — so the value saved in the app is not the same token. "
+                                 "Re-copy it into Settings \u2192 API Keys. Compare 'clean_fingerprint' "
+                                 "here against the first/last 4 characters of your real token.")
+    except Exception as e:
+        result["account_ok"]    = False
+        result["account_error"] = str(e)
+
+    return jsonify(result)
 
 
 # ============================================================================ #
@@ -7369,11 +7901,25 @@ def _image_source_for_grading(path_value, max_side=1600, jpeg_quality=90):
         return None
 
 
+def _ximilar_auth_token():
+    """Return the stored Ximilar token, cleaned of copy-paste artifacts that are
+    a common cause of 401s: surrounding whitespace/newlines, wrapping quotes, an
+    accidental leading 'Token ' (the app adds that prefix itself), and any
+    invisible/zero-width/control characters (BOM, zero-width space, non-breaking
+    space, stray control bytes) that a web-form paste can inject — these survive a
+    plain .strip() and make a token that works in curl fail from the app."""
+    tok = (get_api_key("XIMILAR_API_TOKEN") or "").strip().strip('"').strip("'").strip()
+    if tok.lower().startswith("token "):
+        tok = tok[len("token "):].strip()
+    tok = "".join(ch for ch in tok if ch.isprintable() and not ch.isspace())
+    return tok
+
+
 def _ximilar_http(method, url, payload=None):
     """Small JSON HTTP helper for the Ximilar async request API."""
     data = None
     headers = {
-        "Authorization": f"Token {get_api_key('XIMILAR_API_TOKEN')}",
+        "Authorization": f"Token {_ximilar_auth_token()}",
         "Accept":        "application/json",
         "User-Agent":    "CardCollectorInventoryManager/1.0",
     }
@@ -7392,28 +7938,37 @@ def _ximilar_identify_enabled():
     return _ximilar_fallback_on() and bool(get_api_key("XIMILAR_API_TOKEN"))
 
 
-def _ximilar_identify_card(image_path):
-    """Send one front image to Ximilar's TCG identification endpoint and return a
-    normalized {name, number, set, set_code, rarity, series, year, subcategory}
-    dict — or None on any failure. Best-effort: never raises.
-
-    Ximilar returns records[].​_objects[].​_identification.best_match with the card
-    fields (name, card_number, set, ...); we defensively also accept an
-    _identification directly on the record.
+def _ximilar_identify_card_ex(image_path):
+    """Like _ximilar_identify_card, but returns (result_or_None, error_or_None) so
+    callers can tell a config/network/image failure (error is a human message)
+    from a genuine "Ximilar answered but couldn't identify the card" (result and
+    error are both None). Never raises.
     """
     if not get_api_key("XIMILAR_API_TOKEN"):
-        return None
+        return None, ("No Ximilar API key is set. Add your Ximilar API token in "
+                      "Settings \u2192 API Keys.")
     src = _image_source_for_grading(image_path)   # downscaled base64 (small payload)
     if not src:
-        return None
+        return None, "This card has no readable front image to send to Ximilar."
     try:
         resp = _ximilar_http("POST", XIMILAR_TCG_ID_URL, {"records": [src]})
-    except Exception:
-        return None
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return None, (f"Ximilar refused the request (HTTP {e.code}). This is usually one of: "
+                          "the API token is wrong, OR the token is valid but the account has no "
+                          "active plan / 0 API credits (card identification costs ~10 credits each). "
+                          "Open /ximilar/diagnose to check — if it shows account_ok:true with "
+                          "credits_counter:0, activate a plan / add credits in the Ximilar dashboard.")
+        if e.code == 402:
+            return None, ("Ximilar returned HTTP 402 — the account is out of API credits or has "
+                          "no active plan for this service. Check your plan/credits in the Ximilar dashboard.")
+        return None, f"Couldn't reach Ximilar: HTTP Error {e.code}: {e.reason}"
+    except Exception as e:
+        return None, f"Couldn't reach Ximilar: {e}"
 
     records = (resp or {}).get("records") or []
     if not records:
-        return None
+        return None, None
     rec = records[0] if isinstance(records[0], dict) else {}
 
     ident = None
@@ -7424,16 +7979,16 @@ def _ximilar_identify_card(image_path):
     if ident is None and isinstance(rec.get("_identification"), dict):
         ident = rec["_identification"]
     if not isinstance(ident, dict):
-        return None
+        return None, None
 
     best = ident.get("best_match")
     if not isinstance(best, dict) or not best:
-        return None
+        return None, None
 
     name   = str(best.get("name") or "").strip()
     number = str(best.get("card_number") or "").strip()
     if not name and not number:
-        return None
+        return None, None
 
     return {
         "name":        name,
@@ -7444,7 +7999,17 @@ def _ximilar_identify_card(image_path):
         "series":      str(best.get("series") or "").strip(),
         "year":        best.get("year"),
         "subcategory": str(best.get("subcategory") or best.get("Subcategory") or "").strip(),
-    }
+    }, None
+
+
+def _ximilar_identify_card(image_path):
+    """Send one front image to Ximilar's TCG identification endpoint and return a
+    normalized {name, number, set, set_code, rarity, series, year, subcategory}
+    dict — or None on any failure. Best-effort: never raises. (Thin wrapper over
+    _ximilar_identify_card_ex for callers that don't need the error detail.)
+    """
+    result, _ = _ximilar_identify_card_ex(image_path)
+    return result
 
 
 def _apply_ximilar_identification(record, xi, category_id):
@@ -7489,23 +8054,23 @@ def _apply_ximilar_identification(record, xi, category_id):
 
 
 def _ximilar_identify_candidates(record, category_id):
-    """(candidates, error) for the manual-identify picker when local OCR is weak.
+    """(candidates, error) for the manual-identify picker.
 
     Returns reference candidates (rich: set/rarity/price, applied via
     reference_product_id) when Ximilar's read resolves a synced catalog card;
     otherwise a single raw candidate (source="ximilar") carrying name/number/set/
-    rarity so it can still be applied. `error` is set only when the fallback is on
-    but unusable (no API key)."""
+    rarity so it can still be applied. `error` carries a human-readable message
+    for every non-success outcome (no key, image/network error, or Ximilar
+    couldn't identify the card) so the UI never fails silently."""
     if not get_api_key("XIMILAR_API_TOKEN"):
-        return [], ("Ximilar fallback is enabled but no API key is set. "
-                    "Add your Ximilar API token in Settings \u2192 API Keys, "
-                    "or turn the fallback off in Settings \u2192 General.")
-    try:
-        xi = _ximilar_identify_card(record.image_path)
-    except Exception:
-        xi = None
+        return [], ("No Ximilar API key is set. Add your Ximilar API token in "
+                    "Settings \u2192 API Keys to identify cards with Ximilar.")
+
+    xi, xi_err = _ximilar_identify_card_ex(record.image_path)
+    if xi_err:
+        return [], xi_err
     if not xi:
-        return [], None
+        return [], "Ximilar read the front image but couldn't confidently identify this card."
 
     cands = []
     if category_id and card_ocr is not None:
@@ -7525,6 +8090,237 @@ def _ximilar_identify_candidates(record, category_id):
         cands.append({
             "source":          "ximilar",
             "via":             "ximilar",
+            "name":            xi.get("name", ""),
+            "serial":          xi.get("number", ""),
+            "set":             xi.get("set", ""),
+            "rarity":          xi.get("rarity", ""),
+            "game":            (record.extracted_data or {}).get("game", ""),
+            "score":           0.95,
+            "serial_match":    False,
+            "name_similarity": 1.0,
+        })
+    return cands, None
+
+
+# ============================================================================ #
+# CardSight AI — image-based identification (free tier: 750 calls/month).
+#   Auth:   header  X-API-Key: <32-char alphanumeric key>
+#   Ident:  POST https://api.cardsight.ai/v1/identify/card  (multipart 'image')
+#   Health: GET  https://api.cardsight.ai/v1/health
+# One endpoint covers sports + Pokémon (and MTG as it rolls out). Response:
+#   { success, detections:[ { confidence, card:{ name, number, setName,
+#     releaseName, year, fields:[{key,value}], ... } } ] }
+# ============================================================================ #
+CARDSIGHT_IDENTIFY_URL = "https://api.cardsight.ai/v1/identify/card"
+CARDSIGHT_HEALTH_URL   = "https://api.cardsight.ai/v1/health"
+CARDSIGHT_TIMEOUT      = 40
+
+
+def _cardsight_auth_key():
+    """Stored CardSight key, cleaned of whitespace/quotes/invisible characters.
+    CardSight keys are 32-char alphanumeric and their docs send them WITHOUT
+    hyphens, so we strip hyphens too."""
+    key = (get_api_key("CARDSIGHT_API_KEY") or "").strip().strip('"').strip("'").strip()
+    key = key.replace("-", "")
+    return "".join(ch for ch in key if ch.isprintable() and not ch.isspace())
+
+
+def _downscaled_jpeg_bytes(path_value, max_side=1600, jpeg_quality=90):
+    """Return JPEG bytes for a stored image (downscaled for a small upload), or
+    None. Used for multipart providers like CardSight. Local files are decoded
+    and re-encoded; external URLs are fetched as-is."""
+    relative = normalize_to_upload_relative(path_value)
+    if not relative or relative == "__blank__":
+        return None
+    if relative.startswith("http://") or relative.startswith("https://"):
+        try:
+            with urllib.request.urlopen(relative, timeout=30) as r:
+                return r.read()
+        except Exception:
+            return None
+    abs_path = os.path.join(app.config["UPLOAD_FOLDER"], relative)
+    if not os.path.exists(abs_path):
+        return None
+    try:
+        img = cv2.imread(abs_path)
+        if img is not None:
+            h, w = img.shape[:2]
+            scale = max_side / float(max(h, w)) if max(h, w) > max_side else 1.0
+            if scale < 1.0:
+                img = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))),
+                                 interpolation=cv2.INTER_AREA)
+            ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
+            if ok:
+                return buf.tobytes()
+    except Exception:
+        pass
+    try:
+        with open(abs_path, "rb") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def _multipart_encode(field_name, filename, content_type, data):
+    """Minimal multipart/form-data encoder (one file part) so we stay dependency
+    free. Returns (content_type_header, body_bytes)."""
+    boundary = "----CCIMBoundary" + datetime.now().strftime("%Y%m%d%H%M%S%f")
+    crlf = b"\r\n"
+    body = b"".join([
+        b"--", boundary.encode(), crlf,
+        f'Content-Disposition: form-data; name="{field_name}"; filename="{filename}"'.encode(), crlf,
+        f"Content-Type: {content_type}".encode(), crlf, crlf,
+        data, crlf,
+        b"--", boundary.encode(), b"--", crlf,
+    ])
+    return f"multipart/form-data; boundary={boundary}", body
+
+
+def _cardsight_identify_card_ex(image_path):
+    """Identify one front image with CardSight. Returns (normalized_dict|None,
+    error|None) with the same shape the Ximilar path uses. Never raises."""
+    key = _cardsight_auth_key()
+    if not key:
+        return None, ("No CardSight API key is set. Add your CardSight API key in "
+                      "Settings \u2192 API Keys (free tier: 750 identifications/month).")
+    data = _downscaled_jpeg_bytes(image_path)
+    if not data:
+        return None, "This card has no readable front image to send to CardSight."
+
+    content_type, body = _multipart_encode("image", "card.jpg", "image/jpeg", data)
+    req = urllib.request.Request(
+        CARDSIGHT_IDENTIFY_URL, data=body, method="POST",
+        headers={
+            "X-API-Key":    key,
+            "Content-Type": content_type,
+            "Accept":       "application/json",
+            "User-Agent":   "CardCollectorInventoryManager/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=CARDSIGHT_TIMEOUT) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return None, (f"CardSight rejected the API key (HTTP {e.code}). Check the key in "
+                          "Settings \u2192 API Keys — it's the 32-character key from your CardSight "
+                          "dashboard.")
+        if e.code == 402:
+            return None, ("CardSight returned HTTP 402 — this account is out of API calls for the "
+                          "period. Check your CardSight plan/usage.")
+        if e.code == 429:
+            return None, ("CardSight rate limit reached (HTTP 429) — you may have used the free "
+                          "monthly calls, or sent requests too quickly. Try again later.")
+        return None, f"Couldn't reach CardSight: HTTP Error {e.code}: {e.reason}"
+    except Exception as e:
+        return None, f"Couldn't reach CardSight: {e}"
+
+    if not isinstance(payload, dict) or not payload.get("success"):
+        return None, None
+    detections = payload.get("detections") or []
+    if not detections:
+        return None, None
+    det  = detections[0] if isinstance(detections[0], dict) else {}
+    card = det.get("card") or {}
+
+    name   = str(card.get("name") or "").strip()
+    number = str(card.get("number") or "").strip()
+    if not name and not number:
+        return None, None
+
+    rarity = ""
+    for f in (card.get("fields") or []):
+        if isinstance(f, dict) and str(f.get("key") or f.get("name") or "").upper() == "RARITY":
+            rarity = str(f.get("value") or "").strip()
+            break
+
+    return {
+        "name":        name,
+        "number":      number,
+        "set":         str(card.get("setName") or "").strip(),
+        "set_code":    "",
+        "rarity":      rarity,
+        "series":      str(card.get("releaseName") or "").strip(),
+        "year":        card.get("year"),
+        "subcategory": "",
+        "confidence":  str(det.get("confidence") or "").strip(),
+    }, None
+
+
+def _cardsight_health_ok():
+    """(ok, detail) — validate the CardSight key against its health endpoint."""
+    key = _cardsight_auth_key()
+    if not key:
+        return False, "No CardSight API key is set."
+    req = urllib.request.Request(
+        CARDSIGHT_HEALTH_URL, method="GET",
+        headers={"X-API-Key": key, "Accept": "application/json",
+                 "User-Agent": "CardCollectorInventoryManager/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            resp.read()
+        return True, "CardSight API key is valid."
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}: {e.reason}"
+    except Exception as e:
+        return False, str(e)
+
+
+# --------------------------------------------------------------------------- #
+# Unified provider dispatch — both the import auto-identify and the manual
+# inventory-detail identify go through these, honouring the selected provider.
+# --------------------------------------------------------------------------- #
+# Applying a normalized identity ({name, number, set, rarity}) is provider-
+# agnostic, so both providers reuse the same apply function.
+_apply_external_identification = _apply_ximilar_identification
+
+
+def _external_identify_card_ex(image_path):
+    """Identify a front image using the SELECTED provider. Returns
+    (normalized_dict|None, error|None). Provider 'none' -> (None, None)."""
+    provider = _identify_provider()
+    if provider == "cardsight":
+        return _cardsight_identify_card_ex(image_path)
+    if provider == "ximilar":
+        return _ximilar_identify_card_ex(image_path)
+    return None, None
+
+
+def _external_identify_candidates(record, category_id):
+    """(candidates, error) for the manual-identify picker, using the selected
+    provider. Candidates are tagged with the provider so the UI can badge them."""
+    provider = _identify_provider()
+    if provider == "none":
+        return [], ("No external identification service is selected. Choose Ximilar or CardSight "
+                    "in Settings \u2192 General.")
+    label = _identify_provider_label(provider)
+
+    xi, err = _external_identify_card_ex(record.image_path)
+    if err:
+        return [], err
+    if not xi:
+        return [], f"{label} read the front image but couldn't confidently identify this card."
+
+    cands = []
+    if category_id and card_ocr is not None:
+        try:
+            refs = _reference_candidates_for_ocr(
+                category_id,
+                {"name_guess": xi.get("name", ""), "number_guess": xi.get("number", "")},
+                limit=3,
+            )
+        except Exception:
+            refs = []
+        for r in refs:
+            if float(r.get("score", 0) or 0) >= 0.60:
+                cands.append({**r, "via": provider, "provider_label": label})
+
+    if not cands:
+        cands.append({
+            "source":          provider,      # "ximilar" | "cardsight"
+            "via":             provider,
+            "provider_label":  label,
             "name":            xi.get("name", ""),
             "serial":          xi.get("number", ""),
             "set":             xi.get("set", ""),
