@@ -227,6 +227,7 @@
             const backBtn   = document.getElementById('refBackBtn');
 
             let stopFlag = false, syncedIds = new Set();
+            let pollTimer = null, activeCategoryId = null, activeCategoryName = '';
             function escH(s){ return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
             async function loadStatus() {
@@ -285,13 +286,21 @@
 
             gameSelect.addEventListener('change', function () { startBtn.disabled = !this.value; });
 
-            stopBtn.addEventListener('click', () => {
-                stopFlag = true; stopBtn.disabled = true;
+            stopBtn.addEventListener('click', async () => {
+                stopBtn.disabled = true;
                 stopBtn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Stopping…';
+                if (activeCategoryId != null) {
+                    try {
+                        await fetch('/reference/stop_sync', {
+                            method: 'POST', headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ category_id: activeCategoryId }),
+                        });
+                    } catch (e) {}
+                }
             });
 
             // "Download another" resets back to the setup view.
-            closeBtn.addEventListener('click', showIdle);
+            closeBtn.addEventListener('click', () => { stopPolling(); activeCategoryId = null; showIdle(); });
 
             // Clear a downloaded game
             syncedList.addEventListener('click', async function (e) {
@@ -344,86 +353,117 @@
                 });
             }
 
-            startBtn.addEventListener('click', async function () {
-                const opt = gameSelect.options[gameSelect.selectedIndex];
-                const categoryId = parseInt(gameSelect.value, 10);
-                const categoryName = opt ? (opt.dataset.name || opt.textContent.replace(/ ✓.*$/, '')) : '';
-                if (!categoryId) return;
-                stopFlag = false;
+            // ── Background sync: start a server-side job, then poll its progress ──
+            // The download runs on the server, so it keeps going even if you leave
+            // this page. Coming back resumes the live progress view.
+            function renderProgress(job) {
+                const total = job.total || 0, done = job.done || 0;
+                counterEl.textContent = `${done} / ${total}`;
+                okEl.textContent = job.ok || 0;
+                cardsEl.textContent = job.cards || 0;
+                skipEl.textContent = job.skipped || 0;
+                errEl.textContent = job.err || 0;
+                barEl.style.width = total ? `${Math.round((done / total) * 100)}%` : '0%';
+                currentEl.textContent = job.current || '—';
+            }
 
-                idleBox.style.display = 'none'; runningBox.style.display = '';
-                startBtn.style.display = 'none'; backBtn.style.display = 'none';
+            function showRunning() {
+                idleBox.style.display = 'none'; runningBox.style.display = ''; doneBox.style.display = 'none';
+                startBtn.style.display = 'none'; backBtn.style.display = '';
                 stopBtn.style.display = ''; stopBtn.disabled = false; stopBtn.innerHTML = '<i class="fas fa-stop me-1"></i>Stop';
-                const replace = replaceChk.checked;
-                currentEl.textContent = 'Loading set list…'; counterEl.textContent = '0 / 0';
-                okEl.textContent = '0'; cardsEl.textContent = '0'; skipEl.textContent = '0';
-                errEl.textContent = '0'; barEl.style.width = '0%';
+                closeBtn.style.display = 'none';
+            }
 
-                let groups = [];
-                try {
-                    const gd = await (await fetch(`/reference/groups/${categoryId}`)).json();
-                    if (gd.status !== 'ok') throw new Error(gd.message || 'Could not list sets');
-                    groups = gd.groups || [];
-                } catch (e) {
-                    runningBox.style.display = 'none'; doneBox.style.display = '';
-                    doneMsg.className = 'alert alert-danger mb-0';
-                    doneMsg.innerHTML = `<i class="fas fa-times-circle me-1"></i>${escH(e.message)}`;
-                    stopBtn.style.display = 'none'; closeBtn.style.display = ''; return;
-                }
-
-                const total = groups.length;
-                let done = 0, ok = 0, cards = 0, skipped = 0, err = 0;
-                counterEl.textContent = `0 / ${total}`;
-
-                for (const g of groups) {
-                    if (stopFlag) break;
-
-                    // Set already downloaded and not replacing? Skip it with no
-                    // network call so re-running a game only fills in what's missing.
-                    if (!replace && g.synced) {
-                        skipped++; done++;
-                        counterEl.textContent = `${done} / ${total}`;
-                        skipEl.textContent = skipped;
-                        currentEl.textContent = `${g.name || ('Set #' + g.group_id)} — already downloaded, skipped`;
-                        barEl.style.width = `${Math.round((done / total) * 100)}%`;
-                        continue;
-                    }
-
-                    currentEl.textContent = g.name || `Set #${g.group_id}`;
-                    try {
-                        const data = await (await fetch('/reference/sync_group', {
-                            method: 'POST', headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                                category_id: categoryId, category_name: categoryName,
-                                group_id: g.group_id, group_name: g.name, replace: replace,
-                            }),
-                        })).json();
-                        if (data.status === 'ok') { ok++; cards += (data.added || 0); }
-                        else if (data.status === 'skipped') { skipped++; }
-                        else err++;
-                    } catch (e) { err++; }
-
-                    done++;
-                    counterEl.textContent = `${done} / ${total}`;
-                    okEl.textContent = ok; cardsEl.textContent = cards; skipEl.textContent = skipped; errEl.textContent = err;
-                    barEl.style.width = `${Math.round((done / total) * 100)}%`;
-                    await new Promise(r => setTimeout(r, 120));  // be a good neighbour between sets
-                }
-
+            function showDone(job) {
                 runningBox.style.display = 'none'; doneBox.style.display = '';
+                stopBtn.style.display = 'none'; startBtn.style.display = 'none';
+                closeBtn.style.display = ''; backBtn.style.display = '';
+                if (job.status === 'error') {
+                    doneMsg.className = 'alert alert-danger mb-0';
+                    doneMsg.innerHTML = `<i class="fas fa-times-circle me-1"></i>${escH(job.error || 'Download failed.')}`;
+                    return;
+                }
                 doneMsg.className = 'alert alert-success mb-0';
-                const stoppedNote = stopFlag ? ' (stopped early)' : '';
+                const ok = job.ok || 0, cards = job.cards || 0, skipped = job.skipped || 0, err = job.err || 0;
+                const stoppedNote = job.status === 'stopped' ? ' (stopped early)' : '';
                 doneMsg.innerHTML = `<i class="fas fa-check-circle me-1"></i>Downloaded <strong>${cards}</strong> cards across `
                                   + `<strong>${ok}</strong> set${ok !== 1 ? 's' : ''}`
                                   + (skipped ? `, <strong>${skipped}</strong> set${skipped !== 1 ? 's' : ''} already present (skipped)` : '')
                                   + (err ? `, <strong>${err}</strong> error${err !== 1 ? 's' : ''}` : '')
-                                  + `${stoppedNote} for <strong>${escH(categoryName)}</strong>. `
+                                  + `${stoppedNote} for <strong>${escH(job.game || activeCategoryName)}</strong>. `
                                   + `OCR identification will now match against it.`;
+            }
+
+            function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+
+            async function pollOnce() {
+                let jobs;
+                try {
+                    jobs = (await (await fetch('/reference/sync_progress')).json()).jobs || [];
+                } catch (e) { return; }
+                const job = jobs.find(j => j.category_id === activeCategoryId);
+                if (!job) return;
+                renderProgress(job);
+                if (job.status !== 'running') {
+                    showDone(job);
+                    stopPolling();
+                    loadStatus();  // refresh the downloaded list
+                }
+            }
+
+            function startPolling(categoryId, categoryName) {
+                activeCategoryId = categoryId;
+                activeCategoryName = categoryName || '';
+                stopPolling();
+                pollOnce();
+                pollTimer = setInterval(pollOnce, 1500);
+            }
+
+            function failStart(msg) {
+                runningBox.style.display = 'none'; doneBox.style.display = '';
+                doneMsg.className = 'alert alert-danger mb-0';
+                doneMsg.innerHTML = `<i class="fas fa-times-circle me-1"></i>${escH(msg)}`;
                 stopBtn.style.display = 'none'; closeBtn.style.display = '';
+            }
+
+            startBtn.addEventListener('click', async function () {
+                const opt = gameSelect.options[gameSelect.selectedIndex];
+                const categoryId = parseInt(gameSelect.value, 10);
+                const categoryName = opt ? (opt.dataset.name || opt.textContent.replace(/ \u2713.*$/, '')) : '';
+                if (!categoryId) return;
+                const replace = replaceChk.checked;
+
+                showRunning();
+                currentEl.textContent = 'Starting…'; counterEl.textContent = '0 / 0';
+                okEl.textContent = '0'; cardsEl.textContent = '0'; skipEl.textContent = '0';
+                errEl.textContent = '0'; barEl.style.width = '0%';
+
+                try {
+                    const d = await (await fetch('/reference/start_sync', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ category_id: categoryId, category_name: categoryName, replace: replace }),
+                    })).json();
+                    if (d.status === 'error') { failStart(d.message || 'Could not start the download.'); return; }
+                } catch (e) { failStart(e.message); return; }
+
+                startPolling(categoryId, categoryName);
             });
 
-            // Load status + categories as soon as the page opens.
-            showIdle();
+            // On open: if a download is already running (started before navigating
+            // away), resume its progress view; otherwise show the setup view.
+            (async function resumeOrIdle() {
+                try {
+                    const jobs = (await (await fetch('/reference/sync_progress')).json()).jobs || [];
+                    const running = jobs.find(j => j.status === 'running');
+                    if (running) {
+                        showRunning();
+                        renderProgress(running);
+                        startPolling(running.category_id, running.game);
+                        return;
+                    }
+                } catch (e) { /* fall through to idle */ }
+                showIdle();
+            })();
         })();
     </script>
 </body>

@@ -1038,6 +1038,20 @@
               <button type="button" class="btn-pdf-exit" id="pdfExitBtn">Exit PDF Batch</button>
             </div>
 
+            <div id="pdfBgPanel" style="display:none; margin-top:14px; padding:14px 16px; border:1px solid var(--border); border-radius:12px; background:#f8fafc;">
+              <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap;">
+                <strong id="pdfBgTitle">Background PDF import</strong>
+                <button type="button" id="pdfBgStopBtn" class="btn-pdf-exit">Stop</button>
+              </div>
+              <div style="height:10px; background:#e2e8f0; border-radius:6px; overflow:hidden; margin:10px 0;">
+                <div id="pdfBgBar" style="height:100%; width:0%; background:var(--primary); transition:width .3s;"></div>
+              </div>
+              <div id="pdfBgStats" class="hint" style="margin:0;"></div>
+              <div class="hint" style="margin-top:6px;">
+                This runs on the server — you can leave this page and keep using the app; the import keeps going.
+              </div>
+            </div>
+
             <div class="grid-2">
               <div class="field">
                 <label for="game">Game</label>
@@ -2535,6 +2549,13 @@
 
       const autoImport = autoImportCheckbox.checked;
 
+      // Auto-import + PDF: hand the whole PDF to the server and let it process
+      // in the background, so you can navigate away while it runs.
+      if (autoImport && pdfActive && pdfBatchId) {
+        startBackgroundPdfImport();
+        return;
+      }
+
       // Once Auto-import starts on a PDF, keep chaining through every remaining
       // page automatically (see the img.onload handler).
       if (autoImport && pdfActive) autoImportChaining = true;
@@ -2654,6 +2675,88 @@
     autoImportCheckbox.addEventListener('change', function () {
       autoImportToggle.classList.toggle('on', autoImportCheckbox.checked);
     });
+
+    // ── Background PDF import (server-side, survives navigation) ─────────
+    const pdfBgPanel   = document.getElementById('pdfBgPanel');
+    const pdfBgTitle   = document.getElementById('pdfBgTitle');
+    const pdfBgBar     = document.getElementById('pdfBgBar');
+    const pdfBgStats   = document.getElementById('pdfBgStats');
+    const pdfBgStopBtn = document.getElementById('pdfBgStopBtn');
+    let pdfBgJobId = null, pdfBgTimer = null;
+
+    function showPdfBg(msg) {
+      pdfBgPanel.style.display = '';
+      pdfBgTitle.textContent = 'Background PDF import';
+      pdfBgStats.textContent = msg || '';
+      pdfBgBar.style.width = '0%';
+      pdfBgStopBtn.style.display = '';
+      pdfBgStopBtn.disabled = false;
+      pdfBgStopBtn.textContent = 'Stop';
+    }
+    function renderPdfBg(job) {
+      const total = job.total_pages || 0, done = job.pages_done || 0;
+      pdfBgBar.style.width = total ? Math.round(done / total * 100) + '%' : '0%';
+      const bits = ['Page ' + done + '/' + total, (job.cards || 0) + ' cards imported',
+                    (job.identified || 0) + ' identified'];
+      if (job.errors) bits.push(job.errors + ' errors');
+      pdfBgStats.textContent = (job.current ? job.current + ' — ' : '') + bits.join(' · ');
+    }
+    function stopPdfBgPolling() { if (pdfBgTimer) { clearInterval(pdfBgTimer); pdfBgTimer = null; } }
+    function finishPdfBg(job) {
+      stopPdfBgPolling();
+      pdfBgStopBtn.style.display = 'none';
+      let label = 'Done';
+      if (job.status === 'stopped') label = 'Stopped';
+      else if (job.status === 'cap_reached') label = 'Stopped at inventory cap';
+      else if (job.status === 'error') label = 'Error: ' + (job.error || 'unknown');
+      pdfBgTitle.textContent = 'Background PDF import — ' + label;
+      renderPdfBg(job);
+    }
+    async function pollPdfBg() {
+      let jobs;
+      try { jobs = ((await (await fetch('/import/pdf_progress')).json()).jobs) || []; }
+      catch (e) { return; }
+      const job = jobs.find(j => j.job_id === pdfBgJobId) || jobs.find(j => j.status === 'running');
+      if (!job) return;
+      pdfBgJobId = job.job_id;
+      if (job.status === 'running') renderPdfBg(job);
+      else finishPdfBg(job);
+    }
+    function beginPdfBgPolling() { stopPdfBgPolling(); pollPdfBg(); pdfBgTimer = setInterval(pollPdfBg, 1500); }
+
+    async function startBackgroundPdfImport() {
+      const fd = new FormData(form);
+      fd.delete('image');              // server uses the already-opened PDF via batch_id
+      fd.set('batch_id', pdfBatchId);
+      fd.set('auto_import', '1');
+      showPdfBg('Starting…');
+      setStatus('Background PDF import started — you can leave this page; it keeps running.', 'success');
+      try {
+        const d = await (await fetch('/import/start_pdf', { method: 'POST', body: fd })).json();
+        if (d.status === 'error') { pdfBgStats.textContent = d.message || 'Could not start.'; return; }
+        pdfBgJobId = d.job_id;
+        beginPdfBgPolling();
+      } catch (e) { pdfBgStats.textContent = e.message; }
+    }
+
+    if (pdfBgStopBtn) pdfBgStopBtn.addEventListener('click', async function () {
+      pdfBgStopBtn.disabled = true; pdfBgStopBtn.textContent = 'Stopping…';
+      try {
+        await fetch('/import/stop_pdf', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ job_id: pdfBgJobId }),
+        });
+      } catch (e) {}
+    });
+
+    // Resume a running background import when this page (re)loads.
+    (async function resumePdfBg() {
+      try {
+        const jobs = ((await (await fetch('/import/pdf_progress')).json()).jobs) || [];
+        const running = jobs.find(j => j.status === 'running');
+        if (running) { pdfBgJobId = running.job_id; showPdfBg(''); beginPdfBgPolling(); }
+      } catch (e) { /* none running */ }
+    })();
 
     drawPreview();
   </script>

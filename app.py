@@ -6403,6 +6403,157 @@ def reference_groups(category_id):
     })
 
 
+def _reference_sync_one_group(category_id, category_name, group_id, group_name, replace):
+    """Sync ONE set into ReferenceCard and refresh the game's ReferenceSync row.
+    Returns {"status": "ok"|"skipped", "added": N}. Shared by the per-set route
+    and the background sync worker so both behave identically."""
+    already = (ReferenceCard.query
+               .filter_by(category_id=category_id, group_id=group_id)
+               .first() is not None)
+    if already and not replace:
+        return {"status": "skipped", "added": 0}
+
+    cards = ref_sync.fetch_group_cards(category_id, category_name, group_id, group_name)
+
+    if replace:
+        ReferenceCard.query.filter_by(category_id=category_id, group_id=group_id).delete()
+        db.session.flush()
+    for rec in cards:
+        _reference_upsert(rec)
+
+    rs = ReferenceSync.query.filter_by(category_id=category_id).first()
+    if rs is None:
+        rs = ReferenceSync(category_id=category_id)
+        db.session.add(rs)
+    rs.game = category_name or rs.game
+    rs.status = "ok"
+    rs.remote_updated = ref_sync.get_last_updated() or rs.remote_updated
+    db.session.flush()
+    _reference_recount(category_id)
+    db.session.commit()
+    _REF_FIELDS_CACHE.pop(category_id, None)
+    return {"status": "ok", "added": len(cards)}
+
+
+# ── Background reference-sync jobs ──────────────────────────────────────────
+# A game's catalog is pulled set-by-set on a daemon thread so the download keeps
+# running while the user navigates elsewhere in the app. Progress lives in memory
+# and is polled by the Reference Data page; the SQLite WAL + busy_timeout config
+# lets the worker write while the rest of the app keeps reading.
+import threading as _threading
+_REF_JOBS = {}                       # category_id -> job dict
+_REF_JOBS_LOCK = _threading.Lock()
+
+_REF_JOB_PUBLIC = ("category_id", "game", "status", "total", "done",
+                   "ok", "cards", "skipped", "err", "current", "error", "replace")
+
+
+def _reference_job_snapshot(job):
+    return {k: job.get(k) for k in _REF_JOB_PUBLIC}
+
+
+def _run_reference_sync(flask_app, category_id, category_name, replace):
+    """Worker: download every set of a game, updating the shared job state."""
+    import time as _t
+    with flask_app.app_context():
+        job = _REF_JOBS.get(category_id)
+        if job is None:
+            return
+        try:
+            groups = ref_sync.get_groups(category_id)
+            job["total"] = len(groups)
+            job["current"] = "Loading set list…"
+
+            # Make the game show up in the downloaded list right away.
+            rs = ReferenceSync.query.filter_by(category_id=category_id).first()
+            if rs is None:
+                rs = ReferenceSync(category_id=category_id, game=category_name)
+                db.session.add(rs)
+                rs.status = "syncing"
+                db.session.commit()
+
+            for g in groups:
+                if job["stop"]:
+                    break
+                gid = g.get("groupId")
+                gname = g.get("name") or ""
+                job["current"] = gname or (f"Set #{gid}")
+                try:
+                    res = _reference_sync_one_group(category_id, category_name, gid, gname, replace)
+                    if res["status"] == "ok":
+                        job["ok"] += 1
+                        job["cards"] += res["added"]
+                    else:
+                        job["skipped"] += 1
+                except Exception:
+                    db.session.rollback()
+                    job["err"] += 1
+                job["done"] += 1
+                _t.sleep(0.12)   # be a good neighbour between sets
+
+            job["status"] = "stopped" if job["stop"] else "done"
+        except Exception as exc:
+            job["status"] = "error"
+            job["error"] = str(exc)
+        finally:
+            try:
+                db.session.remove()
+            except Exception:
+                pass
+
+
+@app.route("/reference/start_sync", methods=["POST"])
+def reference_start_sync():
+    """Kick off a background download of a game's catalog and return immediately."""
+    if ref_sync is None:
+        return jsonify({"status": "error", "message": "Reference sync source unavailable."}), 503
+    body = request.get_json() or {}
+    try:
+        category_id = int(body.get("category_id"))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "category_id is required."}), 400
+    category_name = str(body.get("category_name") or "").strip()
+    replace = bool(body.get("replace"))
+
+    with _REF_JOBS_LOCK:
+        existing = _REF_JOBS.get(category_id)
+        if existing and existing["status"] == "running":
+            return jsonify({"status": "already_running", **_reference_job_snapshot(existing)})
+        job = {"category_id": category_id, "game": category_name, "status": "running",
+               "total": 0, "done": 0, "ok": 0, "cards": 0, "skipped": 0, "err": 0,
+               "current": "Preparing…", "stop": False, "error": None, "replace": replace}
+        _REF_JOBS[category_id] = job
+
+    _threading.Thread(target=_run_reference_sync,
+                      args=(app, category_id, category_name, replace),
+                      daemon=True).start()
+    return jsonify({"status": "started", **_reference_job_snapshot(job)})
+
+
+@app.route("/reference/sync_progress")
+def reference_sync_progress():
+    """Snapshot of all reference-sync jobs (running and finished), for polling."""
+    with _REF_JOBS_LOCK:
+        jobs = [_reference_job_snapshot(j) for j in _REF_JOBS.values()]
+    running = [j for j in jobs if j["status"] == "running"]
+    return jsonify({"status": "ok", "jobs": jobs, "running": len(running)})
+
+
+@app.route("/reference/stop_sync", methods=["POST"])
+def reference_stop_sync():
+    """Ask a running background sync to stop after the current set."""
+    body = request.get_json() or {}
+    try:
+        category_id = int(body.get("category_id"))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "category_id is required."}), 400
+    with _REF_JOBS_LOCK:
+        job = _REF_JOBS.get(category_id)
+        if job:
+            job["stop"] = True
+    return jsonify({"status": "ok"})
+
+
 @app.route("/reference/sync_group", methods=["POST"])
 def reference_sync_group():
     """
@@ -6430,50 +6581,17 @@ def reference_sync_group():
     group_name    = str(body.get("group_name") or "").strip()
     replace       = bool(body.get("replace"))
 
-    # Already cached and not replacing? Skip the network round-trip entirely.
-    already_synced = (ReferenceCard.query
-                      .filter_by(category_id=category_id, group_id=group_id)
-                      .first() is not None)
-    if already_synced and not replace:
-        rs = ReferenceSync.query.filter_by(category_id=category_id).first()
-        return jsonify({
-            "status": "skipped",
-            "added": 0,
-            "group_name": group_name,
-            "product_count": rs.product_count if rs else None,
-        })
-
     try:
-        cards = ref_sync.fetch_group_cards(category_id, category_name, group_id, group_name)
+        res = _reference_sync_one_group(category_id, category_name, group_id, group_name, replace)
     except Exception as exc:
         return jsonify({"status": "error", "message": f"Reference fetch failed: {exc}"}), 502
 
-    # Overwrite: drop this set's existing cards first so cards removed upstream
-    # don't linger. Flush before re-inserting to free the unique product_ids.
-    if replace:
-        ReferenceCard.query.filter_by(category_id=category_id, group_id=group_id).delete()
-        db.session.flush()
-
-    for rec in cards:
-        _reference_upsert(rec)
-
-    # Ensure a ReferenceSync row exists and refresh its counts.
     rs = ReferenceSync.query.filter_by(category_id=category_id).first()
-    if rs is None:
-        rs = ReferenceSync(category_id=category_id)
-        db.session.add(rs)
-    rs.game = category_name or rs.game
-    rs.status = "ok"
-    rs.remote_updated = ref_sync.get_last_updated() or rs.remote_updated
-    db.session.flush()
-    _reference_recount(category_id)
-    db.session.commit()
-
     return jsonify({
-        "status": "ok",
-        "added": len(cards),
+        "status": res["status"],
+        "added": res["added"],
         "group_name": group_name,
-        "product_count": rs.product_count,
+        "product_count": rs.product_count if rs else None,
     })
 
 
@@ -7129,57 +7247,13 @@ def run_import_split():
     file.save(import_path)
 
     try:
-        pil_image = Image.open(import_path).convert("RGB")
-        pieces    = split_image_3x3(pil_image, v_cut1, v_cut2, h_cut1, h_cut2)
-
-        results = []
-        for photographed_idx, piece in enumerate(pieces, start=1):
-            slot_num      = resolve_slot_number(photographed_idx, side)
-            slot_filename = f"{safe_game}-{safe_album}-{safe_page}-{slot_num}-{side}.png"
-            split_path    = os.path.join(app.config["TEMP_SPLIT_FOLDER"], slot_filename)
-            piece.save(split_path)
-
-            try:
-                split_cv = cv2.imread(split_path)
-                if split_cv is None:
-                    raise ValueError("Could not read split image")
-
-                # Detect the card in this tile and crop tightly to it, using the
-                # corner strategy for the selected edge type. If no card outline
-                # is found, fall back to a slight deskew so the tile is still
-                # usable (and can be Manual-Adjusted afterwards).
-                cropped, ok = detect_and_crop_card(split_cv, edge_type)
-                processed = cropped if ok else straighten_split_image(split_cv)
-
-                card_path = os.path.join(app.config["TEMP_CARD_FOLDER"], slot_filename)
-                cv2.imwrite(card_path, processed)
-
-                results.append({
-                    "slot": slot_num, "filename": slot_filename,
-                    "status": "processed",
-                    "url": url_for("temp_card_file", filename=slot_filename),
-                })
-            except Exception:
-                # Alignment couldn't run on this tile. In auto-import we still
-                # file the raw cut so the card reaches inventory unattended; in
-                # manual mode we surface it as a fallback for review.
-                if auto_import:
-                    try:
-                        card_path = os.path.join(app.config["TEMP_CARD_FOLDER"], slot_filename)
-                        piece.save(card_path)
-                        results.append({
-                            "slot": slot_num, "filename": slot_filename,
-                            "status": "processed",
-                            "url": url_for("temp_card_file", filename=slot_filename),
-                        })
-                        continue
-                    except Exception:
-                        pass
-                results.append({
-                    "slot": slot_num, "filename": slot_filename,
-                    "status": "fallback",
-                    "url": url_for("temp_split_file", filename=slot_filename),
-                })
+        results = _split_align_page_tiles(import_path, game, album, page, side, edge_type,
+                                          v_cut1, v_cut2, h_cut1, h_cut2)
+        for r in results:
+            if r["status"] == "processed":
+                r["url"] = url_for("temp_card_file", filename=r["filename"])
+            else:
+                r["url"] = url_for("temp_split_file", filename=r["filename"])
 
         processed_count = sum(1 for r in results if r["status"] == "processed")
         fallback_count  = sum(1 for r in results if r["status"] == "fallback")
@@ -7290,124 +7364,8 @@ def import_finalize_batch():
         results = []
 
         for idx, filename in enumerate(filenames, start=1):
-            temp_image_path = os.path.join(app.config["TEMP_CARD_FOLDER"], filename)
-
-            if not os.path.exists(temp_image_path):
-                result = {"filename": filename, "status": "error", "message": "Aligned card image not found"}
-                results.append(result)
-                yield sse("progress", {"slot": idx, "total": len(filenames), "result": result})
-                continue
-
-            filename_fields = parse_card_filename(filename)
-            extracted = {**blank_fields, **filename_fields}
-            if extracted.get("game"):
-                # Capitalize the stored game (e.g. 'pokemon' -> 'Pokemon'). Done
-                # here, before the pocket lookup below, so a normalized front and
-                # its back still resolve to the same key and merge (not duplicate).
-                extracted["game"] = _normalize_game_name(extracted["game"])
-            if collection:
-                extracted["collection"] = collection
-            side = filename_fields.get("side", "front")
-
-            game  = extracted.get("game",  "")
-            album = extracted.get("album", "")
-            page  = extracted.get("page",  "")
-            slot  = extracted.get("slot",  "")
-
-            # Storage kind. A Box has no pages; its cards number continuously,
-            # so derive a stable box_number from the (sheet, slot) pocket key —
-            # deterministic, so a card's front and back land on the same number.
-            if storage_type == "box":
-                extracted["storage_type"] = "box"
-                try:
-                    pnum, snum = int(page or 0), int(slot or 0)
-                    if pnum and snum:
-                        extracted["box_number"] = (pnum - 1) * 9 + snum
-                except (TypeError, ValueError):
-                    pass
-            else:
-                extracted["storage_type"] = "album"
-
             try:
-                final_relative_image_path = move_temp_card_to_inventory(filename)
-                existing = find_existing_record_for_key(game, album, page, slot)
-
-                if existing:
-                    # Same physical pocket already has a record (from the other
-                    # side, or a re-import) — attach this image to it instead of
-                    # creating a duplicate row. Any fields the person has
-                    # already filled in by hand are left alone.
-                    old_image = existing.image_path_back if side == "back" else existing.image_path
-                    if side == "back":
-                        existing.image_path_back = final_relative_image_path
-                    else:
-                        existing.image_path = final_relative_image_path
-
-                    merged = dict(existing.extracted_data or {})
-                    for key, val in extracted.items():
-                        if not merged.get(key) and val:
-                            merged[key] = val
-                    existing.extracted_data = merged
-
-                    db.session.commit()
-
-                    if old_image and old_image != "__blank__":
-                        remove_file_if_exists(old_image)
-
-                    record          = existing
-                    matched_product = existing.matched_product
-                else:
-                    create_kwargs = dict(
-                        template_name=template_name,
-                        extracted=extracted,
-                    )
-                    if side == "back":
-                        # No front photo yet — hold its place with the blank
-                        # sentinel so the back image still has a record to
-                        # live on; the front slot fills in once it's imported.
-                        create_kwargs["image_path"]      = "__blank__"
-                        create_kwargs["image_path_back"] = final_relative_image_path
-                    else:
-                        create_kwargs["image_path"] = final_relative_image_path
-
-                    matched_product, record = create_scan_record(**create_kwargs)
-
-                # ── Auto-identify at the end of import (FRONTS ONLY) ──
-                # Run the same OCR identification the detail page uses on a
-                # 100% match, then apply + save; otherwise leave the entry blank
-                # for manual entry later. Only front pages (odd pages) carry the
-                # name/serial — even pages are card BACKS and are never OCR
-                # name/serial-checked. Also skips if already identified/filled.
-                ident = {"identified": False, "reason": "skipped"}
-                try:
-                    rext = record.extracted_data or {}
-                    has_front = record.image_path and record.image_path != "__blank__"
-                    if side == "front" and has_front and not (_get_name(rext) or _get_serial(rext)):
-                        ident = auto_identify_record(record)
-                        if ident.get("identified") or ident.get("type_applied"):
-                            db.session.commit()
-                            matched_product = record.matched_product or matched_product
-                    elif side == "back":
-                        ident = {"identified": False, "reason": "back_page_skipped"}
-                except Exception:
-                    db.session.rollback()
-                    ident = {"identified": False, "reason": "error"}
-
-                result = {
-                    "filename":        filename,
-                    "status":          "success",
-                    "record_id":       record.id,
-                    "side":            side,
-                    "image_url":       build_uploaded_file_url(record.image_path),
-                    "image_url_back":  build_uploaded_file_url(record.image_path_back) if record.image_path_back else None,
-                    "extracted":       extracted,
-                    "matched_product": matched_product.product_name if matched_product else "No match",
-                    "identified":      bool(ident.get("identified")),
-                    "identified_name": (ident.get("applied") or {}).get("name", "") if ident.get("identified") else "",
-                    "ident_error":     ident.get("error", ""),
-                    "ident_source":    ident.get("source", ""),
-                    "card_type":       (ident.get("type_applied") or {}).get("value", ""),
-                }
+                result = _finalize_one_card(filename, template_name, blank_fields, collection, storage_type)
             except InventoryCapError:
                 # Hit the cap partway through — stop, keeping everything filed so
                 # far, and tell the browser to show the upgrade path.
@@ -7440,6 +7398,418 @@ def import_finalize_batch():
             "X-Accel-Buffering": "no",   # disable nginx buffering if behind a proxy
         },
     )
+
+
+# ====================== BACKGROUND PDF AUTO-IMPORT ======================
+# A long PDF auto-import (cut -> align/crop -> identify -> file, for every page)
+# runs on a daemon thread so you can navigate away and keep using the app while
+# it works. Progress lives in memory and is polled by the import page. Reuses the
+# same pipeline primitives as the interactive flow via the shared helpers below.
+
+def _detect_cut_lines(bgr):
+    """Server-side port of the import page's white-gap cut-line detection. Given a
+    9-pocket page image (BGR), return (v1, v2, h1, h2) as 0-100 percentages for the
+    two vertical and two horizontal cut lines. Any line that can't be confidently
+    found falls back to even thirds. Mirrors detectCutLines()/findBandCenter() in
+    import.html so the background importer places the same lines the interactive
+    preview would."""
+    h0, w0 = bgr.shape[:2]
+    scale = min(900.0 / w0, 560.0 / h0, 1.0)
+    dw = max(1, int(round(w0 * scale)))
+    dh = max(1, int(round(h0 * scale)))
+    small = cv2.resize(bgr, (dw, dh), interpolation=cv2.INTER_AREA)
+
+    b = small[:, :, 0].astype(np.int16)
+    g = small[:, :, 1].astype(np.int16)
+    r = small[:, :, 2].astype(np.int16)
+    mn = np.minimum(np.minimum(r, g), b)
+    mx = np.maximum(np.maximum(r, g), b)
+    white = (mn > 200) & ((mx - mn) < 40)      # near-white background pixel
+
+    col_white = white.mean(axis=0)             # fraction white per column
+    row_white = white.mean(axis=1)             # fraction white per row
+
+    def band_center(profile, lo_frac, hi_frac):
+        L = len(profile)
+        lo, hi = int(L * lo_frac), int(L * hi_frac)
+        if hi <= lo:
+            return None
+        window = profile[lo:hi]
+        peak = float(window.max()) if window.size else 0.0
+        if peak < 0.5:                          # no genuine white gap here
+            return None
+        thr = max(0.6, peak - 0.15)
+        best_len = best_start = cur_len = cur_start = 0
+        for i in range(lo, hi):
+            if profile[i] >= thr:
+                if cur_len == 0:
+                    cur_start = i
+                cur_len += 1
+                if cur_len > best_len:
+                    best_len, best_start = cur_len, cur_start
+            else:
+                cur_len = 0
+        if best_len == 0:
+            return None
+        return (best_start + best_len / 2.0) / L * 100.0
+
+    def clamp(v):
+        return min(95.0, max(5.0, round(v)))
+
+    v1, v2 = band_center(col_white, 0.20, 0.47), band_center(col_white, 0.53, 0.80)
+    h1, h2 = band_center(row_white, 0.20, 0.47), band_center(row_white, 0.53, 0.80)
+    v1 = clamp(v1) if v1 is not None else 100 / 3.0
+    v2 = clamp(v2) if v2 is not None else 200 / 3.0
+    h1 = clamp(h1) if h1 is not None else 100 / 3.0
+    h2 = clamp(h2) if h2 is not None else 200 / 3.0
+    if v1 >= v2:                                # keep cut 1 < cut 2 per axis
+        v1, v2 = 100 / 3.0, 200 / 3.0
+    if h1 >= h2:
+        h1, h2 = 100 / 3.0, 200 / 3.0
+    return v1, v2, h1, h2
+
+
+def _detect_cut_lines_for_path(page_image_path):
+    """Auto-detect cut lines for a page image on disk; even thirds if unreadable."""
+    bgr = cv2.imread(page_image_path)
+    if bgr is None:
+        return (100 / 3.0, 200 / 3.0, 100 / 3.0, 200 / 3.0)
+    return _detect_cut_lines(bgr)
+
+
+def _split_align_page_tiles(page_image_path, game, album, page, side, edge_type,
+                            v1=100 / 3.0, v2=200 / 3.0, h1=100 / 3.0, h2=200 / 3.0):
+    """Cut a 9-pocket page image into 9 tiles, align/crop each to `edge_type`, save
+    to the temp card folder, and return a result list (slot/filename/status). On a
+    tile that can't be aligned the raw cut is still saved so the card reaches
+    inventory. Shared by /run_import_split and the background PDF importer. Does
+    NOT add url_for links (so it's safe to call off the request thread)."""
+    safe_game  = secure_filename(game)  or "game"
+    safe_album = secure_filename(album) or "album"
+    safe_page  = secure_filename(str(page)) or "page"
+
+    pil_image = Image.open(page_image_path).convert("RGB")
+    pieces    = split_image_3x3(pil_image, v1, v2, h1, h2)
+
+    results = []
+    for photographed_idx, piece in enumerate(pieces, start=1):
+        slot_num      = resolve_slot_number(photographed_idx, side)
+        slot_filename = f"{safe_game}-{safe_album}-{safe_page}-{slot_num}-{side}.png"
+        split_path    = os.path.join(app.config["TEMP_SPLIT_FOLDER"], slot_filename)
+        piece.save(split_path)
+        try:
+            split_cv = cv2.imread(split_path)
+            if split_cv is None:
+                raise ValueError("Could not read split image")
+            cropped, ok = detect_and_crop_card(split_cv, edge_type)
+            processed = cropped if ok else straighten_split_image(split_cv)
+            cv2.imwrite(os.path.join(app.config["TEMP_CARD_FOLDER"], slot_filename), processed)
+            results.append({"slot": slot_num, "filename": slot_filename, "status": "processed"})
+        except Exception:
+            try:
+                piece.save(os.path.join(app.config["TEMP_CARD_FOLDER"], slot_filename))
+                results.append({"slot": slot_num, "filename": slot_filename, "status": "processed"})
+            except Exception:
+                results.append({"slot": slot_num, "filename": slot_filename, "status": "fallback"})
+    return results
+
+
+def _finalize_one_card(filename, template_name, blank_fields, collection, storage_type):
+    """Create or merge ONE inventory record from an aligned card image. Fronts are
+    auto-identified; backs merge onto the matching pocket. Raises InventoryCapError
+    if the cap is hit. Returns a result dict. Shared by /import_finalize_batch and
+    the background PDF importer."""
+    temp_image_path = os.path.join(app.config["TEMP_CARD_FOLDER"], filename)
+    if not os.path.exists(temp_image_path):
+        return {"filename": filename, "status": "error", "message": "Aligned card image not found"}
+
+    filename_fields = parse_card_filename(filename)
+    extracted = {**blank_fields, **filename_fields}
+    if extracted.get("game"):
+        extracted["game"] = _normalize_game_name(extracted["game"])
+    if collection:
+        extracted["collection"] = collection
+    side = filename_fields.get("side", "front")
+
+    game  = extracted.get("game",  "")
+    album = extracted.get("album", "")
+    page  = extracted.get("page",  "")
+    slot  = extracted.get("slot",  "")
+
+    if storage_type == "box":
+        extracted["storage_type"] = "box"
+        try:
+            pnum, snum = int(page or 0), int(slot or 0)
+            if pnum and snum:
+                extracted["box_number"] = (pnum - 1) * 9 + snum
+        except (TypeError, ValueError):
+            pass
+    else:
+        extracted["storage_type"] = "album"
+
+    final_relative_image_path = move_temp_card_to_inventory(filename)
+    existing = find_existing_record_for_key(game, album, page, slot)
+
+    if existing:
+        old_image = existing.image_path_back if side == "back" else existing.image_path
+        if side == "back":
+            existing.image_path_back = final_relative_image_path
+        else:
+            existing.image_path = final_relative_image_path
+        merged = dict(existing.extracted_data or {})
+        for key, val in extracted.items():
+            if not merged.get(key) and val:
+                merged[key] = val
+        existing.extracted_data = merged
+        db.session.commit()
+        if old_image and old_image != "__blank__":
+            remove_file_if_exists(old_image)
+        record          = existing
+        matched_product = existing.matched_product
+    else:
+        create_kwargs = dict(template_name=template_name, extracted=extracted)
+        if side == "back":
+            create_kwargs["image_path"]      = "__blank__"
+            create_kwargs["image_path_back"] = final_relative_image_path
+        else:
+            create_kwargs["image_path"] = final_relative_image_path
+        matched_product, record = create_scan_record(**create_kwargs)
+
+    ident = {"identified": False, "reason": "skipped"}
+    try:
+        rext = record.extracted_data or {}
+        has_front = record.image_path and record.image_path != "__blank__"
+        if side == "front" and has_front and not (_get_name(rext) or _get_serial(rext)):
+            ident = auto_identify_record(record)
+            if ident.get("identified") or ident.get("type_applied"):
+                db.session.commit()
+                matched_product = record.matched_product or matched_product
+        elif side == "back":
+            ident = {"identified": False, "reason": "back_page_skipped"}
+    except Exception:
+        db.session.rollback()
+        ident = {"identified": False, "reason": "error"}
+
+    return {
+        "filename":        filename,
+        "status":          "success",
+        "record_id":       record.id,
+        "side":            side,
+        "image_url":       build_uploaded_file_url(record.image_path),
+        "image_url_back":  build_uploaded_file_url(record.image_path_back) if record.image_path_back else None,
+        "extracted":       extracted,
+        "matched_product": matched_product.product_name if matched_product else "No match",
+        "identified":      bool(ident.get("identified")),
+        "identified_name": (ident.get("applied") or {}).get("name", "") if ident.get("identified") else "",
+        "ident_error":     ident.get("error", ""),
+        "ident_source":    ident.get("source", ""),
+        "card_type":       (ident.get("type_applied") or {}).get("value", ""),
+    }
+
+
+def _render_pdf_page_to_path(pdf_path, index):
+    """Rasterise page `index` (1-based) of a PDF to a cached PNG; return its path."""
+    page_filename = f"pdfpage_bg_{os.path.basename(pdf_path)}_{index:03d}.png"
+    page_path = os.path.join(app.config["TEMP_PDF_FOLDER"], page_filename)
+    if os.path.exists(page_path):
+        return page_path
+    doc = fitz.open(pdf_path)
+    try:
+        page = doc.load_page(index - 1)
+        pix = page.get_pixmap(matrix=_pdf_render_matrix(page))
+        pix.save(page_path)
+        del pix, page
+    finally:
+        doc.close()
+    return page_path
+
+
+def _next_sheet_index(name):
+    """Next 'sheet/page' index for a container (max existing page + 1)."""
+    key = (name or "").strip().lower()
+    if not key:
+        return 1
+    rows = (ScanRecord.query.filter(ScanRecord.album_key == key)
+            .with_entities(ScanRecord.extracted_data).all())
+    mx = 0
+    for (data,) in rows:
+        try:
+            p = int((data or {}).get("page") or 0)
+        except (TypeError, ValueError):
+            p = 0
+        mx = max(mx, p)
+    return mx + 1
+
+
+# ── PDF-import job registry ──
+_PDF_JOBS = {}
+_PDF_JOBS_LOCK = _threading.Lock()
+_PDF_JOB_PUBLIC = ("job_id", "game", "status", "total_pages", "pages_done",
+                   "cards", "identified", "errors", "page_errors", "current", "error")
+
+
+def _pdf_job_snapshot(job):
+    return {k: job.get(k) for k in _PDF_JOB_PUBLIC}
+
+
+def _run_pdf_import(flask_app, job_id, pdf_path, page_count, params):
+    """Worker: render every page, cut/align/crop 9 cards, then file + auto-identify."""
+    import time as _t
+    with flask_app.app_context():
+        job = _PDF_JOBS.get(job_id)
+        if job is None:
+            return
+        game         = params["game"]
+        album        = params["album"]
+        base_page    = params["page"]
+        edge_type    = params["edge_type"]
+        collection   = params["collection"]
+        storage_type = params["storage_type"]
+        try:
+            template = load_template(game)
+            blank_fields = {k: "" for k in (template.get("fields", {}) or {}).keys()}
+        except Exception as exc:
+            job["status"] = "error"
+            job["error"] = f"Could not load game '{game}': {exc}"
+            return
+
+        try:
+            for index in range(1, page_count + 1):
+                if job["stop"]:
+                    break
+                pair_idx = (index - 1) // 2
+                side = "front" if (index % 2 == 1) else "back"
+                try:
+                    pocket_page = str(int(base_page) + pair_idx)
+                except (TypeError, ValueError):
+                    pocket_page = str(base_page)
+                job["current"] = f"Page {index} of {page_count} ({side})"
+
+                try:
+                    page_img = _render_pdf_page_to_path(pdf_path, index)
+                    v1, v2, h1, h2 = _detect_cut_lines_for_path(page_img)
+                    tiles = _split_align_page_tiles(page_img, game, album, pocket_page, side,
+                                                    edge_type, v1, v2, h1, h2)
+                    for t in tiles:
+                        try:
+                            res = _finalize_one_card(t["filename"], game, blank_fields, collection, storage_type)
+                            if res.get("status") == "success":
+                                job["cards"] += 1
+                                if res.get("identified"):
+                                    job["identified"] += 1
+                            else:
+                                job["errors"] += 1
+                        except InventoryCapError:
+                            job["status"] = "cap_reached"
+                            job["stop"] = True
+                            break
+                        except Exception:
+                            db.session.rollback()
+                            job["errors"] += 1
+                except Exception:
+                    job["page_errors"] += 1
+
+                job["pages_done"] += 1
+                _t.sleep(0.02)
+
+            if job["status"] != "cap_reached":
+                job["status"] = "stopped" if job["stop"] else "done"
+        except Exception as exc:
+            job["status"] = "error"
+            job["error"] = str(exc)
+        finally:
+            try:
+                os.remove(pdf_path)
+            except OSError:
+                pass
+            try:
+                db.session.remove()
+            except Exception:
+                pass
+
+
+@app.route("/import/start_pdf", methods=["POST"])
+def import_start_pdf():
+    """Start a background PDF auto-import and return immediately. Accepts either a
+    fresh multipart upload (field 'pdf' or 'image') or a batch_id from /pdf_open."""
+    ensure_dirs()
+    if fitz is None:
+        return jsonify({"status": "error", "message": "PDF support isn't installed on the server."}), 500
+
+    form = request.form if len(request.form) else (request.get_json(silent=True) or {})
+
+    pdf_path = None
+    upload = request.files.get("pdf") or request.files.get("image")
+    if upload and upload.filename:
+        batch_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        pdf_path = os.path.join(app.config["TEMP_PDF_FOLDER"], f"upload_{batch_id}.pdf")
+        upload.save(pdf_path)
+    else:
+        batch_id = str(form.get("batch_id") or "").strip()
+        pdf_path = _pdf_batch_upload_path(batch_id) if batch_id else None
+    if not pdf_path or not os.path.exists(pdf_path):
+        return jsonify({"status": "error", "message": "PDF not available — please re-select it."}), 400
+
+    game  = str(form.get("game", "")).strip()
+    album = str(form.get("album", "")).strip()
+    if not game or not album:
+        return jsonify({"status": "error", "message": "Game and storage are required."}), 400
+    storage_type = str(form.get("storage_type", "album") or "album").strip().lower()
+    edge_type    = normalize_card_edge_type(form.get("card_edge_type"))
+    collection   = _clean_collection(form.get("collection"))
+    if storage_type == "box":
+        base_page = _next_sheet_index(album)
+    else:
+        try:
+            base_page = int(str(form.get("page", "")).strip() or "1")
+        except (TypeError, ValueError):
+            base_page = 1
+
+    try:
+        doc = fitz.open(pdf_path)
+        page_count = doc.page_count
+        doc.close()
+    except Exception as exc:
+        return jsonify({"status": "error", "message": f"Could not read PDF: {exc}"}), 500
+    if page_count < 1:
+        return jsonify({"status": "error", "message": "PDF has no pages."}), 400
+
+    job_id = batch_id or datetime.now().strftime("pdf_%Y%m%d_%H%M%S_%f")
+    with _PDF_JOBS_LOCK:
+        for j in _PDF_JOBS.values():
+            if j["status"] == "running":
+                return jsonify({"status": "already_running", **_pdf_job_snapshot(j)})
+        job = {"job_id": job_id, "game": game, "status": "running",
+               "total_pages": page_count, "pages_done": 0, "cards": 0, "identified": 0,
+               "errors": 0, "page_errors": 0, "current": "Starting…", "stop": False, "error": None}
+        _PDF_JOBS[job_id] = job
+
+    params = {"game": game, "album": album, "page": base_page, "edge_type": edge_type,
+              "collection": collection, "storage_type": storage_type}
+    _threading.Thread(target=_run_pdf_import, args=(app, job_id, pdf_path, page_count, params),
+                      daemon=True).start()
+    return jsonify({"status": "started", **_pdf_job_snapshot(job)})
+
+
+@app.route("/import/pdf_progress")
+def import_pdf_progress():
+    """Snapshot of all PDF-import jobs (running and finished), for polling."""
+    with _PDF_JOBS_LOCK:
+        jobs = [_pdf_job_snapshot(j) for j in _PDF_JOBS.values()]
+    running = [j for j in jobs if j["status"] == "running"]
+    return jsonify({"status": "ok", "jobs": jobs, "running": len(running)})
+
+
+@app.route("/import/stop_pdf", methods=["POST"])
+def import_stop_pdf():
+    """Ask a running background PDF import to stop after the current card."""
+    body = request.get_json(silent=True) or {}
+    job_id = str(body.get("job_id") or "").strip()
+    with _PDF_JOBS_LOCK:
+        job = _PDF_JOBS.get(job_id)
+        if job:
+            job["stop"] = True
+    return jsonify({"status": "ok"})
 
 
 # ====================== JUSTTCG MANUAL SEARCH ======================
@@ -11480,4 +11850,4 @@ if __name__ == "__main__":
     print(" • /tcg_save_url/<id>, /tcg_clear_url/<id> — Legacy URL save / pricing data clear")
     print(" • Visit: http://127.0.0.1:5000")
 
-    app.run(host="0.0.0.0", port=5005, debug=True)
+    app.run(host="0.0.0.0", port=5005, debug=True, threaded=True)
