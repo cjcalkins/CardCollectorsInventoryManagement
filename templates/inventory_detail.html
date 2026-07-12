@@ -491,7 +491,11 @@
         }
         #realignCanvas { cursor: crosshair; max-width: 100%; touch-action: none; }
         .realign-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+
+        /* Roomier tooltips for the Identify Card button explanations. */
+        .tooltip-inner { max-width: 320px; text-align: left; }
     </style>
+    <link rel="stylesheet" href="{{ url_for('static', filename='theme.css') }}">
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
@@ -546,6 +550,10 @@
                     <i class="fas fa-rotate-left me-1"></i>Return to Inventory
                 </button>
                 {% endif %}
+                <button class="btn btn-outline-warning" id="wrongMatchBtn" type="button"
+                        title="Clear this entry's card fields (name, number, set, rarity, and every game column) so you can retype the correct details and re-match. Album, location, and prices are kept.">
+                    <i class="fas fa-eraser me-1"></i>Wrong Match
+                </button>
                 {% if prev_id %}
                 <a href="{{ url_for('inventory_detail', record_id=prev_id) }}" class="btn btn-outline-primary">
                     <i class="fas fa-chevron-left me-1"></i>Previous
@@ -570,7 +578,7 @@
         <div class="row g-4">
 
             <!-- ==================== LEFT COLUMN ==================== -->
-            <div class="col-lg-5">
+            <div class="col-lg-5 d-flex flex-column gap-4">
                 <div class="card detail-card">
                     <div class="card-header bg-light"><strong>Scanned Images</strong></div>
                     <div class="card-body text-center">
@@ -720,6 +728,114 @@
                                 </div>
                             </div>
                         </div>
+                    </div>
+                </div>
+
+                <!-- ==================== IDENTIFY CARD PANEL ==================== -->
+                <div class="card detail-card" id="ocrCard">
+                    <div class="card-header bg-light d-flex justify-content-between align-items-center">
+                        <strong><i class="fas fa-magnifying-glass-chart me-2"></i>Identify Card</strong>
+                    </div>
+                    <div class="card-body">
+                        <div class="d-flex flex-wrap gap-2">
+                            <button class="jtcg-fetch-btn" id="ocrIdentifyBtn" data-bs-toggle="tooltip" data-bs-placement="top"
+                                    title="Reads this card's name and collector number from the front image and matches them against your imported catalog and existing entries — no internet needed. A blank card auto-applies a 100% match; an already-filled card opens the matches in a list for manual correction.">
+                                <i class="fas fa-crosshairs me-1"></i>Local OCR Lookup
+                            </button>
+                            <button class="jtcg-fetch-btn" id="cloudIdentifyBtn" style="background:#0d6efd;" data-bs-toggle="tooltip" data-bs-placement="top"
+                                    title="Skips all local reading and sends the front image directly to your configured identification service (Settings → General: CardSight or Ximilar), returning whatever it recognizes.">
+                                <i class="fas fa-cloud me-1"></i>Cloud Identification
+                            </button>
+                            <button class="jtcg-fetch-btn" id="dbMatchBtn" style="background:#198754;" data-bs-toggle="tooltip" data-bs-placement="top"
+                                    title="Uses this entry's Name and Set Number to find the card in your downloaded database, then overwrites this entry's card fields to match it (album, location, and prices are kept). A single exact match is applied automatically; several matches open a chooser.">
+                                <i class="fas fa-database me-1"></i>Database Match
+                            </button>
+                            <button class="jtcg-fetch-btn" id="tcgLookupBtn" style="background:#6f42c1;" data-bs-toggle="tooltip" data-bs-placement="top"
+                                    title="Opens a TCGplayer search in a new tab using this entry's Name and Set Number fields (e.g. “Seaking 28/162”).">
+                                <i class="fas fa-up-right-from-square me-1"></i>TCG Lookup
+                            </button>
+                        </div>
+                        <div id="ocrStatus" class="mt-3"></div>
+                    </div>
+                </div>
+                <!-- end OCR Identify panel -->
+
+                <!-- ==================== TCGPLAYER LINK PANEL ==================== -->
+                {% set tcg_link = record.extracted_data.get('tcgplayer_link') or (record.extracted_data.get('tcgplayer') or {}).get('url') or '' %}
+                <div class="card detail-card" id="tcgLinkCard">
+                    <div class="card-header bg-light d-flex justify-content-between align-items-center">
+                        <strong><i class="fas fa-tag me-2"></i>TCGPlayer Link</strong>
+                        <button class="btn btn-sm btn-outline-primary" id="editTcgLinkBtn">
+                            <i class="fas fa-pen me-1"></i>Edit Link
+                        </button>
+                    </div>
+
+                    <div class="card-body">
+                        <!-- Display mode -->
+                        <div id="tcgLinkView">
+                            {% if tcg_link %}
+                            <a href="{{ tcg_link }}" target="_blank" rel="noopener" id="tcgLinkAnchor" class="text-break">
+                                <i class="fas fa-external-link-alt me-1"></i><span id="tcgLinkText">{{ tcg_link }}</span>
+                            </a>
+                            {% else %}
+                            <span class="text-muted" id="tcgLinkEmpty">No link set yet. Click &ldquo;Edit Link&rdquo; to add a TCGplayer URL.</span>
+                            {% endif %}
+                        </div>
+
+                        <!-- Edit mode -->
+                        <div id="tcgLinkEdit" style="display:none;">
+                            <div class="input-group">
+                                <input type="url" class="form-control" id="tcgLinkInput"
+                                       placeholder="https://www.tcgplayer.com/product/..." value="{{ tcg_link }}">
+                                <button class="btn btn-success" id="tcgLinkSaveBtn"><i class="fas fa-check me-1"></i>Save</button>
+                                <button class="btn btn-outline-secondary" id="tcgLinkCancelBtn">Cancel</button>
+                            </div>
+                            <div class="form-text small">Paste the full TCGplayer URL. Leave blank and Save to remove the link.</div>
+                        </div>
+
+                        <div id="tcgLinkStatus" class="mt-2"></div>
+                    </div>
+                </div>
+                <!-- end TCGPlayer Link panel -->
+
+                <!-- ==================== COPY FROM ENTRY PANEL ==================== -->
+                <div class="card detail-card">
+                    <div class="card-header bg-light">
+                        <strong><i class="fas fa-copy me-2"></i>Copy Values from Another Entry</strong>
+                    </div>
+                    <div class="card-body">
+                        <p class="text-muted small mb-3">
+                            Search for another inventory entry and copy its field values
+                            (name, serial, set, etc.) into this record. Album, page, slot,
+                            and image are never overwritten.
+                        </p>
+
+                        <!-- Searchable dropdown -->
+                        <div class="mb-3 position-relative">
+                            <label class="form-label small fw-semibold mb-1">Search entries</label>
+                            <input type="text" class="form-control" id="copySearchInput"
+                                   placeholder="Type a name, game, album, or record ID…"
+                                   autocomplete="off">
+                            <div id="copyDropdown"
+                                 class="position-absolute w-100 bg-white border rounded-3 shadow-sm mt-1 d-none"
+                                 style="max-height:260px; overflow-y:auto; z-index:50;">
+                            </div>
+                        </div>
+
+                        <!-- Preview of selected source record -->
+                        <div id="copyPreview" class="d-none">
+                            <div class="border rounded-3 p-3 bg-light mb-3" id="copyPreviewContent"></div>
+                            <div class="d-flex gap-2 align-items-center flex-wrap">
+                                <button class="btn btn-primary" id="applycopying">
+                                    <i class="fas fa-paste me-1"></i>Copy Values into This Entry
+                                </button>
+                                <button class="btn btn-outline-secondary btn-sm" id="clearCopySource">
+                                    <i class="fas fa-times me-1"></i>Clear
+                                </button>
+                            </div>
+                        </div>
+
+                        <div id="copyStatus" class="mt-2"></div>
                     </div>
                 </div>
 
@@ -963,123 +1079,6 @@
                         <div id="statusMessage" class="mt-3"></div>
                     </div>
                 </div>
-
-                <!-- ==================== COPY FROM ENTRY PANEL ==================== -->
-                <div class="card detail-card">
-                    <div class="card-header bg-light">
-                        <strong><i class="fas fa-copy me-2"></i>Copy Values from Another Entry</strong>
-                    </div>
-                    <div class="card-body">
-                        <p class="text-muted small mb-3">
-                            Search for another inventory entry and copy its field values
-                            (name, serial, set, etc.) into this record. Album, page, slot,
-                            and image are never overwritten.
-                        </p>
-
-                        <!-- Searchable dropdown -->
-                        <div class="mb-3 position-relative">
-                            <label class="form-label small fw-semibold mb-1">Search entries</label>
-                            <input type="text" class="form-control" id="copySearchInput"
-                                   placeholder="Type a name, game, album, or record ID…"
-                                   autocomplete="off">
-                            <div id="copyDropdown"
-                                 class="position-absolute w-100 bg-white border rounded-3 shadow-sm mt-1 d-none"
-                                 style="max-height:260px; overflow-y:auto; z-index:50;">
-                            </div>
-                        </div>
-
-                        <!-- Preview of selected source record -->
-                        <div id="copyPreview" class="d-none">
-                            <div class="border rounded-3 p-3 bg-light mb-3" id="copyPreviewContent"></div>
-                            <div class="d-flex gap-2 align-items-center flex-wrap">
-                                <button class="btn btn-primary" id="applycopying">
-                                    <i class="fas fa-paste me-1"></i>Copy Values into This Entry
-                                </button>
-                                <button class="btn btn-outline-secondary btn-sm" id="clearCopySource">
-                                    <i class="fas fa-times me-1"></i>Clear
-                                </button>
-                            </div>
-                        </div>
-
-                        <div id="copyStatus" class="mt-2"></div>
-                    </div>
-                </div>
-
-                <!-- ==================== OCR IDENTIFY PANEL ==================== -->
-                <div class="card detail-card" id="ocrCard">
-                    <div class="card-header bg-light d-flex justify-content-between align-items-center">
-                        <strong><i class="fas fa-magnifying-glass-chart me-2"></i>Identify by OCR</strong>
-                    </div>
-                    <div class="card-body">
-                        <p class="text-muted small mb-3">
-                            Reads the top and bottom of this card's front image (name and
-                            <span class="tcg-product-id">N/M</span> collector number), then finds
-                            matching entries. On a blank card a 100% match is applied automatically;
-                            if the card is already filled in, the matches open in a list for manual
-                            correction.
-                        </p>
-                        <div class="d-flex flex-wrap gap-2">
-                            <button class="jtcg-fetch-btn" id="ocrIdentifyBtn">
-                                <i class="fas fa-crosshairs me-1"></i>Local OCR Lookup
-                            </button>
-                            <button class="jtcg-fetch-btn" id="cloudIdentifyBtn" style="background:#0d6efd;">
-                                <i class="fas fa-cloud me-1"></i>Cloud Identification
-                            </button>
-                            <button class="jtcg-fetch-btn" id="tcgLookupBtn" style="background:#6f42c1;">
-                                <i class="fas fa-up-right-from-square me-1"></i>TCG Lookup
-                            </button>
-                        </div>
-                        <div class="form-text small mt-2">
-                            <strong>Local OCR Lookup</strong> reads the card text and matches it against your imported
-                            catalog and existing entries — no internet needed.
-                            <strong>Cloud Identification</strong> skips all local reading and sends the front image
-                            directly to your configured identification service
-                            (Settings → General: CardSight or Ximilar), returning whatever it recognizes.
-                            <strong>TCG Lookup</strong> opens a TCGplayer search in a new tab using this entry's
-                            Name and Set Number fields (e.g. “Seaking 28/162”).
-                        </div>
-                        <div id="ocrStatus" class="mt-3"></div>
-                    </div>
-                </div>
-                <!-- end OCR Identify panel -->
-
-                <!-- ==================== TCGPLAYER LINK PANEL ==================== -->
-                {% set tcg_link = record.extracted_data.get('tcgplayer_link') or (record.extracted_data.get('tcgplayer') or {}).get('url') or '' %}
-                <div class="card detail-card" id="tcgLinkCard">
-                    <div class="card-header bg-light d-flex justify-content-between align-items-center">
-                        <strong><i class="fas fa-tag me-2"></i>TCGPlayer Link</strong>
-                        <button class="btn btn-sm btn-outline-primary" id="editTcgLinkBtn">
-                            <i class="fas fa-pen me-1"></i>Edit Link
-                        </button>
-                    </div>
-
-                    <div class="card-body">
-                        <!-- Display mode -->
-                        <div id="tcgLinkView">
-                            {% if tcg_link %}
-                            <a href="{{ tcg_link }}" target="_blank" rel="noopener" id="tcgLinkAnchor" class="text-break">
-                                <i class="fas fa-external-link-alt me-1"></i><span id="tcgLinkText">{{ tcg_link }}</span>
-                            </a>
-                            {% else %}
-                            <span class="text-muted" id="tcgLinkEmpty">No link set yet. Click &ldquo;Edit Link&rdquo; to add a TCGplayer URL.</span>
-                            {% endif %}
-                        </div>
-
-                        <!-- Edit mode -->
-                        <div id="tcgLinkEdit" style="display:none;">
-                            <div class="input-group">
-                                <input type="url" class="form-control" id="tcgLinkInput"
-                                       placeholder="https://www.tcgplayer.com/product/..." value="{{ tcg_link }}">
-                                <button class="btn btn-success" id="tcgLinkSaveBtn"><i class="fas fa-check me-1"></i>Save</button>
-                                <button class="btn btn-outline-secondary" id="tcgLinkCancelBtn">Cancel</button>
-                            </div>
-                            <div class="form-text small">Paste the full TCGplayer URL. Leave blank and Save to remove the link.</div>
-                        </div>
-
-                        <div id="tcgLinkStatus" class="mt-2"></div>
-                    </div>
-                </div>
-                <!-- end TCGPlayer Link panel -->
 
             </div>
         </div>
@@ -2270,7 +2269,9 @@
     (function () {
         const identifyBtn = document.getElementById('ocrIdentifyBtn');
         const cloudBtn    = document.getElementById('cloudIdentifyBtn');
-        if (!identifyBtn && !cloudBtn) return;
+        const dbMatchBtn  = document.getElementById('dbMatchBtn');
+        const wrongBtn    = document.getElementById('wrongMatchBtn');
+        if (!identifyBtn && !cloudBtn && !dbMatchBtn && !wrongBtn) return;
 
         const status      = document.getElementById('ocrStatus');
         const pickerList  = document.getElementById('ocrPickerList');
@@ -2290,11 +2291,11 @@
         function setBtnBusy(btn, label) {
             if (!btn) return;
             if (!BTN_LABELS.has(btn)) BTN_LABELS.set(btn, btn.innerHTML);
-            [identifyBtn, cloudBtn].forEach(b => { if (b) b.disabled = true; });
+            [identifyBtn, cloudBtn, dbMatchBtn, wrongBtn].forEach(b => { if (b) b.disabled = true; });
             btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>' + label;
         }
         function resetBtns() {
-            [identifyBtn, cloudBtn].forEach(b => {
+            [identifyBtn, cloudBtn, dbMatchBtn, wrongBtn].forEach(b => {
                 if (!b) return;
                 b.disabled = false;
                 if (BTN_LABELS.has(b)) b.innerHTML = BTN_LABELS.get(b);
@@ -2302,6 +2303,7 @@
         }
 
         let selected = null;  // { reference_product_id } | { source_record_id } | { name, number }
+        let dbMatchMode = false;  // true while a Database Match picker is open -> apply with overwrite
 
         pickerList.addEventListener('click', function (e) {
             const row = e.target.closest('.jtcg-picker-item');
@@ -2366,7 +2368,12 @@
             if (!selected) return;
             getPickerModal().hide();
             pickerModal = null;
-            applySelection(selected);
+            // A Database Match should replace the entry's fields with the chosen
+            // reference card; OCR/cloud picks keep their merge behaviour.
+            const payload = (dbMatchMode && selected.reference_product_id != null)
+                ? { ...selected, overwrite: true }
+                : selected;
+            applySelection(payload);
         });
 
         // Render the candidate rows — reference (tcgcsv) cards carry set/rarity/price
@@ -2494,6 +2501,7 @@
             setBtnBusy(btn, busyLabel);
             status.innerHTML = '';
             selected = null;
+            dbMatchMode = false;
             confirmBtn.disabled = true;
             try {
                 const res  = await fetch(url);
@@ -2510,6 +2518,97 @@
                 status.innerHTML = `<div class="alert alert-danger mb-0">Network error: ${esc(err.message)}</div>`;
             }
         }
+
+        // ── Database Match (identify by the typed Name + Number, no OCR) ──
+        function renderDbPicker(data) {
+            const q = data.query || {};
+            // Reuse the reference-card row renderer + apply path: shape our
+            // candidates like the tcgcsv reference candidates it already knows.
+            const cands = (data.candidates || []).map(c => ({
+                source:       'reference',
+                product_id:   c.product_id,
+                name:         c.name,
+                serial:       c.number,
+                set:          c.set,
+                rarity:       c.rarity,
+                market_price: c.market_price,
+                score:        c.score,
+                serial_match: !!c.exact,
+            }));
+            const rows = candidateRows(cands);
+            if (!rows) {
+                status.innerHTML = `<div class="alert alert-warning mb-0"><i class="fas fa-search me-1"></i>`
+                    + `No matching card found in the ${esc(data.game || '')} database for this entry.</div>`;
+                return;
+            }
+            const bits = [];
+            if (q.name)   bits.push(`name “${esc(q.name)}”`);
+            if (q.number) bits.push(`number ${esc(q.number)}`);
+            subtitle.innerHTML = `Matched ${bits.join(' · ') || 'this entry'} against `
+                + `<strong>${esc(data.game || '')}</strong> — ${cands.length} match`
+                + `${cands.length !== 1 ? 'es' : ''}. Pick the correct printing:`;
+            pickerList.innerHTML = rows;
+            getPickerModal().show();
+        }
+
+        async function runDbMatch() {
+            setBtnBusy(dbMatchBtn, 'Matching…');
+            status.innerHTML = '';
+            selected = null;
+            dbMatchMode = true;
+            confirmBtn.disabled = true;
+            try {
+                const res  = await fetch(`/database_match/${recordId}`);
+                const data = await res.json();
+                resetBtns();
+                if (data.status !== 'ok') {
+                    status.innerHTML = `<div class="alert alert-warning mb-0">`
+                        + `<i class="fas fa-exclamation-triangle me-1"></i>${esc(data.message || 'Database match failed.')}</div>`;
+                    return;
+                }
+                // Exactly one exact match -> apply it immediately, overwriting the
+                // entry's fields so it fully matches the reference.
+                if (data.auto_apply) {
+                    const c = data.auto_apply;
+                    const num = c.number ? ' ' + esc(c.number) : '';
+                    applySelection({ reference_product_id: c.product_id, overwrite: true },
+                        `<i class="fas fa-bolt me-1"></i>Auto-applied database match: <strong>${esc(c.name || 'card')}</strong>${num}.`);
+                    return;
+                }
+                // Several / partial matches -> let the user choose.
+                renderDbPicker(data);
+            } catch (err) {
+                resetBtns();
+                status.innerHTML = `<div class="alert alert-danger mb-0">Network error: ${esc(err.message)}</div>`;
+            }
+        }
+
+        if (dbMatchBtn) dbMatchBtn.addEventListener('click', runDbMatch);
+
+        // ── Wrong Match: clear the card fields so a fresh match starts clean ──
+        if (wrongBtn) wrongBtn.addEventListener('click', async function () {
+            if (!confirm("Clear this entry's card fields (name, number, set, rarity, and every game "
+                       + "column) so you can retype the correct details and re-match?\n\n"
+                       + "Album, location, and prices are kept.")) return;
+            setBtnBusy(wrongBtn, 'Clearing…');
+            status.innerHTML = '';
+            try {
+                const res  = await fetch(`/wrong_match/${recordId}`, { method: 'POST' });
+                const data = await res.json();
+                if (data.status === 'success') {
+                    status.innerHTML = `<div class="alert alert-success mb-0">`
+                        + `<i class="fas fa-check-circle me-1"></i>${esc(data.message || 'Cleared.')} Reloading…</div>`;
+                    setTimeout(() => window.location.reload(), 700);
+                } else {
+                    resetBtns();
+                    status.innerHTML = `<div class="alert alert-danger mb-0">`
+                        + `<i class="fas fa-exclamation-triangle me-1"></i>${esc(data.message || 'Could not clear the entry.')}</div>`;
+                }
+            } catch (err) {
+                resetBtns();
+                status.innerHTML = `<div class="alert alert-danger mb-0">Network error: ${esc(err.message)}</div>`;
+            }
+        });
 
         if (identifyBtn) identifyBtn.addEventListener('click',
             () => runIdentify(`/ocr_identify/${recordId}`, identifyBtn, 'Reading…', false));
@@ -2767,6 +2866,12 @@
             btn.addEventListener('click', function () { openRealign(btn.dataset.side); });
         });
     })();
+    </script>
+    <script>
+        // Enable hover tooltips for the Identify Card buttons.
+        document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(function (el) {
+            new bootstrap.Tooltip(el);
+        });
     </script>
 </body>
 </html>

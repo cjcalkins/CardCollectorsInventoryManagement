@@ -78,6 +78,7 @@
         .setting-card h5 { font-size: 1.05rem; font-weight: 700; margin-bottom: .2rem; }
         .setting-card p { font-size: .85rem; color: #6c757d; margin-bottom: 0; }
     </style>
+    <link rel="stylesheet" href="{{ url_for('static', filename='theme.css') }}">
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
@@ -131,6 +132,15 @@
                             <div>
                                 <h5>Type Icons</h5>
                                 <p>Teach the scanner each game's type icons so card types are detected automatically.</p>
+                            </div>
+                        </a>
+                    </div>
+                    <div class="col-12 col-md-6 col-xl-4">
+                        <a href="{{ url_for('reference_data_page') }}" class="setting-card">
+                            <div class="sc-icon"><i class="fas fa-cloud-arrow-down"></i></div>
+                            <div>
+                                <h5>Reference Data</h5>
+                                <p>Download a game's full card catalog (CSV sets) from tcgcsv.com so OCR can auto-fill scans.</p>
                             </div>
                         </a>
                     </div>

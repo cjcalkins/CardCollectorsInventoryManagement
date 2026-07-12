@@ -49,6 +49,7 @@
         .section-head { font-size:.95rem; font-weight:700; color:#343a40; margin:1.75rem 0 .6rem; }
         .chart-box { position:relative; height:360px; }
     </style>
+    <link rel="stylesheet" href="{{ url_for('static', filename='theme.css') }}">
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
@@ -553,8 +554,9 @@
             const tCost = COLL.totals.cost;
             const tExp = COLL.totals.value * (1 - fee);
             const tSold = COLL.totals.sold;
+            const isLot = COLL.cost_source === 'lot';
             const cards = [
-                ['Paid', money(tCost), 'fa-cart-shopping'],
+                [isLot ? 'Bought for (lot)' : 'Paid', money(tCost), 'fa-cart-shopping'],
                 ['Expected (owned)', money(tExp), 'fa-hand-holding-dollar'],
                 ['Sold (realized)', money(tSold), 'fa-money-bill-wave'],
                 ['Return vs paid', money(tExp + tSold - tCost), (tExp + tSold - tCost) >= 0 ? 'fa-arrow-trend-up' : 'fa-arrow-trend-down'],
@@ -597,7 +599,11 @@
             }
             document.getElementById('collectionNote').textContent =
                 (COLL.totals.count || 0).toLocaleString() + ' card(s) in "' + COLL.name + '" across '
-                + rows.length + ' game(s). Expected @ market = current value of owned cards minus the '
+                + rows.length + ' game(s). '
+                + (isLot
+                    ? 'Cost is the collection\u2019s Bought For lot price, spread across its cards. '
+                    : 'Cost is summed from each card\u2019s intake price. ')
+                + 'Expected @ market = current value of owned cards minus the '
                 + (fee * 100).toFixed(1) + '% fee; Sold = summed Sold Price where filled in.';
         }
     </script>

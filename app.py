@@ -22,7 +22,8 @@ _max_img_mp = os.environ.get("MAX_IMAGE_MEGAPIXELS", "").strip()
 Image.MAX_IMAGE_PIXELS = int(float(_max_img_mp) * 1_000_000) if _max_img_mp else None
 from werkzeug.utils import secure_filename
 from models import (db, Product, ScanRecord, ShopConnection, Listing, EmailMonitor,
-                    SaleEvent, ReferenceCard, ReferenceSync, TypeReference, AppSetting)
+                    SaleEvent, ReferenceCard, ReferenceSync, TypeReference, AppSetting,
+                    CollectionPrice)
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -45,17 +46,26 @@ except Exception:
     card_ocr = None
 
 # Reference-catalog provider: downloads a game's card catalog into ReferenceCard
-# rows so OCR results can be matched to a real card and auto-fill entry data. The
-# active source is pokemontcg.io (v2) — it covers the vintage WOTC sets tcgcsv is
-# missing (Base, Jungle, Fossil, Gym, Neo, ...). tcgcsv_sync is kept as a fallback
-# if the pokemontcg adapter isn't importable. Imported optionally so the app still
-# boots without network/module access; the /reference routes report a clear error.
+# rows so OCR results can be matched to a real card and auto-fill entry data.
+#
+# tcgcsv.com mirrors EVERY TCGplayer game (Pokemon, Magic, Yu-Gi-Oh, Lorcana,
+# One Piece, Digimon, Flesh and Blood, ...), so it is the default source and the
+# game picker lists everything it offers. pokemontcg.io is Pokemon-only but has
+# richer vintage WOTC set data (Base, Jungle, Fossil, Gym, Neo, ...); set
+# REFERENCE_PROVIDER=pokemontcg to prefer it if you only collect Pokemon and want
+# that extra fidelity. Both adapters expose the same interface (get_categories /
+# get_groups / fetch_group_cards / get_last_updated / normalize_product), so
+# either can back ref_sync. Imported optionally so the app still boots without
+# network/module access; the /reference routes then report a clear error.
+_REFERENCE_PROVIDER = (os.environ.get("REFERENCE_PROVIDER") or "tcgcsv").strip().lower()
+_ref_provider_order = (["pokemontcg_sync", "tcgcsv_sync"]
+                       if _REFERENCE_PROVIDER == "pokemontcg"
+                       else ["tcgcsv_sync", "pokemontcg_sync"])
 ref_sync = None
-try:
-    import pokemontcg_sync as ref_sync
-except Exception:
+for _ref_mod in _ref_provider_order:
     try:
-        import tcgcsv_sync as ref_sync
+        ref_sync = __import__(_ref_mod)
+        break
     except Exception:
         ref_sync = None
 
@@ -694,6 +704,16 @@ build_album_index = build_storage_index
 # imported cards are simply created with these fields blank, ready to be
 # filled in by hand from the Inventory / Inventory Detail pages.
 def load_template(template_name="product_label"):
+    # Prefer fields derived from this game's downloaded tcgcsv catalog columns, so
+    # each game's entry fields mirror the real per-game columns from the source.
+    # Falls back to the on-disk ROI template when the game has no catalog yet.
+    try:
+        derived = _reference_template_for_name(template_name)
+        if derived is not None:
+            return derived
+    except Exception:
+        pass
+
     template_path = os.path.join(app.config["ROI_TEMPLATE_FOLDER"], f"{template_name}.json")
     if not os.path.exists(template_path):
         template_path = os.path.join(app.config["ROI_TEMPLATE_FOLDER"], "product_label.json")
@@ -1024,14 +1044,23 @@ def resolve_slot_number(photographed_index, side):
 
 def get_template_names():
     ensure_dirs()
-    templates = [
+    names = {
         f.replace(".json", "")
         for f in os.listdir(app.config["ROI_TEMPLATE_FOLDER"])
         if f.endswith(".json")
-    ]
-    if not templates:
-        templates = ["product_label"]
-    return templates
+    }
+    # Every downloaded tcgcsv game is a usable "game" too — its entry fields are
+    # derived from the catalog columns even without an on-disk template file.
+    try:
+        for rs in ReferenceSync.query.all():
+            slug = _slugify_template_name(rs.game)
+            if slug:
+                names.add(slug)
+    except Exception:
+        pass
+    if not names:
+        names = {"product_label"}
+    return sorted(names)
 
 
 def match_product_from_extracted(extracted):
@@ -1276,6 +1305,139 @@ def _resolve_category_for_game(game_str):
     return None, None
 
 
+# ============================================================================ #
+# Per-game entry fields derived from the tcgcsv catalog columns
+# ----------------------------------------------------------------------------
+# A game's entry fields come from the columns tcgcsv actually provides for that
+# game rather than a hand-authored ROI template. That means the core per-card
+# columns (name, set, collector number, rarity) plus every distinct extendedData
+# key the catalog carries — which differ per game (Pokemon: HP/Stage/Energy Type;
+# Magic: Mana Cost/Power/Toughness; Yu-Gi-Oh: Attribute/Level; ...). A column with
+# a small, categorical value set becomes a dropdown (options taken from the
+# catalog); everything else is free text. Results are cached per category and
+# auto-invalidated when the catalog's card count changes.
+_REF_FIELDS_CACHE = {}            # category_id -> (product_count, fields_dict)
+_REF_FIELD_DROPDOWN_MAX = 40      # distinct values at/under which a column is a dropdown
+_REF_FIELD_SAMPLE = 5000          # cards scanned per game to discover columns/values
+
+
+def _infer_ref_field(values):
+    """Pick {field_type[, dropdown_options]} for a column from its observed values.
+    Short, low-cardinality, non-numeric value sets become dropdowns; the rest is text."""
+    distinct = sorted({str(v).strip() for v in values if str(v).strip()})
+    n = len(distinct)
+    if (2 <= n <= _REF_FIELD_DROPDOWN_MAX
+            and all(len(v) <= 40 for v in distinct)
+            and not all(_re.fullmatch(r"-?\d+(?:\.\d+)?", v) for v in distinct)):
+        return {"field_type": "dropdown", "dropdown_options": distinct}
+    return {"field_type": "text"}
+
+
+def _reference_fields_config(category_id):
+    """Derive a downloaded game's entry-field definitions (template "fields" shape)
+    from its tcgcsv catalog columns. Returns {} if the game isn't downloaded."""
+    rs = ReferenceSync.query.filter_by(category_id=category_id).first()
+    if rs is None:
+        return {}
+    count = rs.product_count or 0
+    cached = _REF_FIELDS_CACHE.get(category_id)
+    if cached and cached[0] == count:
+        return cached[1]
+
+    cards = (ReferenceCard.query
+             .filter_by(category_id=category_id)
+             .order_by(ReferenceCard.id)
+             .limit(_REF_FIELD_SAMPLE).all())
+
+    core_keys = {"name", "set", "number", "rarity"}
+    set_vals, rarity_vals = set(), set()
+    ext_values = {}       # field_key -> set of distinct values (bounded)
+    ext_order = []        # first-seen field_key order
+    ext_capped = set()    # keys whose value set overflowed -> forced to text
+
+    for c in cards:
+        if c.set_name:
+            set_vals.add(str(c.set_name).strip())
+        if c.rarity:
+            rarity_vals.add(str(c.rarity).strip())
+        for raw_key, raw_val in (c.extended or {}).items():
+            fk = _slugify_template_name(raw_key)
+            if not fk or fk in core_keys:
+                continue
+            if fk not in ext_values and fk not in ext_capped:
+                ext_values[fk] = set()
+                ext_order.append(fk)
+            if fk in ext_capped:
+                continue
+            sv = str(raw_val or "").strip()
+            if sv:
+                ext_values[fk].add(sv)
+                if len(ext_values[fk]) > _REF_FIELD_DROPDOWN_MAX:
+                    ext_capped.add(fk)   # too many distinct values to be a dropdown
+
+    fields = {
+        "name":   {"field_type": "text"},
+        "set":    _infer_ref_field(set_vals),
+        "number": {"field_type": "text"},
+        "rarity": _infer_ref_field(rarity_vals),
+    }
+    for fk in ext_order:
+        if fk in fields:
+            continue
+        fields[fk] = ({"field_type": "text"} if fk in ext_capped
+                      else _infer_ref_field(ext_values.get(fk, ())))
+
+    _REF_FIELDS_CACHE[category_id] = (count, fields)
+    return fields
+
+
+def _reference_template_for_name(template_name):
+    """If `template_name` maps to a downloaded tcgcsv game, return a template dict
+    whose fields are derived from that game's catalog columns. A matching on-disk
+    file (if any) supplies optional per-field overrides (type/hidden) and a legacy
+    csv_column_mapping. Returns None when the game has no downloaded catalog."""
+    cat_id, cat_game = _resolve_category_for_game(template_name)
+    if cat_id is None:
+        return None
+    derived = _reference_fields_config(cat_id)
+    if not derived:
+        return None
+
+    fields = {k: dict(v) for k, v in derived.items()}
+
+    # Fold in optional overrides from an on-disk template, so the live field-type
+    # / hide edits and any legacy CSV column mapping still apply to catalog games.
+    csv_map = None
+    try:
+        slug = _slugify_template_name(template_name)
+        fpath = os.path.join(app.config["ROI_TEMPLATE_FOLDER"], f"{slug}.json")
+        if os.path.exists(fpath):
+            with open(fpath, "r", encoding="utf-8") as fh:
+                on_disk = json.load(fh) or {}
+            for fk, cfg in (on_disk.get("fields") or {}).items():
+                if fk not in fields or not isinstance(cfg, dict):
+                    continue
+                ftype = cfg.get("field_type")
+                if ftype in ("text", "dropdown", "boolean"):
+                    fields[fk]["field_type"] = ftype
+                    if ftype == "dropdown" and cfg.get("dropdown_options"):
+                        fields[fk]["dropdown_options"] = list(cfg["dropdown_options"])
+                    elif ftype != "dropdown":
+                        fields[fk].pop("dropdown_options", None)
+                if cfg.get("hidden"):
+                    fields[fk]["hidden"] = True
+            csv_map = on_disk.get("csv_column_mapping") or None
+    except Exception:
+        pass
+
+    out = {"name": _slugify_template_name(template_name) or template_name,
+           "fields": fields, "source": "reference",
+           "category_id": cat_id, "category_game": cat_game}
+    if csv_map:
+        out["csv_column_mapping"] = csv_map
+    return out
+
+
 def _collector_number_variants(num_str):
     """
     All plausible string forms of an N/M collector number, so an exact-string DB
@@ -1386,6 +1548,93 @@ def _reference_candidates_for_ocr(category_id, ocr_result, limit=8):
     return card_ocr.match_ocr_to_records(ocr_result, candidates, limit=limit)
 
 
+def _database_match_candidates(category_id, name, number, limit=25):
+    """
+    Match a typed Name + collector Number against a game's downloaded catalog
+    (no OCR/image). Returns (candidates, exact_ids):
+
+      candidates -> best-first list of dicts (product_id, name, number, set,
+                    rarity, market_price, image_url, url, score, exact)
+      exact_ids  -> set of product_ids that match exactly. "Exact" means: both
+                    the normalized name AND the collector number match when both
+                    were supplied; otherwise the single supplied field matches.
+
+    Number matching is padding-insensitive (24/112 == 024/112). The catalog is
+    pre-narrowed by number, then by the name's first token, so we never fuzzy
+    score an entire game.
+    """
+    import difflib
+
+    def _nname(s):
+        return _re.sub(r"[^a-z0-9]+", " ", str(s or "").lower()).strip()
+
+    qname = _nname(name)
+    qnum  = str(number or "").strip()
+    qvariants = _collector_number_variants(qnum) or ({qnum} if qnum else set())
+    qcanon = _canonical_collector_number(qnum) if qnum else ""
+
+    base = ReferenceCard.query.filter(ReferenceCard.category_id == category_id)
+
+    pool = []
+    if qnum:
+        pool = base.filter(ReferenceCard.number.in_(list(qvariants) or [qnum])).limit(400).all()
+    if qname and not pool:
+        first = (qname.split() or [qname])[0]
+        pool = base.filter(ReferenceCard.name.ilike(f"%{first}%")).limit(600).all()
+    elif qname and qnum:
+        # Add name-token matches too, so a padding/number mismatch still surfaces
+        # the right card in the picker rather than hiding it.
+        first = (qname.split() or [qname])[0]
+        seen = {c.product_id for c in pool}
+        pool += [c for c in base.filter(ReferenceCard.name.ilike(f"%{first}%")).limit(400).all()
+                 if c.product_id not in seen]
+    if not pool:
+        pool = base.limit(800).all()
+
+    def _num_ok(cardnum):
+        cn = str(cardnum or "").strip()
+        if not (qnum and cn):
+            return False
+        return cn in qvariants or (bool(qcanon) and _canonical_collector_number(cn) == qcanon)
+
+    out, exact_ids = [], set()
+    for rc in pool:
+        cn_norm  = _nname(rc.name)
+        name_sim = difflib.SequenceMatcher(None, qname, cn_norm).ratio() if qname else 0.0
+        name_ok  = bool(qname) and cn_norm == qname
+        num_ok   = _num_ok(rc.number)
+
+        if qname and qnum:
+            exact = name_ok and num_ok
+            score = (0.5 if num_ok else 0.0) + 0.5 * name_sim
+        elif qnum:
+            exact = num_ok
+            score = 1.0 if num_ok else 0.0
+        else:  # name only
+            exact = name_ok
+            score = name_sim
+
+        if score <= 0 and not exact:
+            continue
+        if exact:
+            exact_ids.add(rc.product_id)
+        out.append({
+            "product_id":   rc.product_id,
+            "name":         rc.name or "",
+            "number":       rc.number or "",
+            "set":          rc.set_name or "",
+            "rarity":       rc.rarity or "",
+            "market_price": rc.market_price,
+            "image_url":    rc.image_url or "",
+            "url":          rc.url or "",
+            "score":        round(min(1.0, score), 4),
+            "exact":        bool(exact),
+        })
+
+    out.sort(key=lambda c: (c["exact"], c["score"]), reverse=True)
+    return out[:limit], exact_ids
+
+
 def remove_file_if_exists(path_value):
     """Delete an uploaded image file, with safety guards:
     - Ignores the '__blank__' sentinel (points to static/blank.jpg, never touched).
@@ -1430,6 +1679,17 @@ def _get_serial(data: dict) -> str:
         v = str(data.get(k, "")).strip()
         if v:
             return v.lower()
+    return ""
+
+
+def _raw_field(data: dict, keys) -> str:
+    """First non-empty value among `keys`, preserving original case/format.
+    Unlike _get_name/_get_serial (which lowercase for matching), this returns the
+    value as the user typed it — used when we need to display or re-match it."""
+    for k in keys:
+        v = str((data or {}).get(k, "")).strip()
+        if v:
+            return v
     return ""
 
 
@@ -1550,6 +1810,48 @@ def _load_prepared_type_refs(game):
     return prepared
 
 
+def _reference_extended_fill(record, ref):
+    """
+    Non-destructive fill of a game's tcgcsv extendedData columns (HP, Stage,
+    Energy Type, attacks, Mana Cost, Power/Toughness, ...) from a matched
+    reference card. Returns {field_key: value} for the game's fields the record
+    hasn't filled yet — it never overwrites a value already present and never
+    blanks anything.
+
+    This lets an imported / OCR-identified card carry the same rich column data
+    that a Database Match applies, without clobbering hand-entered values. (The
+    identity fields name/number/set/rarity/game are handled separately by
+    _REFERENCE_APPLY_MAP; here we only add the extra per-game columns.)
+    """
+    ext = {}
+    for raw_k, raw_v in (getattr(ref, "extended", None) or {}).items():
+        fk = _slugify_template_name(raw_k)
+        sv = "" if raw_v is None else str(raw_v).strip()
+        if fk and sv:
+            ext.setdefault(fk, sv)              # first non-empty value wins
+    if not ext:
+        return {}
+
+    # Restrict to the game's known field set so we never inject stray columns.
+    try:
+        _g = (record.extracted_data or {}).get("game", "") or record.template_used or "product_label"
+        tpl_fields = set((load_template(_g).get("fields") or {}).keys())
+    except Exception:
+        tpl_fields = set()
+
+    data = record.extracted_data or {}
+    out = {}
+    for fk, val in ext.items():
+        if tpl_fields and fk not in tpl_fields:
+            continue
+        if fk in _OVERWRITE_PROTECT:
+            continue
+        if str(data.get(fk) or "").strip():     # keep anything already entered
+            continue
+        out[fk] = val
+    return out
+
+
 def _apply_ocr_candidate(record, cand):
     """
     Merge identity fields from a matched candidate onto `record` (in memory; the
@@ -1595,6 +1897,10 @@ def _apply_ocr_candidate(record, cand):
             type_key = _template_type_field_key(load_template(record.template_used))
             if type_key and not str((record.extracted_data or {}).get(type_key) or "").strip():
                 updates[type_key] = cat_type
+        # Fill the game's remaining tcgcsv columns (HP/Stage/attacks/...) from the
+        # catalog card — non-destructive, so nothing already entered is touched.
+        for _fk, _val in _reference_extended_fill(record, ref).items():
+            updates.setdefault(_fk, _val)
     else:  # an existing record
         try:
             source = ScanRecord.query.get(int(cand.get("record_id")))
@@ -2958,6 +3264,34 @@ def _analytics_params(src):
     }
 
 
+def _collection_lot_prices():
+    """{name_key: bought_for} for collections that have a 'Bought For' lot price."""
+    return {cp.name_key: cp.bought_for
+            for cp in CollectionPrice.query.filter(CollectionPrice.bought_for.isnot(None)).all()}
+
+
+def _collection_counts(records):
+    """{name_key: number of cards} across the given records (the cards a lot covers)."""
+    counts = {}
+    for r in records:
+        c = str((r.extracted_data or {}).get("collection") or "").strip().lower()
+        if c:
+            counts[c] = counts.get(c, 0) + 1
+    return counts
+
+
+def _record_effective_cost(rec, lot_prices, lot_counts):
+    """Cost attributed to one card: an equal share of its collection's lot price
+    when that collection has a 'Bought For' set (so the cards don't each need an
+    intake_price), otherwise the card's own intake_price."""
+    d = rec.extracted_data or {}
+    ck = str(d.get("collection") or "").strip().lower()
+    if ck and ck in lot_prices:
+        n = lot_counts.get(ck, 0)
+        return (lot_prices[ck] / n) if n else 0.0
+    return _analytics_money(d.get("intake_price")) or 0.0
+
+
 @app.route("/analytics")
 def analytics_page():
     ensure_dirs()
@@ -3023,6 +3357,11 @@ def analytics_overview():
         source = "held"
     records = _analytics_filtered_records(source, "", "", "")
 
+    # Lot prices spread across a collection's cards; denominator is the full
+    # collection (held+sold) so an owned subset gets its pro-rata share.
+    lot_prices = _collection_lot_prices()
+    lot_counts = _collection_counts(_analytics_filtered_records("all", "", "", "")) if lot_prices else {}
+
     by = {}
     for r in records:
         d = r.extracted_data or {}
@@ -3031,9 +3370,8 @@ def analytics_overview():
         if b is None:
             b = by[g] = {"game": g, "count": 0, "cost": 0.0, "value": 0.0}
         b["count"] += 1
-        ip = _analytics_money(d.get("intake_price"))
+        b["cost"] += _record_effective_cost(r, lot_prices, lot_counts)
         cv = _analytics_money(d.get("current_value"))
-        if ip is not None: b["cost"] += ip
         if cv is not None: b["value"] += cv
 
     rows = sorted(by.values(), key=lambda x: x["value"], reverse=True)
@@ -3075,6 +3413,10 @@ def analytics_collection():
     target = name.lower()
 
     records = _analytics_filtered_records("all", "", "", "")
+    lot_prices = _collection_lot_prices()
+    lot_counts = _collection_counts(records)
+    bought_for = lot_prices.get(target)
+
     by = {}
     for r in records:
         d = r.extracted_data or {}
@@ -3085,11 +3427,9 @@ def analytics_collection():
         if b is None:
             b = by[g] = {"game": g, "count": 0, "cost": 0.0, "value": 0.0, "sold": 0.0}
         b["count"] += 1
-        ip = _analytics_money(d.get("intake_price"))
+        b["cost"] += _record_effective_cost(r, lot_prices, lot_counts)
         cv = _analytics_money(d.get("current_value"))
         sp = _analytics_money(d.get("sold_price"))
-        if ip is not None:
-            b["cost"] += ip
         if cv is not None and _held_from(d):     # expected = still-owned cards only
             b["value"] += cv
         if sp is not None:                        # realized = cards with a Sold Price
@@ -3100,13 +3440,69 @@ def analytics_collection():
         b["cost"] = round(b["cost"], 2)
         b["value"] = round(b["value"], 2)
         b["sold"] = round(b["sold"], 2)
+    total_cost = bought_for if bought_for is not None else round(sum(b["cost"] for b in rows), 2)
     totals = {
         "count": sum(b["count"] for b in rows),
-        "cost": round(sum(b["cost"] for b in rows), 2),
+        "cost": round(total_cost, 2),
         "value": round(sum(b["value"] for b in rows), 2),
         "sold": round(sum(b["sold"] for b in rows), 2),
     }
-    return jsonify({"status": "success", "name": name, "rows": rows, "totals": totals})
+    return jsonify({"status": "success", "name": name, "rows": rows, "totals": totals,
+                    "bought_for": bought_for,
+                    "cost_source": "lot" if bought_for is not None else "entries"})
+
+
+@app.route("/collections/prices")
+def collections_prices():
+    """List collections (from scanned cards + any saved prices) with their card
+    count and 'Bought For' lot price, for the Inventory pricing modal."""
+    records = _analytics_filtered_records("all", "", "", "")
+    counts = _collection_counts(records)
+    saved = {cp.name_key: cp for cp in CollectionPrice.query.all()}
+
+    names = {}   # name_key -> display name (prefer the casing seen on cards)
+    for r in records:
+        c = str((r.extracted_data or {}).get("collection") or "").strip()
+        if c:
+            names.setdefault(c.lower(), c)
+    for k, cp in saved.items():
+        names.setdefault(k, cp.name)
+
+    out = [{
+        "name": disp,
+        "count": counts.get(k, 0),
+        "bought_for": (saved[k].bought_for if k in saved else None),
+    } for k, disp in names.items()]
+    out.sort(key=lambda x: x["name"].lower())
+    return jsonify({"status": "success", "collections": out})
+
+
+@app.route("/collections/price", methods=["POST"])
+def collections_price_save():
+    """Set (or clear, with a blank value) a collection's 'Bought For' lot price."""
+    body = request.get_json(silent=True) or request.form.to_dict() or {}
+    name = (body.get("name") or "").strip()
+    if not name:
+        return jsonify({"status": "error", "message": "Collection name is required."}), 400
+
+    raw = body.get("bought_for")
+    bought_for = None
+    if raw not in (None, "", "null"):
+        bought_for = _analytics_money(raw)
+        if bought_for is None:
+            return jsonify({"status": "error", "message": "Enter a valid number, or leave blank to clear."}), 400
+
+    key = name.lower()
+    cp = CollectionPrice.query.filter_by(name_key=key).first()
+    if cp is None:
+        cp = CollectionPrice(name_key=key, name=name)
+        db.session.add(cp)
+    cp.name = name
+    cp.bought_for = bought_for
+    db.session.commit()
+
+    msg = "Cleared lot price." if bought_for is None else f"Saved: {name} bought for ${bought_for:,.2f}."
+    return jsonify({"status": "success", "name": name, "bought_for": bought_for, "message": msg})
 
 
 @app.route("/inventory")
@@ -5678,14 +6074,28 @@ def cloud_identify(record_id):
     return jsonify(resp)
 
 
+# Inventory / location / ownership metadata that a full "overwrite to match the
+# reference" must NEVER clobber — only the card's identity + catalog fields change.
+_OVERWRITE_PROTECT = frozenset({
+    "album", "collection", "page", "slot", "storage_type", "box_number",
+    "held", "finalized", "archived", "sold_price", "intake_price", "current_value",
+    "edition", "holographic", "grading", "empty", "catalog_only", "tcgplayer",
+})
+
+
 @app.route("/ocr_apply/<int:record_id>", methods=["POST"])
 def ocr_apply(record_id):
     """
-    Commit an OCR result onto this record. Body is JSON, one of:
+    Commit an OCR / match result onto this record. Body is JSON, one of:
 
       { "reference_product_id": <id> } -> fill fields from a tcgcsv reference
                                           card (name/number/set/rarity/game +
                                           TCGplayer URL under 'tcgplayer').
+                                          Add "overwrite": true to make EVERY
+                                          card field match the reference (fills
+                                          the game's tcgcsv columns and blanks
+                                          any the reference lacks); inventory /
+                                          location metadata is always preserved.
       { "source_record_id": <id> }     -> copy identity fields from a matched
                                           existing record.
       { "name": "...", "number": "..." }  -> write the raw OCR reading.
@@ -5707,6 +6117,9 @@ def ocr_apply(record_id):
             ref = None
         if ref is None:
             return jsonify({"status": "error", "message": "reference_product_id not found."}), 404
+
+        overwrite = bool(body.get("overwrite"))
+
         for key, attr in _REFERENCE_APPLY_MAP.items():
             val = getattr(ref, attr, None)
             if str(val or "").strip():
@@ -5725,9 +6138,44 @@ def ocr_apply(record_id):
                 "set_number":   ref.number or "",
                 "prices":       {"market": ref.market_price} if ref.market_price is not None else {},
             }
-        if getattr(ref, "market_price", None) is not None and \
-           not str((record.extracted_data or {}).get("current_value") or "").strip():
-            updates["current_value"] = ref.market_price
+
+        if overwrite:
+            # Make EVERY card field match the reference: fill the game's fields
+            # (name / number / set / rarity + the tcgcsv extendedData columns)
+            # from the reference, blanking any the reference doesn't provide.
+            # Inventory & location metadata (_OVERWRITE_PROTECT) is left intact.
+            ext = {}
+            for raw_k, raw_v in (ref.extended or {}).items():
+                fk = _slugify_template_name(raw_k)
+                if fk:
+                    ext[fk] = raw_v
+            try:
+                _g = (record.extracted_data or {}).get("game", "") or record.template_used or "product_label"
+                tpl_fields = list((load_template(_g).get("fields") or {}).keys())
+            except Exception:
+                tpl_fields = []
+            ref_by_key = {
+                "name": ref.name, "number": ref.number, "set_number": ref.number,
+                "set": ref.set_name, "rarity": ref.rarity, "game": ref.game,
+            }
+            for fk in (set(tpl_fields) | set(ext.keys()) | set(ref_by_key.keys())):
+                if fk in _OVERWRITE_PROTECT:
+                    continue
+                val = ref_by_key[fk] if fk in ref_by_key else ext.get(fk, "")
+                updates[fk] = "" if val is None else val
+            # Track the reference's market price on a full overwrite.
+            if getattr(ref, "market_price", None) is not None:
+                updates["current_value"] = ref.market_price
+        else:
+            # Non-destructive fill of the game's remaining tcgcsv columns
+            # (HP/Stage/Energy Type/attacks/...), so an OCR-picked reference card
+            # carries the same rich data a Database Match would — without
+            # overwriting anything already entered.
+            for _fk, _val in _reference_extended_fill(record, ref).items():
+                updates.setdefault(_fk, _val)
+            if getattr(ref, "market_price", None) is not None and \
+                    not str((record.extracted_data or {}).get("current_value") or "").strip():
+                updates["current_value"] = ref.market_price
     elif source_id:
         try:
             source = ScanRecord.query.get(int(source_id))
@@ -5775,6 +6223,94 @@ def ocr_apply(record_id):
         "message":        "Identification applied.",
         "applied":        updates,
         "extracted_data": merged,
+    })
+
+
+@app.route("/database_match/<int:record_id>", methods=["GET"])
+def database_match(record_id):
+    """
+    Identify a record against the downloaded tcgcsv catalog using the Name and
+    collector Number already on the entry (no image/OCR). Behaviour:
+
+      * exactly one exact match  -> returned under `auto_apply` so the client
+                                    applies it immediately.
+      * several matches          -> returned under `candidates` for the user to
+                                    pick from in a chooser.
+
+    Applying a chosen card is done through /ocr_apply with its
+    reference_product_id, so the fill logic stays in one place.
+    """
+    record = ScanRecord.query.get_or_404(record_id)
+    data   = record.extracted_data or {}
+
+    name   = _raw_field(data, _NAME_KEYS)
+    number = _raw_field(data, _SERIAL_KEYS)
+    if not name and not number:
+        return jsonify({"status": "error",
+                        "message": "Add a Name or Number to this entry first."}), 400
+
+    category_id, ref_game = _resolve_category_for_game(data.get("game", ""))
+    if not category_id:
+        game_label = str(data.get("game", "")).strip() or "this game"
+        return jsonify({
+            "status": "error", "not_synced": True,
+            "message": f"No downloaded database for {game_label}. "
+                       f"Download it in Settings → Reference Data.",
+        }), 400
+
+    candidates, exact_ids = _database_match_candidates(category_id, name, number)
+
+    auto_apply = None
+    if len(exact_ids) == 1:
+        pid = next(iter(exact_ids))
+        auto_apply = next((c for c in candidates if c["product_id"] == pid), None)
+
+    return jsonify({
+        "status":      "ok",
+        "game":        ref_game or str(data.get("game", "")),
+        "query":       {"name": name, "number": number},
+        "auto_apply":  auto_apply,        # non-null => apply without prompting
+        "exact_count": len(exact_ids),
+        "candidates":  candidates,        # populate the chooser when not auto-applying
+    })
+
+
+@app.route("/wrong_match/<int:record_id>", methods=["POST"])
+def wrong_match(record_id):
+    """
+    Mark the current identification as wrong: blank this entry's card / catalog
+    fields (name, collector number, set, rarity, and the game's tcgcsv columns)
+    and drop the matched TCGplayer link, so the fields are empty and the user can
+    type the correct details and run a fresh match. Inventory / location /
+    ownership / price metadata (album, slot, held, intake & current value,
+    edition, holographic, grading, ...) is preserved, and so is the game — the
+    re-match needs it to know which database to search.
+    """
+    record = ScanRecord.query.get_or_404(record_id)
+    data = dict(record.extracted_data or {})
+
+    protect = set(_OVERWRITE_PROTECT) | {"game"}
+
+    cleared = []
+    for key in list(data.keys()):
+        if key in protect or key.startswith("__"):   # keep metadata + internal keys
+            continue
+        if str(data.get(key) or "").strip():
+            cleared.append(key)
+        data[key] = ""
+
+    # The matched TCGplayer link/price is match-specific — remove it outright.
+    if data.pop("tcgplayer", None) is not None:
+        cleared.append("tcgplayer")
+
+    record.extracted_data = data
+    db.session.commit()
+
+    return jsonify({
+        "status":         "success",
+        "message":        f"Cleared {len(cleared)} field(s) — enter the correct details and re-match.",
+        "cleared":        sorted(set(cleared)),
+        "extracted_data": data,
     })
 
 
@@ -5853,9 +6389,17 @@ def reference_groups(category_id):
         groups = ref_sync.get_groups(category_id)
     except Exception as exc:
         return jsonify({"status": "error", "message": f"Could not reach reference source: {exc}"}), 502
+    # Which of this category's sets already have cached cards? The client uses
+    # this to skip sets it has already downloaded (unless "replace all" is on).
+    synced_ids = {
+        gid for (gid,) in (ReferenceCard.query
+                           .filter_by(category_id=category_id)
+                           .with_entities(ReferenceCard.group_id).distinct().all())
+    }
     return jsonify({
         "status": "ok",
-        "groups": [{"group_id": g.get("groupId"), "name": g.get("name") or ""} for g in groups],
+        "groups": [{"group_id": g.get("groupId"), "name": g.get("name") or "",
+                    "synced": g.get("groupId") in synced_ids} for g in groups],
     })
 
 
@@ -5866,7 +6410,12 @@ def reference_sync_group():
     The client loops this over every group (mirroring the grade/price batch
     pattern) so progress + Stop work naturally and rate-limiting is inherent.
 
-    Body: { category_id, category_name, group_id, group_name }
+    Body: { category_id, category_name, group_id, group_name, replace }
+
+    When `replace` is falsy (the default) and this set already has cached cards,
+    the set is skipped without contacting the source — so re-running a game only
+    fills in the sets it is missing. When `replace` is truthy the set's existing
+    cards are cleared first and re-downloaded, overwriting stale data.
     """
     if ref_sync is None:
         return jsonify({"status": "error", "message": "Reference sync source unavailable."}), 503
@@ -5879,11 +6428,31 @@ def reference_sync_group():
         return jsonify({"status": "error", "message": "category_id and group_id are required."}), 400
     category_name = str(body.get("category_name") or "").strip()
     group_name    = str(body.get("group_name") or "").strip()
+    replace       = bool(body.get("replace"))
+
+    # Already cached and not replacing? Skip the network round-trip entirely.
+    already_synced = (ReferenceCard.query
+                      .filter_by(category_id=category_id, group_id=group_id)
+                      .first() is not None)
+    if already_synced and not replace:
+        rs = ReferenceSync.query.filter_by(category_id=category_id).first()
+        return jsonify({
+            "status": "skipped",
+            "added": 0,
+            "group_name": group_name,
+            "product_count": rs.product_count if rs else None,
+        })
 
     try:
         cards = ref_sync.fetch_group_cards(category_id, category_name, group_id, group_name)
     except Exception as exc:
         return jsonify({"status": "error", "message": f"Reference fetch failed: {exc}"}), 502
+
+    # Overwrite: drop this set's existing cards first so cards removed upstream
+    # don't linger. Flush before re-inserting to free the unique product_ids.
+    if replace:
+        ReferenceCard.query.filter_by(category_id=category_id, group_id=group_id).delete()
+        db.session.flush()
 
     for rec in cards:
         _reference_upsert(rec)
@@ -6995,6 +7564,14 @@ def settings_page():
     former top-level tabs (Templates, Type Icons, Shops, Search by Image,
     Duplicates) are reached from the sidebar on these pages."""
     return render_template("settings.html")
+
+
+@app.route("/settings/reference")
+def reference_data_page():
+    """Reference-data catalog downloader (tcgcsv). Moved here from the Inventory
+    toolbar so catalog imports live alongside the other setup pages. The page's
+    JS drives the existing /reference/* JSON endpoints."""
+    return render_template("reference_data.html")
 
 
 # ============================================================================ #

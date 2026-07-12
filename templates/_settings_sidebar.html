@@ -12,5 +12,5 @@
     <a href="{{ url_for('duplicates') }}" class="ss-link{{ ' active' if ss_active == 'duplicates' else '' }}"><i class="fas fa-clone"></i><span>Duplicates</span></a>
     <a href="{{ url_for('storage_page') }}" class="ss-link{{ ' active' if ss_active == 'storage' else '' }}"><i class="fas fa-hard-drive"></i><span>Storage</span></a>
     <a href="{{ url_for('upgrade_page') }}" class="ss-link{{ ' active' if ss_active == 'upgrade' else '' }}"><i class="fas fa-arrow-up-right-dots"></i><span>Upgrade</span></a>
-    <a href="{{ url_for('reset_page') }}" class="ss-link{{ ' active' if ss_active == 'reset' else '' }}" style="color:#b02a37;"><i class="fas fa-triangle-exclamation"></i><span>Reset System</span></a>
+    <a href="{{ url_for('reset_page') }}" class="ss-link{{ ' active' if ss_active == 'reset' else '' }}" style="color:var(--danger);"><i class="fas fa-triangle-exclamation"></i><span>Reset System</span></a>
 </aside>

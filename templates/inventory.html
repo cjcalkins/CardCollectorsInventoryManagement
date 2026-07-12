@@ -344,6 +344,7 @@
             font-weight: 700;
         }
     </style>
+    <link rel="stylesheet" href="{{ url_for('static', filename='theme.css') }}">
 </head>
 <body class="bg-light">
     <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
@@ -411,6 +412,12 @@
                     <i class="fas fa-hand-holding-dollar me-1"></i>View Sold
                 </a>
                 {% endif %}
+                {% if not catalog_view %}
+                <button class="btn btn-outline-dark" id="collectionPriceBtn" type="button"
+                        data-bs-toggle="modal" data-bs-target="#collectionPriceModal">
+                    <i class="fas fa-tag me-1"></i>Collection Pricing
+                </button>
+                {% endif %}
                 <button class="btn btn-outline-success" id="exportCsvBtn" type="button">
                     <i class="fas fa-file-csv me-1"></i>Export CSV
                 </button>
@@ -424,10 +431,6 @@
                 </button>
                 <button class="btn btn-warning" id="editSelectedBtn" type="button">
                     <i class="fas fa-pen-to-square me-1"></i>Edit Selected
-                </button>
-                <button class="btn btn-outline-primary" id="refDataBtn" type="button"
-                        title="Download a game's card catalog from tcgcsv.com to use as reference for OCR identification">
-                    <i class="fas fa-cloud-arrow-down me-1"></i>Reference Data
                 </button>
                 <button class="btn btn-primary" id="ocrIdentifyBtn" type="button"
                         title="Read the front image of each selected card (name + collector number) and match it to existing entries">
@@ -926,87 +929,6 @@
                         <i class="fas fa-stop me-1"></i>Stop
                     </button>
                     <button type="button" class="btn btn-primary" id="fetchPricesCloseBtn" style="display:none;" data-bs-dismiss="modal">
-                        <i class="fas fa-check me-1"></i>Done
-                    </button>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Grade Condition Modal -->
-    <!-- ==================== REFERENCE DATA (tcgcsv) MODAL ==================== -->
-    <div class="modal fade" id="refModal" tabindex="-1" aria-labelledby="refModalLabel" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
-        <div class="modal-dialog modal-dialog-centered modal-lg">
-            <div class="modal-content">
-                <div class="modal-header">
-                    <h5 class="modal-title" id="refModalLabel">
-                        <i class="fas fa-cloud-arrow-down me-2"></i>Reference Data <span class="text-muted small ms-2">from tcgcsv.com</span>
-                    </h5>
-                </div>
-                <div class="modal-body">
-                    <!-- Idle / setup -->
-                    <div id="refIdle">
-                        <p class="text-muted small mb-3">
-                            Download a game's full card catalog from <strong>tcgcsv.com</strong> (a daily TCGplayer mirror).
-                            Once downloaded, OCR identification can match a scanned card to a real product and auto-fill its
-                            name, collector number, set, rarity, and TCGplayer price.
-                        </p>
-
-                        <div class="mb-3">
-                            <label class="form-label small fw-semibold mb-1">Downloaded games</label>
-                            <div id="refSyncedList" class="border rounded p-2 bg-light small">
-                                <span class="text-muted">Loading…</span>
-                            </div>
-                        </div>
-
-                        <label for="refGameSelect" class="form-label small fw-semibold mb-1">Add / refresh a game</label>
-                        <div class="d-flex gap-2 align-items-center flex-wrap">
-                            <select id="refGameSelect" class="form-select form-select-sm" style="max-width:320px;">
-                                <option value="">Loading games…</option>
-                            </select>
-                            <span class="text-muted small" id="refLastUpdated"></span>
-                        </div>
-                        <p class="text-muted small mt-2 mb-0">
-                            <i class="fas fa-circle-info me-1"></i>A full game is fetched one set at a time to respect
-                            tcgcsv's rate limits, so large games (e.g. Pokémon, Magic) take a couple of minutes.
-                        </p>
-                    </div>
-
-                    <!-- Running -->
-                    <div id="refRunning" style="display:none;">
-                        <div class="mb-2 d-flex justify-content-between align-items-center">
-                            <span class="small fw-semibold text-muted">Downloading sets</span>
-                            <span class="small text-muted" id="refCounter">0 / 0</span>
-                        </div>
-                        <div class="progress mb-3" style="height:10px;">
-                            <div id="refBar" class="progress-bar progress-bar-striped progress-bar-animated"
-                                 role="progressbar" style="width:0%"></div>
-                        </div>
-                        <div class="border rounded px-3 py-2 bg-light mb-3" style="min-height:48px;">
-                            <div class="small text-muted mb-1">Current set</div>
-                            <div id="refCurrentSet" class="fw-semibold text-truncate">—</div>
-                        </div>
-                        <div class="d-flex gap-3 justify-content-center small mb-3">
-                            <span class="text-success"><i class="fas fa-check-circle me-1"></i><span id="refCountOk">0</span> sets</span>
-                            <span class="text-primary"><i class="fas fa-layer-group me-1"></i><span id="refCountCards">0</span> cards</span>
-                            <span class="text-danger"><i class="fas fa-times-circle me-1"></i><span id="refCountErr">0</span> errors</span>
-                        </div>
-                    </div>
-
-                    <!-- Done -->
-                    <div id="refDone" style="display:none;">
-                        <div class="alert alert-success mb-0" id="refDoneMsg"></div>
-                    </div>
-                </div>
-                <div class="modal-footer">
-                    <button type="button" class="btn btn-secondary" id="refCancelBtn">Cancel</button>
-                    <button type="button" class="btn btn-primary" id="refStartBtn" disabled>
-                        <i class="fas fa-download me-1"></i>Download
-                    </button>
-                    <button type="button" class="btn btn-warning" id="refStopBtn" style="display:none;">
-                        <i class="fas fa-stop me-1"></i>Stop
-                    </button>
-                    <button type="button" class="btn btn-primary" id="refCloseBtn" style="display:none;" data-bs-dismiss="modal">
                         <i class="fas fa-check me-1"></i>Done
                     </button>
                 </div>
@@ -1971,177 +1893,6 @@
                                   + `${stoppedNote}. Open a card's detail page to see its saved condition.`;
                 stopBtn.style.display  = 'none';
                 closeBtn.style.display = '';
-            });
-        })();
-
-        // ====================== REFERENCE DATA SYNC (tcgcsv) ======================
-        (function () {
-            const openBtn = document.getElementById('refDataBtn');
-            if (!openBtn) return;
-
-            const modal = new bootstrap.Modal(document.getElementById('refModal'));
-            const idleBox    = document.getElementById('refIdle');
-            const runningBox = document.getElementById('refRunning');
-            const doneBox    = document.getElementById('refDone');
-            const doneMsg    = document.getElementById('refDoneMsg');
-
-            const syncedList = document.getElementById('refSyncedList');
-            const gameSelect = document.getElementById('refGameSelect');
-            const lastUpd    = document.getElementById('refLastUpdated');
-
-            const counterEl = document.getElementById('refCounter');
-            const barEl     = document.getElementById('refBar');
-            const currentEl = document.getElementById('refCurrentSet');
-            const okEl      = document.getElementById('refCountOk');
-            const cardsEl   = document.getElementById('refCountCards');
-            const errEl     = document.getElementById('refCountErr');
-
-            const startBtn  = document.getElementById('refStartBtn');
-            const stopBtn   = document.getElementById('refStopBtn');
-            const closeBtn  = document.getElementById('refCloseBtn');
-            const cancelBtn = document.getElementById('refCancelBtn');
-
-            let stopFlag = false, syncedIds = new Set();
-            function escH(s){ return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
-
-            async function loadStatus() {
-                syncedList.innerHTML = '<span class="text-muted">Loading…</span>';
-                try {
-                    const data = await (await fetch('/reference/status')).json();
-                    if (!data.available) {
-                        syncedList.innerHTML = '<span class="text-danger">tcgcsv sync module unavailable on the server.</span>';
-                        return;
-                    }
-                    syncedIds = new Set((data.games || []).map(g => g.category_id));
-                    if (!data.games || !data.games.length) {
-                        syncedList.innerHTML = '<span class="text-muted">No games downloaded yet.</span>';
-                    } else {
-                        syncedList.innerHTML = data.games.map(g => `
-                            <div class="d-flex justify-content-between align-items-center py-1">
-                                <span><strong>${escH(g.game || ('#' + g.category_id))}</strong>
-                                  <span class="text-muted">· ${g.product_count} cards · ${g.group_count} sets</span></span>
-                                <button class="btn btn-sm btn-outline-danger ref-clear-btn py-0 px-2"
-                                        data-cat="${g.category_id}" data-game="${escH(g.game || '')}" title="Delete downloaded data">
-                                    <i class="fas fa-trash"></i></button>
-                            </div>`).join('');
-                    }
-                } catch (e) {
-                    syncedList.innerHTML = `<span class="text-danger">Failed to load status: ${escH(e.message)}</span>`;
-                }
-            }
-
-            async function loadCategories() {
-                gameSelect.innerHTML = '<option value="">Loading games…</option>';
-                startBtn.disabled = true;
-                try {
-                    const data = await (await fetch('/reference/categories')).json();
-                    if (data.status !== 'ok') {
-                        gameSelect.innerHTML = `<option value="">${escH(data.message || 'Failed to load')}</option>`;
-                        return;
-                    }
-                    lastUpd.textContent = data.last_updated ? `tcgcsv updated: ${data.last_updated}` : '';
-                    gameSelect.innerHTML = '<option value="">— choose a game —</option>' +
-                        (data.categories || []).map(c =>
-                            `<option value="${c.category_id}" data-name="${escH(c.name)}">${escH(c.name)}${syncedIds.has(c.category_id) ? ' ✓ (re-download)' : ''}</option>`
-                        ).join('');
-                } catch (e) {
-                    gameSelect.innerHTML = `<option value="">${escH(e.message)}</option>`;
-                }
-            }
-
-            gameSelect.addEventListener('change', function () { startBtn.disabled = !this.value; });
-
-            openBtn.addEventListener('click', function () {
-                stopFlag = false;
-                idleBox.style.display = ''; runningBox.style.display = 'none'; doneBox.style.display = 'none';
-                startBtn.style.display = ''; startBtn.disabled = true;
-                stopBtn.style.display = 'none'; closeBtn.style.display = 'none'; cancelBtn.style.display = '';
-                modal.show();
-                loadStatus().then(loadCategories);
-            });
-
-            cancelBtn.addEventListener('click', () => modal.hide());
-            stopBtn.addEventListener('click', () => {
-                stopFlag = true; stopBtn.disabled = true;
-                stopBtn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Stopping…';
-            });
-
-            // Clear a downloaded game
-            syncedList.addEventListener('click', async function (e) {
-                const btn = e.target.closest('.ref-clear-btn');
-                if (!btn) return;
-                const cat = parseInt(btn.dataset.cat, 10);
-                if (!confirm(`Delete downloaded reference data for ${btn.dataset.game || ('category ' + cat)}?`)) return;
-                btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
-                try {
-                    await fetch('/reference/clear', {
-                        method: 'POST', headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ category_id: cat }),
-                    });
-                } catch (e) {}
-                loadStatus().then(loadCategories);
-            });
-
-            startBtn.addEventListener('click', async function () {
-                const opt = gameSelect.options[gameSelect.selectedIndex];
-                const categoryId = parseInt(gameSelect.value, 10);
-                const categoryName = opt ? (opt.dataset.name || opt.textContent.replace(/ ✓.*$/, '')) : '';
-                if (!categoryId) return;
-                stopFlag = false;
-
-                idleBox.style.display = 'none'; runningBox.style.display = '';
-                startBtn.style.display = 'none'; cancelBtn.style.display = 'none';
-                stopBtn.style.display = ''; stopBtn.disabled = false; stopBtn.innerHTML = '<i class="fas fa-stop me-1"></i>Stop';
-                currentEl.textContent = 'Loading set list…'; counterEl.textContent = '0 / 0';
-                okEl.textContent = '0'; cardsEl.textContent = '0'; errEl.textContent = '0'; barEl.style.width = '0%';
-
-                let groups = [];
-                try {
-                    const gd = await (await fetch(`/reference/groups/${categoryId}`)).json();
-                    if (gd.status !== 'ok') throw new Error(gd.message || 'Could not list sets');
-                    groups = gd.groups || [];
-                } catch (e) {
-                    runningBox.style.display = 'none'; doneBox.style.display = '';
-                    doneMsg.className = 'alert alert-danger mb-0';
-                    doneMsg.innerHTML = `<i class="fas fa-times-circle me-1"></i>${escH(e.message)}`;
-                    stopBtn.style.display = 'none'; closeBtn.style.display = ''; return;
-                }
-
-                const total = groups.length;
-                let done = 0, ok = 0, cards = 0, err = 0;
-                counterEl.textContent = `0 / ${total}`;
-
-                for (const g of groups) {
-                    if (stopFlag) break;
-                    currentEl.textContent = g.name || `Set #${g.group_id}`;
-                    try {
-                        const data = await (await fetch('/reference/sync_group', {
-                            method: 'POST', headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                                category_id: categoryId, category_name: categoryName,
-                                group_id: g.group_id, group_name: g.name,
-                            }),
-                        })).json();
-                        if (data.status === 'ok') { ok++; cards += (data.added || 0); }
-                        else err++;
-                    } catch (e) { err++; }
-
-                    done++;
-                    counterEl.textContent = `${done} / ${total}`;
-                    okEl.textContent = ok; cardsEl.textContent = cards; errEl.textContent = err;
-                    barEl.style.width = `${Math.round((done / total) * 100)}%`;
-                    await new Promise(r => setTimeout(r, 120));  // be a good neighbour between sets
-                }
-
-                runningBox.style.display = 'none'; doneBox.style.display = '';
-                doneMsg.className = 'alert alert-success mb-0';
-                const stoppedNote = stopFlag ? ' (stopped early)' : '';
-                doneMsg.innerHTML = `<i class="fas fa-check-circle me-1"></i>Downloaded <strong>${cards}</strong> cards across `
-                                  + `<strong>${ok}</strong> set${ok !== 1 ? 's' : ''}`
-                                  + (err ? `, <strong>${err}</strong> error${err !== 1 ? 's' : ''}` : '')
-                                  + `${stoppedNote} for <strong>${escH(categoryName)}</strong>. `
-                                  + `OCR identification will now match against it.`;
-                stopBtn.style.display = 'none'; closeBtn.style.display = '';
             });
         })();
 
@@ -3252,6 +3003,138 @@
 
         // ====================== INIT ======================
         loadFilterOptions();
+    </script>
+
+    <!-- ── Collection Pricing modal ── -->
+    <div class="modal fade" id="collectionPriceModal" tabindex="-1" aria-hidden="true">
+      <div class="modal-dialog modal-lg modal-dialog-scrollable">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title"><i class="fas fa-tag me-2"></i>Collection Pricing</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body">
+            <p class="text-muted" style="font-size:.9rem;">
+              Set a single <strong>Bought For</strong> price for a whole collection instead of entering an
+              intake price on every card. In Analytics, that lot price becomes the collection's cost, spread
+              across every card scanned with that collection identifier. Leave a field blank to clear it.
+            </p>
+
+            <div class="table-responsive">
+              <table class="table align-middle mb-3">
+                <thead>
+                  <tr>
+                    <th>Collection</th>
+                    <th style="width:110px;">Cards</th>
+                    <th style="width:200px;">Bought For ($)</th>
+                    <th style="width:90px;"></th>
+                  </tr>
+                </thead>
+                <tbody id="collectionPriceRows">
+                  <tr><td colspan="4" class="text-muted">Loading…</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <hr>
+            <h6 class="fw-semibold mb-2">Add a collection price</h6>
+            <div class="row g-2 align-items-end">
+              <div class="col-12 col-md-6">
+                <label class="form-label small mb-1">Collection name</label>
+                <input type="text" class="form-control" id="newCollName" placeholder="e.g. 2024 Vault Purchase">
+              </div>
+              <div class="col-8 col-md-4">
+                <label class="form-label small mb-1">Bought For ($)</label>
+                <input type="number" class="form-control" id="newCollPrice" step="0.01" min="0" placeholder="0.00">
+              </div>
+              <div class="col-4 col-md-2 d-grid">
+                <button class="btn btn-dark" type="button" onclick="saveCollectionPrice(document.getElementById('newCollName').value, document.getElementById('newCollPrice').value, this)">Add</button>
+              </div>
+            </div>
+            <div class="small mt-2" id="collPriceStatus"></div>
+          </div>
+          <div class="modal-footer">
+            <a href="{{ url_for('analytics_page') }}" class="btn btn-outline-primary me-auto"><i class="fas fa-chart-line me-1"></i>Open Analytics</a>
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Done</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+        const COLL_PRICES_URL = '{{ url_for("collections_prices") }}';
+        const COLL_PRICE_SAVE_URL = '{{ url_for("collections_price_save") }}';
+
+        function collPriceStatus(msg, kind) {
+            const el = document.getElementById('collPriceStatus');
+            el.textContent = msg || '';
+            el.className = 'small mt-2 ' + (kind === 'err' ? 'text-danger' : (kind === 'ok' ? 'text-success' : 'text-muted'));
+        }
+        function escColl(s) {
+            return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+        }
+
+        function loadCollectionPrices() {
+            const tbody = document.getElementById('collectionPriceRows');
+            tbody.innerHTML = '<tr><td colspan="4" class="text-muted">Loading…</td></tr>';
+            fetch(COLL_PRICES_URL).then(r => r.json()).then(d => {
+                const list = d.collections || [];
+                if (!list.length) {
+                    tbody.innerHTML = '<tr><td colspan="4" class="text-muted">No collections yet. Tag cards with a Collection, or add one below.</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = list.map(c => {
+                    const nm = escColl(c.name);
+                    const val = (c.bought_for === null || c.bought_for === undefined) ? '' : c.bought_for;
+                    return '<tr>'
+                        + '<td>' + nm + '</td>'
+                        + '<td><span class="badge bg-light text-dark">' + c.count + '</span></td>'
+                        + '<td><div class="input-group input-group-sm"><span class="input-group-text">$</span>'
+                        + '<input type="number" step="0.01" min="0" class="form-control" value="' + val + '" '
+                        + 'data-coll="' + nm + '" placeholder="—"></td>'
+                        + '<td><button class="btn btn-sm btn-dark" type="button" '
+                        + 'onclick="saveRowPrice(this)">Save</button></td>'
+                        + '</tr>';
+                }).join('');
+            }).catch(e => {
+                tbody.innerHTML = '<tr><td colspan="4" class="text-danger">Failed to load: ' + e + '</td></tr>';
+            });
+        }
+
+        function saveRowPrice(btn) {
+            const input = btn.closest('tr').querySelector('input[data-coll]');
+            saveCollectionPrice(input.getAttribute('data-coll'), input.value, btn);
+        }
+
+        function saveCollectionPrice(name, price, btn) {
+            name = (name || '').trim();
+            if (!name) { collPriceStatus('Enter a collection name.', 'err'); return; }
+            const original = btn ? btn.innerHTML : '';
+            if (btn) { btn.disabled = true; btn.innerHTML = '…'; }
+            fetch(COLL_PRICE_SAVE_URL, {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ name, bought_for: price })
+            })
+            .then(r => r.json())
+            .then(d => {
+                if (btn) { btn.disabled = false; btn.innerHTML = original; }
+                if (d.status === 'success') {
+                    collPriceStatus(d.message, 'ok');
+                    document.getElementById('newCollName').value = '';
+                    document.getElementById('newCollPrice').value = '';
+                    loadCollectionPrices();
+                } else {
+                    collPriceStatus(d.message || 'Save failed.', 'err');
+                }
+            })
+            .catch(e => {
+                if (btn) { btn.disabled = false; btn.innerHTML = original; }
+                collPriceStatus('Request failed: ' + e, 'err');
+            });
+        }
+
+        document.getElementById('collectionPriceModal')
+            .addEventListener('show.bs.modal', loadCollectionPrices);
     </script>
 </body>
 </html>

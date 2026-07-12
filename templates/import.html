@@ -886,6 +886,7 @@
       .import-mode-toggle { flex-direction: column; }
     }
   </style>
+    <link rel="stylesheet" href="{{ url_for('static', filename='theme.css') }}">
 </head>
 <body>
   <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
@@ -2655,6 +2656,76 @@
     });
 
     drawPreview();
+  </script>
+  <script>
+  // Populate the Game dropdowns (Singles + 3x3 Page tabs) with every game
+  // available from the Reference Data source (tcgcsv), marking already-downloaded
+  // games with a check. Falls back to the server-rendered options if the source
+  // can't be reached, and keeps any custom template games not in the source.
+  (function () {
+    const selects = ['singleGame', 'game']
+      .map(id => document.getElementById(id))
+      .filter(Boolean);
+    if (!selects.length) return;
+
+    const norm = s => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+
+    function rebuild(sel, cats, downloaded) {
+      const prev = sel.value;
+      const prevNorm = norm(prev);
+
+      // Reference games: downloaded first, then the rest (already popularity-sorted).
+      const catNorms = new Set(cats.map(c => norm(c.name)));
+      const dl = [], rest = [];
+      cats.forEach(c => {
+        const isDown = downloaded.has(norm(c.name));
+        (isDown ? dl : rest).push({ value: c.name, label: c.name + (isDown ? '  \u2713' : '') });
+      });
+
+      // Preserve any custom template games that aren't offered by the source.
+      const extras = Array.from(sel.querySelectorAll('option'))
+        .filter(o => o.value && !catNorms.has(norm(o.value)))
+        .map(o => ({ value: o.value, label: o.textContent.trim() }));
+
+      const ordered = [...dl, ...rest, ...extras];
+
+      const placeholder = sel.querySelector('option[value=""]');
+      sel.innerHTML = '';
+      if (placeholder) sel.appendChild(placeholder);
+      ordered.forEach(o => {
+        const opt = document.createElement('option');
+        opt.value = o.value;
+        opt.textContent = o.label;
+        sel.appendChild(opt);
+      });
+
+      // Restore the previous selection if still present (by value, then by name).
+      if (prev) {
+        const match = Array.from(sel.options).find(o => o.value === prev)
+                   || Array.from(sel.options).find(o => norm(o.value) === prevNorm);
+        if (match) sel.value = match.value;
+      }
+    }
+
+    (async function load() {
+      let cats;
+      try {
+        const d = await (await fetch('/reference/categories')).json();
+        if (d.status !== 'ok' || !Array.isArray(d.categories) || !d.categories.length) return;
+        cats = d.categories;
+      } catch (e) {
+        return;  // offline / source unavailable -> keep server-rendered options
+      }
+
+      const downloaded = new Set();
+      try {
+        const d = await (await fetch('/reference/status')).json();
+        (d.games || []).forEach(g => downloaded.add(norm(g.game)));
+      } catch (e) { /* download markers are best-effort */ }
+
+      selects.forEach(sel => rebuild(sel, cats, downloaded));
+    })();
+  })();
   </script>
 </body>
 </html>

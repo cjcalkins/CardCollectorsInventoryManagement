@@ -281,3 +281,23 @@ class AppSetting(db.Model):
 
     def __repr__(self):
         return f"<AppSetting {self.key}>"
+
+
+class CollectionPrice(db.Model):
+    """
+    A single "Bought For" lot price for a collection, so a whole collection can be
+    priced at once instead of entering intake_price on every card. Keyed by a
+    normalized (lower/stripped) collection name; `name` keeps the display casing.
+    Analytics treats this lot price as the collection's cost basis, spread across
+    its scanned cards. bought_for NULL/absent means "no lot price — fall back to
+    summing individual card intake_price".
+    """
+    __tablename__ = 'collection_prices'
+    id         = db.Column(db.Integer, primary_key=True)
+    name_key   = db.Column(db.String(200), unique=True, nullable=False, index=True)
+    name       = db.Column(db.String(200), nullable=False)
+    bought_for = db.Column(db.Float, nullable=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<CollectionPrice {self.name} {self.bought_for}>"

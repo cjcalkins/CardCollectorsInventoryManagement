@@ -1,0 +1,271 @@
+/* ============================================================================
+   Card Collector Inventory Manager — shared theme
+   ----------------------------------------------------------------------------
+   One place for the whole app's colour profile. Loaded last on every page, so
+   it retints the existing pages without touching their layout. Tuned for long
+   sessions of reading entries and analytics: softer canvas, off-white surfaces
+   (less glare), calmer dark bands, and one restful teal accent instead of the
+   default electric blue. Change a value here and every page follows.
+   ============================================================================ */
+
+:root {
+    /* Canvas & surfaces — no pure white, no bright blue-white */
+    --bg:          #ebedf0;   /* page background */
+    --surface:     #fafbfc;   /* cards / panels (glare-reduced white) */
+    --panel:       #fafbfc;   /* alias used by the import page */
+    --surface-2:   #eef1f4;   /* insets, code, table headers, image wells */
+    --panel-2:     #eef1f4;   /* alias used by the import page */
+    --surface-3:   #e7ebef;   /* hover wells */
+
+    /* Lines */
+    --border:        #dde2e7;
+    --border-strong: #cbd2d9;
+
+    /* Text — soft near-black instead of #212529, easier over long reads */
+    --text:      #26313a;
+    --text-soft: #3b454d;
+    --muted:     #5c6771;
+
+    /* Dark chrome (navbar, table headers, dark buttons) — desaturated slate,
+       lower contrast than the old near-black so the big bands don't glare */
+    --ink:    #2b343b;
+    --ink-2:  #3a454d;
+    --on-ink: #eef1f3;   /* text on dark, not pure white */
+
+    /* One calm accent — teal, aligned to the import page's existing --primary */
+    --accent:        #2f7d74;
+    --accent-strong: #266a62;
+    --accent-soft:   #e3efed;
+    --accent-text:   #235d56;
+    --primary:       #2f7d74;   /* aliases used by the import page */
+    --primary-hover: #266a62;
+
+    /* Status — kept meaningful but desaturated so nothing vibrates */
+    --success:      #2f7256;
+    --success-bg:   #e6f1eb;
+    --success-text: #255c45;
+    --warn:         #8a6a1e;
+    --warn-bg:      #f6edd6;
+    --warn-text:    #6f5417;
+    --danger:       #b23a48;
+    --danger-bg:    #f7e7e9;
+    --danger-text:  #933039;
+    --redline:      #c0392b;
+
+    /* Softer shadows — less hard-edged than the originals */
+    --shadow-sm: 0 2px 10px rgba(35, 45, 52, .05);
+    --shadow:    0 4px 16px rgba(35, 45, 52, .06);
+    --shadow-lg: 0 10px 26px rgba(35, 45, 52, .09);
+    --radius:    14px;
+}
+
+/* ── Base ─────────────────────────────────────────────────────────────── */
+body {
+    background-color: var(--bg) !important;
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent-text); }
+a:hover { color: var(--accent-strong); }
+code, .path-line, .masked {
+    background: var(--surface-2) !important;
+    color: var(--text-soft);
+}
+::selection { background: var(--accent-soft); }
+
+/* ── Dark chrome: navbar & dark table headers ─────────────────────────── */
+.navbar.bg-dark { background-color: var(--ink) !important; }
+
+.table-dark {
+    --bs-table-bg: var(--ink);
+    --bs-table-border-color: var(--ink-2);
+    --bs-table-color: var(--on-ink);
+    color: var(--on-ink);
+}
+
+/* ── Buttons — route Bootstrap's own component variables ──────────────── */
+.btn-dark {
+    --bs-btn-bg: var(--ink);            --bs-btn-border-color: var(--ink);
+    --bs-btn-hover-bg: var(--ink-2);    --bs-btn-hover-border-color: var(--ink-2);
+    --bs-btn-active-bg: var(--ink-2);   --bs-btn-active-border-color: var(--ink-2);
+    --bs-btn-disabled-bg: var(--ink);   --bs-btn-disabled-border-color: var(--ink);
+}
+.btn-primary {
+    --bs-btn-bg: var(--accent);            --bs-btn-border-color: var(--accent);
+    --bs-btn-hover-bg: var(--accent-strong); --bs-btn-hover-border-color: var(--accent-strong);
+    --bs-btn-active-bg: var(--accent-strong);--bs-btn-active-border-color: var(--accent-strong);
+    --bs-btn-disabled-bg: var(--accent);   --bs-btn-disabled-border-color: var(--accent);
+}
+.btn-outline-primary {
+    --bs-btn-color: var(--accent-text);      --bs-btn-border-color: var(--accent);
+    --bs-btn-hover-bg: var(--accent);        --bs-btn-hover-border-color: var(--accent);
+    --bs-btn-hover-color: #fff;
+    --bs-btn-active-bg: var(--accent-strong);--bs-btn-active-border-color: var(--accent-strong);
+}
+.btn-outline-secondary {
+    --bs-btn-color: var(--text-soft);        --bs-btn-border-color: var(--border-strong);
+    --bs-btn-hover-bg: var(--ink);           --bs-btn-hover-border-color: var(--ink);
+    --bs-btn-hover-color: var(--on-ink);
+}
+.btn-danger {
+    --bs-btn-bg: var(--danger);            --bs-btn-border-color: var(--danger);
+    --bs-btn-hover-bg: var(--danger-text); --bs-btn-hover-border-color: var(--danger-text);
+    --bs-btn-active-bg: var(--danger-text);--bs-btn-active-border-color: var(--danger-text);
+    --bs-btn-disabled-bg: var(--danger);   --bs-btn-disabled-border-color: var(--danger);
+}
+
+/* ── Forms — calm teal focus instead of electric blue ─────────────────── */
+.form-control:focus, .form-select:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 .2rem rgba(47, 125, 116, .18);
+}
+.form-check-input:checked {
+    background-color: var(--accent);
+    border-color: var(--accent);
+}
+.form-check-input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 .2rem rgba(47, 125, 116, .18);
+}
+
+/* ── Cards, alerts, pagination, progress ──────────────────────────────── */
+.card {
+    --bs-card-bg: var(--surface);
+    --bs-card-border-color: var(--border);
+}
+.alert-light {
+    background: var(--surface-2);
+    border-color: var(--border);
+    color: var(--text-soft);
+}
+.page-link {
+    --bs-pagination-color: var(--accent-text);
+    --bs-pagination-hover-color: var(--accent-strong);
+    --bs-pagination-active-bg: var(--accent);
+    --bs-pagination-active-border-color: var(--accent);
+    --bs-pagination-focus-box-shadow: 0 0 0 .2rem rgba(47, 125, 116, .18);
+}
+.progress-bar.bg-success { background-color: var(--success) !important; }
+.progress-bar.bg-warning { background-color: var(--warn)    !important; }
+.progress-bar.bg-danger  { background-color: var(--danger)  !important; }
+
+/* ── App framework: top nav tabs ──────────────────────────────────────── */
+.nav-tab { color: rgba(255, 255, 255, .82); }
+.nav-tab:hover { color: #fff; }
+.nav-tab.active { background: var(--surface); color: var(--text); }
+
+/* ── App framework: settings sidebar ──────────────────────────────────── */
+.settings-sidebar { background: var(--surface); border-color: var(--border); }
+.settings-sidebar a.ss-link { color: var(--text-soft); }
+.settings-sidebar a.ss-link:hover { background: var(--surface-2); color: var(--text); }
+.settings-sidebar a.ss-link.active { background: var(--ink); color: var(--on-ink); }
+
+/* ── Named surfaces (recolour only: bg / border / shadow) ─────────────── */
+.setting-card, .stat-card, .quick-link, .cap-card, .step-card,
+.storage-card, .key-card, .panel, .card-mini, .type-group, .summary-card {
+    background: var(--surface);
+    border-color: var(--border);
+    box-shadow: var(--shadow-sm);
+}
+.setting-card:hover, .quick-link:hover { box-shadow: var(--shadow-lg); border-color: var(--border-strong); }
+.table-card  { box-shadow: var(--shadow) !important; }
+.summary-card{ box-shadow: var(--shadow) !important; }
+.pack-block  { border-color: var(--border-strong); }
+.danger-card { background: var(--surface); border-color: #e8b9bf; }
+.thumbnail, .mobile-card { background: var(--surface); border-color: var(--border); }
+
+/* ── Hero (welcome) ───────────────────────────────────────────────────── */
+.hero {
+    background: linear-gradient(135deg, var(--ink) 0%, var(--ink-2) 100%);
+    box-shadow: var(--shadow-lg);
+}
+
+/* ── Album / box slots ────────────────────────────────────────────────── */
+.album-slot, .box-slot { border-color: var(--border); background: var(--surface); }
+.slot-label { background: var(--surface); border-top-color: var(--border); color: var(--text); }
+.slot-image-wrap, .empty-slot { background: var(--surface-2); }
+
+/* ── Analytics ────────────────────────────────────────────────────────── */
+table.analytics-table th { background: var(--surface-2); color: var(--text-soft); }
+table.analytics-table th, table.analytics-table td { border-bottom-color: var(--border); }
+table.analytics-table tr.total-row td { background: var(--surface-2); border-top-color: var(--border-strong); }
+.section-head { color: var(--text-soft); }
+.source-toggle { border-color: var(--border-strong); }
+.source-toggle label { background: var(--surface); color: var(--text-soft); }
+.source-toggle label.active { background: var(--ink); color: var(--on-ink); }
+
+/* ── Inventory table: gentle zebra + soft hover for all-day row tracking ─ */
+#inventoryTable tbody tr:nth-child(even) > td { background-color: rgba(47, 125, 116, .035); }
+#inventoryTable tbody tr:hover > td { background-color: var(--accent-soft) !important; }
+
+/* ── Builder ──────────────────────────────────────────────────────────── */
+.chip { border-color: var(--border-strong); }
+.chip.active { background: var(--ink); border-color: var(--ink); color: var(--on-ink); }
+.card-mini img { background: var(--surface-2); }
+
+/* ── Import: retint the "done" step green to the calm success tone ──────── */
+.step-list-item.done { color: var(--success); }
+.auto-import-toggle.on { background: var(--accent-soft); }
+
+/* ── Type icons ───────────────────────────────────────────────────────── */
+.seg label { border-color: var(--border-strong); }
+.seg label.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.preview { background: var(--surface-2); border-color: var(--border-strong); }
+
+/* ── Duplicates: swap electric-blue hover for the accent ──────────────── */
+.dup-record:hover { border-color: var(--accent); background: var(--accent-soft); }
+.dup-record.selected-canonical { border-color: var(--accent); }
+
+/* ── Search by image: swap electric-blue accents for the calm teal ──────── */
+#drop-zone.drag-over { border-color: var(--accent); background: var(--accent-soft); }
+.match-bar-fill { background: linear-gradient(90deg, var(--accent), #3f9a8f); }
+.top-match { border-color: var(--accent); background: var(--accent-soft); }
+.top-match .match-pct { color: var(--accent-text); }
+.jtcg-picker-item.selected { background: var(--accent-soft); }
+
+/* ── Respect reduced-motion preferences ───────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; scroll-behavior: auto !important; }
+}
+
+/* ============================================================================
+   Additional pages: setup, inventory landing, albums, record detail
+   Neutral surfaces retinted to the palette. Meaningful accents are left as-is
+   on purpose: grading-tier badges, JTCG pricing green, and the layout-edit
+   purple all signal state and shouldn't blend into the accent.
+   ============================================================================ */
+
+/* ── Setup / choose-implementation ────────────────────────────────────── */
+.opt-card { background: var(--surface); border-color: var(--border); }
+.opt-card:hover:not(.disabled) { border-color: var(--border-strong); box-shadow: var(--shadow-lg); }
+.opt-card.selected { border-color: var(--accent); box-shadow: var(--shadow-lg); }
+.opt-card ul { color: var(--text-soft); }
+.opt-card .check { color: var(--accent); }
+.badge-cap   { background: var(--accent-soft);  color: var(--accent-text);  }
+.badge-nocap { background: var(--success-bg);   color: var(--success-text); }
+.disabled-note { color: var(--danger); }
+
+/* ── Inventory landing: game cards ────────────────────────────────────── */
+.game-card { box-shadow: var(--shadow); }
+.game-card:hover { box-shadow: var(--shadow-lg); }
+.game-meta, .empty-state { color: var(--muted); }
+.field-pill      { background: var(--surface-2); color: var(--text-soft); }
+.field-pill-more { background: var(--surface-3); color: var(--muted); }
+
+/* ── Albums ───────────────────────────────────────────────────────────── */
+.album-card-wrap { box-shadow: var(--shadow); }
+.album-card-wrap:hover { box-shadow: var(--shadow-lg); }
+.album-img-area { background: var(--surface-2); }
+.album-placeholder { background: var(--ink); }        /* softened dark card back */
+.album-name-label { background: var(--surface); border-top-color: var(--border); color: var(--text); }
+
+/* ── Record detail: neutral surfaces only ─────────────────────────────── */
+.record-image      { background: var(--surface); border-color: var(--border); }
+.jtcg-linked-panel { background: var(--surface); }                       /* keeps its "linked" green border */
+.jtcg-unlinked-panel { background: var(--surface-2); border-color: var(--border); }
+.jtcg-picker-list  { border-color: var(--border); }
+.jtcg-picker-item  { border-bottom-color: var(--border); }
+.tcg-product-id    { background: var(--surface-2); }
+.copy-option       { border-bottom-color: var(--border); }
+.realign-dialog    { background: var(--surface); }
+.realign-shell     { background: var(--surface-2); border-color: var(--border); }

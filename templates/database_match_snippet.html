@@ -1,0 +1,180 @@
+{# ============================================================================
+   DATABASE MATCH — drop-in for inventory_detail.html
+   ----------------------------------------------------------------------------
+   Identifies this entry against the downloaded tcgcsv catalog using the Name +
+   collector Number already on the card. One exact match is applied instantly;
+   several matches open a chooser. Applying reuses the existing /ocr_apply route.
+
+   HOW TO INSTALL (3 parts):
+   1) BUTTON  — paste next to the other identification buttons (OCR / Cloud /
+      Grade). Keep the id="dbMatchBtn".
+   2) MODAL   — paste once, anywhere in <body> (near the page's other modals).
+   3) SCRIPT  — paste once before </body> (Bootstrap's bundle must already be
+      loaded on the page, which it is for the identify buttons to work).
+   Requires nothing else; it reads {{ record.id }} directly.
+   ========================================================================== #}
+
+
+{# ─────────────────────────── 1) BUTTON ─────────────────────────── #}
+<button type="button" id="dbMatchBtn" class="btn btn-outline-primary"
+        title="Match this card against the downloaded database by its Name and Number">
+    <i class="fas fa-database me-1"></i>Database Match
+</button>
+
+
+{# ─────────────────────────── 2) MODAL ──────────────────────────── #}
+<div class="modal fade" id="dbMatchModal" tabindex="-1" aria-labelledby="dbMatchModalLabel"
+     aria-hidden="true" data-bs-backdrop="static">
+    <div class="modal-dialog modal-dialog-centered modal-lg modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="dbMatchModalLabel">
+                    <i class="fas fa-database me-2"></i>Choose the matching card
+                </h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <p class="text-muted small mb-3" id="dbMatchQuery"></p>
+                <div id="dbMatchAlert"></div>
+                <div id="dbMatchList" class="list-group"></div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" id="dbMatchApplyBtn" disabled>
+                    <i class="fas fa-check me-1"></i>Apply selected
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+
+{# ─────────────────────────── 3) SCRIPT ─────────────────────────── #}
+<script>
+(function () {
+    const RECORD_ID = {{ record.id }};
+    const openBtn   = document.getElementById('dbMatchBtn');
+    if (!openBtn) return;
+
+    const modalEl   = document.getElementById('dbMatchModal');
+    const modal     = new bootstrap.Modal(modalEl);
+    const queryEl   = document.getElementById('dbMatchQuery');
+    const alertEl   = document.getElementById('dbMatchAlert');
+    const listEl    = document.getElementById('dbMatchList');
+    const applyBtn  = document.getElementById('dbMatchApplyBtn');
+
+    function escH(s) {
+        return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                              .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+    function money(v) {
+        return (v === null || v === undefined || v === '') ? '' : '$' + Number(v).toFixed(2);
+    }
+    function setBusy(busy) {
+        openBtn.disabled = busy;
+        openBtn.innerHTML = busy
+            ? '<i class="fas fa-spinner fa-spin me-1"></i>Matching…'
+            : '<i class="fas fa-database me-1"></i>Database Match';
+    }
+    function toast(msg, kind) {
+        // Minimal inline feedback; swap for the page's own toast if it has one.
+        alertEl.innerHTML = `<div class="alert alert-${kind} py-2 mb-3">${escH(msg)}</div>`;
+    }
+
+    // Apply a chosen catalog card by reusing the existing OCR-apply route.
+    async function applyProduct(productId) {
+        const res = await fetch('/ocr_apply/' + RECORD_ID, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reference_product_id: productId }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.status !== 'success') {
+            throw new Error(data.message || 'Could not apply the selected card.');
+        }
+    }
+
+    function renderCandidates(cands) {
+        listEl.innerHTML = cands.map((c, i) => {
+            const pct  = Math.round((c.score || 0) * 100);
+            const badge = c.exact
+                ? '<span class="badge bg-success ms-2">Exact</span>'
+                : `<span class="badge bg-secondary ms-2">${pct}%</span>`;
+            const thumb = c.image_url
+                ? `<img src="${escH(c.image_url)}" alt="" style="width:40px;height:56px;object-fit:contain;" class="me-3 flex-shrink-0">`
+                : '';
+            const meta = [c.set, c.number, c.rarity, money(c.market_price)]
+                .filter(Boolean).map(escH).join(' · ');
+            return `
+              <label class="list-group-item d-flex align-items-center gap-2" style="cursor:pointer;">
+                <input class="form-check-input flex-shrink-0 me-2 dbMatchRadio" type="radio"
+                       name="dbMatchPick" value="${escH(c.product_id)}" ${i === 0 ? 'checked' : ''}>
+                ${thumb}
+                <span class="flex-grow-1">
+                    <span class="fw-semibold">${escH(c.name || '(unnamed)')}</span>${badge}
+                    <span class="d-block text-muted small">${meta}</span>
+                </span>
+              </label>`;
+        }).join('');
+        applyBtn.disabled = cands.length === 0;
+    }
+
+    openBtn.addEventListener('click', async function () {
+        setBusy(true);
+        try {
+            const res  = await fetch('/database_match/' + RECORD_ID);
+            const data = await res.json().catch(() => ({}));
+
+            if (!res.ok || data.status !== 'ok') {
+                // No catalog for this game, or nothing typed yet, etc.
+                window.alert(data.message || 'Database match failed.');
+                return;
+            }
+
+            // Exactly one exact match -> apply immediately, no prompt.
+            if (data.auto_apply) {
+                await applyProduct(data.auto_apply.product_id);
+                window.location.reload();
+                return;
+            }
+
+            const cands = data.candidates || [];
+            if (!cands.length) {
+                window.alert('No matching card found in the downloaded database for '
+                             + (data.query && data.query.name ? '“' + data.query.name + '”' : 'this entry') + '.');
+                return;
+            }
+
+            // Multiple matches -> let the user choose.
+            const q = data.query || {};
+            queryEl.innerHTML =
+                'Matching <strong>' + escH(q.name || '—') + '</strong>'
+                + (q.number ? ' · #' + escH(q.number) : '')
+                + ' against <strong>' + escH(data.game || '') + '</strong>. '
+                + 'Multiple cards matched — pick the correct printing:';
+            alertEl.innerHTML = '';
+            renderCandidates(cands);
+            modal.show();
+        } catch (err) {
+            window.alert(err.message || 'Database match failed.');
+        } finally {
+            setBusy(false);
+        }
+    });
+
+    applyBtn.addEventListener('click', async function () {
+        const picked = modalEl.querySelector('.dbMatchRadio:checked');
+        if (!picked) return;
+        applyBtn.disabled = true;
+        applyBtn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Applying…';
+        try {
+            await applyProduct(picked.value);
+            window.location.reload();
+        } catch (err) {
+            toast(err.message || 'Could not apply the selected card.', 'danger');
+            applyBtn.disabled = false;
+            applyBtn.innerHTML = '<i class="fas fa-check me-1"></i>Apply selected';
+        }
+    });
+})();
+</script>
