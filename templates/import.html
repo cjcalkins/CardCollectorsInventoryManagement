@@ -2670,7 +2670,7 @@
 
     const norm = s => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 
-    function rebuild(sel, cats, downloaded) {
+    function rebuild(sel, cats, downloaded, statusGames) {
       const prev = sel.value;
       const prevNorm = norm(prev);
 
@@ -2682,12 +2682,19 @@
         (isDown ? dl : rest).push({ value: c.name, label: c.name + (isDown ? '  \u2713' : '') });
       });
 
-      // Preserve any custom template games that aren't offered by the source.
+      // Custom games (uploaded CSVs) live only in the downloaded list, not in the
+      // tcgcsv catalog — surface them up top with the other downloaded games.
+      const customs = (statusGames || [])
+        .filter(g => g.game && !catNorms.has(norm(g.game)))
+        .map(g => ({ value: g.game, label: g.game + '  \u2713' }));
+
+      // Preserve any leftover custom template games not already covered above.
+      const covered = new Set([...catNorms, ...customs.map(c => norm(c.value))]);
       const extras = Array.from(sel.querySelectorAll('option'))
-        .filter(o => o.value && !catNorms.has(norm(o.value)))
+        .filter(o => o.value && !covered.has(norm(o.value)))
         .map(o => ({ value: o.value, label: o.textContent.trim() }));
 
-      const ordered = [...dl, ...rest, ...extras];
+      const ordered = [...dl, ...customs, ...rest, ...extras];
 
       const placeholder = sel.querySelector('option[value=""]');
       sel.innerHTML = '';
@@ -2718,12 +2725,14 @@
       }
 
       const downloaded = new Set();
+      let statusGames = [];
       try {
         const d = await (await fetch('/reference/status')).json();
-        (d.games || []).forEach(g => downloaded.add(norm(g.game)));
+        statusGames = d.games || [];
+        statusGames.forEach(g => downloaded.add(norm(g.game)));
       } catch (e) { /* download markers are best-effort */ }
 
-      selects.forEach(sel => rebuild(sel, cats, downloaded));
+      selects.forEach(sel => rebuild(sel, cats, downloaded, statusGames));
     })();
   })();
   </script>

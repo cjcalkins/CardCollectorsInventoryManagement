@@ -6492,6 +6492,166 @@ def reference_clear():
     return jsonify({"status": "success", "deleted": deleted})
 
 
+# Header aliases -> core ReferenceCard fields. Any header not matched becomes an
+# extendedData column, so every CSV header ends up as an entry field for the game.
+_CSV_CORE_ALIASES = {
+    "name":         {"name", "card name", "cardname", "product name", "productname", "card", "title"},
+    "number":       {"number", "no", "no.", "num", "card number", "cardnumber", "collector number",
+                     "collectornumber", "set number", "setnumber", "#"},
+    "set_name":     {"set", "set name", "setname", "expansion", "series"},
+    "rarity":       {"rarity", "rare"},
+    "market_price": {"price", "market price", "marketprice", "market", "value", "tcg price", "tcgprice"},
+    "url":          {"url", "link", "tcgplayer", "tcgplayer url", "tcgplayerurl", "product url"},
+    "image_url":    {"image", "image url", "imageurl", "img", "image link", "picture"},
+}
+
+
+def _csv_header_role(header):
+    """Return the core ReferenceCard field a CSV header maps to, or None (-> extended)."""
+    h = str(header or "").strip().lower()
+    for role, aliases in _CSV_CORE_ALIASES.items():
+        if h in aliases:
+            return role
+    return None
+
+
+def _csv_price(v):
+    """Parse a price cell to a float, tolerating $ and thousands separators."""
+    try:
+        return float(str(v).replace("$", "").replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+@app.route("/reference/upload_csv", methods=["POST"])
+def reference_upload_csv():
+    """
+    Create a custom game catalog from an uploaded CSV, for TCGs not on tcgcsv.
+
+    Row 1 is the header: each column name becomes an entry field for that game.
+    Recognized headers (name / number / set / rarity / price / url / image) map to
+    the core reference fields; every other column is kept as a per-game
+    extendedData column. The uploaded file's name (without extension) becomes the
+    Game name shown in the import dropdown and used by Database Match.
+
+    Stored in the same ReferenceSync / ReferenceCard tables as downloaded games,
+    under a synthetic negative category_id so it never collides with tcgcsv IDs.
+    Re-uploading a file with the same game name replaces that game's rows.
+    """
+    import csv, io
+
+    file = request.files.get("file")
+    if file is None or not file.filename:
+        return jsonify({"status": "error", "message": "No CSV file was uploaded."}), 400
+
+    raw_name = os.path.splitext(os.path.basename(file.filename))[0].strip()
+    game = _normalize_game_name(raw_name)
+    if not game:
+        return jsonify({"status": "error", "message": "Could not read a game name from the file name."}), 400
+
+    try:
+        text = file.read().decode("utf-8-sig", errors="replace")
+        rows = list(csv.reader(io.StringIO(text)))
+    except Exception as exc:
+        return jsonify({"status": "error", "message": f"Could not read the CSV: {exc}"}), 400
+    if not rows:
+        return jsonify({"status": "error", "message": "The CSV is empty."}), 400
+
+    headers = [str(h or "").strip() for h in rows[0]]
+    if not any(headers):
+        return jsonify({"status": "error", "message": "The first row must contain column headers."}), 400
+    roles = [_csv_header_role(h) for h in headers]
+
+    # Reuse this game's category if it was uploaded before (replace it); refuse to
+    # clobber a real tcgcsv download; otherwise mint a new synthetic negative id.
+    existing_cid, _ = _resolve_category_for_game(game)
+    if existing_cid is not None and existing_cid >= 0:
+        return jsonify({"status": "error",
+                        "message": f"“{game}” already exists as a downloaded tcgcsv catalog. "
+                                   f"Rename your file, or delete that catalog first."}), 409
+    if existing_cid is not None:
+        category_id = existing_cid
+        ReferenceCard.query.filter_by(category_id=category_id).delete()
+        db.session.flush()
+    else:
+        min_cid = db.session.query(db.func.min(ReferenceCard.category_id)).scalar()
+        min_sync = db.session.query(db.func.min(ReferenceSync.category_id)).scalar()
+        floor = min(0, min_cid if min_cid is not None else 0, min_sync if min_sync is not None else 0)
+        category_id = floor - 1
+
+    # Synthetic unique product_ids (negative), below anything already stored.
+    min_pid = db.session.query(db.func.min(ReferenceCard.product_id)).scalar()
+    pid = min(0, min_pid if min_pid is not None else 0) - 1
+
+    set_group_ids, next_group, added = {}, 1, 0
+    for row in rows[1:]:
+        if not any(str(c or "").strip() for c in row):
+            continue
+        core = {"name": "", "number": "", "set_name": "", "rarity": "",
+                "market_price": None, "url": "", "image_url": ""}
+        extended = {}
+        for idx, header in enumerate(headers):
+            if not header:
+                continue
+            val = str(row[idx]).strip() if idx < len(row) and row[idx] is not None else ""
+            role = roles[idx]
+            if role == "market_price":
+                core["market_price"] = _csv_price(val)
+            elif role:
+                core[role] = val
+            else:
+                extended[header] = val
+
+        set_name = core["set_name"] or ""
+        if set_name not in set_group_ids:
+            set_group_ids[set_name] = next_group
+            next_group += 1
+
+        _reference_upsert({
+            "product_id":   pid,
+            "category_id":  category_id,
+            "group_id":     set_group_ids[set_name],
+            "game":         game,
+            "set_name":     set_name,
+            "name":         core["name"],
+            "clean_name":   core["name"].lower(),
+            "number":       core["number"],
+            "rarity":       core["rarity"],
+            "image_url":    core["image_url"],
+            "url":          core["url"],
+            "market_price": core["market_price"],
+            "extended":     extended,
+        })
+        pid -= 1
+        added += 1
+
+    if added == 0:
+        db.session.rollback()
+        return jsonify({"status": "error", "message": "The CSV had headers but no data rows."}), 400
+
+    rs = ReferenceSync.query.filter_by(category_id=category_id).first()
+    if rs is None:
+        rs = ReferenceSync(category_id=category_id)
+        db.session.add(rs)
+    rs.game = game
+    rs.status = "ok"
+    rs.remote_updated = None
+    db.session.flush()
+    _reference_recount(category_id)
+    db.session.commit()
+    _REF_FIELDS_CACHE.pop(category_id, None)   # rebuild derived fields from the new rows
+
+    fields = [h for h in headers if h]
+    return jsonify({
+        "status": "success",
+        "game": game,
+        "category_id": category_id,
+        "added": added,
+        "fields": fields,
+        "message": f"Imported {added} card(s) for “{game}” with {len(fields)} field(s).",
+    })
+
+
 # ====================== TYPE-ICON LIBRARY ROUTES ======================
 # A per-game library of labelled "type" icons (Pokemon energy, Yu-Gi-Oh
 # attribute, ...). Populate it by uploading an icon image or capturing one from a
