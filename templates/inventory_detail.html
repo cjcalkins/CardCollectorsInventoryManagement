@@ -504,11 +504,12 @@
                 <img src="{{ url_for('static', filename='favicon.jpg') }}" alt="logo" width="24" height="24" style="object-fit:cover;border-radius:4px;margin-right:0.5rem;" class="me-2">Card Collector Inventory Manager
             </a>
             <div class="nav-tabs-minimal">
-                <a href="{{ url_for('import_page') }}" class="nav-tab">Import</a>
-                <a href="{{ url_for('inventory') }}" class="nav-tab active">Inventory</a>
-                <a href="{{ url_for('storage_list') }}" class="nav-tab">Storage</a>
-                <a href="{{ url_for('analytics_page') }}" class="nav-tab">Analytics</a>
-                <a href="{{ url_for('settings_page') }}" class="nav-tab" title="Settings"><i class="fas fa-gear"></i></a>
+                {% if can_view('import') %}<a href="{{ url_for('import_page') }}" class="nav-tab">Import</a>{% endif %}
+                {% if can_view('inventory') %}<a href="{{ url_for('inventory') }}" class="nav-tab active">Inventory</a>{% endif %}
+                {% if can_view('storage') %}<a href="{{ url_for('storage_list') }}" class="nav-tab">Storage</a>{% endif %}
+                {% if can_view('analytics') %}<a href="{{ url_for('analytics_page') }}" class="nav-tab">Analytics</a>{% endif %}
+                {% if can_view('settings') %}<a href="{{ url_for('settings_page') }}" class="nav-tab" title="Settings"><i class="fas fa-gear"></i></a>{% endif %}
+                {% if auth_user %}<a href="{{ url_for('auth_logout') }}" class="nav-tab" title="Sign out ({{ auth_username }})"><i class="fas fa-right-from-bracket"></i></a>{% endif %}
             </div>
         </div>
     </nav>
@@ -1064,6 +1065,11 @@
                                         </div>
                                         <div class="form-text">Amount it sold for.</div>
                                     </div>
+                                </div>
+                                <div id="cardNetRow" class="mt-3 pt-3 border-top d-none align-items-baseline gap-2">
+                                    <span class="small fw-semibold">Card Net</span>
+                                    <span class="text-muted small">(Sold Price − Intake Price)</span>
+                                    <span id="cardNetValue" class="ms-auto fs-5 fw-bold"></span>
                                 </div>
                             </div>
 
@@ -2872,6 +2878,49 @@
         document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(function (el) {
             new bootstrap.Tooltip(el);
         });
+    </script>
+    <script>
+        // Card Net = Sold Price − Intake Price. Shown only when all three price
+        // fields (Intake, Current Value, Sold) are filled with valid numbers.
+        // Green when positive, red when negative. Read-only, updates live.
+        (function () {
+            const intakeEl  = document.getElementById('intakePrice');
+            const currentEl = document.getElementById('currentValue');
+            const soldEl    = document.getElementById('soldPrice');
+            const netRow    = document.getElementById('cardNetRow');
+            const netVal    = document.getElementById('cardNetValue');
+            if (!intakeEl || !currentEl || !soldEl || !netRow || !netVal) return;
+
+            const num = el => {
+                const v = (el.value || '').trim();
+                if (v === '') return null;
+                const n = parseFloat(v);
+                return Number.isFinite(n) ? n : null;
+            };
+            const fmt = n => (n < 0 ? '−$' : '$') + Math.abs(n).toFixed(2);
+
+            function update() {
+                const intake = num(intakeEl), current = num(currentEl), sold = num(soldEl);
+                // Require all three filled; Current Value gates display but isn't in the math.
+                if (intake === null || current === null || sold === null) {
+                    netRow.classList.add('d-none');
+                    netRow.classList.remove('d-flex');
+                    return;
+                }
+                const net = sold - intake;
+                netVal.textContent = fmt(net);
+                netVal.classList.remove('text-success', 'text-danger', 'text-muted');
+                netVal.classList.add(net > 0 ? 'text-success' : net < 0 ? 'text-danger' : 'text-muted');
+                netRow.classList.remove('d-none');
+                netRow.classList.add('d-flex');
+            }
+
+            [intakeEl, currentEl, soldEl].forEach(el => {
+                el.addEventListener('input', update);
+                el.addEventListener('change', update);
+            });
+            update();  // reflect saved values on load
+        })();
     </script>
 </body>
 </html>

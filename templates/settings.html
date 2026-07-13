@@ -88,11 +88,14 @@
                      style="object-fit:cover;border-radius:4px;margin-right:0.5rem;" class="me-2">Card Collector Inventory Manager
             </a>
             <div class="nav-tabs-minimal">
-                <a href="{{ url_for('import_page') }}" class="nav-tab">Import</a>
-                <a href="{{ url_for('inventory') }}" class="nav-tab">Inventory</a>
-                <a href="{{ url_for('storage_list') }}" class="nav-tab">Storage</a>
-                <a href="{{ url_for('analytics_page') }}" class="nav-tab">Analytics</a>
-                <a href="{{ url_for('settings_page') }}" class="nav-tab active" title="Settings"><i class="fas fa-gear"></i></a>
+                {% if can_view('import') %}<a href="{{ url_for('import_page') }}" class="nav-tab">Import</a>{% endif %}
+                {% if can_view('inventory') %}<a href="{{ url_for('inventory') }}" class="nav-tab">Inventory</a>{% endif %}
+                {% if can_view('storage') %}<a href="{{ url_for('storage_list') }}" class="nav-tab">Storage</a>{% endif %}
+                {% if can_view('analytics') %}<a href="{{ url_for('analytics_page') }}" class="nav-tab">Analytics</a>{% endif %}
+                {% if can_view('settings') %}<a href="{{ url_for('settings_page') }}" class="nav-tab active" title="Settings"><i class="fas fa-gear"></i></a>{% endif %}
+                {% if auth_user %}
+                <a href="{{ url_for('auth_logout') }}" class="nav-tab" title="Sign out ({{ auth_username }})"><i class="fas fa-right-from-bracket"></i></a>
+                {% endif %}
             </div>
         </div>
     </nav>
@@ -108,6 +111,26 @@
                 </div>
 
                 <div class="row g-4">
+                    {% if auth_is_admin %}
+                    <div class="col-12 col-md-6 col-xl-4">
+                        <a href="/settings/users" class="setting-card">
+                            <div class="sc-icon"><i class="fas fa-users"></i></div>
+                            <div>
+                                <h5>Users</h5>
+                                <p>Create accounts, assign roles, reset passwords, and enable or disable access.</p>
+                            </div>
+                        </a>
+                    </div>
+                    <div class="col-12 col-md-6 col-xl-4">
+                        <a href="/settings/roles" class="setting-card">
+                            <div class="sc-icon"><i class="fas fa-user-shield"></i></div>
+                            <div>
+                                <h5>Roles &amp; Permissions</h5>
+                                <p>Define roles with per-tab, per-tool view/edit permissions and mark administrators.</p>
+                            </div>
+                        </a>
+                    </div>
+                    {% endif %}
                     <div class="col-12 col-md-6 col-xl-4">
                         <a href="{{ url_for('general_page') }}" class="setting-card">
                             <div class="sc-icon"><i class="fas fa-sliders"></i></div>
@@ -159,6 +182,15 @@
                             <div>
                                 <h5>API Keys</h5>
                                 <p>Store and update service API keys (JustTCG, Ximilar, CardSight) securely in the database.</p>
+                            </div>
+                        </a>
+                    </div>
+                    <div class="col-12 col-md-6 col-xl-4">
+                        <a href="{{ url_for('network_settings_page') }}" class="setting-card">
+                            <div class="sc-icon"><i class="fas fa-network-wired"></i></div>
+                            <div>
+                                <h5>Network Name</h5>
+                                <p>Set the name the server advertises on your LAN, so devices can reach it at &lt;name&gt;.local.</p>
                             </div>
                         </a>
                     </div>

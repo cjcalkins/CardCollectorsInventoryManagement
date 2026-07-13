@@ -1,12 +1,19 @@
-from flask import Flask, request, jsonify, render_template, send_from_directory, url_for, redirect, Response
+from flask import Flask, request, jsonify, render_template, send_from_directory, url_for, redirect, Response, session, g
 import os
 import re as _re
-# OpenCV enforces a max decoded-image size (OPENCV_IO_MAX_IMAGE_PIXELS, default
-# ~1.07 G px) at import time. Very high-DPI card scans (a 2400-DPI letter page is
-# ~0.54 G px, larger for bigger pages) can approach it, so raise the ceiling
-# before cv2 is imported. Tunable via env; the memory budget below is the real
-# safety limit.
-os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", str(1 << 40))
+# Decoded-image size ceiling, in megapixels. This is the core defense against
+# image "decompression bombs" — a tiny file that declares enormous dimensions and
+# exhausts RAM when decoded. Both OpenCV (imread/imdecode) and Pillow honor it, so
+# every image decode in the app is bounded. It's generous by default so real
+# high-DPI scans still load (a 2400-DPI letter page is ~0.54 G px); raise
+# MAX_IMAGE_MEGAPIXELS if your scans are bigger and you have the RAM, or lower it
+# to tighten. PDFs are bounded separately by the render-DPI cap, not this value.
+try:
+    _MAX_IMAGE_MP = float(os.environ.get("MAX_IMAGE_MEGAPIXELS", "2000") or "2000")
+except ValueError:
+    _MAX_IMAGE_MP = 2000.0
+_MAX_IMAGE_PIXELS = max(1, int(_MAX_IMAGE_MP * 1_000_000))
+os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", str(_MAX_IMAGE_PIXELS))
 import cv2
 import json
 import shutil
@@ -14,12 +21,8 @@ import tempfile
 import numpy as np
 from datetime import datetime
 from PIL import Image
-# Pillow raises DecompressionBombError above ~89 MP by default; legitimate
-# high-DPI card scans exceed that, so lift the ceiling. None disables the check;
-# a finite value can be set via MAX_IMAGE_MEGAPIXELS. The per-page memory budget
-# (PDF_MAX_MEGAPIXELS) is what actually protects RAM.
-_max_img_mp = os.environ.get("MAX_IMAGE_MEGAPIXELS", "").strip()
-Image.MAX_IMAGE_PIXELS = int(float(_max_img_mp) * 1_000_000) if _max_img_mp else None
+# Same ceiling for Pillow (its default is ~89 MP, far below legitimate scans).
+Image.MAX_IMAGE_PIXELS = _MAX_IMAGE_PIXELS
 from werkzeug.utils import secure_filename
 from models import (db, Product, ScanRecord, ShopConnection, Listing, EmailMonitor,
                     SaleEvent, ReferenceCard, ReferenceSync, TypeReference, AppSetting,
@@ -73,6 +76,149 @@ app = Flask(__name__, template_folder="templates")
 
 # ====================== CONFIG ======================
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+# ── Security hardening ──
+# Stable secret for any signed cookies/sessions (none today, but future-proof and
+# needed by some extensions). Override with SECRET_KEY to keep it stable across
+# restarts; otherwise a fresh random key is used each launch.
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or os.urandom(24).hex()
+
+# Cap request bodies to blunt memory/disk exhaustion from oversized uploads.
+# High-DPI PDF/image imports are expected, so the default is generous and tunable
+# via MAX_UPLOAD_MB (set MAX_UPLOAD_MB=0 to disable the cap entirely).
+try:
+    _max_upload_mb = int(os.environ.get("MAX_UPLOAD_MB", "1024"))
+except (TypeError, ValueError):
+    _max_upload_mb = 1024
+if _max_upload_mb > 0:
+    app.config["MAX_CONTENT_LENGTH"] = _max_upload_mb * 1024 * 1024
+
+# Harden session cookies if sessions are ever introduced.
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
+
+@app.after_request
+def _security_headers(resp):
+    """Conservative, app-safe response headers. (No strict CSP — the UI relies on
+    inline scripts/styles — but these block MIME sniffing, clickjacking, and
+    referrer leakage.)"""
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    resp.headers.setdefault("Referrer-Policy", "same-origin")
+    return resp
+
+
+def _within_dir(base, target):
+    """True if `target` resolves to a location inside `base` (blocks ../ traversal
+    and absolute-path escapes when a user-influenced name is joined onto a dir)."""
+    try:
+        base_r = os.path.realpath(base)
+        target_r = os.path.realpath(target)
+        return target_r == base_r or target_r.startswith(base_r + os.sep)
+    except Exception:
+        return False
+
+
+# ── Decompression-bomb guard for uploaded images ──
+# A legitimate high-res scan is a LARGE FILE that decodes to a large image (a
+# modest ratio); a decompression bomb is a TINY FILE that claims a huge image (an
+# extreme ratio). We read the header dimensions cheaply — without decoding pixels
+# — and reject only the over-ceiling or extreme-ratio cases, so genuine scans of
+# any realistic size pass. The finite MAX_IMAGE_MEGAPIXELS ceiling on OpenCV/Pillow
+# is the hard backstop; this is the early, clearly-explained check.
+class ImageRejected(Exception):
+    """Raised when an uploaded image is over the pixel ceiling or looks like a bomb."""
+
+
+try:
+    _IMG_MAX_DECODE_RATIO = float(os.environ.get("MAX_IMAGE_DECODE_RATIO", "300") or "300")
+except ValueError:
+    _IMG_MAX_DECODE_RATIO = 300.0
+_IMG_BOMB_FLOOR_PX = 40 * 1_000_000     # don't ratio-check images under ~40 MP
+
+
+def _peek_image_size(src):
+    """(width, height) from an image header without decoding pixels, or None if it
+    isn't a readable image. Propagates Pillow's DecompressionBombError."""
+    try:
+        with Image.open(src) as im:
+            return int(im.width), int(im.height)
+    except Image.DecompressionBombError:
+        raise
+    except Exception:
+        return None
+
+
+def _guard_image_upload(file_storage):
+    """Validate a Werkzeug FileStorage image against decompression-bomb heuristics
+    before it is saved or decoded. Raises ImageRejected on a likely bomb / oversized
+    image. Non-images are ignored (downstream handles them). Leaves the upload
+    stream rewound so the caller can still save it."""
+    if file_storage is None:
+        return
+    stream = getattr(file_storage, "stream", None)
+    if stream is None:
+        return
+    try:
+        start = stream.tell()
+    except Exception:
+        start = 0
+    try:
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+    except Exception:
+        size = 0
+    finally:
+        try:
+            stream.seek(0)
+        except Exception:
+            pass
+
+    try:
+        dims = _peek_image_size(stream)
+    except Image.DecompressionBombError:
+        _rewind(stream, start)
+        raise ImageRejected("Image exceeds the decoded-size limit (possible decompression bomb).")
+    _rewind(stream, start)
+
+    if not dims:
+        return   # not a decodable image header; let the route decide what to do
+    w, h = dims
+    px = w * h
+    if px > _MAX_IMAGE_PIXELS:
+        raise ImageRejected(
+            f"Image is {px / 1_000_000:.0f} MP, over the {_MAX_IMAGE_MP:.0f} MP limit. "
+            f"If it's a genuine scan, raise MAX_IMAGE_MEGAPIXELS.")
+    decoded = px * 4   # worst-case bytes at RGBA
+    if size > 0 and px > _IMG_BOMB_FLOOR_PX and decoded > size * _IMG_MAX_DECODE_RATIO:
+        raise ImageRejected(
+            "This image looks like a decompression bomb — its decoded size is far "
+            "larger than the file. If it's a real scan, re-save it as PNG or JPEG and retry.")
+
+
+def _rewind(stream, pos):
+    try:
+        stream.seek(pos)
+    except Exception:
+        try:
+            stream.seek(0)
+        except Exception:
+            pass
+
+
+def _reject_if_bomb(*file_storages):
+    """Guard one or more uploaded images; return a Flask (json, 413) error response
+    if any is a decompression bomb / oversized, else None. Usage in a route:
+        bad = _reject_if_bomb(file);  if bad: return bad"""
+    try:
+        for fs in file_storages:
+            _guard_image_upload(fs)
+        return None
+    except ImageRejected as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 413
+
+
 
 # ---------------------------------------------------------------------------- #
 # Dynamic storage locations
@@ -714,9 +860,12 @@ def load_template(template_name="product_label"):
     except Exception:
         pass
 
-    template_path = os.path.join(app.config["ROI_TEMPLATE_FOLDER"], f"{template_name}.json")
-    if not os.path.exists(template_path):
-        template_path = os.path.join(app.config["ROI_TEMPLATE_FOLDER"], "product_label.json")
+    folder = app.config["ROI_TEMPLATE_FOLDER"]
+    template_path = os.path.join(folder, f"{template_name}.json")
+    # Contain within the templates folder: a crafted game/template name must never
+    # be able to read arbitrary files via ../ or an absolute path.
+    if not _within_dir(folder, template_path) or not os.path.exists(template_path):
+        template_path = os.path.join(folder, "product_label.json")
 
     with open(template_path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -2205,7 +2354,343 @@ def utility_functions():
 # ====================== FIRST-RUN SETUP GATE ======================
 # Until a system mode is chosen (first run, or after a Reset), every page is
 # redirected to /setup so the operator picks Sorting Machine vs Dedicated Server.
-_SETUP_ALLOWED_PREFIXES = ("/setup", "/static")
+# ====================== AUTHENTICATION & ROLES ======================
+# Session-based login with per-role, per-tab/tool "view" / "edit" permissions.
+# Enforced centrally in a before_request gate: GET/HEAD needs "view", any mutating
+# method needs "edit". Admin roles bypass all checks. A fresh install (no accounts)
+# is routed to a one-time setup page to create the first administrator, and the
+# DISABLE_AUTH=1 env var is a kill-switch so you can never be permanently locked out.
+from werkzeug.security import generate_password_hash, check_password_hash
+
+# The tabs/tools that can be permissioned. (key, human label)
+PROTECTED_RESOURCES = [
+    ("templates",    "Game Templates (home)"),
+    ("inventory",    "Inventory"),
+    ("albums",       "Albums"),
+    ("import",       "Import / scanning"),
+    ("duplicates",   "Duplicates"),
+    ("analytics",    "Analytics"),
+    ("image_search", "Search by Image"),
+    ("reference",    "Reference Data"),
+    ("shops",        "Shops / listings"),
+    ("pricing",      "Pricing lookups"),
+    ("identify",     "Card identification"),
+    ("api_keys",     "API Keys"),
+    ("storage",      "Storage locations"),
+    ("network",      "Network name"),
+    ("settings",     "General settings"),
+    ("upgrade",      "Upgrade / export"),
+]
+_RESOURCE_KEYS = {k for k, _ in PROTECTED_RESOURCES}
+_PERM_RANK = {"none": 0, "view": 1, "edit": 2}
+
+
+class Role(db.Model):
+    __tablename__ = "auth_roles"
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(64), unique=True, nullable=False)
+    is_admin = db.Column(db.Boolean, default=False, nullable=False)
+    permissions = db.Column(db.JSON, default=dict)   # {resource_key: none|view|edit}
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class User(db.Model):
+    __tablename__ = "auth_users"
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(64), unique=True, nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+    role_id = db.Column(db.Integer, db.ForeignKey("auth_roles.id"))
+    role = db.relationship("Role")
+    active = db.Column(db.Boolean, default=True, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def set_password(self, pw):
+        self.password_hash = generate_password_hash(pw)
+
+    def check_password(self, pw):
+        try:
+            return check_password_hash(self.password_hash, pw)
+        except Exception:
+            return False
+
+
+def _auth_disabled():
+    """Kill-switch: DISABLE_AUTH=1 turns authentication off entirely."""
+    return os.environ.get("DISABLE_AUTH", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _users_exist():
+    try:
+        return db.session.query(User.id).first() is not None
+    except Exception:
+        return False
+
+
+def _admin_count():
+    try:
+        return (db.session.query(User.id)
+                .join(Role, User.role_id == Role.id)
+                .filter(Role.is_admin.is_(True), User.active.is_(True)).count())
+    except Exception:
+        return 0
+
+
+def _current_user():
+    uid = session.get("uid")
+    if not uid:
+        return None
+    try:
+        u = User.query.get(uid)
+    except Exception:
+        u = None
+    if u is None or not u.active:
+        return None
+    return u
+
+
+def _role_allows(role, resource, need):
+    if role is None:
+        return False
+    if role.is_admin:
+        return True
+    have = (role.permissions or {}).get(resource, "none")
+    return _PERM_RANK.get(have, 0) >= _PERM_RANK.get(need, 1)
+
+
+def _resource_for_path(path):
+    """Map a request path to a protected resource key, '__admin__' for the user/role
+    manager, or None for endpoints that only require being signed in."""
+    p = (path or "/").rstrip("/")
+    seg = [s for s in p.split("/") if s]
+    if not seg:
+        return "templates"
+    head = seg[0]
+    if head == "settings":
+        sub = seg[1] if len(seg) > 1 else ""
+        if sub in ("users", "roles"):
+            return "__admin__"
+        return {"reference": "reference", "api": "api_keys", "storage": "storage",
+                "network": "network", "identify": "identify", "upgrade": "upgrade",
+                "general": "settings"}.get(sub, "settings")
+    return {
+        "inventory": "inventory",
+        "albums": "albums", "album": "albums",
+        "import": "import", "run_import_split": "import", "manual_process_card": "import",
+        "import_single_card": "import", "import_finalize_batch": "import",
+        "pdf_open": "import", "pdf_render_page": "import", "pdf_close": "import",
+        "duplicates": "duplicates",
+        "analytics": "analytics", "analytics_page": "analytics",
+        "search_by_image": "image_search", "search_by_image_page": "image_search",
+        "reference": "reference",
+        "shops": "shops", "shop": "shops",
+        "justtcg_fetch": "pricing", "justtcg_search_manual": "pricing",
+        "tcg_save_url": "pricing", "tcg_clear_url": "pricing",
+        "cloud_identify": "identify", "identify": "identify", "identify_diagnose": "identify",
+        "storage": "storage", "upgrade": "upgrade",
+        "template": "templates", "template_save": "templates",
+    }.get(head, None)
+
+
+_AUTH_PUBLIC_PREFIXES = ("/auth/", "/static/")
+
+
+def _wants_json():
+    return (request.method not in ("GET", "HEAD")
+            or request.headers.get("X-Requested-With") == "XMLHttpRequest"
+            or "application/json" in (request.headers.get("Accept") or ""))
+
+
+def _forbidden(msg):
+    if _wants_json():
+        return jsonify({"status": "error", "forbidden": True, "message": msg}), 403
+    body = (f"<div style='font-family:system-ui;max-width:560px;margin:80px auto;text-align:center'>"
+            f"<h1 style='font-size:20px'>403 &mdash; Not allowed</h1>"
+            f"<p style='color:#6b7280'>{msg}</p>"
+            f"<p><a href='{url_for('index')}'>Home</a> &nbsp;·&nbsp; "
+            f"<a href='{url_for('auth_logout')}'>Sign out</a></p></div>")
+    return Response(body, status=403, mimetype="text/html")
+
+
+@app.before_request
+def _auth_gate():
+    if _auth_disabled():
+        return
+    path = request.path or "/"
+    if path == "/favicon.ico" or any(path.startswith(p) for p in _AUTH_PUBLIC_PREFIXES):
+        return
+    # Fresh install: no accounts yet -> force first-administrator creation.
+    if not _users_exist():
+        if _wants_json():
+            return jsonify({"status": "error", "needs_auth_setup": True,
+                            "message": "Create the first administrator account."}), 409
+        return redirect(url_for("auth_setup_page"))
+    user = _current_user()
+    if user is None:
+        if _wants_json():
+            return jsonify({"status": "error", "auth_required": True,
+                            "message": "Sign in required."}), 401
+        return redirect(url_for("auth_login_page", next=path))
+    g.user = user
+    if user.role and user.role.is_admin:
+        return
+    resource = _resource_for_path(path)
+    if resource is None:
+        return  # only requires being signed in
+    if resource == "__admin__":
+        return _forbidden("Administrator access is required for user and role management.")
+    need = "edit" if request.method not in ("GET", "HEAD", "OPTIONS") else "view"
+    if not _role_allows(user.role, resource, need):
+        label = dict(PROTECTED_RESOURCES).get(resource, resource)
+        return _forbidden(f"Your role doesn't have &ldquo;{need}&rdquo; access to {label}.")
+
+
+@app.context_processor
+def _inject_auth():
+    u = getattr(g, "user", None) or _current_user()
+
+    def _perm_check(resource, need):
+        if _auth_disabled():
+            return True
+        if u is None:
+            return False
+        if u.role and u.role.is_admin:
+            return True
+        if resource not in _RESOURCE_KEYS:
+            return True   # not a gated resource -> any signed-in user may see it
+        return _role_allows(u.role, resource, need)
+
+    return {
+        "auth_user": u,
+        "auth_username": (u.username if u else ""),
+        "auth_is_admin": bool(u and u.role and u.role.is_admin),
+        "auth_enabled": not _auth_disabled(),
+        "can_view": (lambda r: _perm_check(r, "view")),
+        "can_edit": (lambda r: _perm_check(r, "edit")),
+    }
+
+
+import hmac as _hmac
+import secrets as _secrets
+
+# ── CSRF protection (synchronizer token) ──
+# A per-session token is embedded in every page and auto-attached to all
+# same-origin state-changing requests by a small injected script that patches
+# fetch/XMLHttpRequest/form submits — so existing pages need no changes. The
+# server validates the token on every mutating request.
+def _csrf_token():
+    tok = session.get("_csrf")
+    if not tok:
+        tok = _secrets.token_hex(32)
+        session["_csrf"] = tok
+    return tok
+
+
+def csrf_exempt(view):
+    """Decorator to opt a view out of CSRF checks (e.g. a machine-to-machine
+    endpoint). Not currently used, but available for future non-browser callers."""
+    view._csrf_exempt = True
+    return view
+
+
+_CSRF_SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
+
+
+@app.before_request
+def _csrf_protect():
+    if request.method in _CSRF_SAFE_METHODS:
+        return
+    path = request.path or "/"
+    if path.startswith("/static/"):
+        return
+    fn = app.view_functions.get(request.endpoint)
+    if fn is not None and getattr(fn, "_csrf_exempt", False):
+        return
+    expected = session.get("_csrf")
+    sent = (request.headers.get("X-CSRFToken")
+            or request.headers.get("X-CSRF-Token")
+            or request.form.get("csrf_token"))
+    if not expected or not sent or not _hmac.compare_digest(str(sent), str(expected)):
+        if _wants_json():
+            return jsonify({"status": "error", "csrf": True,
+                            "message": "Your session's security token is missing or expired. "
+                                       "Refresh the page and try again."}), 400
+        return Response("<div style='font-family:system-ui;max-width:520px;margin:80px auto;text-align:center'>"
+                        "<h1 style='font-size:20px'>Security check failed</h1>"
+                        "<p style='color:#6b7280'>Please refresh the page and try again.</p></div>",
+                        status=400, mimetype="text/html")
+
+
+# Client-side shim: sets the token and transparently attaches it to same-origin
+# mutating fetch/XHR requests and form posts. Injected right after <body> so it's
+# active before any page script runs.
+_CSRF_SCRIPT = ("<script>(function(){var T=\"__CSRF__\";"
+                "function so(u){try{return new URL(u,location.href).origin===location.origin;}catch(e){return true;}}"
+                "if(window.fetch){var _f=window.fetch;window.fetch=function(input,init){init=init||{};"
+                "var m=(init.method||(input&&typeof input!=='string'&&input.method)||'GET').toUpperCase();"
+                "var u=(typeof input==='string')?input:(input&&input.url)||'';"
+                "if(m!=='GET'&&m!=='HEAD'&&so(u)){var base=init.headers||(input&&typeof input!=='string'&&input.headers)||{};"
+                "var h=new Headers(base);if(!h.has('X-CSRFToken'))h.set('X-CSRFToken',T);init.headers=h;}"
+                "return _f.call(this,input,init);};}"
+                "if(window.XMLHttpRequest){var o=XMLHttpRequest.prototype.open,s=XMLHttpRequest.prototype.send;"
+                "XMLHttpRequest.prototype.open=function(m,u){this.__m=(m||'GET').toUpperCase();this.__u=u;return o.apply(this,arguments);};"
+                "XMLHttpRequest.prototype.send=function(b){try{if(this.__m&&this.__m!=='GET'&&this.__m!=='HEAD'&&so(this.__u))this.setRequestHeader('X-CSRFToken',T);}catch(e){}return s.apply(this,arguments);};}"
+                "document.addEventListener('submit',function(e){var f=e.target;if(!f||!f.tagName||f.tagName!=='FORM')return;"
+                "if((f.method||'get').toUpperCase()!=='POST')return;if(f.querySelector('input[name=csrf_token]'))return;"
+                "var i=document.createElement('input');i.type='hidden';i.name='csrf_token';i.value=T;f.appendChild(i);},true);"
+                "})();</script>")
+
+_LOGOUT_FLOAT = ('<a href="/auth/logout" title="Sign out (%s)" '
+                 'style="position:fixed;bottom:16px;right:16px;z-index:2147483000;'
+                 'background:#111827;color:#fff;padding:8px 14px;border-radius:999px;'
+                 'font:600 13px system-ui,-apple-system,Segoe UI,Roboto,sans-serif;'
+                 'text-decoration:none;box-shadow:0 3px 12px rgba(0,0,0,.3);opacity:.92">'
+                 '&#10150; Sign out</a>')
+
+
+@app.after_request
+def _inject_client_helpers(resp):
+    """Inject the CSRF shim (all HTML pages) and, as a safety net, a floating
+    logout on signed-in pages whose nav doesn't already have one."""
+    try:
+        if getattr(resp, "direct_passthrough", False):
+            return resp
+        if "text/html" not in (resp.content_type or ""):
+            return resp
+        body = resp.get_data(as_text=True)
+        if "</body>" not in body:
+            return resp
+        changed = False
+
+        # CSRF shim — right after the opening <body> tag so it runs first.
+        script = _CSRF_SCRIPT.replace("__CSRF__", _csrf_token())
+        m = _re.search(r"<body[^>]*>", body, _re.IGNORECASE)
+        if m:
+            body = body[:m.end()] + script + body[m.end():]
+        else:
+            body = body.replace("</body>", script + "</body>", 1)
+        changed = True
+
+        # Floating logout fallback for signed-in pages missing a nav logout.
+        if session.get("uid") and "/auth/logout" not in body:
+            u = getattr(g, "user", None) or _current_user()
+            if u is not None:
+                uname = (u.username or "").replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;")
+                body = body.replace("</body>", (_LOGOUT_FLOAT % uname) + "</body>", 1)
+
+        if changed:
+            resp.set_data(body)
+    except Exception:
+        pass
+    return resp
+
+
+@app.context_processor
+def _inject_csrf_token():
+    # Also expose the token to templates that want to add it to a form manually.
+    return {"csrf_token": _csrf_token}
+
+
+_SETUP_ALLOWED_PREFIXES = ("/setup", "/static", "/auth")
 
 
 @app.before_request
@@ -2220,6 +2705,423 @@ def _require_system_mode():
         return jsonify({"status": "error", "needs_setup": True,
                         "message": "System not configured. Open the app to choose an implementation."}), 409
     return redirect(url_for("setup_page"))
+
+
+_AUTH_CSS = """
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:#f5f7fb; color:#1f2937; margin:0; padding:24px; }
+  .card { max-width:640px; margin:6vh auto 0; background:#fff; border:1px solid #e5e7eb; border-radius:16px; padding:26px 28px; box-shadow:0 10px 30px rgba(0,0,0,.06); }
+  .wide { max-width:960px; }
+  h1 { font-size:22px; margin:0 0 6px; } p.sub { color:#6b7280; margin:0 0 20px; }
+  label.fld { display:block; font-weight:700; margin:14px 0 6px; }
+  input[type=text], input[type=password], select { width:100%; box-sizing:border-box; border:1px solid #d1d5db; border-radius:10px; padding:10px 12px; font-size:15px; }
+  button { background:#4f46e5; color:#fff; border:0; border-radius:10px; padding:10px 18px; font-weight:700; cursor:pointer; }
+  button.sec { background:#eef2ff; color:#4338ca; } button.danger { background:#fee2e2; color:#991b1b; }
+  button:disabled { opacity:.6; cursor:default; }
+  .row { display:flex; gap:10px; align-items:center; margin-top:18px; flex-wrap:wrap; }
+  a { color:#4f46e5; text-decoration:none; } a:hover { text-decoration:underline; }
+  .msg { margin-top:16px; padding:12px 14px; border-radius:10px; display:none; } .msg.show { display:block; }
+  .msg.ok { background:#ecfdf5; color:#065f46; border:1px solid #a7f3d0; } .msg.err { background:#fef2f2; color:#991b1b; border:1px solid #fecaca; }
+  table { width:100%; border-collapse:collapse; margin-top:10px; } th,td { text-align:left; padding:8px 10px; border-bottom:1px solid #eef0f4; font-size:14px; vertical-align:middle; }
+  th { color:#6b7280; font-weight:700; } .pill { font-size:12px; font-weight:700; padding:2px 8px; border-radius:999px; background:#eef2ff; color:#4338ca; }
+  .links { margin-top:22px; font-size:14px; color:#6b7280; } .links a { margin-right:14px; }
+  .grid { width:100%; border-collapse:collapse; margin-top:8px; } .grid th,.grid td { padding:6px 8px; border-bottom:1px solid #eef0f4; font-size:14px; }
+  .seg { display:inline-flex; border:1px solid #d1d5db; border-radius:8px; overflow:hidden; } .seg label { padding:4px 10px; cursor:pointer; font-size:13px; }
+  .seg input { display:none; } .seg label.on { background:#4f46e5; color:#fff; }
+"""
+
+_AUTH_SETUP_HTML = ("""<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width, initial-scale=1"><title>Create administrator</title>
+<style>""" + _AUTH_CSS + """</style></head><body>
+<div class=card>
+  <h1>Welcome &mdash; create your administrator</h1>
+  <p class=sub>This is the first account. It gets full access and can create roles and other users.</p>
+  <label class=fld for=u>Username</label><input id=u type=text autocomplete=username autofocus>
+  <label class=fld for=p>Password</label><input id=p type=password autocomplete=new-password placeholder="at least 6 characters">
+  <label class=fld for=p2>Confirm password</label><input id=p2 type=password autocomplete=new-password>
+  <div class=row><button id=go>Create administrator</button></div>
+  <div id=msg class=msg></div>
+</div>
+<script>
+  var msg=document.getElementById('msg');
+  function show(t,ok){msg.textContent=t;msg.className='msg show '+(ok?'ok':'err');}
+  document.getElementById('go').addEventListener('click',async function(){
+    var u=document.getElementById('u').value.trim(),p=document.getElementById('p').value,p2=document.getElementById('p2').value;
+    if(u.length<3){show('Username needs 3+ characters.',false);return;}
+    if(p.length<6){show('Password needs 6+ characters.',false);return;}
+    if(p!==p2){show('Passwords do not match.',false);return;}
+    this.disabled=true;
+    try{var r=await fetch('/auth/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
+      var d=await r.json(); if(d.status==='success'){location.href=d.redirect||'/';} else {show(d.message||'Failed.',false);this.disabled=false;}
+    }catch(e){show('Error: '+e.message,false);this.disabled=false;}
+  });
+</script></body></html>""")
+
+_AUTH_LOGIN_HTML = ("""<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width, initial-scale=1"><title>Sign in</title>
+<style>""" + _AUTH_CSS + """</style></head><body>
+<div class=card>
+  <h1>Sign in</h1>
+  <p class=sub>Card Collector Inventory Manager</p>
+  <label class=fld for=u>Username</label><input id=u type=text autocomplete=username autofocus>
+  <label class=fld for=p>Password</label><input id=p type=password autocomplete=current-password>
+  <div class=row><button id=go>Sign in</button></div>
+  <div id=msg class=msg></div>
+</div>
+<script>
+  var msg=document.getElementById('msg');
+  function show(t,ok){msg.textContent=t;msg.className='msg show '+(ok?'ok':'err');}
+  function nextParam(){var m=location.search.match(/[?&]next=([^&]+)/);return m?decodeURIComponent(m[1]):'';}
+  async function submit(){
+    var b=document.getElementById('go');b.disabled=true;
+    try{var r=await fetch('/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({username:document.getElementById('u').value.trim(),password:document.getElementById('p').value,next:nextParam()})});
+      var d=await r.json(); if(d.status==='success'){location.href=d.redirect||'/';} else {show(d.message||'Failed.',false);b.disabled=false;}
+    }catch(e){show('Error: '+e.message,false);b.disabled=false;}
+  }
+  document.getElementById('go').addEventListener('click',submit);
+  document.getElementById('p').addEventListener('keydown',function(e){if(e.key==='Enter')submit();});
+</script></body></html>""")
+
+
+@app.route("/auth/setup", methods=["GET"])
+def auth_setup_page():
+    if _users_exist():
+        return redirect(url_for("auth_login_page"))
+    return Response(_AUTH_SETUP_HTML, mimetype="text/html")
+
+
+@app.route("/auth/setup", methods=["POST"])
+def auth_setup_submit():
+    if _users_exist():
+        return jsonify({"status": "error", "message": "Already set up."}), 409
+    body = request.get_json(silent=True) or request.form
+    username = str(body.get("username", "")).strip()
+    password = str(body.get("password", ""))
+    if len(username) < 3 or len(password) < 6:
+        return jsonify({"status": "error", "message": "Username (3+) and password (6+) required."}), 400
+    admin  = Role(name="Administrator", is_admin=True, permissions={})
+    editor = Role(name="Editor", is_admin=False, permissions={k: "edit" for k in _RESOURCE_KEYS})
+    viewer = Role(name="Viewer", is_admin=False, permissions={k: "view" for k in _RESOURCE_KEYS})
+    db.session.add_all([admin, editor, viewer])
+    db.session.flush()
+    u = User(username=username, role_id=admin.id, active=True)
+    u.set_password(password)
+    db.session.add(u)
+    db.session.commit()
+    session["uid"] = u.id
+    return jsonify({"status": "success", "redirect": url_for("index")})
+
+
+@app.route("/auth/login", methods=["GET"])
+def auth_login_page():
+    if not _users_exist():
+        return redirect(url_for("auth_setup_page"))
+    if _current_user() is not None:
+        return redirect(url_for("index"))
+    return Response(_AUTH_LOGIN_HTML, mimetype="text/html")
+
+
+@app.route("/auth/login", methods=["POST"])
+def auth_login_submit():
+    body = request.get_json(silent=True) or request.form
+    username = str(body.get("username", "")).strip()
+    password = str(body.get("password", ""))
+    u = User.query.filter(db.func.lower(User.username) == username.lower()).first()
+    if u is None or not u.active or not u.check_password(password):
+        return jsonify({"status": "error", "message": "Invalid username or password."}), 401
+    session["uid"] = u.id
+    nxt = str(body.get("next", "") or url_for("index"))
+    if not nxt.startswith("/") or nxt.startswith("//"):   # open-redirect guard
+        nxt = url_for("index")
+    return jsonify({"status": "success", "redirect": nxt})
+
+
+@app.route("/auth/logout")
+def auth_logout():
+    session.pop("uid", None)
+    return redirect(url_for("auth_login_page"))
+
+
+# ---- User management (admin only; gated by _resource_for_path -> '__admin__') ----
+_AUTH_USERS_HTML = ("""<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width, initial-scale=1"><title>Users</title>
+<style>""" + _AUTH_CSS + """</style></head><body>
+<div class="card wide">
+  <h1>Users</h1>
+  <p class=sub>Create accounts and assign each a role. Roles decide what each account can view or edit.</p>
+  <table id=tbl><thead><tr><th>Username</th><th>Role</th><th>Active</th><th></th></tr></thead><tbody></tbody></table>
+
+  <h1 style="font-size:17px;margin-top:26px">Add a user</h1>
+  <div class=row style="align-items:flex-end">
+    <div><label class=fld for=nu>Username</label><input id=nu type=text style="width:200px"></div>
+    <div><label class=fld for=np>Password</label><input id=np type=password style="width:200px" placeholder="6+ chars"></div>
+    <div><label class=fld for=nr>Role</label><select id=nr style="width:200px"></select></div>
+    <button id=addBtn>Add user</button>
+  </div>
+  <div id=msg class=msg></div>
+  <div class=links><a href="/settings/roles">Manage roles</a><a href="/settings">All settings</a><a href="/auth/logout">Sign out</a></div>
+</div>
+<script>
+  var msg=document.getElementById('msg');
+  function show(t,ok){msg.textContent=t;msg.className='msg show '+(ok?'ok':'err');}
+  function opt(sel,val,txt,cur){var o=document.createElement('option');o.value=val;o.textContent=txt;if(String(val)===String(cur))o.selected=true;sel.appendChild(o);}
+  var DATA={users:[],roles:[],me:null};
+  async function load(){
+    var d=await (await fetch('/settings/users/list',{headers:{'X-Requested-With':'XMLHttpRequest'}})).json();
+    DATA=d; var tb=document.querySelector('#tbl tbody'); tb.innerHTML='';
+    d.users.forEach(function(u){
+      var tr=document.createElement('tr');
+      var td1=document.createElement('td'); td1.textContent=u.username; if(u.id===d.me){var b=document.createElement('span');b.className='pill';b.textContent='you';b.style.marginLeft='8px';td1.appendChild(b);} tr.appendChild(td1);
+      var td2=document.createElement('td'); var sel=document.createElement('select'); d.roles.forEach(function(r){opt(sel,r.id,r.name+(r.is_admin?' (admin)':''),u.role_id);});
+      sel.addEventListener('change',function(){upd(u.id,{role_id:parseInt(sel.value,10)});}); td2.appendChild(sel); tr.appendChild(td2);
+      var td3=document.createElement('td'); var cb=document.createElement('input'); cb.type='checkbox'; cb.checked=u.active;
+      cb.addEventListener('change',function(){upd(u.id,{active:cb.checked});}); td3.appendChild(cb); tr.appendChild(td3);
+      var td4=document.createElement('td');
+      var rp=document.createElement('button'); rp.className='sec'; rp.textContent='Reset password'; rp.style.marginRight='6px';
+      rp.addEventListener('click',function(){var p=prompt('New password for '+u.username+' (6+ chars):');if(p){if(p.length<6){show('Password too short.',false);return;}upd(u.id,{password:p});}});
+      var del=document.createElement('button'); del.className='danger'; del.textContent='Delete';
+      del.addEventListener('click',function(){if(confirm('Delete user '+u.username+'?'))act('/settings/users/delete',{id:u.id});});
+      td4.appendChild(rp); td4.appendChild(del); tr.appendChild(td4); tb.appendChild(tr);
+    });
+    var nr=document.getElementById('nr'); nr.innerHTML=''; d.roles.forEach(function(r){opt(nr,r.id,r.name+(r.is_admin?' (admin)':''),null);});
+  }
+  async function act(url,payload){
+    try{var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest'},body:JSON.stringify(payload)});
+      var d=await r.json(); if(d.status==='success'){show('Saved.',true);load();} else show(d.message||'Failed.',false);
+    }catch(e){show('Error: '+e.message,false);}
+  }
+  function upd(id,patch){patch.id=id;act('/settings/users/update',patch);}
+  document.getElementById('addBtn').addEventListener('click',function(){
+    var u=document.getElementById('nu').value.trim(),p=document.getElementById('np').value,r=document.getElementById('nr').value;
+    if(u.length<3||p.length<6){show('Username 3+ and password 6+ required.',false);return;}
+    act('/settings/users/create',{username:u,password:p,role_id:parseInt(r,10)});
+    document.getElementById('nu').value='';document.getElementById('np').value='';
+  });
+  load();
+</script></body></html>""")
+
+
+@app.route("/settings/users")
+def users_page():
+    return Response(_AUTH_USERS_HTML, mimetype="text/html")
+
+
+@app.route("/settings/users/list")
+def users_list():
+    users = User.query.order_by(User.username).all()
+    roles = Role.query.order_by(Role.is_admin.desc(), Role.name).all()
+    return jsonify({
+        "status": "ok",
+        "me": session.get("uid"),
+        "users": [{"id": u.id, "username": u.username, "role_id": u.role_id,
+                   "role_name": (u.role.name if u.role else "\u2014"),
+                   "is_admin": bool(u.role and u.role.is_admin), "active": u.active} for u in users],
+        "roles": [{"id": r.id, "name": r.name, "is_admin": r.is_admin} for r in roles],
+    })
+
+
+@app.route("/settings/users/create", methods=["POST"])
+def users_create():
+    body = request.get_json(silent=True) or request.form
+    username = str(body.get("username", "")).strip()
+    password = str(body.get("password", ""))
+    if len(username) < 3 or len(password) < 6:
+        return jsonify({"status": "error", "message": "Username (3+) and password (6+) required."}), 400
+    if User.query.filter(db.func.lower(User.username) == username.lower()).first():
+        return jsonify({"status": "error", "message": "That username already exists."}), 409
+    rid = body.get("role_id")
+    role = Role.query.get(int(rid)) if rid else None
+    u = User(username=username, role_id=(role.id if role else None), active=True)
+    u.set_password(password)
+    db.session.add(u)
+    db.session.commit()
+    return jsonify({"status": "success"})
+
+
+@app.route("/settings/users/update", methods=["POST"])
+def users_update():
+    body = request.get_json(silent=True) or request.form
+    u = User.query.get(int(body.get("id", 0) or 0))
+    if u is None:
+        return jsonify({"status": "error", "message": "No such user."}), 404
+    # Guard against removing the last active administrator.
+    currently_admin = bool(u.role and u.role.is_admin and u.active)
+    if currently_admin:
+        new_role = Role.query.get(int(body["role_id"])) if body.get("role_id") else u.role
+        will_admin = bool(new_role and new_role.is_admin)
+        will_active = bool(body["active"]) if "active" in body else u.active
+        if (not (will_admin and will_active)) and _admin_count() <= 1:
+            return jsonify({"status": "error",
+                            "message": "This is the only administrator — keep at least one."}), 400
+    if body.get("role_id"):
+        u.role_id = int(body["role_id"])
+    if "active" in body:
+        u.active = bool(body["active"])
+    pw = str(body.get("password", "") or "")
+    if pw:
+        if len(pw) < 6:
+            return jsonify({"status": "error", "message": "Password must be 6+ characters."}), 400
+        u.set_password(pw)
+    db.session.commit()
+    return jsonify({"status": "success"})
+
+
+@app.route("/settings/users/delete", methods=["POST"])
+def users_delete():
+    body = request.get_json(silent=True) or request.form
+    u = User.query.get(int(body.get("id", 0) or 0))
+    if u is None:
+        return jsonify({"status": "error", "message": "No such user."}), 404
+    if u.role and u.role.is_admin and u.active and _admin_count() <= 1:
+        return jsonify({"status": "error", "message": "Can't delete the only administrator."}), 400
+    db.session.delete(u)
+    db.session.commit()
+    return jsonify({"status": "success"})
+
+
+# ---- Role management (admin only) ----
+_AUTH_ROLES_HTML = ("""<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width, initial-scale=1"><title>Roles</title>
+<style>""" + _AUTH_CSS + """</style></head><body>
+<div class="card wide">
+  <h1>Roles</h1>
+  <p class=sub>A role sets, for each tab and tool, whether members can <b>view</b>, <b>edit</b>, or have no access.
+     &ldquo;Edit&rdquo; implies view. Administrator roles have full access and manage users and roles.</p>
+  <div id=roles></div>
+
+  <h1 style="font-size:17px;margin-top:26px">Create a role</h1>
+  <div class=row style="align-items:flex-end">
+    <div><label class=fld for=rn>Role name</label><input id=rn type=text style="width:240px" placeholder="e.g. Front desk"></div>
+    <label style="font-weight:600"><input type=checkbox id=radmin> Administrator (full access)</label>
+    <button id=newBtn>Create role</button>
+  </div>
+  <div id=msg class=msg></div>
+  <div class=links><a href="/settings/users">Manage users</a><a href="/settings">All settings</a><a href="/auth/logout">Sign out</a></div>
+</div>
+<script>
+  var msg=document.getElementById('msg'),RES=[],ROLES=[];
+  function show(t,ok){msg.textContent=t;msg.className='msg show '+(ok?'ok':'err');}
+  function seg(role,key){
+    var cur=(role.permissions||{})[key]||'none';
+    var wrap=document.createElement('div');wrap.className='seg';
+    ['none','view','edit'].forEach(function(lvl){
+      var id='r'+role.id+'_'+key+'_'+lvl;
+      var lab=document.createElement('label');lab.textContent=lvl;lab.className=(cur===lvl?'on':'');
+      var inp=document.createElement('input');inp.type='radio';inp.name='r'+role.id+'_'+key;inp.value=lvl;if(cur===lvl)inp.checked=true;
+      lab.addEventListener('click',function(){wrap.querySelectorAll('label').forEach(function(l){l.className='';});lab.className='on';inp.checked=true;});
+      lab.prepend(inp);wrap.appendChild(lab);
+    });
+    return wrap;
+  }
+  function renderRole(role){
+    var box=document.createElement('div');box.style.cssText='border:1px solid #e5e7eb;border-radius:12px;padding:14px 16px;margin-bottom:14px';
+    var h=document.createElement('div');h.style.cssText='display:flex;align-items:center;gap:10px;flex-wrap:wrap';
+    var nm=document.createElement('input');nm.type='text';nm.value=role.name;nm.style.cssText='font-weight:700;font-size:15px;width:240px';
+    h.appendChild(nm);
+    var adm=document.createElement('label');adm.style.fontWeight='600';var ac=document.createElement('input');ac.type='checkbox';ac.checked=role.is_admin;adm.appendChild(ac);adm.appendChild(document.createTextNode(' Administrator'));
+    h.appendChild(adm);
+    var inuse=document.createElement('span');inuse.className='pill';inuse.textContent=role.in_use+' user'+(role.in_use===1?'':'s');h.appendChild(inuse);
+    box.appendChild(h);
+    var gridWrap=document.createElement('div');gridWrap.style.marginTop='10px';
+    var tbl=document.createElement('table');tbl.className='grid';
+    RES.forEach(function(rc){
+      var tr=document.createElement('tr');var td1=document.createElement('td');td1.textContent=rc[1];td1.style.width='55%';tr.appendChild(td1);
+      var td2=document.createElement('td');td2.appendChild(seg(role,rc[0]));tr.appendChild(td2);tbl.appendChild(tr);
+    });
+    gridWrap.appendChild(tbl);
+    function setGridDisabled(dis){gridWrap.style.opacity=dis?'.45':'1';gridWrap.style.pointerEvents=dis?'none':'auto';}
+    setGridDisabled(role.is_admin);ac.addEventListener('change',function(){setGridDisabled(ac.checked);});
+    box.appendChild(gridWrap);
+    var row=document.createElement('div');row.className='row';
+    var save=document.createElement('button');save.textContent='Save';
+    save.addEventListener('click',function(){
+      var perms={};RES.forEach(function(rc){var sel=box.querySelector('input[name="r'+role.id+'_'+rc[0]+'"]:checked');perms[rc[0]]=sel?sel.value:'none';});
+      act('/settings/roles/save',{id:role.id,name:nm.value.trim(),is_admin:ac.checked,permissions:perms});
+    });
+    row.appendChild(save);
+    if(role.in_use===0){var del=document.createElement('button');del.className='danger';del.textContent='Delete';del.addEventListener('click',function(){if(confirm('Delete role '+role.name+'?'))act('/settings/roles/delete',{id:role.id});});row.appendChild(del);}
+    box.appendChild(row);return box;
+  }
+  async function load(){
+    var d=await (await fetch('/settings/roles/list',{headers:{'X-Requested-With':'XMLHttpRequest'}})).json();
+    RES=d.resources;ROLES=d.roles;var c=document.getElementById('roles');c.innerHTML='';d.roles.forEach(function(r){c.appendChild(renderRole(r));});
+  }
+  async function act(url,payload){
+    try{var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest'},body:JSON.stringify(payload)});
+      var d=await r.json();if(d.status==='success'){show('Saved.',true);load();}else show(d.message||'Failed.',false);
+    }catch(e){show('Error: '+e.message,false);}
+  }
+  document.getElementById('newBtn').addEventListener('click',function(){
+    var n=document.getElementById('rn').value.trim();if(!n){show('Enter a role name.',false);return;}
+    act('/settings/roles/save',{name:n,is_admin:document.getElementById('radmin').checked,permissions:{}});
+    document.getElementById('rn').value='';document.getElementById('radmin').checked=false;
+  });
+  load();
+</script></body></html>""")
+
+
+@app.route("/settings/roles")
+def roles_page():
+    return Response(_AUTH_ROLES_HTML, mimetype="text/html")
+
+
+@app.route("/settings/roles/list")
+def roles_list():
+    roles = Role.query.order_by(Role.is_admin.desc(), Role.name).all()
+    return jsonify({
+        "status": "ok",
+        "resources": PROTECTED_RESOURCES,
+        "roles": [{"id": r.id, "name": r.name, "is_admin": r.is_admin,
+                   "permissions": (r.permissions or {}),
+                   "in_use": User.query.filter_by(role_id=r.id).count()} for r in roles],
+    })
+
+
+@app.route("/settings/roles/save", methods=["POST"])
+def roles_save():
+    body = request.get_json(silent=True) or {}
+    name = str(body.get("name", "")).strip()
+    if not name:
+        return jsonify({"status": "error", "message": "Role name is required."}), 400
+    is_admin = bool(body.get("is_admin"))
+    perms_in = body.get("permissions") or {}
+    perms = {k: (perms_in.get(k) if perms_in.get(k) in ("none", "view", "edit") else "none")
+             for k in _RESOURCE_KEYS}
+    rid = body.get("id")
+    if rid:
+        r = Role.query.get(int(rid))
+        if r is None:
+            return jsonify({"status": "error", "message": "No such role."}), 404
+        # Don't let the last administrator lose admin.
+        if r.is_admin and not is_admin and _admin_count() <= 1:
+            return jsonify({"status": "error",
+                            "message": "Can't remove admin from the only administrator."}), 400
+        dup = Role.query.filter(db.func.lower(Role.name) == name.lower(), Role.id != r.id).first()
+        if dup:
+            return jsonify({"status": "error", "message": "A role with that name already exists."}), 409
+        r.name, r.is_admin, r.permissions = name, is_admin, perms
+    else:
+        if Role.query.filter(db.func.lower(Role.name) == name.lower()).first():
+            return jsonify({"status": "error", "message": "A role with that name already exists."}), 409
+        r = Role(name=name, is_admin=is_admin, permissions=perms)
+        db.session.add(r)
+    db.session.commit()
+    return jsonify({"status": "success", "id": r.id})
+
+
+@app.route("/settings/roles/delete", methods=["POST"])
+def roles_delete():
+    body = request.get_json(silent=True) or {}
+    r = Role.query.get(int(body.get("id", 0) or 0))
+    if r is None:
+        return jsonify({"status": "error", "message": "No such role."}), 404
+    if User.query.filter_by(role_id=r.id).count() > 0:
+        return jsonify({"status": "error", "message": "Reassign users off this role before deleting it."}), 400
+    if r.is_admin and _admin_count() <= 1:
+        return jsonify({"status": "error", "message": "Can't delete the only administrator role."}), 400
+    db.session.delete(r)
+    db.session.commit()
+    return jsonify({"status": "success"})
 
 
 @app.route("/setup")
@@ -4063,6 +4965,9 @@ def storage_upload_image():
 
     if not name or not file or not file.filename:
         return jsonify({"status": "error", "message": "Storage name and image file are required"}), 400
+    bad = _reject_if_bomb(file)
+    if bad:
+        return bad
 
     # Cover images continue to live under uploads/albums/ for continuity with
     # any images uploaded before the Storage rename.
@@ -4091,6 +4996,9 @@ def inventory_upload_game_image():
 
     if not game_name or not file or not file.filename:
         return jsonify({"status": "error", "message": "Game name and image file are required"}), 400
+    bad = _reject_if_bomb(file)
+    if bad:
+        return bad
 
     game_img_folder = os.path.join(app.config["UPLOAD_FOLDER"], "game_icons")
     os.makedirs(game_img_folder, exist_ok=True)
@@ -4223,6 +5131,10 @@ PDF_SPILL_THRESHOLD = 500 * 1024 * 1024  # 500 MB
 PDF_RASTER_ZOOM  = float(os.environ.get("PDF_RASTER_ZOOM", "4.0"))    # floor ≈288 DPI
 PDF_CAPPED_DPI   = float(os.environ.get("PDF_CAPPED_DPI", "600"))     # cap when unlimited is OFF
 PDF_SANITY_DPI   = float(os.environ.get("PDF_SANITY_DPI", "4800"))    # absolute guard even when ON
+try:
+    MAX_PDF_PAGES = int(os.environ.get("MAX_PDF_PAGES", "5000") or "5000")  # bound processing time
+except ValueError:
+    MAX_PDF_PAGES = 5000
 
 
 def _pdf_native_zoom(page):
@@ -4608,6 +5520,9 @@ def import_single_card():
     if not front or not front.filename:
         return jsonify({"status": "error", "message": "A front image or PDF is required"}), 400
     back = request.files.get("back_image")
+    bad = _reject_if_bomb(front, back)
+    if bad:
+        return bad
 
     # Refuse up front if the inventory is already full. (PDF batches can still
     # partially import up to the cap and report it — see _import_pdf_pages.)
@@ -4762,6 +5677,9 @@ def update_scan(record_id):
 def update_scan_image(record_id):
     record = ScanRecord.query.get_or_404(record_id)
     file = request.files.get("image")
+    bad = _reject_if_bomb(file)
+    if bad:
+        return bad
     side = request.form.get("side", "front").strip().lower()
     if side not in ("front", "back"):
         side = "front"
@@ -6845,6 +7763,9 @@ def type_reference_add():
     source = "upload"
 
     up = request.files.get("image")
+    bad = _reject_if_bomb(up)
+    if bad:
+        return bad
     record_id = (request.form.get("record_id") or "").strip()
 
     if up and up.filename:
@@ -7109,6 +8030,15 @@ def pdf_open():
             pass
         return jsonify({"status": "error", "message": "PDF has no pages"}), 400
 
+    if page_count > MAX_PDF_PAGES:
+        try:
+            os.remove(pdf_path)
+        except OSError:
+            pass
+        return jsonify({"status": "error",
+                        "message": f"PDF has {page_count} pages, over the {MAX_PDF_PAGES}-page limit. "
+                                   f"Split it, or raise MAX_PDF_PAGES."}), 413
+
     return jsonify({
         "status":     "success",
         "message":    f"PDF opened — {page_count} page(s).",
@@ -7206,6 +8136,9 @@ def run_import_split():
     file = request.files.get("image")
     if not file or not file.filename:
         return jsonify({"status": "error", "message": "No image provided"}), 400
+    bad = _reject_if_bomb(file)
+    if bad:
+        return bad
 
     game  = request.form.get("game",  "").strip()
     album = request.form.get("album", "").strip()
@@ -7773,6 +8706,10 @@ def import_start_pdf():
         return jsonify({"status": "error", "message": f"Could not read PDF: {exc}"}), 500
     if page_count < 1:
         return jsonify({"status": "error", "message": "PDF has no pages."}), 400
+    if page_count > MAX_PDF_PAGES:
+        return jsonify({"status": "error",
+                        "message": f"PDF has {page_count} pages, over the {MAX_PDF_PAGES}-page limit. "
+                                   f"Split it, or raise MAX_PDF_PAGES."}), 413
 
     job_id = batch_id or datetime.now().strftime("pdf_%Y%m%d_%H%M%S_%f")
     with _PDF_JOBS_LOCK:
@@ -8355,6 +9292,129 @@ def identify_settings_page():
             .replace("__XIMILAR_SET__", "yes" if g["ximilar_key_set"] else "no")
             .replace("__CARDSIGHT_SET__", "yes" if g["cardsight_key_set"] else "no"))
     return Response(html, mimetype="text/html")
+
+
+# Self-contained page to set the advertised .local network name. Inline (no theme
+# template dependency), reachable at /settings/network.
+_NETWORK_SETTINGS_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Network Name</title>
+<style>
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:#f5f7fb; color:#1f2937; margin:0; padding:24px; }
+  .card { max-width:720px; margin:0 auto; background:#fff; border:1px solid #e5e7eb; border-radius:16px; padding:24px 28px; box-shadow:0 10px 30px rgba(0,0,0,.05); }
+  h1 { font-size:22px; margin:0 0 6px; }
+  p.sub { color:#6b7280; margin:0 0 20px; }
+  label.fld { display:block; font-weight:700; margin-bottom:6px; }
+  .inrow { display:flex; align-items:stretch; max-width:440px; }
+  .inrow input { flex:1; border:1px solid #d1d5db; border-right:0; border-radius:10px 0 0 10px; padding:10px 12px; font-size:15px; }
+  .inrow .suffix { display:flex; align-items:center; padding:0 12px; border:1px solid #d1d5db; border-left:0; border-radius:0 10px 10px 0; background:#f3f4f6; color:#6b7280; font-size:15px; }
+  .preview { margin-top:12px; font-size:14px; color:#374151; }
+  .preview code, .note code, .warn code { background:#f3f4f6; border:1px solid #e5e7eb; border-radius:6px; padding:2px 8px; }
+  .row { display:flex; gap:10px; align-items:center; margin-top:18px; flex-wrap:wrap; }
+  button { background:#4f46e5; color:#fff; border:0; border-radius:10px; padding:10px 18px; font-weight:700; cursor:pointer; }
+  button:disabled { opacity:.6; cursor:default; }
+  .note { margin-top:18px; font-size:13px; color:#6b7280; line-height:1.55; }
+  .warn { margin-top:14px; padding:10px 12px; border-radius:10px; background:#fffbeb; border:1px solid #fde68a; color:#92400e; font-size:13px; display:__ZC_WARN__; }
+  a { color:#4f46e5; text-decoration:none; } a:hover { text-decoration:underline; }
+  .msg { margin-top:16px; padding:12px 14px; border-radius:10px; display:none; }
+  .msg.show { display:block; }
+  .msg.ok { background:#ecfdf5; color:#065f46; border:1px solid #a7f3d0; }
+  .msg.err { background:#fef2f2; color:#991b1b; border:1px solid #fecaca; }
+  .links { margin-top:20px; font-size:14px; color:#6b7280; } .links a { margin-right:14px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Network Name (.local)</h1>
+    <p class="sub">Set the name this server advertises on your local network. Devices on the same
+       Wi-Fi/LAN can then reach it at <strong>&lt;name&gt;.local</strong> &mdash; no IP address or
+       router setup needed.</p>
+
+    <label class="fld" for="nm">Advertised name</label>
+    <div class="inrow">
+      <input id="nm" type="text" value="__NAME__" autocomplete="off" spellcheck="false" placeholder="cardcollector">
+      <span class="suffix">.local__PORTSUFFIX__</span>
+    </div>
+    <div class="preview">Address: <code id="prev">http://__NAME__.local__PORTSUFFIX__</code></div>
+
+    <div class="warn">The <code>zeroconf</code> package isn't installed, so nothing is being advertised yet.
+       Your name is saved and takes effect once you run <code>pip install zeroconf</code> and restart.</div>
+
+    <div class="row"><button id="saveBtn">Save name</button></div>
+    <div id="msg" class="msg"></div>
+
+    <div class="note">
+      Letters, numbers and hyphens only &mdash; spaces and other characters become hyphens
+      (e.g. &ldquo;My Cards&rdquo; &rarr; <code>my-cards</code>). Saving re-advertises immediately on this
+      network; already-open tabs may need a refresh. mDNS/<code>.local</code> only works for devices on the
+      <em>same</em> local network &mdash; it doesn't cross networks or reach the internet.
+    </div>
+
+    <div class="links">
+      <a href="/settings/general">General settings</a>
+      <a href="/settings">All settings</a>
+    </div>
+  </div>
+<script>
+  var PORTSUFFIX = "__PORTSUFFIX__";
+  var nm = document.getElementById('nm');
+  var prev = document.getElementById('prev');
+  function slug(v){ return (v||'').toLowerCase().replace(/[^a-z0-9-]+/g,'-').replace(/-{2,}/g,'-').replace(/^-+|-+$/g,'').slice(0,63); }
+  function updatePrev(){ prev.textContent = 'http://' + (slug(nm.value) || 'cardcollector') + '.local' + PORTSUFFIX; }
+  nm.addEventListener('input', updatePrev); updatePrev();
+
+  var msg = document.getElementById('msg');
+  function showMsg(t, ok){ msg.textContent = t; msg.className = 'msg show ' + (ok ? 'ok':'err'); }
+  document.getElementById('saveBtn').addEventListener('click', async function(){
+    var btn = this; btn.disabled = true;
+    try {
+      var res = await fetch('/settings/network/name', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ name: nm.value })
+      });
+      var data = await res.json();
+      if (res.ok && data.status === 'success') { nm.value = data.name; updatePrev(); showMsg(data.message || 'Saved.', true); }
+      else { showMsg(data.message || 'Save failed.', false); }
+    } catch(e){ showMsg('Network error: ' + e.message, false); }
+    finally { btn.disabled = false; }
+  });
+</script>
+</body>
+</html>"""
+
+
+@app.route("/settings/network")
+def network_settings_page():
+    """Standalone page to set the advertised .local name (self-contained)."""
+    name = get_mdns_name()
+    port = _MDNS.get("port") or int(os.environ.get("PORT", "80"))
+    suffix = "" if port == 80 else f":{port}"
+    zc_active = _MDNS.get("zc") is not None
+    html = (_NETWORK_SETTINGS_HTML
+            .replace("__NAME__", name)
+            .replace("__PORTSUFFIX__", suffix)
+            .replace("__ZC_WARN__", "none" if zc_active else "block"))
+    return Response(html, mimetype="text/html")
+
+
+@app.route("/settings/network/name", methods=["POST"])
+def network_set_name():
+    """Persist and live re-advertise the .local name."""
+    body = request.get_json(silent=True) or request.form
+    name = set_mdns_name(str(body.get("name", "")))
+    try:
+        restart_mdns(name)
+    except Exception:
+        pass
+    port = _MDNS.get("port") or int(os.environ.get("PORT", "80"))
+    url = f"http://{name}.local" + ("" if port == 80 else f":{port}")
+    active = _MDNS.get("zc") is not None
+    msg = (f"Saved — now advertising at {url}" if active
+           else f"Saved as \u201c{name}\u201d. Install 'zeroconf' and restart to advertise it.")
+    return jsonify({"status": "success", "name": name, "url": url, "message": msg})
 
 
 @app.route("/identify/diagnose", methods=["GET"])
@@ -9481,6 +10541,9 @@ def search_by_image():
     file = request.files.get("image")
     if not file:
         return jsonify({"status": "error", "message": "No image uploaded"}), 400
+    bad = _reject_if_bomb(file)
+    if bad:
+        return bad
 
     np_buf    = np.frombuffer(file.read(), np.uint8)
     query_img = cv2.imdecode(np_buf, cv2.IMREAD_COLOR)
@@ -11791,6 +12854,113 @@ def migrate_add_scan_scaling_columns():
         _backfill_scan_columns()
 
 
+def _lan_ip():
+    """Best-effort primary LAN IPv4 of this machine (no packet is actually sent)."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+MDNS_NAME_KEY = "MDNS_HOSTNAME"        # app_settings key
+_MDNS = {"zc": None, "port": None}     # live advertisement state (serving process)
+
+
+def _slug_hostname(raw, default="cardcollector"):
+    """Sanitize free text into a valid single mDNS/DNS label: lowercase, digits and
+    hyphens only, no leading/trailing hyphen, max 63 chars. Empty -> default."""
+    s = (raw or "").strip().lower()
+    s = _re.sub(r"[^a-z0-9-]+", "-", s)
+    s = _re.sub(r"-{2,}", "-", s).strip("-")
+    return s[:63] or default
+
+
+def get_mdns_name():
+    """The configured advertised name (sanitized), defaulting to 'cardcollector'."""
+    return _slug_hostname(get_setting(MDNS_NAME_KEY, "cardcollector"))
+
+
+def set_mdns_name(raw):
+    """Persist a new advertised name (sanitized); returns the value stored."""
+    name = _slug_hostname(raw)
+    set_setting(MDNS_NAME_KEY, name)
+    return name
+
+
+def start_mdns(host_label=None, port=5005):
+    """Advertise this server on the local network as <host_label>.local via mDNS,
+    so it's reachable at a stable name on whatever LAN it's started on — no router
+    setup or per-device hosts edits. Records the live handle so the name can be
+    changed at runtime (see restart_mdns). Returns the Zeroconf handle or None.
+
+    No-op if the optional 'zeroconf' package isn't installed. Note: mDNS only
+    resolves for devices ON THE SAME local network; it is not reachable across
+    different networks or over the internet (use a tunnel/VPN for that)."""
+    host_label = _slug_hostname(host_label) if host_label else get_mdns_name()
+    _MDNS["port"] = port
+    try:
+        from zeroconf import Zeroconf, ServiceInfo
+    except Exception:
+        print("[mDNS] Optional 'zeroconf' package not installed — skipping the .local name.")
+        print("[mDNS] Enable a stable http://%s.local address with:  pip install zeroconf" % host_label)
+        return None
+    import socket
+    ip = _lan_ip()
+    try:
+        info = ServiceInfo(
+            "_http._tcp.local.",
+            f"{host_label}._http._tcp.local.",
+            addresses=[socket.inet_aton(ip)],
+            port=port,
+            properties={"path": "/"},
+            server=f"{host_label}.local.",
+        )
+        zc = Zeroconf()
+        zc.register_service(info)
+        _MDNS["zc"] = zc
+        shown = f"http://{host_label}.local" + ("" if port == 80 else f":{port}")
+        print(f"[mDNS] Also reachable on this network at:  {shown}   (IP {ip})")
+        return zc
+    except Exception as exc:
+        print(f"[mDNS] Could not start the .local advertisement: {exc}")
+        return None
+
+
+def restart_mdns(new_name):
+    """Re-advertise under a new (sanitized) name on the current port, live. Returns
+    the name now in effect. Safe to call even if zeroconf isn't installed."""
+    name = _slug_hostname(new_name)
+    zc = _MDNS.get("zc")
+    if zc is not None:
+        try:
+            zc.close()
+        except Exception:
+            pass
+        _MDNS["zc"] = None
+    port = _MDNS.get("port") or int(os.environ.get("PORT", "80"))
+    start_mdns(name, port)
+    return name
+
+
+def _port_bindable(port):
+    """True if we can bind the given TCP port on all interfaces right now."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("0.0.0.0", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
 if __name__ == "__main__":
     # Complete any deferred cleanup from a previous DB relocation now that we're
     # (re)starting on the current configured database.
@@ -11805,6 +12975,20 @@ if __name__ == "__main__":
         migrate_add_performance_indexes()
         optimize_database()
         load_settings()   # load API keys/settings; one-time seed from .env
+
+        # Stable session secret so logins survive restarts and are shared across the
+        # reloader's parent/child processes. Env SECRET_KEY wins; otherwise a value
+        # is generated once and stored in app_settings.
+        _sk = os.environ.get("SECRET_KEY")
+        if not _sk:
+            _sk = get_setting("FLASK_SECRET_KEY", "")
+            if not _sk:
+                _sk = os.urandom(32).hex()
+                try:
+                    set_setting("FLASK_SECRET_KEY", _sk)
+                except Exception:
+                    pass
+        app.config["SECRET_KEY"] = _sk
 
         # First-run vs existing install: if the mode was never chosen but the
         # database already has records, adopt Sorting Machine (backward-compatible,
@@ -11848,6 +13032,41 @@ if __name__ == "__main__":
     print(" • /template_save   — Save a Game definition (name + fields)")
     print(" • /justtcg_fetch/<id>              — Fetch live price from JustTCG API (POST, manual trigger)")
     print(" • /tcg_save_url/<id>, /tcg_clear_url/<id> — Legacy URL save / pricing data clear")
-    print(" • Visit: http://127.0.0.1:5000")
+    # Port: default to 80 so the URL needs no ":port" suffix. Binding to 80 needs
+    # admin/root (ports below 1024 are privileged); if that's not available or 80
+    # is already in use, fall back so the app still starts. Override with the PORT
+    # env var (e.g. PORT=5005) to pin a specific port.
+    PORT = int(os.environ.get("PORT", "80"))
+    if not _port_bindable(PORT):
+        fallback = int(os.environ.get("PORT_FALLBACK", "5005"))
+        if PORT != fallback:
+            print(f"[port] Couldn't bind port {PORT} — it needs admin/root privileges, "
+                  f"or it's already in use.")
+            print(f"[port] Falling back to {fallback}. To use {PORT}: launch with elevated "
+                  f"privileges (e.g. 'sudo'), or set PORT to a free port.")
+            PORT = fallback
 
-    app.run(host="0.0.0.0", port=5005, debug=True, threaded=True)
+    with app.app_context():
+        _mdns_name = get_mdns_name()
+    _url = f"http://{_mdns_name}.local" + ("" if PORT == 80 else f":{PORT}")
+    print(f" • Visit: http://127.0.0.1{'' if PORT == 80 else ':' + str(PORT)}  (or  {_url}  on this LAN)")
+
+    # The Werkzeug debug reloader is OFF by default: its interactive debugger allows
+    # remote code execution, which is dangerous on a LAN-exposed server. Turn it on
+    # only for local development with FLASK_DEBUG=1.
+    DEBUG = os.environ.get("FLASK_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on")
+
+    # Advertise mDNS from the process that actually serves requests: the reloader
+    # child when debug is on (WERKZEUG_RUN_MAIN==true), or the sole process when off.
+    _mdns = None
+    if (os.environ.get("WERKZEUG_RUN_MAIN") == "true") or not DEBUG:
+        _mdns = start_mdns(_mdns_name, PORT)
+
+    try:
+        app.run(host="0.0.0.0", port=PORT, debug=DEBUG, threaded=True)
+    finally:
+        if _mdns is not None:
+            try:
+                _mdns.close()
+            except Exception:
+                pass
