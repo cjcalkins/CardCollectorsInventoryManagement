@@ -19,7 +19,7 @@ import json
 import shutil
 import tempfile
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from PIL import Image
 # Same ceiling for Pillow (its default is ~89 MP, far below legitimate scans).
 Image.MAX_IMAGE_PIXELS = _MAX_IMAGE_PIXELS
@@ -2370,6 +2370,8 @@ PROTECTED_RESOURCES = [
     ("import",       "Import / scanning"),
     ("duplicates",   "Duplicates"),
     ("analytics",    "Analytics"),
+    ("reports",      "Financial reports"),
+    ("quick_scan",   "Quick Scan (camera)"),
     ("image_search", "Search by Image"),
     ("reference",    "Reference Data"),
     ("shops",        "Shops / listings"),
@@ -2480,6 +2482,8 @@ def _resource_for_path(path):
         "pdf_open": "import", "pdf_render_page": "import", "pdf_close": "import",
         "duplicates": "duplicates",
         "analytics": "analytics", "analytics_page": "analytics",
+        "reports": "reports",
+        "quickscan": "quick_scan",
         "search_by_image": "image_search", "search_by_image_page": "image_search",
         "reference": "reference",
         "shops": "shops", "shop": "shops",
@@ -4352,6 +4356,807 @@ def analytics_collection():
     return jsonify({"status": "success", "name": name, "rows": rows, "totals": totals,
                     "bought_for": bought_for,
                     "cost_source": "lot" if bought_for is not None else "entries"})
+
+
+# ====================== PERIOD REPORTS ======================
+# Weekly / monthly / quarterly / annual PDF (and on-screen) reports covering
+# acquisitions, sales by shop, derived strategies, and the financial outcome for
+# the period. Acquisitions key off ScanRecord.scan_date; sales come from each
+# record's extracted_data (integration sales_log entries carry a shop + price +
+# date, manual sales carry sold_price + sold_at).
+
+def _parse_dt(v):
+    """Parse an ISO-ish datetime (or datetime) into a naive datetime, or None."""
+    if not v:
+        return None
+    if isinstance(v, datetime):
+        return v
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m/%d/%Y"):
+            try:
+                return datetime.strptime(s, fmt)
+            except Exception:
+                pass
+    return None
+
+
+def _report_period_range(period_type, ref=None):
+    """Return (start, end, label, normalized_type) for the period containing ref."""
+    ref = ref or datetime.now()
+    day = datetime(ref.year, ref.month, ref.day)
+    pt = (period_type or "monthly").lower()
+    if pt == "weekly":
+        start = day - timedelta(days=day.weekday())          # Monday
+        end = start + timedelta(days=7)
+        label = f"Week of {start:%b %d} – {end - timedelta(days=1):%b %d, %Y}"
+    elif pt == "quarterly":
+        q = (day.month - 1) // 3
+        start = datetime(day.year, q * 3 + 1, 1)
+        em = q * 3 + 4
+        end = datetime(day.year + (1 if em > 12 else 0), ((em - 1) % 12) + 1, 1)
+        label = f"Q{q + 1} {day.year}"
+    elif pt == "annual":
+        start = datetime(day.year, 1, 1)
+        end = datetime(day.year + 1, 1, 1)
+        label = f"{day.year}"
+    else:
+        pt = "monthly"
+        start = datetime(day.year, day.month, 1)
+        end = datetime(day.year + (1 if day.month == 12 else 0), (day.month % 12) + 1, 1)
+        label = f"{start:%B %Y}"
+    return start, end, label, pt
+
+
+_SOURCE_LABELS = {"ebay": "eBay", "tcgplayer": "TCGplayer", "tcg": "TCGplayer",
+                  "manual": "Manual / Direct", "": "Manual / Direct", "other": "Other"}
+
+
+def _norm_source(s):
+    k = (s or "").strip().lower()
+    return _SOURCE_LABELS.get(k, k.title() if k else "Manual / Direct")
+
+
+def _report_record_title(rec):
+    d = rec.extracted_data or {}
+    name = (d.get("name") or d.get("card_name") or d.get("title") or "").strip()
+    num = (d.get("number") or d.get("card_number") or "").strip()
+    setn = (d.get("set") or d.get("set_name") or "").strip()
+    bits = [name or f"Record #{rec.id}"]
+    if num:
+        bits.append(f"#{num}")
+    if setn:
+        bits.append(f"({setn})")
+    return " ".join(bits)
+
+
+def _record_sale_in_period(rec, start, end):
+    """If this record recorded a sale within [start, end), return
+    {source, revenue, date, qty}; else None."""
+    data = rec.extracted_data or {}
+    entries = []
+    for e in (data.get("sales_log") or []):
+        d = _parse_dt(e.get("at"))
+        if d:
+            entries.append((d, e.get("source") or "other", _analytics_money(e.get("price"))))
+    if entries:
+        in_p = [(d, s, p) for (d, s, p) in entries if start <= d < end]
+        if not in_p:
+            return None
+        revenue = sum(p for (_, _, p) in in_p if p is not None)
+        if not revenue:
+            sp = _analytics_money(data.get("sold_price"))
+            revenue = sp if sp is not None else 0.0
+        last = max(in_p, key=lambda t: t[0])
+        return {"source": last[1], "revenue": revenue or 0.0, "date": last[0], "qty": len(in_p)}
+    if not _held_from(data):
+        sp = _analytics_money(data.get("sold_price"))
+        at = _parse_dt(data.get("sold_at"))
+        if sp is not None and at and start <= at < end:
+            return {"source": "manual", "revenue": sp, "date": at, "qty": 1}
+    return None
+
+
+def _report_build(start, end, label, period_type):
+    """Aggregate everything for the period into a plain dict (money as floats)."""
+    from sqlalchemy import func as _f, and_
+    money = _analytics_money
+    records = ScanRecord.query.filter(and_(
+        _f.coalesce(ScanRecord.is_catalog, False) == False,   # noqa: E712
+        _f.coalesce(ScanRecord.is_archived, False) == False,  # noqa: E712
+    )).all()
+
+    # ── Acquisitions in period, grouped by collection ──
+    acq, acq_tot = {}, {"count": 0, "intake": 0.0, "market": 0.0, "sold_count": 0, "sold_value": 0.0}
+    for rec in records:
+        d = rec.scan_date
+        if not (d and start <= d < end):
+            continue
+        data = rec.extracted_data or {}
+        coll = (data.get("collection") or "").strip() or "Uncategorized"
+        ip = money(data.get("intake_price")) or 0.0
+        cv = money(data.get("current_value")) or 0.0
+        sp = money(data.get("sold_price"))
+        sold = not _held_from(data)
+        b = acq.setdefault(coll, {"collection": coll, "count": 0, "intake": 0.0, "market": 0.0,
+                                  "sold_count": 0, "sold_value": 0.0, "games": set()})
+        b["count"] += 1
+        b["intake"] += ip
+        b["market"] += cv
+        g = (data.get("game") or "").strip()
+        if g:
+            b["games"].add(g)
+        acq_tot["count"] += 1
+        acq_tot["intake"] += ip
+        acq_tot["market"] += cv
+        if sold and sp is not None:
+            b["sold_count"] += 1
+            b["sold_value"] += sp
+            acq_tot["sold_count"] += 1
+            acq_tot["sold_value"] += sp
+    acq_rows = sorted(acq.values(), key=lambda r: r["intake"], reverse=True)
+    for r in acq_rows:
+        r["games"] = ", ".join(sorted(r["games"])) if r["games"] else "—"
+
+    # ── Sales in period, grouped by shop/source ──
+    sales, sales_tot = {}, {"count": 0, "revenue": 0.0, "cost": 0.0, "profit": 0.0}
+    sale_items, undated = [], 0
+    for rec in records:
+        s = _record_sale_in_period(rec, start, end)
+        if s is None:
+            data = rec.extracted_data or {}
+            if (not _held_from(data)) and not (data.get("sales_log")) \
+               and money(data.get("sold_price")) is not None and _parse_dt(data.get("sold_at")) is None:
+                undated += 1
+            continue
+        data = rec.extracted_data or {}
+        intake = money(data.get("intake_price")) or 0.0
+        src = _norm_source(s["source"])
+        b = sales.setdefault(src, {"source": src, "count": 0, "revenue": 0.0, "cost": 0.0, "profit": 0.0})
+        b["count"] += s["qty"]
+        b["revenue"] += s["revenue"]
+        b["cost"] += intake
+        b["profit"] += (s["revenue"] - intake)
+        sales_tot["count"] += s["qty"]
+        sales_tot["revenue"] += s["revenue"]
+        sales_tot["cost"] += intake
+        sales_tot["profit"] += (s["revenue"] - intake)
+        sale_items.append({"title": _report_record_title(rec), "source": src, "date": s["date"],
+                           "revenue": s["revenue"], "intake": intake, "profit": s["revenue"] - intake,
+                           "collection": (data.get("collection") or "—")})
+    sales_rows = sorted(sales.values(), key=lambda r: r["revenue"], reverse=True)
+    sale_items.sort(key=lambda i: i["date"], reverse=True)
+
+    # ── Strategies (explicit tag if present, else derived from holding behavior) ──
+    strat = {}
+    for rec in records:
+        d = rec.scan_date
+        if not (d and start <= d < end):
+            continue
+        data = rec.extracted_data or {}
+        tag = (data.get("strategy") or "").strip()
+        if not tag:
+            if not _held_from(data):
+                sale_dt = _parse_dt(data.get("sold_at"))
+                if not sale_dt:
+                    sl = [_parse_dt(e.get("at")) for e in (data.get("sales_log") or [])]
+                    sl = [x for x in sl if x]
+                    sale_dt = max(sl) if sl else None
+                held_days = (sale_dt - d).days if sale_dt else None
+                tag = "Flip (sold ≤30 days)" if (held_days is not None and held_days <= 30) else "Resold (held >30 days)"
+            else:
+                tag = "Buy & Hold"
+        ip = money(data.get("intake_price")) or 0.0
+        cv = money(data.get("current_value")) or 0.0
+        sp = money(data.get("sold_price"))
+        b = strat.setdefault(tag, {"strategy": tag, "count": 0, "cost": 0.0, "market": 0.0, "realized": 0.0})
+        b["count"] += 1
+        b["cost"] += ip
+        b["market"] += cv
+        if (not _held_from(data)) and sp is not None:
+            b["realized"] += sp - ip
+    strat_rows = sorted(strat.values(), key=lambda r: r["count"], reverse=True)
+
+    # ── Unrealized gain on held items acquired this period ──
+    unrealized = 0.0
+    for rec in records:
+        d = rec.scan_date
+        if d and start <= d < end and _held_from(rec.extracted_data or {}):
+            data = rec.extracted_data or {}
+            unrealized += (money(data.get("current_value")) or 0.0) - (money(data.get("intake_price")) or 0.0)
+
+    financial = {
+        "acq_cost": acq_tot["intake"],
+        "acq_market": acq_tot["market"],
+        "sales_revenue": sales_tot["revenue"],
+        "sales_cost": sales_tot["cost"],
+        "realized_profit": sales_tot["profit"],
+        "unrealized_gain": unrealized,
+        "net_cash_flow": sales_tot["revenue"] - acq_tot["intake"],
+    }
+
+    return {
+        "label": label, "period_type": period_type, "start": start, "end": end,
+        "generated": datetime.now(),
+        "acquisitions": {"rows": acq_rows, "totals": acq_tot},
+        "sales": {"rows": sales_rows, "totals": sales_tot, "items": sale_items, "undated": undated},
+        "strategies": strat_rows,
+        "financial": financial,
+    }
+
+
+def _money_str(v):
+    v = v or 0.0
+    return ("-$%s" % format(abs(v), ",.2f")) if v < 0 else ("$%s" % format(v, ",.2f"))
+
+
+def _report_from_args():
+    period = (request.args.get("period") or "monthly").lower()
+    ref = _parse_dt((request.args.get("date") or "").strip()) or datetime.now()
+    start, end, label, pt = _report_period_range(period, ref)
+    return _report_build(start, end, label, pt)
+
+
+# ── On-screen HTML report ──
+def _report_to_html(rep):
+    from markupsafe import escape as e
+    fin = rep["financial"]
+    pt = rep["period_type"].title()
+
+    def cell(v, cls=""):
+        return f'<td class="{cls}">{e(v)}</td>'
+
+    def money_td(v):
+        cls = "pos" if (v or 0) > 0 else ("neg" if (v or 0) < 0 else "")
+        return f'<td class="num {cls}">{e(_money_str(v))}</td>'
+
+    # Financial summary
+    fin_rows = "".join(
+        f"<tr><th>{e(lbl)}</th>{money_td(val)}</tr>" for lbl, val in [
+            ("Acquisition cost (spent)", fin["acq_cost"]),
+            ("Acquisition market value", fin["acq_market"]),
+            ("Sales revenue (income)", fin["sales_revenue"]),
+            ("Cost basis of items sold", fin["sales_cost"]),
+            ("Realized profit on sales", fin["realized_profit"]),
+            ("Net cash flow (revenue − spend)", fin["net_cash_flow"]),
+            ("Unrealized gain on held (acquired this period)", fin["unrealized_gain"]),
+        ])
+
+    st = rep["sales"]["totals"]
+    sales_rows = "".join(
+        f"<tr>{cell(r['source'])}<td class='num'>{r['count']}</td>{money_td(r['revenue'])}"
+        f"{money_td(r['cost'])}{money_td(r['profit'])}</tr>" for r in rep["sales"]["rows"]) \
+        or "<tr><td colspan=5 class='muted'>No sales recorded in this period.</td></tr>"
+    sales_total = (f"<tr class='tot'><th>Total</th><td class='num'>{st['count']}</td>"
+                   f"{money_td(st['revenue'])}{money_td(st['cost'])}{money_td(st['profit'])}</tr>")
+
+    at = rep["acquisitions"]["totals"]
+    acq_rows = "".join(
+        f"<tr>{cell(r['collection'])}<td class='num'>{r['count']}</td>{money_td(r['intake'])}"
+        f"{money_td(r['market'])}<td class='num'>{r['sold_count']}</td>{money_td(r['sold_value'])}"
+        f"{cell(r['games'])}</tr>" for r in rep["acquisitions"]["rows"]) \
+        or "<tr><td colspan=7 class='muted'>No acquisitions recorded in this period.</td></tr>"
+    acq_total = (f"<tr class='tot'><th>Total</th><td class='num'>{at['count']}</td>"
+                 f"{money_td(at['intake'])}{money_td(at['market'])}<td class='num'>{at['sold_count']}</td>"
+                 f"{money_td(at['sold_value'])}<td></td></tr>")
+
+    strat_rows = "".join(
+        f"<tr>{cell(r['strategy'])}<td class='num'>{r['count']}</td>{money_td(r['cost'])}"
+        f"{money_td(r['market'])}{money_td(r['realized'])}</tr>" for r in rep["strategies"]) \
+        or "<tr><td colspan=5 class='muted'>No activity in this period.</td></tr>"
+
+    items = rep["sales"]["items"][:60]
+    item_rows = "".join(
+        f"<tr>{cell(i['title'])}{cell(i['source'])}<td>{i['date']:%Y-%m-%d}</td>"
+        f"{money_td(i['revenue'])}{money_td(i['intake'])}{money_td(i['profit'])}</tr>" for i in items) \
+        or "<tr><td colspan=6 class='muted'>No sales to itemize.</td></tr>"
+
+    undated_note = ""
+    if rep["sales"]["undated"]:
+        undated_note = (f"<p class='muted'>Note: {rep['sales']['undated']} manually-sold item(s) had no "
+                        f"recorded sale date and were excluded from period sales. Re-marking them sold now "
+                        f"stamps a date.</p>")
+
+    qs = f"period={rep['period_type']}&date={rep['start']:%Y-%m-%d}"
+    return f"""<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width, initial-scale=1"><title>{e(pt)} report — {e(rep['label'])}</title>
+<style>
+ body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#1f2937;background:#f5f7fb;margin:0;padding:28px;}}
+ .wrap{{max-width:1000px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:28px 32px;box-shadow:0 10px 30px rgba(0,0,0,.05);}}
+ h1{{font-size:22px;margin:0 0 2px;}} .sub{{color:#6b7280;margin:0 0 18px;}}
+ h2{{font-size:15px;text-transform:uppercase;letter-spacing:.04em;color:#4338ca;margin:26px 0 8px;}}
+ table{{width:100%;border-collapse:collapse;margin-top:4px;font-size:14px;}}
+ th,td{{text-align:left;padding:7px 10px;border-bottom:1px solid #eef0f4;}}
+ td.num,th.num{{text-align:right;}} .num{{text-align:right;font-variant-numeric:tabular-nums;}}
+ tr.tot th,tr.tot td{{border-top:2px solid #d1d5db;font-weight:700;background:#fafafe;}}
+ .pos{{color:#047857;}} .neg{{color:#b91c1c;}} .muted{{color:#9ca3af;}}
+ .cards{{display:flex;gap:14px;flex-wrap:wrap;margin:6px 0 4px;}}
+ .kpi{{flex:1;min-width:150px;border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;}}
+ .kpi .l{{font-size:12px;color:#6b7280;}} .kpi .v{{font-size:20px;font-weight:700;}}
+ .toolbar{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;}}
+ a.btn{{background:#4f46e5;color:#fff;text-decoration:none;padding:9px 15px;border-radius:10px;font-weight:600;font-size:14px;}}
+ a.btn.sec{{background:#eef2ff;color:#4338ca;}}
+ @media print{{.toolbar{{display:none;}} body{{background:#fff;padding:0;}} .wrap{{box-shadow:none;border:0;}}}}
+</style></head><body><div class=wrap>
+ <div class=toolbar>
+   <a class="btn" href="/reports/pdf?{qs}">Download PDF</a>
+   <a class="btn sec" href="/reports">Choose another period</a>
+ </div>
+ <h1>{e(pt)} Report — {e(rep['label'])}</h1>
+ <p class=sub>{rep['start']:%b %d, %Y} to {rep['end'] - timedelta(days=1):%b %d, %Y} · generated {rep['generated']:%Y-%m-%d %H:%M}</p>
+
+ <div class=cards>
+   <div class=kpi><div class=l>Acquisition cost</div><div class=v>{e(_money_str(fin['acq_cost']))}</div></div>
+   <div class=kpi><div class=l>Sales revenue</div><div class=v>{e(_money_str(fin['sales_revenue']))}</div></div>
+   <div class=kpi><div class=l>Realized profit</div><div class="v {'pos' if fin['realized_profit']>=0 else 'neg'}">{e(_money_str(fin['realized_profit']))}</div></div>
+   <div class=kpi><div class=l>Net cash flow</div><div class="v {'pos' if fin['net_cash_flow']>=0 else 'neg'}">{e(_money_str(fin['net_cash_flow']))}</div></div>
+ </div>
+
+ <h2>Financial outcome</h2>
+ <table>{fin_rows}</table>
+
+ <h2>Sales by shop</h2>
+ <table><thead><tr><th>Source</th><th class=num>Sales</th><th class=num>Revenue</th><th class=num>Cost basis</th><th class=num>Profit</th></tr></thead>
+ <tbody>{sales_rows}{sales_total}</tbody></table>
+ {undated_note}
+
+ <h2>Acquisitions by collection</h2>
+ <table><thead><tr><th>Collection</th><th class=num>Items</th><th class=num>Purchase</th><th class=num>Market</th><th class=num>Sold</th><th class=num>Sold value</th><th>Games</th></tr></thead>
+ <tbody>{acq_rows}{acq_total}</tbody></table>
+
+ <h2>Strategies</h2>
+ <table><thead><tr><th>Strategy</th><th class=num>Items</th><th class=num>Cost</th><th class=num>Market</th><th class=num>Realized</th></tr></thead>
+ <tbody>{strat_rows}</tbody></table>
+
+ <h2>Itemized sales</h2>
+ <table><thead><tr><th>Item</th><th>Source</th><th>Date</th><th class=num>Revenue</th><th class=num>Cost</th><th class=num>Profit</th></tr></thead>
+ <tbody>{item_rows}</tbody></table>
+</div></body></html>"""
+
+
+# ── PDF report (reportlab) ──
+def _report_to_pdf(rep):
+    from io import BytesIO
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import inch
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+    INDIGO = colors.HexColor("#4338ca")
+    GREY = colors.HexColor("#6b7280")
+    LINE = colors.HexColor("#e5e7eb")
+    POS = colors.HexColor("#047857")
+    NEG = colors.HexColor("#b91c1c")
+
+    styles = getSampleStyleSheet()
+    h1 = ParagraphStyle("h1", parent=styles["Title"], fontSize=18, spaceAfter=2, textColor=colors.HexColor("#111827"))
+    sub = ParagraphStyle("sub", parent=styles["Normal"], fontSize=9, textColor=GREY, spaceAfter=12)
+    h2 = ParagraphStyle("h2", parent=styles["Heading2"], fontSize=11, textColor=INDIGO, spaceBefore=14, spaceAfter=4)
+    note = ParagraphStyle("note", parent=styles["Normal"], fontSize=8, textColor=GREY, spaceBefore=4)
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=0.7 * inch, bottomMargin=0.7 * inch,
+                            leftMargin=0.7 * inch, rightMargin=0.7 * inch,
+                            title=f"{rep['period_type'].title()} report {rep['label']}")
+    story = []
+    story.append(Paragraph(f"{rep['period_type'].title()} Report &mdash; {rep['label']}", h1))
+    story.append(Paragraph(
+        f"{rep['start']:%b %d, %Y} to {rep['end'] - timedelta(days=1):%b %d, %Y} &middot; "
+        f"generated {rep['generated']:%Y-%m-%d %H:%M}", sub))
+
+    def money_cells(row, idxs):
+        """Build a TableStyle color list for money columns (green/red)."""
+        cmds = []
+        for (ri, ci, val) in idxs:
+            cmds.append(("TEXTCOLOR", (ci, ri), (ci, ri), POS if (val or 0) > 0 else (NEG if (val or 0) < 0 else colors.black)))
+        return cmds
+
+    def make_table(header, rows, aligns, col_widths=None, money_cols=(), totals_row=False):
+        data = [header] + rows
+        t = Table(data, colWidths=col_widths, repeatRows=1)
+        style = [
+            ("FONT", (0, 0), (-1, 0), "Helvetica-Bold", 9),
+            ("FONT", (0, 1), (-1, -1), "Helvetica", 9),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("BACKGROUND", (0, 0), (-1, 0), INDIGO),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.4, LINE),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ]
+        for ci, a in enumerate(aligns):
+            style.append(("ALIGN", (ci, 0), (ci, -1), a))
+        # money color per data cell
+        for (ri, row) in enumerate(rows, start=1):
+            for ci in money_cols:
+                raw = row[ci]
+                v = 0.0
+                try:
+                    v = float(str(raw).replace("$", "").replace(",", ""))
+                except Exception:
+                    v = 0.0
+                if v > 0:
+                    style.append(("TEXTCOLOR", (ci, ri), (ci, ri), POS))
+                elif v < 0:
+                    style.append(("TEXTCOLOR", (ci, ri), (ci, ri), NEG))
+        if totals_row:
+            r = len(data) - 1
+            style += [("FONT", (0, r), (-1, r), "Helvetica-Bold", 9),
+                      ("LINEABOVE", (0, r), (-1, r), 1, colors.HexColor("#9ca3af")),
+                      ("BACKGROUND", (0, r), (-1, r), colors.HexColor("#fafafe"))]
+        t.setStyle(TableStyle(style))
+        return t
+
+    fin = rep["financial"]
+    story.append(Paragraph("Financial outcome", h2))
+    fin_data = [
+        ("Acquisition cost (spent)", _money_str(fin["acq_cost"])),
+        ("Acquisition market value", _money_str(fin["acq_market"])),
+        ("Sales revenue (income)", _money_str(fin["sales_revenue"])),
+        ("Cost basis of items sold", _money_str(fin["sales_cost"])),
+        ("Realized profit on sales", _money_str(fin["realized_profit"])),
+        ("Net cash flow (revenue - spend)", _money_str(fin["net_cash_flow"])),
+        ("Unrealized gain on held (acquired this period)", _money_str(fin["unrealized_gain"])),
+    ]
+    story.append(make_table(["Metric", "Amount"], [list(r) for r in fin_data],
+                            ["LEFT", "RIGHT"], col_widths=[4.7 * inch, 2.1 * inch], money_cols=(1,)))
+
+    st = rep["sales"]["totals"]
+    story.append(Paragraph("Sales by shop", h2))
+    srows = [[r["source"], str(r["count"]), _money_str(r["revenue"]), _money_str(r["cost"]), _money_str(r["profit"])]
+             for r in rep["sales"]["rows"]]
+    if not srows:
+        srows = [["No sales in this period", "", "", "", ""]]
+    srows.append(["Total", str(st["count"]), _money_str(st["revenue"]), _money_str(st["cost"]), _money_str(st["profit"])])
+    story.append(make_table(["Source", "Sales", "Revenue", "Cost basis", "Profit"], srows,
+                            ["LEFT", "RIGHT", "RIGHT", "RIGHT", "RIGHT"],
+                            col_widths=[2.4 * inch, 0.8 * inch, 1.2 * inch, 1.2 * inch, 1.2 * inch],
+                            money_cols=(2, 3, 4), totals_row=True))
+    if rep["sales"]["undated"]:
+        story.append(Paragraph(
+            f"Note: {rep['sales']['undated']} manually-sold item(s) had no recorded sale date and were "
+            f"excluded from period sales.", note))
+
+    at = rep["acquisitions"]["totals"]
+    story.append(Paragraph("Acquisitions by collection", h2))
+    arows = [[r["collection"], str(r["count"]), _money_str(r["intake"]), _money_str(r["market"]),
+              str(r["sold_count"]), _money_str(r["sold_value"]), r["games"]]
+             for r in rep["acquisitions"]["rows"]]
+    if not arows:
+        arows = [["No acquisitions in this period", "", "", "", "", "", ""]]
+    arows.append(["Total", str(at["count"]), _money_str(at["intake"]), _money_str(at["market"]),
+                  str(at["sold_count"]), _money_str(at["sold_value"]), ""])
+    story.append(make_table(["Collection", "Items", "Purchase", "Market", "Sold", "Sold value", "Games"], arows,
+                            ["LEFT", "RIGHT", "RIGHT", "RIGHT", "RIGHT", "RIGHT", "LEFT"],
+                            col_widths=[1.7 * inch, 0.6 * inch, 0.95 * inch, 0.95 * inch, 0.55 * inch, 0.95 * inch, 1.35 * inch],
+                            money_cols=(2, 3, 5), totals_row=True))
+
+    story.append(Paragraph("Strategies", h2))
+    strows = [[r["strategy"], str(r["count"]), _money_str(r["cost"]), _money_str(r["market"]), _money_str(r["realized"])]
+              for r in rep["strategies"]] or [["No activity in this period", "", "", "", ""]]
+    story.append(make_table(["Strategy", "Items", "Cost", "Market", "Realized"], strows,
+                            ["LEFT", "RIGHT", "RIGHT", "RIGHT", "RIGHT"],
+                            col_widths=[2.7 * inch, 0.8 * inch, 1.1 * inch, 1.1 * inch, 1.1 * inch],
+                            money_cols=(2, 3, 4)))
+
+    items = rep["sales"]["items"][:40]
+    if items:
+        story.append(Paragraph("Itemized sales", h2))
+        irows = [[i["title"][:44], i["source"], f"{i['date']:%Y-%m-%d}",
+                  _money_str(i["revenue"]), _money_str(i["intake"]), _money_str(i["profit"])] for i in items]
+        story.append(make_table(["Item", "Source", "Date", "Revenue", "Cost", "Profit"], irows,
+                                ["LEFT", "LEFT", "LEFT", "RIGHT", "RIGHT", "RIGHT"],
+                                col_widths=[2.5 * inch, 1.1 * inch, 0.9 * inch, 0.95 * inch, 0.85 * inch, 0.9 * inch],
+                                money_cols=(3, 4, 5)))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
+_REPORTS_LANDING_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width, initial-scale=1"><title>Reports</title>
+<style>
+ body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#1f2937;background:#f5f7fb;margin:0;padding:28px;}
+ .card{max-width:640px;margin:6vh auto 0;background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:26px 28px;box-shadow:0 10px 30px rgba(0,0,0,.06);}
+ h1{font-size:22px;margin:0 0 6px;} p.sub{color:#6b7280;margin:0 0 20px;}
+ label{display:block;font-weight:700;margin:14px 0 6px;}
+ select,input{width:100%;box-sizing:border-box;border:1px solid #d1d5db;border-radius:10px;padding:10px 12px;font-size:15px;}
+ .row{display:flex;gap:12px;} .row>div{flex:1;}
+ .btns{display:flex;gap:10px;margin-top:20px;flex-wrap:wrap;}
+ button{background:#4f46e5;color:#fff;border:0;border-radius:10px;padding:11px 18px;font-weight:700;cursor:pointer;font-size:14px;}
+ button.sec{background:#eef2ff;color:#4338ca;}
+ .links{margin-top:20px;font-size:14px;color:#6b7280;} .links a{margin-right:14px;}
+ .hint{color:#6b7280;font-size:13px;margin-top:14px;line-height:1.5;}
+</style></head><body>
+<div class=card>
+ <h1>Financial reports</h1>
+ <p class=sub>Generate a report of acquisitions, sales by shop, strategies, and the financial outcome for a period.</p>
+ <div class=row>
+   <div>
+     <label for=period>Period</label>
+     <select id=period>
+       <option value=weekly>Weekly</option>
+       <option value=monthly selected>Monthly</option>
+       <option value=quarterly>Quarterly</option>
+       <option value=annual>Annual</option>
+     </select>
+   </div>
+   <div>
+     <label for=date>Any date in the period</label>
+     <input type=date id=date>
+   </div>
+ </div>
+ <div class=btns>
+   <button id=view>View report</button>
+   <button id=pdf class=sec>Download PDF</button>
+ </div>
+ <p class=hint>The report covers the week, month, quarter, or year containing the date you pick (defaults to today).
+    Acquisitions are grouped by collection with purchase and market value; sales are split by shop (eBay, TCGplayer, etc.).</p>
+ <div class=links><a href="/">Home</a><a href="/analytics">Analytics</a></div>
+</div>
+<script>
+ var d=new Date();document.getElementById('date').value=d.toISOString().slice(0,10);
+ function qs(){return 'period='+encodeURIComponent(document.getElementById('period').value)+'&date='+encodeURIComponent(document.getElementById('date').value);}
+ document.getElementById('view').addEventListener('click',function(){location.href='/reports/view?'+qs();});
+ document.getElementById('pdf').addEventListener('click',function(){location.href='/reports/pdf?'+qs();});
+</script></body></html>"""
+
+
+@app.route("/reports")
+def reports_page():
+    return Response(_REPORTS_LANDING_HTML, mimetype="text/html")
+
+
+@app.route("/reports/view")
+def reports_view():
+    return Response(_report_to_html(_report_from_args()), mimetype="text/html")
+
+
+@app.route("/reports/pdf")
+def reports_pdf():
+    rep = _report_from_args()
+    try:
+        pdf = _report_to_pdf(rep)
+    except ImportError:
+        return jsonify({"status": "error",
+                        "message": "PDF generation needs the 'reportlab' package. Run: pip install reportlab"}), 500
+    fname = "report_%s_%s.pdf" % (rep["period_type"], rep["start"].strftime("%Y%m%d"))
+    return Response(pdf, mimetype="application/pdf",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+
+def _held_inventory_match(game, name, number):
+    """Count HELD (unsold, non-catalog, non-archived) inventory records matching an
+    identified card by name (and collector number when both have one). Read-only —
+    used purely for the 'already in inventory' indicator."""
+    from sqlalchemy import func as _f, and_
+    tn = _re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+    if not tn:
+        return 0
+    tnum_variants = _collector_number_variants(number) if number else set()
+    q = ScanRecord.query.filter(and_(
+        _f.coalesce(ScanRecord.is_catalog, False) == False,   # noqa: E712
+        _f.coalesce(ScanRecord.is_archived, False) == False,  # noqa: E712
+    ))
+    gk = (game or "").strip().lower()
+    if gk:
+        q = q.filter(ScanRecord.game_key == gk)
+    count = 0
+    for r in q.all():
+        data = r.extracted_data or {}
+        if not _held_from(data):
+            continue
+        rn = _re.sub(r"[^a-z0-9]+", "", (_get_name(data) or "").lower())
+        if not rn or not (tn == rn or tn in rn or rn in tn):
+            continue
+        if tnum_variants:
+            rnum = (_get_serial(data) or "").strip()
+            rvar = _collector_number_variants(rnum) if rnum else set()
+            if rvar and not (tnum_variants & rvar):
+                continue   # both have numbers but they disagree
+        count += 1
+    return count
+
+
+_QUICK_SCAN_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width, initial-scale=1"><title>Quick Scan</title>
+<style>
+ body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#1f2937;background:#f5f7fb;margin:0;padding:18px;}
+ .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px;}
+ .bar h1{font-size:20px;margin:0;margin-right:auto;}
+ select{border:1px solid #d1d5db;padding:9px 10px;border-radius:9px;font-size:14px;}
+ button{background:#4f46e5;color:#fff;border:0;padding:9px 15px;cursor:pointer;border-radius:9px;font-size:14px;font-weight:700;}
+ button.sec{background:#eef2ff;color:#4338ca;}
+ label.file{background:#eef2ff;color:#4338ca;padding:9px 15px;cursor:pointer;border-radius:9px;font-size:14px;font-weight:700;}
+ .note{color:#6b7280;font-size:13px;margin:6px 0 12px;line-height:1.5;}
+ .stage{display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start;}
+ .camwrap{position:relative;width:360px;max-width:100%;background:#000;border-radius:12px;overflow:hidden;}
+ video{width:100%;display:block;} .frame{position:absolute;inset:8% 14%;border:3px dashed rgba(255,255,255,.7);border-radius:10px;pointer-events:none;}
+ .side{flex:1;min-width:300px;}
+ #status{min-height:22px;font-size:14px;margin:8px 0;font-weight:600;}
+ table{width:100%;border-collapse:collapse;font-size:13px;} th,td{padding:6px 8px;border-bottom:1px solid #eef0f4;text-align:left;}
+ th{color:#6b7280;} .miss{color:#b91c1c;} .ok{color:#047857;}
+ .x{color:#9ca3af;cursor:pointer;} .links{margin-top:14px;font-size:14px;color:#6b7280;} .links a{margin-right:14px;}
+ .overlay{position:fixed;left:50%;top:34%;transform:translate(-50%,-50%);z-index:99999;padding:18px 34px;border-radius:16px;font-size:22px;font-weight:800;color:#fff;box-shadow:0 12px 40px rgba(0,0,0,.35);opacity:0;transition:opacity .25s ease;pointer-events:none;text-align:center;}
+ .overlay.show{opacity:1;} .overlay.have{background:#059669;} .overlay.new{background:#2563eb;}
+</style></head><body>
+ <div id=ovl class=overlay></div>
+ <div class=bar>
+   <h1>Quick Scan</h1>
+   <select id=game></select>
+   <button id=startBtn class=sec>Start camera</button>
+   <button id=scanBtn>Scan card</button>
+   <label class=file>Photo<input type=file id=file accept="image/*" capture="environment" style="display:none"></label>
+   <label style="font-weight:500;font-size:13px;"><input type=checkbox id=auto> Auto every 3s</label>
+   <button id=csv class=sec>Export CSV</button>
+ </div>
+ <p class=note>Point the camera at a card and press Scan. Each read is matched against the selected game's catalog and listed below &mdash; <b>nothing is saved to inventory</b>. Export the CSV when done.</p>
+ <div class=stage>
+   <div class=camwrap><video id=video autoplay playsinline muted></video><div class=frame></div></div>
+   <div class=side>
+     <div id=status></div>
+     <table id=tbl><thead><tr><th>OCR name</th><th>OCR #</th><th>Matched</th><th>#</th><th>Set</th><th>Rarity</th><th>Price</th><th>Score</th><th></th></tr></thead><tbody></tbody></table>
+   </div>
+ </div>
+ <div class=links><a href="/">Home</a><a href="/settings/reference">Reference Data</a></div>
+<script>
+ var NL=String.fromCharCode(10);
+ var gameSel=document.getElementById('game'),video=document.getElementById('video'),statusEl=document.getElementById('status');
+ var rows=[], stream=null, autoTimer=null;
+ function setStatus(t,cls){statusEl.textContent=t;statusEl.className=cls||'';}
+ var ovl=document.getElementById('ovl'), ovlTimer=null;
+ function flashOverlay(inInv,count){
+   ovl.textContent = inInv ? ('\u2713 Already in held inventory'+(count>1?(' ('+count+')'):'')) : '\u2717 Not in held inventory';
+   ovl.className='overlay show '+(inInv?'have':'new');
+   if(ovlTimer)clearTimeout(ovlTimer);
+   ovlTimer=setTimeout(function(){ovl.className='overlay '+(inInv?'have':'new');},2000);
+ }
+ async function loadGames(){
+   try{
+     var d=await (await fetch('/reference/status',{headers:{'X-Requested-With':'XMLHttpRequest'}})).json();
+     var games=(d.games||[]);
+     if(!games.length){gameSel.innerHTML='<option value="">No catalogs — download one in Reference Data</option>';return;}
+     gameSel.innerHTML=''; games.forEach(function(g){var o=document.createElement('option');o.value=g.game;o.textContent=g.game;gameSel.appendChild(o);});
+   }catch(e){gameSel.innerHTML='<option value="">Could not load games</option>';}
+ }
+ async function startCamera(){
+   try{
+     stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}},audio:false});
+     video.srcObject=stream; setStatus('Camera on. Point at a card and press Scan.','ok');
+   }catch(e){ setStatus('Live camera unavailable (needs HTTPS or localhost). Use the Photo button instead.','miss'); }
+ }
+ function grabBlob(cb){
+   if(!video.videoWidth){setStatus('Camera not started. Use Start camera or the Photo button.','miss');return;}
+   var c=document.createElement('canvas');c.width=video.videoWidth;c.height=video.videoHeight;
+   c.getContext('2d').drawImage(video,0,0);c.toBlob(function(b){cb(b);},'image/jpeg',0.92);
+ }
+ async function scanBlob(blob){
+   var game=gameSel.value;
+   if(!game){setStatus('Choose a game first.','miss');return;}
+   setStatus('Scanning...','');
+   var fd=new FormData();fd.append('image',blob,'frame.jpg');fd.append('game',game);
+   try{
+     var d=await (await fetch('/quickscan/identify',{method:'POST',body:fd})).json();
+     if(d.status!=='ok'){setStatus(d.message||'Scan failed.','miss');return;}
+     if(!d.detected && !d.ocr_name && !d.ocr_number){setStatus('No card detected — reposition and try again.','miss');return;}
+     addRow(d);
+     flashOverlay(d.in_inventory, d.inventory_count||0);
+     setStatus(d.matched?('Matched: '+d.name+(d.number?(' #'+d.number):'')):'Read but no catalog match.', d.matched?'ok':'miss');
+   }catch(e){setStatus('Error: '+e.message,'miss');}
+ }
+ function addRow(d){
+   rows.push(d);
+   var tb=document.querySelector('#tbl tbody'),tr=document.createElement('tr');
+   function td(v,cls){var c=document.createElement('td');c.textContent=(v==null?'':v);if(cls)c.className=cls;return c;}
+   tr.appendChild(td(d.ocr_name));tr.appendChild(td(d.ocr_number));
+   tr.appendChild(td(d.matched?d.name:'no match',d.matched?'ok':'miss'));
+   tr.appendChild(td(d.number));tr.appendChild(td(d.set));tr.appendChild(td(d.rarity));
+   tr.appendChild(td(d.market_price==null?'':('$'+d.market_price)));tr.appendChild(td(d.score==null?'':(d.score+'%')));
+   var x=td('remove','x');x.onclick=function(){var i=rows.indexOf(d);if(i>=0)rows.splice(i,1);tr.remove();};tr.appendChild(x);
+   tb.appendChild(tr);
+ }
+ function exportCsv(){
+   if(!rows.length){setStatus('Nothing to export yet.','miss');return;}
+   var head=['OCR Name','OCR Number','Matched Name','Number','Set','Rarity','Market Price','Score','Game'];
+   var lines=[head];
+   rows.forEach(function(r){lines.push([r.ocr_name,r.ocr_number,(r.matched?r.name:''),r.number,r.set,r.rarity,r.market_price,r.score,r.game]);});
+   var csv=lines.map(function(row){return row.map(function(cell){var s=(cell==null?'':String(cell));return '"'+s.replace(/"/g,'""')+'"';}).join(',');}).join(NL);
+   var blob=new Blob([csv],{type:'text/csv'});var a=document.createElement('a');a.href=URL.createObjectURL(blob);
+   a.download='quick_scan_'+Date.now()+'.csv';a.click();URL.revokeObjectURL(a.href);
+ }
+ document.getElementById('startBtn').addEventListener('click',startCamera);
+ document.getElementById('scanBtn').addEventListener('click',function(){grabBlob(function(b){if(b)scanBlob(b);});});
+ document.getElementById('file').addEventListener('change',function(e){var f=e.target.files[0];if(f)scanBlob(f);e.target.value='';});
+ document.getElementById('csv').addEventListener('click',exportCsv);
+ document.getElementById('auto').addEventListener('change',function(){
+   if(this.checked){autoTimer=setInterval(function(){grabBlob(function(b){if(b)scanBlob(b);});},3000);}
+   else if(autoTimer){clearInterval(autoTimer);autoTimer=null;}
+ });
+ loadGames();
+</script></body></html>"""
+
+
+@app.route("/quickscan")
+def quick_scan_page():
+    return Response(_QUICK_SCAN_HTML, mimetype="text/html")
+
+
+@app.route("/quickscan/identify", methods=["POST"])
+def quick_scan_identify():
+    """Detect + OCR + catalog-match one camera frame and return the matched data.
+    Does NOT create any inventory record — purely a lookup for CSV export."""
+    if card_ocr is None:
+        return jsonify({"status": "error",
+                        "message": "OCR isn't installed. Add it with: pip install pytesseract "
+                                   "(plus the tesseract-ocr binary)."}), 503
+    file = request.files.get("image")
+    if not file or not file.filename:
+        return jsonify({"status": "error", "message": "No image provided."}), 400
+    bad = _reject_if_bomb(file)
+    if bad:
+        return bad
+    game = (request.form.get("game") or "").strip()
+    if not game:
+        return jsonify({"status": "error", "message": "Choose a game first."}), 400
+
+    ensure_dirs()
+    tmp = os.path.join(app.config["TEMP_CARD_FOLDER"],
+                       "quickscan_" + datetime.utcnow().strftime("%Y%m%d%H%M%S%f") + ".png")
+    try:
+        file.save(tmp)
+        bgr = cv2.imread(tmp)
+        if bgr is None:
+            return jsonify({"status": "error", "message": "Could not read the image."}), 400
+        cropped, ok = detect_and_crop_card(bgr, CARD_EDGE_DEFAULT)
+        if ok:
+            cv2.imwrite(tmp, cropped)
+        try:
+            ocr = card_ocr.ocr_card_front(tmp, game=game, type_refs=_load_prepared_type_refs(game))
+        except Exception:
+            ocr = {"ocr_available": False}
+        if not ocr.get("ocr_available"):
+            return jsonify({"status": "error", "message": "OCR is unavailable on the server."}), 503
+
+        name_guess = (ocr.get("name_guess") or "").strip()
+        number_guess = (ocr.get("number_guess") or "").strip()
+        category_id, _ = _resolve_category_for_game(game)
+        cands = _reference_candidates_for_ocr(category_id, ocr) if category_id else []
+        top = cands[0] if cands else None
+
+        # Non-destructive "do I already own this?" check against HELD inventory.
+        match_name = (top.get("name") if top else "") or name_guess
+        match_number = (top.get("serial") if top else "") or number_guess
+        held_count = _held_inventory_match(game, match_name, match_number)
+
+        return jsonify({
+            "status": "ok",
+            "detected": bool(ok),
+            "ocr_name": name_guess,
+            "ocr_number": number_guess,
+            "matched": bool(top),
+            "score": (round(float(top.get("score")), 1) if top and top.get("score") is not None else None),
+            "name": (top.get("name") if top else ""),
+            "number": (top.get("serial") if top else ""),
+            "set": (top.get("set") if top else ""),
+            "rarity": (top.get("rarity") if top else ""),
+            "market_price": (top.get("market_price") if top else None),
+            "thumbnail": (top.get("thumbnail") if top else ""),
+            "url": (top.get("url") if top else ""),
+            "game": game,
+            "in_inventory": held_count > 0,
+            "inventory_count": held_count,
+        })
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 @app.route("/collections/prices")
@@ -9626,6 +10431,12 @@ def _set_held(ids, value):
         if bool(_held_from(data)) == bool(value):
             continue
         data["held"] = bool(value)
+        if not value:
+            # Marking sold — stamp a sale date (unless an integration sale already
+            # recorded one) so the sale lands in the right reporting period.
+            data.setdefault("sold_at", datetime.utcnow().isoformat())
+        else:
+            data.pop("sold_at", None)   # back to held: drop the stale sale date
         r.extracted_data = data   # reassign -> row dirty -> before_update resyncs column
         changed += 1
     if changed:
@@ -11469,6 +12280,117 @@ def _condition_to_ebay(record):
     return m.get(str(label).lower(), "USED_VERY_GOOD")
 
 
+EBAY_TEMPLATE_KEY = "EBAY_DESCRIPTION_TEMPLATE"
+
+# Default eBay listing description. Uses {{token}} placeholders filled per item.
+# Any entry field works as a token (e.g. {{name}}, {{set}}, {{number}}, {{rarity}},
+# {{game}}, {{edition}}, {{holographic}}, {{language}}); plus computed tokens
+# {{title}}, {{condition}}, {{price}}, {{image}}, {{images}}, {{image_url}}.
+_DEFAULT_EBAY_TEMPLATE = """<div style="font-family:Arial,Helvetica,sans-serif;max-width:820px;margin:auto;color:#222;">
+  <h1 style="font-size:22px;margin:0 0 10px;">{{title}}</h1>
+  <div style="text-align:center;margin:12px 0;">{{image}}</div>
+  <table style="border-collapse:collapse;width:100%;margin:14px 0;font-size:14px;">
+    <tr><td style="padding:7px 10px;border:1px solid #ddd;background:#f7f7f7;font-weight:bold;width:180px;">Game</td><td style="padding:7px 10px;border:1px solid #ddd;">{{game}}</td></tr>
+    <tr><td style="padding:7px 10px;border:1px solid #ddd;background:#f7f7f7;font-weight:bold;">Set</td><td style="padding:7px 10px;border:1px solid #ddd;">{{set}}</td></tr>
+    <tr><td style="padding:7px 10px;border:1px solid #ddd;background:#f7f7f7;font-weight:bold;">Card Number</td><td style="padding:7px 10px;border:1px solid #ddd;">{{number}}</td></tr>
+    <tr><td style="padding:7px 10px;border:1px solid #ddd;background:#f7f7f7;font-weight:bold;">Rarity</td><td style="padding:7px 10px;border:1px solid #ddd;">{{rarity}}</td></tr>
+    <tr><td style="padding:7px 10px;border:1px solid #ddd;background:#f7f7f7;font-weight:bold;">Condition</td><td style="padding:7px 10px;border:1px solid #ddd;">{{condition}}</td></tr>
+  </table>
+  <p style="line-height:1.5;">{{name}} &mdash; a great addition to any collection. Ships securely in a protective sleeve and top-loader with tracking.</p>
+  <p style="color:#888;font-size:12px;border-top:1px solid #eee;padding-top:8px;">Listed with Card Collector Inventory Manager.</p>
+</div>"""
+
+
+def _ebay_template():
+    return get_setting(EBAY_TEMPLATE_KEY, "") or _DEFAULT_EBAY_TEMPLATE
+
+
+def _ebay_context(record):
+    """Build the {{token}} -> value map for one record. Text values are stored raw
+    and HTML-escaped at substitution time; image tokens are pre-built safe HTML."""
+    from markupsafe import escape as _esc
+    data = record.extracted_data or {}
+    ctx = {}
+    for k, v in data.items():
+        if str(k).startswith("__"):
+            continue
+        if isinstance(v, (str, int, float)):
+            ctx[str(k)] = v
+
+    name = _record_display_name(record)
+    game = data.get("game", "")
+    serial = _get_serial(data)
+    title = name
+    if game:
+        title = f"{name} - {game}"
+    if serial:
+        title = f"{title} #{serial}"
+    grade = ((data.get("grading") or {}).get("front") or {}).get("label") or ""
+    price = _record_market_price(record)
+
+    try:
+        urls, _b64 = _record_image_sources(record)
+    except Exception:
+        urls = []
+
+    ctx.update({
+        "name": name,
+        "title": title,
+        "condition": grade or ctx.get("condition", ""),
+        "grade": grade,
+        "price": (format(price, ",.2f") if isinstance(price, (int, float)) and price else (price or "")),
+        "image_url": urls[0] if urls else "",
+    })
+    img_style = 'max-width:100%;height:auto;border-radius:6px;margin:4px;'
+    ctx["image"] = (f'<img src="{_esc(urls[0])}" alt="{_esc(name)}" style="{img_style}">' if urls else "")
+    ctx["images"] = "".join(f'<img src="{_esc(u)}" alt="{_esc(name)}" style="{img_style}">' for u in urls)
+    return ctx
+
+
+_TOKEN_RE = _re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}")
+_EBAY_HTML_TOKENS = {"image", "images"}
+
+
+def _render_tokens(template, ctx):
+    """Replace {{token}} with ctx values. Non-HTML tokens are HTML-escaped so a
+    value can never break the markup; {{image}}/{{images}} are inserted as-is."""
+    from markupsafe import escape as _esc
+
+    def repl(m):
+        key = m.group(1)
+        if key not in ctx:
+            return ""
+        if key in _EBAY_HTML_TOKENS:
+            return str(ctx[key])
+        return str(_esc(str(ctx[key])))
+
+    return _TOKEN_RE.sub(repl, template)
+
+
+def _render_ebay_description(record):
+    """Rendered HTML description for a record, or None to fall back to the default."""
+    try:
+        return _render_tokens(_ebay_template(), _ebay_context(record))
+    except Exception:
+        return None
+
+
+def _ebay_template_tokens(sample_record=None):
+    """List of available tokens for the editor UI: computed ones + fields present
+    on a sample record."""
+    base = ["title", "name", "condition", "grade", "price", "image", "images", "image_url",
+            "game", "set", "number", "rarity", "edition", "holographic", "language"]
+    seen = set(base)
+    extra = []
+    if sample_record is not None:
+        for k in (sample_record.extracted_data or {}).keys():
+            k = str(k)
+            if not k.startswith("__") and k not in seen:
+                extra.append(k)
+                seen.add(k)
+    return base + sorted(extra)
+
+
 def _build_payload(record, marketplace, price=None, quantity=None):
     data = record.extracted_data or {}
     name = _record_display_name(record)
@@ -11491,6 +12413,12 @@ def _build_payload(record, marketplace, price=None, quantity=None):
     if grade:
         desc_bits.append(f"Condition (AI): {grade}")
     description = "<br>".join(desc_bits) or name
+    # eBay supports a full HTML description — render the (customizable) listing
+    # template filled with this item's details. Falls back to the plain text above.
+    if marketplace == "ebay":
+        rendered = _render_ebay_description(record)
+        if rendered:
+            description = rendered
 
     # Map the AI condition label into each marketplace's condition vocabulary.
     grade_label = str(grade or "").lower()
@@ -11534,6 +12462,236 @@ def _build_payload(record, marketplace, price=None, quantity=None):
                                     or (data.get("cardtrader") or {}).get("blueprint_id")),
         "cardtrader_condition": shop_providers.CardTraderProvider.CONDITION_MAP.get(grade_label, "Near Mint"),
     }
+
+
+def _ebay_sample_record():
+    from sqlalchemy import func as _f, and_
+    return (ScanRecord.query.filter(and_(
+        _f.coalesce(ScanRecord.is_catalog, False) == False,   # noqa: E712
+        _f.coalesce(ScanRecord.is_archived, False) == False,  # noqa: E712
+    )).order_by(ScanRecord.scan_date.desc()).first())
+
+
+_EBAY_TEMPLATE_PAGE_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width, initial-scale=1"><title>eBay listing template</title>
+<link href="https://cdn.jsdelivr.net/npm/grapesjs/dist/css/grapes.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/grapesjs-preset-webpage/dist/grapesjs-preset-webpage.min.css" rel="stylesheet">
+<style>
+ body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#1f2937;background:#f5f7fb;margin:0;padding:16px;}
+ .bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px;}
+ .bar h1{font-size:19px;margin:0;margin-right:auto;}
+ button{background:#4f46e5;color:#fff;border:0;border-radius:9px;padding:9px 15px;font-weight:700;cursor:pointer;font-size:14px;}
+ button.sec{background:#eef2ff;color:#4338ca;} button.warn{background:#fef3c7;color:#92400e;}
+ #gjs{border:1px solid #d1d5db;border-radius:10px;overflow:hidden;}
+ .msg{margin:10px 0;padding:9px 12px;border-radius:9px;display:none;font-size:14px;}
+ .msg.show{display:block;} .msg.ok{background:#ecfdf5;color:#065f46;border:1px solid #a7f3d0;} .msg.err{background:#fef2f2;color:#991b1b;border:1px solid #fecaca;}
+ .hint{color:#6b7280;font-size:13px;margin:8px 0;line-height:1.5;}
+ .links{margin-top:14px;font-size:14px;color:#6b7280;} .links a{margin-right:14px;}
+ #rawWrap{display:none;} #raw{width:100%;height:520px;box-sizing:border-box;border:1px solid #d1d5db;border-radius:10px;padding:12px;font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;}
+ .modal{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;align-items:center;justify-content:center;z-index:9999;}
+ .modal.show{display:flex;} .modal .box{background:#fff;border-radius:12px;width:min(720px,92vw);max-height:88vh;overflow:hidden;display:flex;flex-direction:column;}
+ .modal .box header{padding:12px 16px;font-weight:700;border-bottom:1px solid #eee;display:flex;justify-content:space-between;align-items:center;}
+ .modal iframe{border:0;width:100%;height:70vh;}
+</style></head><body>
+ <div class=bar>
+   <h1>eBay listing template</h1>
+   <button id=save>Save</button>
+   <button id=previewBtn class=sec>Preview with data</button>
+   <button id=htmlBtn class=sec>Edit HTML</button>
+   <button id=reset class=warn>Reset to default</button>
+ </div>
+ <p class=hint>Drag <b>Blocks</b> (right panel) onto the canvas: text, images, columns, and the <b>Item tokens</b> that fill from each entry (photo, name, set, price...). Move blocks by dragging; edit text by double-clicking. Drop an image block and upload or drag your own logo or banner. Everything is saved as the HTML description used for eBay listings.</p>
+ <div id=msg class=msg></div>
+ <div id=gjs></div>
+ <div id=rawWrap>
+   <p class=hint>Raw HTML (advanced). Edits here apply back to the visual editor when you switch back.</p>
+   <textarea id=raw spellcheck=false></textarea>
+ </div>
+ <div class=links><a href="/settings">All settings</a><a href="/inventory/builder">Builder</a></div>
+
+ <div class=modal id=pvModal><div class=box>
+   <header><span>Preview (filled with a sample item)</span><button class=sec id=pvClose>Close</button></header>
+   <iframe id=pvFrame></iframe>
+ </div></div>
+
+<script src="https://cdn.jsdelivr.net/npm/grapesjs"></script>
+<script src="https://cdn.jsdelivr.net/npm/grapesjs-preset-webpage"></script>
+<script>
+ var msg=document.getElementById('msg');
+ function show(t,ok){msg.textContent=t;msg.className='msg show '+(ok?'ok':'err');setTimeout(function(){msg.className='msg';},4000);}
+ var DETAILS_TABLE='<table style="border-collapse:collapse;width:100%;margin:14px 0;font-size:14px;">'
+   +'<tr><td style="padding:7px 10px;border:1px solid #ddd;background:#f7f7f7;font-weight:bold;width:170px;">Game</td><td style="padding:7px 10px;border:1px solid #ddd;">{{game}}</td></tr>'
+   +'<tr><td style="padding:7px 10px;border:1px solid #ddd;background:#f7f7f7;font-weight:bold;">Set</td><td style="padding:7px 10px;border:1px solid #ddd;">{{set}}</td></tr>'
+   +'<tr><td style="padding:7px 10px;border:1px solid #ddd;background:#f7f7f7;font-weight:bold;">Card Number</td><td style="padding:7px 10px;border:1px solid #ddd;">{{number}}</td></tr>'
+   +'<tr><td style="padding:7px 10px;border:1px solid #ddd;background:#f7f7f7;font-weight:bold;">Rarity</td><td style="padding:7px 10px;border:1px solid #ddd;">{{rarity}}</td></tr>'
+   +'<tr><td style="padding:7px 10px;border:1px solid #ddd;background:#f7f7f7;font-weight:bold;">Condition</td><td style="padding:7px 10px;border:1px solid #ddd;">{{condition}}</td></tr></table>';
+ var editor=null, rawMode=false;
+
+ function buildTemplate(){
+   if(rawMode) return document.getElementById('raw').value;
+   var css=(editor.getCss()||'').trim();
+   var html=editor.getHtml();
+   return css ? ('<style>'+css+'</style>'+html) : html;
+ }
+ function loadIntoEditor(t){
+   t=(t||'').trim(); var css='';
+   if(t.toLowerCase().indexOf('<style>')===0){var end=t.toLowerCase().indexOf('</style>'); if(end>0){css=t.slice(7,end); t=t.slice(end+8);}}
+   editor.setComponents(t);
+   if(css){try{editor.setStyle(css);}catch(e){}}
+ }
+ async function api(url,payload){var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload||{})});return r.json();}
+
+ function startEditor(tokens, template){
+   editor=grapesjs.init({container:'#gjs',height:'620px',fromElement:false,storageManager:false,
+     assetManager:{upload:'/shops/ebay/template/asset',uploadName:'files',autoAdd:true,credentials:'same-origin'},
+     plugins:['grapesjs-preset-webpage'],pluginsOpts:{'grapesjs-preset-webpage':{}}});
+   var bm=editor.BlockManager;
+   bm.add('tok-item-photo',{label:'Item Photo',category:'Item tokens',content:'<div style="text-align:center;margin:8px 0;">{{image}}</div>'});
+   bm.add('tok-all-photos',{label:'All Photos',category:'Item tokens',content:'<div>{{images}}</div>'});
+   bm.add('tok-details',{label:'Details Table',category:'Item tokens',content:DETAILS_TABLE});
+   bm.add('tok-title',{label:'Title',category:'Item tokens',content:'<h1 style="font-size:22px;">{{title}}</h1>'});
+   bm.add('tok-price',{label:'Price',category:'Item tokens',content:'<div style="font-size:18px;font-weight:bold;">${{price}}</div>'});
+   (tokens||[]).forEach(function(t){ if(['image','images','image_url','title','price'].indexOf(t)>=0)return;
+     bm.add('tok-'+t,{label:'{{'+t+'}}',category:'Item tokens',content:'<span>{{'+t+'}}</span>'}); });
+   loadIntoEditor(template);
+ }
+
+ (async function(){
+   var d=await (await fetch('/shops/ebay/template/data',{headers:{'X-Requested-With':'XMLHttpRequest'}})).json();
+   var template=d.template||'';
+   if(typeof grapesjs==='undefined'){
+     document.getElementById('gjs').style.display='none';
+     document.getElementById('htmlBtn').style.display='none';
+     document.getElementById('previewBtn').style.display='none';
+     rawMode=true; document.getElementById('rawWrap').style.display='block';
+     document.getElementById('raw').value=template;
+     show('Visual editor could not load (offline?). Editing raw HTML instead.',false);
+   } else { startEditor(d.tokens||[], template); }
+ })();
+
+ document.getElementById('save').addEventListener('click',async function(){var d=await api('/shops/ebay/template/save',{template:buildTemplate()});show(d.status==='success'?'Saved.':(d.message||'Save failed.'),d.status==='success');});
+ document.getElementById('reset').addEventListener('click',async function(){if(!confirm('Reset to the default template? Your custom design will be replaced.'))return;var d=await api('/shops/ebay/template/reset',{});if(d.status==='success'){if(rawMode){document.getElementById('raw').value=d.template;}else{loadIntoEditor(d.template);}show('Reset to default.',true);}});
+ document.getElementById('htmlBtn').addEventListener('click',function(){var raw=document.getElementById('raw'),wrap=document.getElementById('rawWrap'),gjs=document.getElementById('gjs');if(!rawMode){raw.value=buildTemplate();wrap.style.display='block';gjs.style.display='none';rawMode=true;this.textContent='Visual editor';}else{loadIntoEditor(raw.value);wrap.style.display='none';gjs.style.display='';rawMode=false;this.textContent='Edit HTML';}});
+ document.getElementById('previewBtn').addEventListener('click',async function(){var d=await api('/shops/ebay/template/preview',{template:buildTemplate()});document.getElementById('pvFrame').srcdoc=d.html||'';document.getElementById('pvModal').classList.add('show');});
+ document.getElementById('pvClose').addEventListener('click',function(){document.getElementById('pvModal').classList.remove('show');});
+</script></body></html>"""
+
+
+@app.route("/shops/ebay/template")
+def ebay_template_page():
+    return Response(_EBAY_TEMPLATE_PAGE_HTML, mimetype="text/html")
+
+
+@app.route("/shops/ebay/template/data")
+def ebay_template_data():
+    sample = _ebay_sample_record()
+    return jsonify({"status": "ok", "template": _ebay_template(),
+                    "is_default": not bool(get_setting(EBAY_TEMPLATE_KEY, "")),
+                    "tokens": _ebay_template_tokens(sample),
+                    "has_sample": sample is not None})
+
+
+@app.route("/shops/ebay/template/save", methods=["POST"])
+def ebay_template_save():
+    body = request.get_json(silent=True) or request.form
+    tpl = str(body.get("template", ""))
+    if len(tpl) > 200_000:
+        return jsonify({"status": "error", "message": "Template too large (200 KB max)."}), 400
+    set_setting(EBAY_TEMPLATE_KEY, tpl)
+    return jsonify({"status": "success"})
+
+
+@app.route("/shops/ebay/template/reset", methods=["POST"])
+def ebay_template_reset():
+    set_setting(EBAY_TEMPLATE_KEY, "")   # empty -> the built-in default is used
+    return jsonify({"status": "success", "template": _DEFAULT_EBAY_TEMPLATE})
+
+
+@app.route("/shops/ebay/template/preview", methods=["POST"])
+def ebay_template_preview():
+    body = request.get_json(silent=True) or {}
+    tpl = str(body.get("template", "")) or _ebay_template()
+    sample = _ebay_sample_record()
+    if sample is not None:
+        ctx = _ebay_context(sample)
+    else:
+        ctx = {"title": "Charizard - Pokemon #4", "name": "Charizard", "game": "Pokemon",
+               "set": "Base Set", "number": "4", "rarity": "Holo Rare", "condition": "Near Mint",
+               "price": "350.00", "image": "", "images": "", "image_url": ""}
+    try:
+        html = _render_tokens(tpl, ctx)
+    except Exception as exc:
+        return jsonify({"status": "error", "message": f"Template error: {exc}"}), 400
+    return jsonify({"status": "ok", "html": html})
+
+
+@app.route("/shops/ebay/template/asset", methods=["POST"])
+def ebay_template_asset():
+    """Store images dragged/uploaded in the visual editor; return GrapesJS-shaped
+    JSON ({data:[{src}]}) so they appear in the asset manager with a real URL."""
+    ensure_dirs()
+    files = request.files.getlist("files")
+    if not files:
+        one = request.files.get("file") or request.files.get("files[]")
+        files = [one] if one else []
+    sub = os.path.join(app.config["UPLOAD_FOLDER"], "ebay_assets")
+    os.makedirs(sub, exist_ok=True)
+    saved = []
+    for f in files:
+        if not f or not f.filename:
+            continue
+        bad = _reject_if_bomb(f)
+        if bad:
+            return bad
+        ext = os.path.splitext(secure_filename(f.filename))[1].lower() or ".png"
+        name = datetime.utcnow().strftime("%Y%m%d%H%M%S%f") + ext
+        f.save(os.path.join(sub, name))
+        saved.append({"src": url_for("uploaded_file", filename=f"ebay_assets/{name}")})
+    return jsonify({"data": saved})
+
+
+@app.route("/shops/ebay/listing_csv", methods=["POST"])
+def ebay_listing_csv():
+    """eBay bulk-listing CSV (File Exchange style). Description is the rendered
+    template per item. Accepts {record_ids:[...]} or Builder {groups:[...]}.
+    Category / ConditionID are left for you to set for your account/category."""
+    import csv as _csv
+    import io as _io
+    body = request.get_json(silent=True) or {}
+    ids = list(body.get("record_ids") or [])
+    if not ids and body.get("groups"):
+        ids = [i for _l, i in _builder_flatten(body["groups"])]
+    ids = [int(i) for i in ids if str(i).strip().lstrip("-").isdigit()]
+    if not ids:
+        return jsonify({"status": "error", "message": "No records specified."}), 400
+
+    recs = {r.id: r for r in ScanRecord.query.filter(ScanRecord.id.in_(ids)).all()}
+    buf = _io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow(["Action(SiteID=US|Country=US|Currency=USD|Version=1193)", "CustomLabel",
+                "Category", "Title", "Description", "ConditionID", "PicURL",
+                "Quantity", "Format", "StartPrice", "Duration"])
+    for i in ids:
+        r = recs.get(i)
+        if not r:
+            continue
+        p = _build_payload(r, "ebay")
+        w.writerow([
+            "Add",
+            p.get("sku", ""),
+            "",                                   # Category — set for your account
+            (p.get("title") or "")[:80],
+            p.get("description", ""),             # rendered HTML template
+            "",                                   # ConditionID — set per category
+            ";".join(p.get("image_urls") or []),
+            p.get("quantity", 1),
+            "FixedPrice",
+            p.get("price") if p.get("price") is not None else "",
+            "GTC",
+        ])
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    return Response(buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="ebay_listings_{stamp}.csv"'})
 
 
 def _listing_for(record_id, marketplace):

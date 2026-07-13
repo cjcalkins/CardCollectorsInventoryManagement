@@ -111,6 +111,39 @@
                 </div>
 
                 <div class="row g-4">
+                    {% if can_view('quick_scan') %}
+                    <div class="col-12 col-md-6 col-xl-4">
+                        <a href="/quickscan" class="setting-card">
+                            <div class="sc-icon"><i class="fas fa-camera-retro"></i></div>
+                            <div>
+                                <h5>Quick Scan</h5>
+                                <p>Identify cards live from the camera to a CSV without saving them to inventory.</p>
+                            </div>
+                        </a>
+                    </div>
+                    {% endif %}
+                    {% if can_view('shops') %}
+                    <div class="col-12 col-md-6 col-xl-4">
+                        <a href="/shops/ebay/template" class="setting-card">
+                            <div class="sc-icon"><i class="fab fa-ebay"></i></div>
+                            <div>
+                                <h5>eBay Listing Template</h5>
+                                <p>Design the HTML description used for eBay listings, filled from each item's details.</p>
+                            </div>
+                        </a>
+                    </div>
+                    {% endif %}
+                    {% if can_view('reports') %}
+                    <div class="col-12 col-md-6 col-xl-4">
+                        <a href="/reports" class="setting-card">
+                            <div class="sc-icon"><i class="fas fa-file-invoice-dollar"></i></div>
+                            <div>
+                                <h5>Financial Reports</h5>
+                                <p>Weekly, monthly, quarterly, and annual PDF reports of acquisitions, sales by shop, and outcome.</p>
+                            </div>
+                        </a>
+                    </div>
+                    {% endif %}
                     {% if auth_is_admin %}
                     <div class="col-12 col-md-6 col-xl-4">
                         <a href="/settings/users" class="setting-card">
