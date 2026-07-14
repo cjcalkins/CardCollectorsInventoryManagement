@@ -100,12 +100,18 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 @app.after_request
 def _security_headers(resp):
-    """Conservative, app-safe response headers. (No strict CSP — the UI relies on
-    inline scripts/styles — but these block MIME sniffing, clickjacking, and
-    referrer leakage.)"""
+    """Conservative, app-safe response headers. (No strict CSP on app pages — the UI
+    relies on inline scripts/styles — but these block MIME sniffing, clickjacking,
+    and referrer leakage.) User-uploaded files are additionally served sandboxed so
+    a booby-trapped SVG/HTML upload can't execute script in the app's origin."""
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
     resp.headers.setdefault("Referrer-Policy", "same-origin")
+    p = request.path or ""
+    if p.startswith(("/uploads/", "/temp_cards/", "/temp_split/", "/temp_pdf/")):
+        # Treat served user content as inert: no scripts, sandboxed, own origin.
+        resp.headers["Content-Security-Policy"] = (
+            "sandbox; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'")
     return resp
 
 
@@ -217,6 +223,18 @@ def _reject_if_bomb(*file_storages):
         return None
     except ImageRejected as exc:
         return jsonify({"status": "error", "message": str(exc)}), 413
+
+
+def _csv_safe(v):
+    """Neutralize spreadsheet formula injection: a cell that begins with = + - @ or
+    a control char is prefixed with an apostrophe so Excel/Sheets/Numbers treat it
+    as text rather than executing it. Use on every user-influenced CSV cell."""
+    if v is None:
+        return ""
+    s = str(v)
+    if s[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + s
+    return s
 
 
 
@@ -2825,14 +2843,53 @@ def auth_login_page():
     return Response(_AUTH_LOGIN_HTML, mimetype="text/html")
 
 
+_LOGIN_FAILS = {}
+_LOGIN_FAILS_LOCK = _threading.Lock()
+_LOGIN_MAX_FAILS = 10          # failures per (IP + username) before a cooldown
+_LOGIN_WINDOW = 600            # rolling window / cooldown, seconds
+
+
+def _login_throttle_key(username):
+    # Keyed by IP + username so an attacker hammering one account is throttled
+    # without locking that user out from a different machine.
+    return (request.remote_addr or "?") + "|" + (username or "").strip().lower()
+
+
+def _login_is_locked(key):
+    now = time.time()
+    with _LOGIN_FAILS_LOCK:
+        fails = [t for t in _LOGIN_FAILS.get(key, []) if now - t < _LOGIN_WINDOW]
+        _LOGIN_FAILS[key] = fails
+        return len(fails) >= _LOGIN_MAX_FAILS
+
+
+def _login_record_fail(key):
+    now = time.time()
+    with _LOGIN_FAILS_LOCK:
+        fails = [t for t in _LOGIN_FAILS.get(key, []) if now - t < _LOGIN_WINDOW]
+        fails.append(now)
+        _LOGIN_FAILS[key] = fails
+
+
+def _login_clear(key):
+    with _LOGIN_FAILS_LOCK:
+        _LOGIN_FAILS.pop(key, None)
+
+
 @app.route("/auth/login", methods=["POST"])
 def auth_login_submit():
     body = request.get_json(silent=True) or request.form
     username = str(body.get("username", "")).strip()
     password = str(body.get("password", ""))
+    key = _login_throttle_key(username)
+    if _login_is_locked(key):
+        return jsonify({"status": "error",
+                        "message": "Too many failed attempts. Wait a few minutes and try again."}), 429
     u = User.query.filter(db.func.lower(User.username) == username.lower()).first()
     if u is None or not u.active or not u.check_password(password):
+        _login_record_fail(key)
         return jsonify({"status": "error", "message": "Invalid username or password."}), 401
+    _login_clear(key)
     session["uid"] = u.id
     nxt = str(body.get("next", "") or url_for("index"))
     if not nxt.startswith("/") or nxt.startswith("//"):   # open-redirect guard
@@ -3911,7 +3968,7 @@ def _builder_csv(groups):
     for label, i in flat:
         r = recs.get(i)
         if not r:
-            w.writerow([label, i] + [""] * (len(header) - 2))
+            w.writerow([_csv_safe(label), i] + [""] * (len(header) - 2))
             continue
         data = r.extracted_data or {}
         mp = r.matched_product
@@ -3922,7 +3979,7 @@ def _builder_csv(groups):
             (mp.sku if mp else ""),
             r.image_path or "",
         ]
-        w.writerow(row)
+        w.writerow([_csv_safe(c) for c in row])
     return buf.getvalue(), ids
 
 
@@ -4241,7 +4298,7 @@ def analytics_export():
                         if d["key"] == p["group_by"]), p["group_by"] or "All")
     w.writerow([group_label] + [m["label"] for m in result["metrics"]])
     for row in result["rows"]:
-        w.writerow([row["group"]] + [row["values"][m["key"]] for m in result["metrics"]])
+        w.writerow([_csv_safe(row["group"])] + [_csv_safe(row["values"][m["key"]]) for m in result["metrics"]])
     w.writerow([])
     w.writerow(["TOTAL"] + [result["totals"][m["key"]] for m in result["metrics"]])
 
@@ -5066,7 +5123,7 @@ _QUICK_SCAN_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
    var head=['OCR Name','OCR Number','Matched Name','Number','Set','Rarity','Market Price','Score','Game'];
    var lines=[head];
    rows.forEach(function(r){lines.push([r.ocr_name,r.ocr_number,(r.matched?r.name:''),r.number,r.set,r.rarity,r.market_price,r.score,r.game]);});
-   var csv=lines.map(function(row){return row.map(function(cell){var s=(cell==null?'':String(cell));return '"'+s.replace(/"/g,'""')+'"';}).join(',');}).join(NL);
+   var csv=lines.map(function(row){return row.map(function(cell){var s=(cell==null?'':String(cell));if(s&&'=+-@'.indexOf(s.charAt(0))>=0)s="'"+s;return '"'+s.replace(/"/g,'""')+'"';}).join(',');}).join(NL);
    var blob=new Blob([csv],{type:'text/csv'});var a=document.createElement('a');a.href=URL.createObjectURL(blob);
    a.download='quick_scan_'+Date.now()+'.csv';a.click();URL.revokeObjectURL(a.href);
  }
@@ -5488,7 +5545,7 @@ def inventory_export_csv():
 
     # Data rows
     for record in records:
-        writer.writerow([extractor(record) for _, extractor in columns])
+        writer.writerow([_csv_safe(extractor(record)) for _, extractor in columns])
 
     csv_bytes = output.getvalue().encode("utf-8-sig")  # utf-8-sig adds BOM for Excel
 
@@ -10143,7 +10200,7 @@ _NETWORK_SETTINGS_HTML = """<!doctype html>
       <input id="nm" type="text" value="__NAME__" autocomplete="off" spellcheck="false" placeholder="cardcollector">
       <span class="suffix">.local__PORTSUFFIX__</span>
     </div>
-    <div class="preview">Address: <code id="prev">http://__NAME__.local__PORTSUFFIX__</code></div>
+    <div class="preview">Address: <code id="prev">__SCHEME__://__NAME__.local__PORTSUFFIX__</code></div>
 
     <div class="warn">The <code>zeroconf</code> package isn't installed, so nothing is being advertised yet.
        Your name is saved and takes effect once you run <code>pip install zeroconf</code> and restart.</div>
@@ -10164,11 +10221,11 @@ _NETWORK_SETTINGS_HTML = """<!doctype html>
     </div>
   </div>
 <script>
-  var PORTSUFFIX = "__PORTSUFFIX__";
+  var PORTSUFFIX = "__PORTSUFFIX__"; var SCHEME = "__SCHEME__";
   var nm = document.getElementById('nm');
   var prev = document.getElementById('prev');
   function slug(v){ return (v||'').toLowerCase().replace(/[^a-z0-9-]+/g,'-').replace(/-{2,}/g,'-').replace(/^-+|-+$/g,'').slice(0,63); }
-  function updatePrev(){ prev.textContent = 'http://' + (slug(nm.value) || 'cardcollector') + '.local' + PORTSUFFIX; }
+  function updatePrev(){ prev.textContent = SCHEME + '://' + (slug(nm.value) || 'cardcollector') + '.local' + PORTSUFFIX; }
   nm.addEventListener('input', updatePrev); updatePrev();
 
   var msg = document.getElementById('msg');
@@ -10195,11 +10252,14 @@ _NETWORK_SETTINGS_HTML = """<!doctype html>
 def network_settings_page():
     """Standalone page to set the advertised .local name (self-contained)."""
     name = get_mdns_name()
+    scheme = _MDNS.get("scheme", "http")
     port = _MDNS.get("port") or int(os.environ.get("PORT", "80"))
-    suffix = "" if port == 80 else f":{port}"
+    default_port = 443 if scheme == "https" else 80
+    suffix = "" if port == default_port else f":{port}"
     zc_active = _MDNS.get("zc") is not None
     html = (_NETWORK_SETTINGS_HTML
             .replace("__NAME__", name)
+            .replace("__SCHEME__", scheme)
             .replace("__PORTSUFFIX__", suffix)
             .replace("__ZC_WARN__", "none" if zc_active else "block"))
     return Response(html, mimetype="text/html")
@@ -10214,8 +10274,10 @@ def network_set_name():
         restart_mdns(name)
     except Exception:
         pass
+    scheme = _MDNS.get("scheme", "http")
     port = _MDNS.get("port") or int(os.environ.get("PORT", "80"))
-    url = f"http://{name}.local" + ("" if port == 80 else f":{port}")
+    default_port = 443 if scheme == "https" else 80
+    url = f"{scheme}://{name}.local" + ("" if port == default_port else f":{port}")
     active = _MDNS.get("zc") is not None
     msg = (f"Saved — now advertising at {url}" if active
            else f"Saved as \u201c{name}\u201d. Install 'zeroconf' and restart to advertise it.")
@@ -12511,7 +12573,7 @@ _EBAY_TEMPLATE_PAGE_HTML = """<!doctype html><html lang=en><head><meta charset=u
 
  <div class=modal id=pvModal><div class=box>
    <header><span>Preview (filled with a sample item)</span><button class=sec id=pvClose>Close</button></header>
-   <iframe id=pvFrame></iframe>
+   <iframe id=pvFrame sandbox="allow-same-origin"></iframe>
  </div></div>
 
 <script src="https://cdn.jsdelivr.net/npm/grapesjs"></script>
@@ -12643,7 +12705,22 @@ def ebay_template_asset():
         bad = _reject_if_bomb(f)
         if bad:
             return bad
-        ext = os.path.splitext(secure_filename(f.filename))[1].lower() or ".png"
+        ext = os.path.splitext(secure_filename(f.filename))[1].lower()
+        if ext not in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}:
+            return jsonify({"status": "error",
+                            "message": "Only image files (PNG, JPG, GIF, WebP, BMP) are allowed."}), 415
+        try:
+            f.stream.seek(0)
+            real = _peek_image_size(f.stream)
+        except Exception:
+            real = None
+        finally:
+            try:
+                f.stream.seek(0)
+            except Exception:
+                pass
+        if real is None:
+            return jsonify({"status": "error", "message": "That file isn't a readable image."}), 415
         name = datetime.utcnow().strftime("%Y%m%d%H%M%S%f") + ext
         f.save(os.path.join(sub, name))
         saved.append({"src": url_for("uploaded_file", filename=f"ebay_assets/{name}")})
@@ -12676,19 +12753,19 @@ def ebay_listing_csv():
         if not r:
             continue
         p = _build_payload(r, "ebay")
-        w.writerow([
+        w.writerow([_csv_safe(c) for c in [
             "Add",
             p.get("sku", ""),
             "",                                   # Category — set for your account
             (p.get("title") or "")[:80],
-            p.get("description", ""),             # rendered HTML template
+            p.get("description", ""),             # rendered HTML template (kept as-is)
             "",                                   # ConditionID — set per category
             ";".join(p.get("image_urls") or []),
             p.get("quantity", 1),
             "FixedPrice",
             p.get("price") if p.get("price") is not None else "",
             "GTC",
-        ])
+        ]])
     stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     return Response(buf.getvalue(), mimetype="text/csv",
                     headers={"Content-Disposition": f'attachment; filename="ebay_listings_{stamp}.csv"'})
@@ -14026,7 +14103,7 @@ def _lan_ip():
 
 
 MDNS_NAME_KEY = "MDNS_HOSTNAME"        # app_settings key
-_MDNS = {"zc": None, "port": None}     # live advertisement state (serving process)
+_MDNS = {"zc": None, "port": None, "scheme": "http"}   # live advertisement state (serving process)
 
 
 def _slug_hostname(raw, default="cardcollector"):
@@ -14050,7 +14127,7 @@ def set_mdns_name(raw):
     return name
 
 
-def start_mdns(host_label=None, port=5005):
+def start_mdns(host_label=None, port=5005, scheme="http"):
     """Advertise this server on the local network as <host_label>.local via mDNS,
     so it's reachable at a stable name on whatever LAN it's started on — no router
     setup or per-device hosts edits. Records the live handle so the name can be
@@ -14061,18 +14138,21 @@ def start_mdns(host_label=None, port=5005):
     different networks or over the internet (use a tunnel/VPN for that)."""
     host_label = _slug_hostname(host_label) if host_label else get_mdns_name()
     _MDNS["port"] = port
+    _MDNS["scheme"] = scheme
     try:
         from zeroconf import Zeroconf, ServiceInfo
     except Exception:
         print("[mDNS] Optional 'zeroconf' package not installed — skipping the .local name.")
-        print("[mDNS] Enable a stable http://%s.local address with:  pip install zeroconf" % host_label)
+        print("[mDNS] Enable a stable %s://%s.local address with:  pip install zeroconf" % (scheme, host_label))
         return None
     import socket
     ip = _lan_ip()
+    svc = "_https._tcp.local." if scheme == "https" else "_http._tcp.local."
+    default = 443 if scheme == "https" else 80
     try:
         info = ServiceInfo(
-            "_http._tcp.local.",
-            f"{host_label}._http._tcp.local.",
+            svc,
+            f"{host_label}.{svc}",
             addresses=[socket.inet_aton(ip)],
             port=port,
             properties={"path": "/"},
@@ -14081,7 +14161,7 @@ def start_mdns(host_label=None, port=5005):
         zc = Zeroconf()
         zc.register_service(info)
         _MDNS["zc"] = zc
-        shown = f"http://{host_label}.local" + ("" if port == 80 else f":{port}")
+        shown = f"{scheme}://{host_label}.local" + ("" if port == default else f":{port}")
         print(f"[mDNS] Also reachable on this network at:  {shown}   (IP {ip})")
         return zc
     except Exception as exc:
@@ -14101,7 +14181,7 @@ def restart_mdns(new_name):
             pass
         _MDNS["zc"] = None
     port = _MDNS.get("port") or int(os.environ.get("PORT", "80"))
-    start_mdns(name, port)
+    start_mdns(name, port, scheme=_MDNS.get("scheme", "http"))
     return name
 
 
@@ -14117,6 +14197,61 @@ def _port_bindable(port):
         return False
     finally:
         s.close()
+
+
+def _ensure_self_signed_cert(cert_dir, hostnames, ips):
+    """Generate (once) and reuse a persistent self-signed certificate covering the
+    given hostnames + IPs, so the app can be served over HTTPS on the LAN — which
+    browsers require before they'll allow camera (getUserMedia) access from any
+    machine other than the server itself. Returns (cert_path, key_path)."""
+    import datetime as _dt
+    import ipaddress
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    os.makedirs(cert_dir, exist_ok=True)
+    cert_path = os.path.join(cert_dir, "cardcollector.crt")
+    key_path = os.path.join(cert_dir, "cardcollector.key")
+    if os.path.exists(cert_path) and os.path.exists(key_path):
+        return cert_path, key_path
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    cn = hostnames[0] if hostnames else "cardcollector.local"
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+    san = []
+    for h in dict.fromkeys(hostnames):
+        try:
+            san.append(x509.DNSName(h))
+        except Exception:
+            pass
+    for ip in dict.fromkeys(ips):
+        try:
+            san.append(x509.IPAddress(ipaddress.ip_address(ip)))
+        except ValueError:
+            pass
+    now = _dt.datetime.utcnow()
+    cert = (x509.CertificateBuilder()
+            .subject_name(name).issuer_name(name)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - _dt.timedelta(days=1))
+            .not_valid_after(now + _dt.timedelta(days=3650))
+            .add_extension(x509.SubjectAlternativeName(san), critical=False)
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .sign(key, hashes.SHA256()))
+    with open(key_path, "wb") as f:
+        f.write(key.private_bytes(serialization.Encoding.PEM,
+                                  serialization.PrivateFormat.TraditionalOpenSSL,
+                                  serialization.NoEncryption()))
+    try:
+        os.chmod(key_path, 0o600)   # private key must not be world-readable
+    except OSError:
+        pass
+    with open(cert_path, "wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+    return cert_path, key_path
 
 
 if __name__ == "__main__":
@@ -14194,9 +14329,17 @@ if __name__ == "__main__":
     # admin/root (ports below 1024 are privileged); if that's not available or 80
     # is already in use, fall back so the app still starts. Override with the PORT
     # env var (e.g. PORT=5005) to pin a specific port.
-    PORT = int(os.environ.get("PORT", "80"))
+    # HTTPS is required for the live camera (getUserMedia) to work on machines other
+    # than the server, so it's ON by default; a self-signed certificate is generated
+    # automatically. Disable with USE_HTTPS=0 to serve plain HTTP. Default port is
+    # 443 for HTTPS, 80 for HTTP.
+    USE_HTTPS = os.environ.get("USE_HTTPS", "1").strip().lower() in ("1", "true", "yes", "on")
+    scheme = "https" if USE_HTTPS else "http"
+    default_port = 443 if USE_HTTPS else 80
+
+    PORT = int(os.environ.get("PORT", str(default_port)))
     if not _port_bindable(PORT):
-        fallback = int(os.environ.get("PORT_FALLBACK", "5005"))
+        fallback = int(os.environ.get("PORT_FALLBACK", "8443" if USE_HTTPS else "5005"))
         if PORT != fallback:
             print(f"[port] Couldn't bind port {PORT} — it needs admin/root privileges, "
                   f"or it's already in use.")
@@ -14206,8 +14349,31 @@ if __name__ == "__main__":
 
     with app.app_context():
         _mdns_name = get_mdns_name()
-    _url = f"http://{_mdns_name}.local" + ("" if PORT == 80 else f":{PORT}")
-    print(f" • Visit: http://127.0.0.1{'' if PORT == 80 else ':' + str(PORT)}  (or  {_url}  on this LAN)")
+
+    # Set up HTTPS (self-signed) if requested; fall back to HTTP on any failure.
+    ssl_context = None
+    if USE_HTTPS:
+        try:
+            cert_dir = os.path.join(app.root_path, "certs")
+            hostnames = [f"{_mdns_name}.local", _mdns_name, "localhost"]
+            ips = [_lan_ip(), "127.0.0.1"]
+            ssl_context = _ensure_self_signed_cert(cert_dir, hostnames, ips)
+            print(f"[https] Serving over HTTPS with a self-signed certificate ({cert_dir}).")
+            print("[https] Browsers show a one-time 'not secure' warning for self-signed "
+                  "certs — accept it once per device to enable the camera.")
+        except Exception as exc:
+            print(f"[https] Could not set up HTTPS ({exc}); serving over HTTP instead.")
+            USE_HTTPS = False
+            scheme = "http"
+            default_port = 80
+
+    def _visit_url(host):
+        return f"{scheme}://{host}" + ("" if PORT == default_port else f":{PORT}")
+
+    print(f" • Visit: {_visit_url('127.0.0.1')}  (or  {_visit_url(_mdns_name + '.local')}  on this LAN)")
+    if not USE_HTTPS:
+        print(" • Running over HTTP — the live camera won't work on other devices. "
+              "HTTPS is the default; unset USE_HTTPS=0 to restore it.")
 
     # The Werkzeug debug reloader is OFF by default: its interactive debugger allows
     # remote code execution, which is dangerous on a LAN-exposed server. Turn it on
@@ -14218,10 +14384,10 @@ if __name__ == "__main__":
     # child when debug is on (WERKZEUG_RUN_MAIN==true), or the sole process when off.
     _mdns = None
     if (os.environ.get("WERKZEUG_RUN_MAIN") == "true") or not DEBUG:
-        _mdns = start_mdns(_mdns_name, PORT)
+        _mdns = start_mdns(_mdns_name, PORT, scheme=scheme)
 
     try:
-        app.run(host="0.0.0.0", port=PORT, debug=DEBUG, threaded=True)
+        app.run(host="0.0.0.0", port=PORT, debug=DEBUG, threaded=True, ssl_context=ssl_context)
     finally:
         if _mdns is not None:
             try:
