@@ -1,17 +1,24 @@
-# Python 3.10.9
-# Third-party dependencies for app_33.py (Flask OCR Inventory Scanner)
-# Install with: pip install -r requirements.txt
-#
-# NOTE: pytesseract wraps the system Tesseract OCR binary, which must be
-# installed separately (e.g. `sudo apt install tesseract-ocr` on Debian/Ubuntu
-# or `brew install tesseract` on macOS). It is NOT a pip package.
+# Card Collector Inventory Manager — Python dependencies
+# Install with:  pip install -r requirements.txt
 
-Flask>=2.3,<3.1
-Flask-SQLAlchemy>=3.0,<3.2
-Werkzeug>=2.3,<3.1
-SQLAlchemy>=2.0,<2.1
-opencv-python>=4.8,<4.11
-pytesseract>=0.3.10,<0.4
-numpy>=1.24,<2.1
-Pillow>=9.5,<11.0
-dotenv
+# ── Core web app ──
+Flask>=3.0
+Flask-SQLAlchemy>=3.1
+SQLAlchemy>=2.0
+Werkzeug>=3.0
+python-dotenv>=1.0
+
+# ── Imaging ──
+opencv-python-headless>=4.8      # use opencv-python instead if you need GUI/debug windows
+Pillow>=10.0
+numpy>=1.26
+
+# ── Reports & security/networking ──
+reportlab>=4.0                   # PDF financial reports
+cryptography>=42.0               # self-signed HTTPS certificate generation
+requests>=2.31                   # provider / marketplace API calls
+
+# ── Optional (features degrade gracefully if missing) ──
+PyMuPDF>=1.24                    # optional: PDF import/rasterization  (import "fitz")
+pytesseract>=0.3.10             # optional: card OCR — also needs the Tesseract binary
+zeroconf>=0.130                 # optional: advertises the stable <name>.local address
