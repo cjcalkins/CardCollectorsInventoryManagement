@@ -5042,7 +5042,7 @@ _QUICK_SCAN_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
  th{color:#6b7280;} .miss{color:#b91c1c;} .ok{color:#047857;}
  .x{color:#9ca3af;cursor:pointer;} .links{margin-top:14px;font-size:14px;color:#6b7280;} .links a{margin-right:14px;}
  .overlay{position:fixed;left:50%;top:34%;transform:translate(-50%,-50%);z-index:99999;padding:18px 34px;border-radius:16px;font-size:22px;font-weight:800;color:#fff;box-shadow:0 12px 40px rgba(0,0,0,.35);opacity:0;transition:opacity .25s ease;pointer-events:none;text-align:center;}
- .overlay.show{opacity:1;} .overlay.have{background:#059669;} .overlay.new{background:#2563eb;}
+ .overlay.show{opacity:1;} .overlay.have{background:#059669;} .overlay.new{background:#2563eb;} .overlay.proc{background:#4f46e5;}
 </style></head><body>
  <div id=ovl class=overlay></div>
  <div class=bar>
@@ -5059,7 +5059,7 @@ _QUICK_SCAN_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
    <div class=camwrap><video id=video autoplay playsinline muted></video><div class=frame></div></div>
    <div class=side>
      <div id=status></div>
-     <table id=tbl><thead><tr><th>OCR name</th><th>OCR #</th><th>Matched</th><th>#</th><th>Set</th><th>Rarity</th><th>Price</th><th>Score</th><th></th></tr></thead><tbody></tbody></table>
+     <table id=tbl><thead><tr><th>Held</th><th>OCR name</th><th>OCR #</th><th>Matched</th><th>#</th><th>Set</th><th>Rarity</th><th>Price</th><th>Score</th><th></th></tr></thead><tbody></tbody></table>
    </div>
  </div>
  <div class=links><a href="/">Home</a><a href="/settings/reference">Reference Data</a></div>
@@ -5075,6 +5075,9 @@ _QUICK_SCAN_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
    if(ovlTimer)clearTimeout(ovlTimer);
    ovlTimer=setTimeout(function(){ovl.className='overlay '+(inInv?'have':'new');},2000);
  }
+ function showProcessing(){ if(ovlTimer){clearTimeout(ovlTimer);ovlTimer=null;} ovl.textContent='\u23f3 Identifying\u2026 finding a match'; ovl.className='overlay show proc'; }
+ function hideOverlay(){ if(ovlTimer){clearTimeout(ovlTimer);ovlTimer=null;} ovl.className='overlay'; }
+ function overlayNoCard(){ if(ovlTimer)clearTimeout(ovlTimer); ovl.textContent='No card detected'; ovl.className='overlay show proc'; ovlTimer=setTimeout(function(){ovl.className='overlay';},1500); }
  async function loadGames(){
    try{
      var d=await (await fetch('/reference/status',{headers:{'X-Requested-With':'XMLHttpRequest'}})).json();
@@ -5098,20 +5101,26 @@ _QUICK_SCAN_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
    var game=gameSel.value;
    if(!game){setStatus('Choose a game first.','miss');return;}
    setStatus('Scanning...','');
+   showProcessing();
    var fd=new FormData();fd.append('image',blob,'frame.jpg');fd.append('game',game);
    try{
      var d=await (await fetch('/quickscan/identify',{method:'POST',body:fd})).json();
-     if(d.status!=='ok'){setStatus(d.message||'Scan failed.','miss');return;}
-     if(!d.detected && !d.ocr_name && !d.ocr_number){setStatus('No card detected — reposition and try again.','miss');return;}
+     if(d.status!=='ok'){hideOverlay();setStatus(d.message||'Scan failed.','miss');return;}
+     if(!d.detected && !d.ocr_name && !d.ocr_number){overlayNoCard();setStatus('No card detected — reposition and try again.','miss');return;}
      addRow(d);
      flashOverlay(d.in_inventory, d.inventory_count||0);
      setStatus(d.matched?('Matched: '+d.name+(d.number?(' #'+d.number):'')):'Read but no catalog match.', d.matched?'ok':'miss');
-   }catch(e){setStatus('Error: '+e.message,'miss');}
+   }catch(e){hideOverlay();setStatus('Error: '+e.message,'miss');}
  }
  function addRow(d){
    rows.push(d);
    var tb=document.querySelector('#tbl tbody'),tr=document.createElement('tr');
    function td(v,cls){var c=document.createElement('td');c.textContent=(v==null?'':v);if(cls)c.className=cls;return c;}
+   var ind=document.createElement('td');var mark=document.createElement('span');
+   mark.style.fontWeight='800';mark.style.fontSize='16px';
+   if(d.in_inventory){mark.textContent='\u2713';mark.style.color='#059669';mark.title='In held inventory'+(d.inventory_count>1?(' ('+d.inventory_count+')'):'');}
+   else{mark.textContent='\u2717';mark.style.color='#2563eb';mark.title='Not in held inventory';}
+   ind.appendChild(mark);tr.appendChild(ind);
    tr.appendChild(td(d.ocr_name));tr.appendChild(td(d.ocr_number));
    tr.appendChild(td(d.matched?d.name:'no match',d.matched?'ok':'miss'));
    tr.appendChild(td(d.number));tr.appendChild(td(d.set));tr.appendChild(td(d.rarity));
@@ -5121,11 +5130,11 @@ _QUICK_SCAN_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
  }
  function exportCsv(){
    if(!rows.length){setStatus('Nothing to export yet.','miss');return;}
-   var head=['OCR Name','OCR Number','Matched Name','Number','Set','Rarity','Market Price','Score','Game'];
+   var head=['In Held Inventory','OCR Name','OCR Number','Matched Name','Number','Set','Rarity','Market Price','Score','Game'];
    var lines=[head];
-   rows.forEach(function(r){lines.push([r.ocr_name,r.ocr_number,(r.matched?r.name:''),r.number,r.set,r.rarity,r.market_price,r.score,r.game]);});
+   rows.forEach(function(r){lines.push([(r.in_inventory?'\u2713 Yes':'\u2717 No'),r.ocr_name,r.ocr_number,(r.matched?r.name:''),r.number,r.set,r.rarity,r.market_price,r.score,r.game]);});
    var csv=lines.map(function(row){return row.map(function(cell){var s=(cell==null?'':String(cell));if(s&&'=+-@'.indexOf(s.charAt(0))>=0)s="'"+s;return '"'+s.replace(/"/g,'""')+'"';}).join(',');}).join(NL);
-   var blob=new Blob([csv],{type:'text/csv'});var a=document.createElement('a');a.href=URL.createObjectURL(blob);
+   var blob=new Blob([String.fromCharCode(0xFEFF)+csv],{type:'text/csv;charset=utf-8'});var a=document.createElement('a');a.href=URL.createObjectURL(blob);
    a.download='quick_scan_'+Date.now()+'.csv';a.click();URL.revokeObjectURL(a.href);
  }
  document.getElementById('startBtn').addEventListener('click',startCamera);
@@ -14363,7 +14372,11 @@ if __name__ == "__main__":
             print("[https] Browsers show a one-time 'not secure' warning for self-signed "
                   "certs — accept it once per device to enable the camera.")
         except Exception as exc:
+            if isinstance(exc, ImportError):
+                print("[https] HTTPS needs the 'cryptography' package. Install it with:")
+                print("[https]     pip install cryptography      (or: pip install -r requirements.txt)")
             print(f"[https] Could not set up HTTPS ({exc}); serving over HTTP instead.")
+            print("[https] Note: the live camera won't work on other devices over HTTP.")
             USE_HTTPS = False
             scheme = "http"
             default_port = 80
