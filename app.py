@@ -18,6 +18,7 @@ import cv2
 import json
 import shutil
 import tempfile
+import threading as _threading
 import numpy as np
 from datetime import datetime, timedelta
 from PIL import Image
