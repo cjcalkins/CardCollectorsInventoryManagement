@@ -226,8 +226,86 @@ def _parse_message(raw):
     return {
         "subject": subject, "from": sender, "date": date,
         "order_id": sale["order_id"], "items": sale["items"],
+        # {} when the email carries no recognisable address block. The shipping
+        # layer treats that as "needs address" rather than guessing one.
+        "address": parse_shipping_address(body),
         "needs_review": sale["needs_review"], "excerpt": body[:600],
     }
+
+
+def parse_shipping_address(text):
+    """
+    Best-effort extraction of a US/CA shipping address from a sale email.
+
+    Returns {} rather than guessing. The shipping layer treats a missing address
+    as "needs address" and asks the user, which is a far better failure than
+    buying postage to a hallucinated street.
+
+    Recognises the common layout:
+
+        Shipping Address:
+        John Smith
+        123 Main St
+        Apt 4
+        New York, NY 10001
+
+    The "City, ST ZIP" line is the anchor — it's the only line with a reliable
+    shape — so we find that first and read the name/street lines above it.
+    """
+    if not text:
+        return {}
+
+    lines = [ln.strip() for ln in text.splitlines()]
+
+    # Find where the address block starts.
+    start = None
+    for i, ln in enumerate(lines):
+        if re.search(r"\b(shipping|ship\s*to|delivery|recipient)\s*(address)?\s*:?\s*$", ln, re.I):
+            start = i + 1
+            break
+    if start is None:
+        return {}
+
+    # Take a short window; an address never runs long, and reading further
+    # risks swallowing the next section of the email.
+    window = [ln for ln in lines[start:start + 8]]
+
+    csz_re = re.compile(
+        r"^(?P<city>[A-Za-z .'\-]{2,40}),?\s+"
+        r"(?P<state>[A-Za-z]{2})\.?\s+"
+        r"(?P<zip>\d{5}(?:-\d{4})?|[A-Za-z]\d[A-Za-z]\s*\d[A-Za-z]\d)$"
+    )
+
+    anchor, m = None, None
+    for i, ln in enumerate(window):
+        if not ln:
+            continue
+        m = csz_re.match(ln)
+        if m:
+            anchor = i
+            break
+    if anchor is None or not m:
+        return {}
+
+    # Everything above the anchor, ignoring blanks, is name + street lines.
+    above = [ln for ln in window[:anchor] if ln]
+    if len(above) < 2:
+        return {}   # need at least a name and a street
+
+    out = {
+        "name": above[0][:200],
+        "address1": above[1][:200],
+        "city": m.group("city").strip()[:120],
+        "state": m.group("state").upper(),
+        "zip": m.group("zip").replace(" ", "")[:12],
+        "country": "US",
+    }
+    if len(above) >= 3:
+        out["address2"] = above[2][:200]
+    # A Canadian postal code means it isn't a US ZIP.
+    if not re.match(r"^\d{5}", out["zip"]):
+        out["country"] = "CA"
+    return out
 
 
 def parse_tcgplayer_sale(subject, text):

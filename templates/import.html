@@ -66,7 +66,7 @@
     .nav a {
       padding: 10px 14px;
       border-radius: 10px;
-      background: #eef2f7;
+      background: var(--surface-2);
       font-weight: 600;
     }
 
@@ -83,7 +83,7 @@
         font-weight: 600; transition: 0.2s ease;
     }
     .nav-tab:hover { background: rgba(255,255,255,0.18); color: #fff; }
-    .nav-tab.active { background: #fff; color: #212529; }
+    .nav-tab.active { background: var(--surface); color: var(--text); }
 
     .page {
       padding: 24px;
@@ -139,7 +139,7 @@
       padding: 12px 12px;
       border-radius: 10px;
       border: 1px solid var(--border);
-      background: white;
+      background: var(--surface);
       color: var(--text);
       font-size: 14px;
     }
@@ -169,13 +169,13 @@
       font-size: 14px;
       font-weight: 700;
       cursor: pointer;
-      background: white;
+      background: var(--surface);
     }
     .mode-toggle input { margin: 0; }
     .mode-toggle label.active {
-      background: #111827;
+      background: var(--ink);
       color: #fff;
-      border-color: #111827;
+      border-color: var(--ink);
     }
 
     .new-field-row {
@@ -221,12 +221,12 @@
       padding: 10px 12px;
       border: 1px solid var(--border);
       border-radius: 8px;
-      background: #f8fafc;
+      background: var(--surface-2);
       cursor: pointer;
       user-select: none;
     }
     .auto-import-toggle input { margin: 2px 0 0; cursor: pointer; }
-    .auto-import-toggle .auto-import-text { font-size: 12.5px; line-height: 1.45; color: #334155; }
+    .auto-import-toggle .auto-import-text { font-size: 12.5px; line-height: 1.45; color: var(--text-soft); }
     .auto-import-toggle .auto-import-text strong { color: var(--primary); }
     .auto-import-toggle.on { border-color: var(--primary); background: #f0fdfa; }
 
@@ -321,7 +321,7 @@
     }
 
     .btn-secondary {
-      background: #e8eef7;
+      background: var(--surface-2);
       color: var(--text);
     }
 
@@ -458,7 +458,7 @@
     }
 
     .canvas-shell {
-      background: #eef3f8;
+      background: var(--surface-2);
       border: 1px solid var(--border);
       border-radius: 14px;
       min-height: 500px;
@@ -472,7 +472,7 @@
     canvas {
       max-width: 100%;
       display: block;
-      background: #fafafa;
+      background: var(--surface);
       border-radius: 10px;
     }
 
@@ -496,13 +496,13 @@
       border: 1px solid var(--border);
       border-radius: 12px;
       overflow: hidden;
-      background: white;
+      background: var(--surface);
     }
 
     .card-tile img {
       width: 100%;
       display: block;
-      background: #f8fafc;
+      background: var(--surface-2);
     }
 
     .clickable-fallback {
@@ -527,8 +527,8 @@
       border-radius: 999px;
       font-size: 12px;
       font-weight: 700;
-      background: #e2e8f0;
-      color: #334155;
+      background: var(--surface-2);
+      color: var(--text-soft);
     }
 
     .badge.ok {
@@ -555,7 +555,7 @@
       border: 1px solid var(--border);
       border-radius: 12px;
       padding: 12px;
-      background: #fff;
+      background: var(--surface);
     }
 
     .ocr-item strong {
@@ -573,7 +573,7 @@
     }
 
     .manual-dialog {
-      background: white;
+      background: var(--surface);
       max-width: 1150px;
       height: 90vh;
       margin: 0 auto;
@@ -604,7 +604,7 @@
       overflow: auto;
       border: 1px solid var(--border);
       border-radius: 14px;
-      background: #eef3f8;
+      background: var(--surface-2);
       padding: 14px;
     }
 
@@ -687,7 +687,7 @@
     }
 
     .ocr-progress-dialog {
-      background: white;
+      background: var(--surface);
       border-radius: 20px;
       padding: 36px 40px;
       width: min(480px, 90vw);
@@ -725,7 +725,7 @@
     .ocr-progress-track {
       width: 100%;
       height: 12px;
-      background: #e2e8f0;
+      background: var(--surface-2);
       border-radius: 999px;
       overflow: hidden;
     }
@@ -757,7 +757,7 @@
         font-weight: 600; transition: 0.2s ease;
     }
     .nav-tab:hover { background: rgba(255,255,255,0.18); color: #fff; }
-    .nav-tab.active { background: #fff; color: #212529; }
+    .nav-tab.active { background: var(--surface); color: var(--text); }
 
     .page {
         padding: 16px;
@@ -800,7 +800,7 @@
       box-shadow: var(--shadow);
       transition: 0.18s ease;
     }
-    .import-mode-btn:hover { color: var(--text); border-color: #b9c6d6; }
+    .import-mode-btn:hover { color: var(--text); border-color: var(--border-strong); }
     .import-mode-btn.active {
       background: var(--primary);
       border-color: var(--primary);
@@ -848,7 +848,7 @@
       height: 88px;
       object-fit: cover;
       border-radius: 8px;
-      background: #fff;
+      background: var(--surface);
       border: 1px solid var(--border);
     }
     .single-result .single-result-body { flex: 1; }
@@ -868,11 +868,11 @@
       font-size: 14px;
       font-weight: 700;
       cursor: pointer;
-      background: white;
+      background: var(--surface);
       color: var(--text);
       transition: 0.15s ease;
     }
-    .edge-toggle label:hover { border-color: #b9c6d6; }
+    .edge-toggle label:hover { border-color: var(--border-strong); }
     .edge-toggle label i { font-size: 0.9rem; color: var(--muted); }
     .edge-toggle input { display: none; }
     .edge-toggle label.active {
@@ -1039,12 +1039,12 @@
               <button type="button" class="btn-pdf-exit" id="pdfExitBtn">Exit PDF Batch</button>
             </div>
 
-            <div id="pdfBgPanel" style="display:none; margin-top:14px; padding:14px 16px; border:1px solid var(--border); border-radius:12px; background:#f8fafc;">
+            <div id="pdfBgPanel" style="display:none; margin-top:14px; padding:14px 16px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2);">
               <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap;">
                 <strong id="pdfBgTitle">Background PDF import</strong>
                 <button type="button" id="pdfBgStopBtn" class="btn-pdf-exit">Stop</button>
               </div>
-              <div style="height:10px; background:#e2e8f0; border-radius:6px; overflow:hidden; margin:10px 0;">
+              <div style="height:10px; background:var(--surface-2); border-radius:6px; overflow:hidden; margin:10px 0;">
                 <div id="pdfBgBar" style="height:100%; width:0%; background:var(--primary); transition:width .3s;"></div>
               </div>
               <div id="pdfBgStats" class="hint" style="margin:0;"></div>

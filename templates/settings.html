@@ -8,7 +8,7 @@
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <style>
-        body { background-color: #f8f9fa; }
+        body { background-color: var(--bg); }
 
         .nav-tabs-minimal { display: flex; gap: 10px; margin-left: auto; }
         .nav-tab {
@@ -17,7 +17,7 @@
             font-weight: 600; transition: 0.2s ease;
         }
         .nav-tab:hover { background: rgba(255,255,255,0.18); color: #fff; }
-        .nav-tab.active { background: #fff; color: #212529; }
+        .nav-tab.active { background: var(--surface); color: var(--text); }
         @media (max-width: 768px) {
             .nav-tabs-minimal { margin-left: 0; margin-top: 12px; width: 100%; }
             .nav-tab { flex: 1; text-align: center; }
@@ -29,27 +29,27 @@
             flex: 0 0 240px; align-self: stretch;
             position: sticky; top: 0;
             min-height: calc(100vh - 56px);
-            background: #fff; border-right: 1px solid #dee2e6;
+            background: var(--surface); border-right: 1px solid var(--border);
             padding: 1rem .75rem; z-index: 1000;
         }
         .settings-sidebar .ss-title {
             font-size: .72rem; text-transform: uppercase; letter-spacing: .06em;
-            color: #6c757d; padding: .4rem .75rem .6rem; font-weight: 700;
+            color: var(--muted); padding: .4rem .75rem .6rem; font-weight: 700;
         }
         .settings-sidebar a.ss-link {
             display: flex; align-items: center; gap: .65rem;
             padding: .6rem .75rem; margin-bottom: 3px; border-radius: 8px;
-            color: #343a40; text-decoration: none; font-weight: 600; font-size: .92rem;
+            color: var(--text-soft); text-decoration: none; font-weight: 600; font-size: .92rem;
         }
-        .settings-sidebar a.ss-link:hover { background: #f1f3f5; color: #212529; }
-        .settings-sidebar a.ss-link.active { background: #212529; color: #fff; }
+        .settings-sidebar a.ss-link:hover { background: var(--surface-2); color: var(--text); }
+        .settings-sidebar a.ss-link.active { background: var(--ink); color: #fff; }
         .settings-sidebar a.ss-link i { width: 18px; text-align: center; font-size: .95rem; }
         .settings-content { flex: 1 1 auto; min-width: 0; }
         @media (max-width: 991px) {
             .settings-layout { flex-direction: column; }
             .settings-sidebar {
                 position: static; flex: none; width: 100%; min-height: 0;
-                border-right: none; border-bottom: 1px solid #dee2e6;
+                border-right: none; border-bottom: 1px solid var(--border);
                 display: flex; gap: 6px; overflow-x: auto; padding: .5rem;
             }
             .settings-sidebar .ss-title { display: none; }
@@ -59,7 +59,7 @@
         /* ── Overview cards ── */
         .setting-card {
             display: flex; align-items: flex-start; gap: 1rem;
-            background: #fff; border: 1px solid #e9ecef; border-radius: 14px;
+            background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
             padding: 1.25rem 1.35rem; height: 100%;
             text-decoration: none; color: inherit;
             box-shadow: 0 3px 14px rgba(0,0,0,0.05);
@@ -67,16 +67,16 @@
         }
         .setting-card:hover {
             transform: translateY(-3px); color: inherit;
-            box-shadow: 0 10px 26px rgba(0,0,0,0.10); border-color: #dee2e6;
+            box-shadow: 0 10px 26px rgba(0,0,0,0.10); border-color: var(--border);
         }
         .setting-card .sc-icon {
             flex-shrink: 0; width: 48px; height: 48px; border-radius: 12px;
             display: flex; align-items: center; justify-content: center;
-            background: linear-gradient(135deg, #343a40 0%, #495057 100%);
+            background: linear-gradient(135deg, var(--ink) 0%, var(--ink-2) 100%);
             color: #fff; font-size: 1.15rem;
         }
         .setting-card h5 { font-size: 1.05rem; font-weight: 700; margin-bottom: .2rem; }
-        .setting-card p { font-size: .85rem; color: #6c757d; margin-bottom: 0; }
+        .setting-card p { font-size: .85rem; color: var(--muted); margin-bottom: 0; }
     </style>
     <link rel="stylesheet" href="{{ url_for('static', filename='theme.css') }}">
 </head>
@@ -265,7 +265,7 @@
                     </div>
                     <div class="col-12 col-md-6 col-xl-4">
                         <a href="{{ url_for('reset_page') }}" class="setting-card">
-                            <div class="sc-icon" style="background:linear-gradient(135deg,#b02a37,#dc3545);"><i class="fas fa-triangle-exclamation"></i></div>
+                            <div class="sc-icon" style="background:linear-gradient(135deg,var(--danger-text),var(--danger));"><i class="fas fa-triangle-exclamation"></i></div>
                             <div>
                                 <h5>Reset System</h5>
                                 <p>Wipe the database and all storage, then return to first-run setup. Cannot be undone.</p>

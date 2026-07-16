@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <link rel="icon" type="image/jpeg" href="{{ url_for('static', filename='favicon.jpg') }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shipping - Card Collector Inventory Manager</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <style>
+        body { background-color: var(--bg); }
+
+        .nav-tabs-minimal { display: flex; gap: 10px; margin-left: auto; }
+        .nav-tab {
+            padding: 8px 14px; text-decoration: none; border-radius: 8px;
+            background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.85);
+            font-weight: 600; transition: 0.2s ease;
+        }
+        .nav-tab:hover { background: rgba(255,255,255,0.18); color: #fff; }
+        .nav-tab.active { background: var(--surface); color: var(--text); }
+        @media (max-width: 768px) {
+            .nav-tabs-minimal { margin-left: 0; margin-top: 12px; width: 100%; }
+            .nav-tab { flex: 1; text-align: center; }
+        }
+
+        .panel {
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: 14px; padding: 1.25rem 1.35rem;
+            box-shadow: 0 3px 14px rgba(0,0,0,0.05);
+        }
+
+        /* ── Provider cards ── */
+        .prov-card { height: 100%; display: flex; flex-direction: column; }
+        .prov-head { display: flex; align-items: center; gap: .85rem; }
+        .prov-icon {
+            flex-shrink: 0; width: 44px; height: 44px; border-radius: 11px;
+            display: flex; align-items: center; justify-content: center;
+            color: #fff; font-size: 1.1rem;
+        }
+        .prov-blurb { font-size: .85rem; color: var(--muted); margin: .75rem 0 0; }
+        .badge-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+        .st-connected { background: var(--success, #16a34a); }
+        .st-error { background: var(--danger, #dc2626); }
+        .st-disconnected { background: var(--muted, #9ca3af); }
+        .prov-note {
+            font-size: .78rem; border-left: 3px solid var(--border);
+            padding: .4rem .65rem; color: var(--muted); margin-top: .75rem;
+            background: var(--surface-2); border-radius: 0 6px 6px 0;
+        }
+
+        /* ── Orders table ── */
+        .orders-table { font-size: .9rem; }
+        .orders-table th {
+            font-size: .72rem; text-transform: uppercase; letter-spacing: .05em;
+            color: var(--muted); font-weight: 700; border-bottom: 1px solid var(--border);
+        }
+        .orders-table td { vertical-align: middle; }
+        .order-row { cursor: pointer; }
+        .order-row:hover { background: var(--surface-2); }
+
+        .pill {
+            display: inline-block; padding: .18rem .55rem; border-radius: 999px;
+            font-size: .72rem; font-weight: 700; letter-spacing: .02em;
+        }
+        .pill-needs_address { background: #fef3c7; color: #92400e; }
+        .pill-ready        { background: #dbeafe; color: #1e40af; }
+        .pill-labeled      { background: #e0e7ff; color: #3730a3; }
+        .pill-shipped      { background: #cffafe; color: #155e75; }
+        .pill-delivered    { background: #dcfce7; color: #166534; }
+        .pill-cancelled    { background: #f3f4f6; color: #4b5563; }
+
+        .track-bar { height: 5px; border-radius: 999px; background: var(--surface-2); overflow: hidden; }
+        .track-bar > div { height: 100%; background: var(--ink); transition: width .3s ease; }
+
+        /* ── Tracking timeline ── */
+        .timeline { list-style: none; padding: 0; margin: 0; }
+        .timeline li {
+            position: relative; padding: 0 0 1rem 1.4rem;
+            border-left: 2px solid var(--border);
+        }
+        .timeline li:last-child { border-left-color: transparent; padding-bottom: 0; }
+        .timeline li::before {
+            content: ''; position: absolute; left: -6px; top: 3px;
+            width: 10px; height: 10px; border-radius: 50%;
+            background: var(--border);
+        }
+        .timeline li:first-child::before { background: var(--ink); }
+        .tl-desc { font-weight: 600; font-size: .88rem; }
+        .tl-meta { font-size: .78rem; color: var(--muted); }
+
+        .label-frame {
+            width: 100%; height: 420px; border: 1px solid var(--border);
+            border-radius: 10px; background: var(--surface-2);
+        }
+        .empty-state { text-align: center; padding: 3rem 1rem; color: var(--muted); }
+        .empty-state i { font-size: 2rem; opacity: .35; margin-bottom: .75rem; display: block; }
+    </style>
+    <link rel="stylesheet" href="{{ url_for('static', filename='theme.css') }}">
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+        <div class="container d-flex flex-wrap align-items-center">
+            <a class="navbar-brand" href="{{ url_for('index') }}">
+                <img src="{{ url_for('static', filename='favicon.jpg') }}" alt="logo" width="24" height="24"
+                     style="object-fit:cover;border-radius:4px;margin-right:0.5rem;" class="me-2">Card Collector Inventory Manager
+            </a>
+            <div class="nav-tabs-minimal">
+                {% if can_view('import') %}<a href="{{ url_for('import_page') }}" class="nav-tab">Import</a>{% endif %}
+                {% if can_view('inventory') %}<a href="{{ url_for('inventory') }}" class="nav-tab">Inventory</a>{% endif %}
+                {% if can_view('storage') %}<a href="{{ url_for('storage_list') }}" class="nav-tab">Storage</a>{% endif %}
+                {% if can_view('analytics') %}<a href="{{ url_for('analytics_page') }}" class="nav-tab">Analytics</a>{% endif %}
+                {% if can_view('shops') %}<a href="{{ url_for('shipping.shipping_page') }}" class="nav-tab active">Shipping</a>{% endif %}
+                {% if can_view('settings') %}<a href="{{ url_for('settings_page') }}" class="nav-tab" title="Settings"><i class="fas fa-gear"></i></a>{% endif %}
+                {% if auth_user %}
+                <a href="{{ url_for('auth_logout') }}" class="nav-tab" title="Sign out ({{ auth_username }})"><i class="fas fa-right-from-bracket"></i></a>
+                {% endif %}
+            </div>
+        </div>
+    </nav>
+
+    <div class="container py-4">
+        <div class="d-flex flex-wrap align-items-start justify-content-between mb-4 gap-2">
+            <div>
+                <h2 class="mb-1"><i class="fas fa-box-open me-2"></i>Shipping</h2>
+                <div class="text-muted">Turn sales into labels, print them, and follow them to the mailbox.</div>
+            </div>
+            <div class="d-flex gap-2">
+                <button class="btn btn-outline-secondary" id="btnRefreshTracking">
+                    <i class="fas fa-satellite-dish me-1"></i> Refresh tracking
+                </button>
+                <button class="btn btn-outline-secondary" data-bs-toggle="modal" data-bs-target="#importModal">
+                    <i class="fas fa-file-csv me-1"></i> Import CSV
+                </button>
+                <button class="btn btn-dark" data-bs-toggle="modal" data-bs-target="#newOrderModal">
+                    <i class="fas fa-plus me-1"></i> New order
+                </button>
+            </div>
+        </div>
+
+        <!-- ── Connectors ─────────────────────────────────────────────── -->
+        <div class="row g-3 mb-4">
+            {% for key, meta in providers.items() %}
+            {% set conn = connections[key] %}
+            <div class="col-12 col-lg-6">
+                <div class="panel prov-card">
+                    <div class="prov-head">
+                        <div class="prov-icon" style="background: {{ meta.color }};">
+                            <i class="{{ meta.icon }}"></i>
+                        </div>
+                        <div class="flex-grow-1">
+                            <h5 class="mb-0">{{ meta.label }}</h5>
+                            <div class="small text-muted d-flex align-items-center gap-2">
+                                <span class="badge-dot st-{{ conn.status }}"></span>
+                                <span id="status-{{ key }}">{{ conn.status_detail or conn.status|title }}</span>
+                            </div>
+                        </div>
+                        {% if meta.buys_postage %}
+                            <span class="badge bg-primary-subtle text-primary-emphasis">Buys postage</span>
+                        {% else %}
+                            <span class="badge bg-secondary-subtle text-secondary-emphasis">Tracking only</span>
+                        {% endif %}
+                    </div>
+
+                    <p class="prov-blurb">{{ meta.blurb }}</p>
+
+                    <div class="mt-2">
+                        <a class="small" data-bs-toggle="collapse" href="#cfg-{{ key }}" role="button">
+                            <i class="fas fa-sliders me-1"></i>Settings
+                        </a>
+                    </div>
+
+                    <div class="collapse mt-3" id="cfg-{{ key }}">
+                        <form class="prov-form" data-provider="{{ key }}">
+                            <div class="row g-2">
+                                {% for f in meta.fields %}
+                                <div class="col-12 col-md-6">
+                                    {% if f.type == 'checkbox' %}
+                                        <div class="form-check mt-4">
+                                            <input class="form-check-input" type="checkbox" name="{{ f.key }}"
+                                                   value="1" id="f-{{ key }}-{{ f.key }}"
+                                                   {% if conn.config.get(f.key) %}checked{% endif %}>
+                                            <label class="form-check-label small" for="f-{{ key }}-{{ f.key }}">{{ f.label }}</label>
+                                        </div>
+                                    {% elif f.type == 'select' %}
+                                        <label class="form-label small mb-1">{{ f.label }}</label>
+                                        <select class="form-select form-select-sm" name="{{ f.key }}">
+                                            {% for opt in f.options %}
+                                            <option value="{{ opt }}" {% if conn.config.get(f.key) == opt %}selected{% endif %}>{{ opt }}</option>
+                                            {% endfor %}
+                                        </select>
+                                    {% elif f.secret %}
+                                        <label class="form-label small mb-1">{{ f.label }}</label>
+                                        <input type="password" class="form-control form-control-sm" name="{{ f.key }}"
+                                               placeholder="{% if conn.secrets_set.get(f.key) %}•••••••• saved — leave blank to keep{% else %}{{ f.placeholder or '' }}{% endif %}">
+                                    {% else %}
+                                        <label class="form-label small mb-1">{{ f.label }}</label>
+                                        <input type="text" class="form-control form-control-sm" name="{{ f.key }}"
+                                               value="{{ conn.config.get(f.key, '') }}" placeholder="{{ f.placeholder or '' }}">
+                                    {% endif %}
+                                </div>
+                                {% endfor %}
+                            </div>
+
+                            {% if meta.help %}<div class="prov-note">{{ meta.help }}</div>{% endif %}
+
+                            <div class="d-flex gap-2 mt-3">
+                                <button type="submit" class="btn btn-sm btn-dark">Save</button>
+                                <button type="button" class="btn btn-sm btn-outline-secondary btn-test">Test connection</button>
+                                {% if conn.enabled %}
+                                <button type="button" class="btn btn-sm btn-outline-danger ms-auto btn-disconnect">Disconnect</button>
+                                {% endif %}
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+
+        <!-- ── Orders ─────────────────────────────────────────────────── -->
+        <div class="panel">
+            <div class="d-flex flex-wrap align-items-center gap-2 mb-3">
+                <ul class="nav nav-pills flex-grow-1" id="statusTabs">
+                    {% for st, lbl in [('all','All'), ('needs_address','Needs address'), ('ready','Ready'),
+                                       ('labeled','Labeled'), ('shipped','Shipped'), ('delivered','Delivered')] %}
+                    <li class="nav-item">
+                        <a class="nav-link {% if st == 'all' %}active{% endif %} py-1 px-3" href="#" data-status="{{ st }}">
+                            {{ lbl }}
+                            {% if st != 'all' and counts.get(st) %}<span class="badge bg-secondary ms-1">{{ counts[st] }}</span>{% endif %}
+                        </a>
+                    </li>
+                    {% endfor %}
+                </ul>
+                <input type="search" class="form-control form-control-sm" id="orderSearch"
+                       placeholder="Search order # or buyer" style="max-width: 240px;">
+                <button class="btn btn-sm btn-outline-dark" id="btnPrintSelected" disabled>
+                    <i class="fas fa-print me-1"></i> Print selected
+                </button>
+            </div>
+
+            <div class="table-responsive">
+                <table class="table table-hover orders-table align-middle mb-0">
+                    <thead>
+                        <tr>
+                            <th style="width:32px;"><input type="checkbox" class="form-check-input" id="checkAll"></th>
+                            <th>Order</th>
+                            <th>Buyer</th>
+                            <th class="text-end">Items</th>
+                            <th class="text-end">Value</th>
+                            <th>Status</th>
+                            <th>Tracking</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody id="ordersBody">
+                        <tr><td colspan="8" class="text-center text-muted py-4">Loading…</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="d-flex justify-content-between align-items-center mt-3">
+                <div class="small text-muted" id="orderCount"></div>
+                <div class="btn-group btn-group-sm">
+                    <button class="btn btn-outline-secondary" id="prevPage">Previous</button>
+                    <button class="btn btn-outline-secondary" id="nextPage">Next</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Order detail ───────────────────────────────────────────────── -->
+    <div class="modal fade" id="orderModal" tabindex="-1">
+        <div class="modal-dialog modal-xl modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="orderModalTitle">Order</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body" id="orderModalBody"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── New order ──────────────────────────────────────────────────── -->
+    <div class="modal fade" id="newOrderModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <form id="newOrderForm">
+                    <div class="modal-header">
+                        <h5 class="modal-title">New order</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="row g-2 mb-3">
+                            <div class="col-md-6">
+                                <label class="form-label small mb-1">Order number</label>
+                                <input class="form-control form-control-sm" name="external_order_id" placeholder="optional">
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small mb-1">Source</label>
+                                <select class="form-select form-select-sm" name="source">
+                                    <option value="manual">Manual</option>
+                                    <option value="tcgplayer">TCGplayer</option>
+                                    <option value="ebay">eBay</option>
+                                    <option value="shopify">Shopify</option>
+                                    <option value="manapool">Mana Pool</option>
+                                </select>
+                            </div>
+                        </div>
+                        <h6 class="small text-uppercase text-muted">Ship to</h6>
+                        <div class="row g-2 mb-3" id="newOrderAddress"></div>
+                        <h6 class="small text-uppercase text-muted">Items</h6>
+                        <div id="newItems"></div>
+                        <button type="button" class="btn btn-sm btn-outline-secondary mt-2" id="addItemRow">
+                            <i class="fas fa-plus me-1"></i> Add item
+                        </button>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                        <button type="submit" class="btn btn-dark">Create order</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── CSV import ─────────────────────────────────────────────────── -->
+    <div class="modal fade" id="importModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <form id="importForm">
+                    <div class="modal-header">
+                        <h5 class="modal-title">Import orders from CSV</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <p class="small text-muted">
+                            Export the shipping/packing list from your marketplace and upload it here. Column names are
+                            matched loosely, so most exports work as-is. Rows sharing an order number become one order.
+                            Re-importing updates addresses but never duplicates items.
+                        </p>
+                        <div class="mb-3">
+                            <label class="form-label small mb-1">Source</label>
+                            <select class="form-select form-select-sm" name="source">
+                                <option value="tcgplayer">TCGplayer</option>
+                                <option value="manapool">Mana Pool</option>
+                                <option value="ebay">eBay</option>
+                                <option value="shopify">Shopify</option>
+                                <option value="csv">Other</option>
+                            </select>
+                        </div>
+                        <input type="file" class="form-control" name="file" accept=".csv,text/csv" required>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                        <button type="submit" class="btn btn-dark">Import</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast-container position-fixed bottom-0 end-0 p-3" id="toasts"></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+    const PROVIDERS = {{ providers|tojson }};
+    const ENVELOPE_SIZES = {{ envelope_sizes|tojson }};
+    const CONNECTIONS = {{ connections|tojson }};
+
+    let state = { page: 1, status: 'all', q: '' };
+    let selected = new Set();
+
+    // ── utilities ────────────────────────────────────────────────────────
+    function toast(msg, kind = 'dark') {
+        const el = document.createElement('div');
+        el.className = `toast align-items-center text-bg-${kind} border-0 show`;
+        el.innerHTML = `<div class="d-flex"><div class="toast-body">${msg}</div>
+            <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button></div>`;
+        document.getElementById('toasts').appendChild(el);
+        setTimeout(() => el.remove(), 6000);
+    }
+    const money = v => (v === null || v === undefined) ? '—' : '$' + Number(v).toFixed(2);
+    const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+    async function post(url, formData) {
+        const r = await fetch(url, { method: 'POST', body: formData });
+        let j = {};
+        try { j = await r.json(); } catch (e) { j = { status: 'error', message: `HTTP ${r.status}` }; }
+        return j;
+    }
+
+    // ── provider config ──────────────────────────────────────────────────
+    document.querySelectorAll('.prov-form').forEach(form => {
+        const key = form.dataset.provider;
+        form.addEventListener('submit', async e => {
+            e.preventDefault();
+            const j = await post(`/shipping/save/${key}`, new FormData(form));
+            toast(j.message, j.status === 'success' ? 'success' : 'danger');
+        });
+        form.querySelector('.btn-test').addEventListener('click', async () => {
+            const btn = form.querySelector('.btn-test');
+            btn.disabled = true; btn.textContent = 'Testing…';
+            await post(`/shipping/save/${key}`, new FormData(form));   // save first, then test what's stored
+            const j = await post(`/shipping/test/${key}`, new FormData());
+            toast(j.message, j.status === 'success' ? 'success' : 'danger');
+            document.getElementById(`status-${key}`).textContent = j.message;
+            btn.disabled = false; btn.textContent = 'Test connection';
+        });
+        const dis = form.querySelector('.btn-disconnect');
+        if (dis) dis.addEventListener('click', async () => {
+            if (!confirm('Remove the stored API key for this provider?')) return;
+            const j = await post(`/shipping/disconnect/${key}`, new FormData());
+            toast(j.message, 'secondary');
+            setTimeout(() => location.reload(), 700);
+        });
+    });
+
+    // ── orders list ──────────────────────────────────────────────────────
+    function trackingCell(o) {
+        const s = o.shipment;
+        if (!s) return '<span class="text-muted">—</span>';
+        const pct = s.tracking_percent;
+        const bar = (pct !== null && pct !== undefined)
+            ? `<div class="track-bar mt-1"><div style="width:${pct}%"></div></div>` : '';
+        const code = s.tracking_url
+            ? `<a href="${esc(s.tracking_url)}" target="_blank" rel="noopener">${esc(s.tracking_code)}</a>`
+            : esc(s.tracking_code || '—');
+        return `<div class="small">${code}</div>
+                <div class="tl-meta">${esc(s.tracking_status || 'Awaiting first scan')}</div>${bar}`;
+    }
+
+    async function loadOrders() {
+        const params = new URLSearchParams({ page: state.page, status: state.status, q: state.q });
+        const r = await fetch(`/shipping/orders?${params}`);
+        const j = await r.json();
+        const body = document.getElementById('ordersBody');
+
+        if (!j.orders || !j.orders.length) {
+            body.innerHTML = `<tr><td colspan="8"><div class="empty-state">
+                <i class="fas fa-inbox"></i>No orders here yet.
+                <div class="small mt-1">Import a CSV, add one by hand, or let a sale email create one.</div>
+            </div></td></tr>`;
+            document.getElementById('orderCount').textContent = '';
+            return;
+        }
+
+        body.innerHTML = j.orders.map(o => `
+            <tr class="order-row" data-id="${o.id}">
+                <td onclick="event.stopPropagation()">
+                    <input type="checkbox" class="form-check-input row-check" value="${o.id}"
+                           ${o.shipment && o.shipment.has_label ? '' : 'disabled title="No label yet"'}
+                           ${selected.has(String(o.id)) ? 'checked' : ''}>
+                </td>
+                <td>
+                    <div class="fw-semibold">${esc(o.external_order_id || '#' + o.id)}</div>
+                    <div class="tl-meta">${esc(o.source)} · ${esc(o.created_at)}</div>
+                </td>
+                <td>
+                    <div>${esc(o.buyer_name || o.buyer_company || '—')}</div>
+                    <div class="tl-meta">${esc([o.city, o.state].filter(Boolean).join(', '))}</div>
+                </td>
+                <td class="text-end">${o.item_count}</td>
+                <td class="text-end">${money(o.value)}</td>
+                <td><span class="pill pill-${o.status}">${esc(o.status.replace('_', ' '))}</span></td>
+                <td>${trackingCell(o)}</td>
+                <td class="text-end">
+                    ${o.shipment && o.shipment.has_label
+                        ? `<a class="btn btn-sm btn-outline-secondary" target="_blank" rel="noopener"
+                              href="/shipping/label/${o.shipment.id}/view" onclick="event.stopPropagation()"
+                              title="Open label"><i class="fas fa-print"></i></a>`
+                        : ''}
+                </td>
+            </tr>`).join('');
+
+        document.getElementById('orderCount').textContent =
+            `${j.total} order(s) · page ${j.page} of ${j.pages}`;
+        document.getElementById('prevPage').disabled = j.page <= 1;
+        document.getElementById('nextPage').disabled = j.page >= j.pages;
+
+        body.querySelectorAll('.order-row').forEach(row =>
+            row.addEventListener('click', () => openOrder(row.dataset.id)));
+        body.querySelectorAll('.row-check').forEach(cb =>
+            cb.addEventListener('change', () => {
+                cb.checked ? selected.add(cb.value) : selected.delete(cb.value);
+                document.getElementById('btnPrintSelected').disabled = selected.size === 0;
+            }));
+    }
+
+    document.getElementById('statusTabs').addEventListener('click', e => {
+        const a = e.target.closest('a[data-status]');
+        if (!a) return;
+        e.preventDefault();
+        document.querySelectorAll('#statusTabs .nav-link').forEach(n => n.classList.remove('active'));
+        a.classList.add('active');
+        state.status = a.dataset.status; state.page = 1;
+        loadOrders();
+    });
+
+    let searchTimer;
+    document.getElementById('orderSearch').addEventListener('input', e => {
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(() => { state.q = e.target.value.trim(); state.page = 1; loadOrders(); }, 300);
+    });
+    document.getElementById('prevPage').onclick = () => { if (state.page > 1) { state.page--; loadOrders(); } };
+    document.getElementById('nextPage').onclick = () => { state.page++; loadOrders(); };
+    document.getElementById('checkAll').addEventListener('change', e => {
+        document.querySelectorAll('.row-check:not(:disabled)').forEach(cb => {
+            cb.checked = e.target.checked;
+            cb.checked ? selected.add(cb.value) : selected.delete(cb.value);
+        });
+        document.getElementById('btnPrintSelected').disabled = selected.size === 0;
+    });
+
+    document.getElementById('btnPrintSelected').onclick = () => {
+        if (!selected.size) return;
+        window.open(`/shipping/print?ids=${[...selected].join(',')}`, '_blank');
+    };
+
+    document.getElementById('btnRefreshTracking').onclick = async function () {
+        this.disabled = true;
+        const old = this.innerHTML;
+        this.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span> Checking…';
+        const j = await post('/shipping/track/refresh', new FormData());
+        toast(j.message, j.status === 'success' ? 'success' : 'danger');
+        this.disabled = false; this.innerHTML = old;
+        loadOrders();
+    };
+
+    // ── order detail ─────────────────────────────────────────────────────
+    const ADDRESS_FIELDS = [
+        ['buyer_name', 'Name', 6], ['buyer_company', 'Company', 6],
+        ['address1', 'Street', 12], ['address2', 'Street 2', 12],
+        ['city', 'City', 5], ['state', 'State', 3], ['zipcode', 'ZIP', 4],
+        ['country', 'Country', 4], ['email', 'Email', 4], ['phone', 'Phone', 4],
+    ];
+
+    function addressForm(o) {
+        return ADDRESS_FIELDS.map(([k, lbl, w]) => `
+            <div class="col-md-${w}">
+                <label class="form-label small mb-1">${lbl}</label>
+                <input class="form-control form-control-sm" name="${k}" value="${esc(o[k] || '')}">
+            </div>`).join('');
+    }
+
+    function timeline(events) {
+        if (!events || !events.length)
+            return '<div class="text-muted small">No scans yet. USPS usually posts the first one within a day.</div>';
+        return `<ul class="timeline">${events.map(e => `
+            <li>
+                <div class="tl-desc">${esc(e.description || '—')}</div>
+                <div class="tl-meta">${esc([e.city, e.state].filter(Boolean).join(', '))} ${esc(e.at || '')}</div>
+                ${e.detail ? `<div class="tl-meta fst-italic">${esc(e.detail)}</div>` : ''}
+            </li>`).join('')}</ul>`;
+    }
+
+    function providerPicker(o) {
+        const opts = Object.entries(PROVIDERS).map(([k, m]) => {
+            const conn = CONNECTIONS[k];
+            const disabled = conn.enabled ? '' : 'disabled';
+            const suffix = conn.enabled ? (m.buys_postage ? ' — buys postage' : ' — tracking only')
+                                        : ' — not connected';
+            return `<option value="${k}" ${disabled}>${esc(m.label)}${suffix}</option>`;
+        }).join('');
+        const sizes = ENVELOPE_SIZES.map(([id, lbl]) => `<option value="${id}">${esc(lbl)}</option>`).join('');
+        return `
+            <div class="row g-2 align-items-end">
+                <div class="col-md-5">
+                    <label class="form-label small mb-1">Provider</label>
+                    <select class="form-select form-select-sm" id="labelProvider">${opts}</select>
+                </div>
+                <div class="col-md-4" id="sizeWrap">
+                    <label class="form-label small mb-1">Envelope size</label>
+                    <select class="form-select form-select-sm" id="labelSize">${sizes}</select>
+                </div>
+                <div class="col-md-3">
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" id="labelInsured">
+                        <label class="form-check-label small" for="labelInsured">Insure</label>
+                    </div>
+                </div>
+            </div>
+            <div class="d-flex gap-2 mt-3">
+                <button class="btn btn-sm btn-outline-dark" id="btnQuote">Get rates</button>
+                <button class="btn btn-sm btn-dark" id="btnBuy">Create label</button>
+            </div>
+            <div id="rateBox" class="mt-3"></div>`;
+    }
+
+    async function openOrder(id) {
+        const r = await fetch(`/shipping/orders/${id}`);
+        const j = await r.json();
+        if (j.status !== 'success') return toast(j.message, 'danger');
+        const o = j.order;
+
+        document.getElementById('orderModalTitle').innerHTML =
+            `${esc(o.external_order_id || '#' + o.id)} <span class="pill pill-${o.status} ms-2">${esc(o.status.replace('_', ' '))}</span>`;
+
+        const ship = o.shipments.filter(s => s.status !== 'error').slice(-1)[0];
+        const errors = o.shipments.filter(s => s.status === 'error').slice(-2);
+
+        document.getElementById('orderModalBody').innerHTML = `
+          <div class="row g-4">
+            <div class="col-lg-6">
+                <h6 class="small text-uppercase text-muted">Ship to</h6>
+                <form id="addrForm"><div class="row g-2">${addressForm(o)}</div>
+                    <button class="btn btn-sm btn-outline-dark mt-3">Save address</button>
+                </form>
+
+                <h6 class="small text-uppercase text-muted mt-4">Items</h6>
+                <table class="table table-sm mb-1">
+                    <tbody>${o.items.map(i => `
+                        <tr>
+                            <td>${esc(i.name)}${i.set_name ? `<div class="tl-meta">${esc(i.set_name)}</div>` : ''}</td>
+                            <td class="text-end" style="width:60px;">×${i.qty}</td>
+                            <td class="text-end" style="width:90px;">${money(i.price)}</td>
+                        </tr>`).join('') || '<tr><td class="text-muted small">No items recorded.</td></tr>'}
+                    </tbody>
+                </table>
+                <div class="text-end fw-semibold">Value: ${money(o.value)}</div>
+            </div>
+
+            <div class="col-lg-6">
+                <h6 class="small text-uppercase text-muted">Label</h6>
+                ${ship ? `
+                    <div class="panel mb-3" style="padding:.85rem 1rem;">
+                        <div class="d-flex justify-content-between align-items-start">
+                            <div>
+                                <div class="fw-semibold">${esc(ship.carrier || '')} ${esc(ship.service || '')}</div>
+                                <div class="tl-meta">${esc(PROVIDERS[ship.provider]?.label || ship.provider)}
+                                    · ${ship.rate_amount ? money(ship.rate_amount) : 'no postage charge'}
+                                    ${ship.insured ? ' · insured ' + money(ship.insurance_amount) : ''}</div>
+                                <div class="small mt-1">${ship.tracking_url
+                                    ? `<a href="${esc(ship.tracking_url)}" target="_blank" rel="noopener">${esc(ship.tracking_code)}</a>`
+                                    : esc(ship.tracking_code || '')}</div>
+                            </div>
+                            <div class="btn-group btn-group-sm">
+                                ${ship.has_label ? `<a class="btn btn-outline-secondary" target="_blank" rel="noopener"
+                                    href="/shipping/label/${ship.id}/view"><i class="fas fa-print"></i></a>
+                                    <a class="btn btn-outline-secondary"
+                                    href="/shipping/label/${ship.id}/download"><i class="fas fa-download"></i></a>` : ''}
+                                <button class="btn btn-outline-secondary" id="btnReprint" title="Fetch the label again">
+                                    <i class="fas fa-rotate"></i></button>
+                            </div>
+                        </div>
+                        ${ship.has_label ? `<iframe class="label-frame mt-2" src="/shipping/label/${ship.id}/view"></iframe>` : ''}
+                    </div>
+
+                    <div class="d-flex justify-content-between align-items-center">
+                        <h6 class="small text-uppercase text-muted mb-0">Tracking</h6>
+                        <button class="btn btn-sm btn-outline-secondary" id="btnTrack">Refresh</button>
+                    </div>
+                    <div class="tl-meta mb-2">
+                        ${esc(ship.tracking_status || 'Awaiting first scan')}
+                        ${ship.delivery_date ? ' · expected ' + esc(ship.delivery_date) : ''}
+                        ${ship.last_tracked_at ? ' · checked ' + esc(ship.last_tracked_at) : ''}
+                    </div>
+                    <div id="tlBox">${timeline(ship.events)}</div>
+                ` : providerPicker(o)}
+
+                ${errors.length ? `<div class="alert alert-danger mt-3 py-2 small mb-0">
+                    <strong>Last label attempt failed.</strong><br>${esc(errors.slice(-1)[0].error)}</div>` : ''}
+            </div>
+          </div>`;
+
+        // -- wire the detail view --
+        document.getElementById('addrForm').addEventListener('submit', async e => {
+            e.preventDefault();
+            const res = await post(`/shipping/orders/${o.id}/update`, new FormData(e.target));
+            toast(res.message, res.status === 'success' ? 'success' : 'danger');
+            if (res.status === 'success') { loadOrders(); openOrder(o.id); }
+        });
+
+        const sizeWrap = document.getElementById('sizeWrap');
+        const provSel = document.getElementById('labelProvider');
+        if (provSel) {
+            const syncSize = () => sizeWrap.style.display =
+                provSel.value === 'tcgtracking' ? '' : 'none';
+            provSel.addEventListener('change', syncSize); syncSize();
+
+            document.getElementById('btnQuote').onclick = async () => {
+                const fd = new FormData();
+                fd.append('provider', provSel.value);
+                const res = await post(`/shipping/quote/${o.id}`, fd);
+                const box = document.getElementById('rateBox');
+                if (res.status !== 'success') { box.innerHTML =
+                    `<div class="alert alert-warning py-2 small mb-0">${esc(res.message)}</div>`; return; }
+                box.innerHTML = `<div class="list-group list-group-flush">${res.rates.map((rt, i) => `
+                    <label class="list-group-item d-flex align-items-center gap-2 px-0">
+                        <input class="form-check-input m-0" type="radio" name="rate" value="${esc(rt.id)}"
+                               data-shipment="${esc(res.shipment_id || '')}" ${i === 0 ? 'checked' : ''}>
+                        <span class="flex-grow-1 small">
+                            <strong>${esc(rt.carrier)} ${esc(rt.service)}</strong>
+                            ${rt.delivery_days ? `<span class="tl-meta"> · ${rt.delivery_days} day(s)</span>` : ''}
+                            ${rt.note ? `<div class="tl-meta">${esc(rt.note)}</div>` : ''}
+                        </span>
+                        <span class="fw-semibold">${money(rt.amount)}</span>
+                    </label>`).join('')}</div>`;
+            };
+
+            document.getElementById('btnBuy').onclick = async function () {
+                const chosen = document.querySelector('input[name="rate"]:checked');
+                const fd = new FormData();
+                fd.append('provider', provSel.value);
+                fd.append('insured', document.getElementById('labelInsured').checked ? '1' : '0');
+                if (provSel.value === 'tcgtracking') fd.append('envelope_size', document.getElementById('labelSize').value);
+                if (chosen && provSel.value === 'easypost') {
+                    fd.append('rate_id', chosen.value);
+                    fd.append('shipment_id', chosen.dataset.shipment);
+                }
+                this.disabled = true;
+                this.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span> Working…';
+                const res = await post(`/shipping/label/${o.id}`, fd);
+                toast(res.message, res.status === 'success' ? 'success' : 'danger');
+                this.disabled = false; this.textContent = 'Create label';
+                if (res.status === 'success') { loadOrders(); openOrder(o.id); }
+            };
+        }
+
+        const btnTrack = document.getElementById('btnTrack');
+        if (btnTrack) btnTrack.onclick = async function () {
+            this.disabled = true;
+            const res = await post(`/shipping/track/${ship.id}`, new FormData());
+            toast(res.message, res.status === 'success' ? 'success' : 'danger');
+            if (res.shipment) document.getElementById('tlBox').innerHTML = timeline(res.shipment.events);
+            this.disabled = false;
+            loadOrders();
+        };
+
+        const btnReprint = document.getElementById('btnReprint');
+        if (btnReprint) btnReprint.onclick = async function () {
+            this.disabled = true;
+            const fd = new FormData();
+            const sz = document.getElementById('labelSize');
+            if (sz && ship.provider === 'tcgtracking') fd.append('envelope_size', sz.value);
+            const res = await post(`/shipping/label/${ship.id}/reprint`, fd);
+            toast(res.message, res.status === 'success' ? 'success' : 'danger');
+            this.disabled = false;
+            if (res.status === 'success') openOrder(o.id);
+        };
+
+        bootstrap.Modal.getOrCreateInstance(document.getElementById('orderModal')).show();
+    }
+
+    // ── new order ────────────────────────────────────────────────────────
+    document.getElementById('newOrderAddress').innerHTML = ADDRESS_FIELDS.map(([k, lbl, w]) => `
+        <div class="col-md-${w}">
+            <label class="form-label small mb-1">${lbl}</label>
+            <input class="form-control form-control-sm" name="${k}" ${k === 'country' ? 'value="US"' : ''}>
+        </div>`).join('');
+
+    function itemRow() {
+        const d = document.createElement('div');
+        d.className = 'row g-2 mb-2';
+        d.innerHTML = `
+            <div class="col-6"><input class="form-control form-control-sm" name="item_name" placeholder="Card name"></div>
+            <div class="col-3"><input class="form-control form-control-sm" name="item_qty" type="number" min="1" value="1"></div>
+            <div class="col-3"><input class="form-control form-control-sm" name="item_price" type="number" step="0.01" placeholder="0.00"></div>`;
+        return d;
+    }
+    document.getElementById('newItems').appendChild(itemRow());
+    document.getElementById('addItemRow').onclick = () =>
+        document.getElementById('newItems').appendChild(itemRow());
+
+    document.getElementById('newOrderForm').addEventListener('submit', async e => {
+        e.preventDefault();
+        const j = await post('/shipping/orders/create', new FormData(e.target));
+        toast(j.message, j.status === 'success' ? 'success' : 'danger');
+        if (j.status === 'success') {
+            bootstrap.Modal.getInstance(document.getElementById('newOrderModal')).hide();
+            e.target.reset();
+            loadOrders();
+        }
+    });
+
+    document.getElementById('importForm').addEventListener('submit', async e => {
+        e.preventDefault();
+        const j = await post('/shipping/orders/import_csv', new FormData(e.target));
+        toast(j.message, j.status === 'success' ? 'success' : 'danger');
+        if (j.status === 'success') {
+            bootstrap.Modal.getInstance(document.getElementById('importModal')).hide();
+            e.target.reset();
+            loadOrders();
+        }
+    });
+
+    loadOrders();
+    </script>
+</body>
+</html>

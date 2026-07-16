@@ -9,7 +9,7 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 
     <style>
-        body { background-color: #f8f9fa; }
+        body { background-color: var(--bg); }
 
         .nav-tabs-minimal { display: flex; gap: 10px; margin-left: auto; }
         .nav-tab {
@@ -18,7 +18,7 @@
             font-weight: 600; transition: 0.2s ease;
         }
         .nav-tab:hover { background: rgba(255,255,255,0.18); color: #fff; }
-        .nav-tab.active { background: #fff; color: #212529; }
+        .nav-tab.active { background: var(--surface); color: var(--text); }
 
         .game-card {
             border: none;
@@ -76,7 +76,7 @@
         .game-icon {
             width: 56px; height: 56px;
             border-radius: 14px;
-            background: linear-gradient(135deg, #343a40 0%, #495057 100%);
+            background: linear-gradient(135deg, var(--ink) 0%, var(--ink-2) 100%);
             display: flex; align-items: center; justify-content: center;
             margin-bottom: 1rem;
             flex-shrink: 0;
@@ -91,7 +91,7 @@
         }
         .game-meta {
             font-size: 0.82rem;
-            color: #6c757d;
+            color: var(--muted);
         }
         .game-fields-preview {
             margin-top: 0.75rem;
@@ -101,23 +101,23 @@
         }
         .field-pill {
             font-size: 0.72rem;
-            background: #e9ecef;
-            color: #495057;
+            background: var(--surface-2);
+            color: var(--text-soft);
             border-radius: 20px;
             padding: 2px 9px;
             font-weight: 500;
         }
         .field-pill-more {
             font-size: 0.72rem;
-            background: #dee2e6;
-            color: #6c757d;
+            background: var(--surface-3);
+            color: var(--muted);
             border-radius: 20px;
             padding: 2px 9px;
         }
         .empty-state {
             text-align: center;
             padding: 5rem 1rem;
-            color: #6c757d;
+            color: var(--muted);
         }
         .empty-state i { font-size: 3.5rem; margin-bottom: 1.5rem; opacity: 0.35; }
 
