@@ -178,30 +178,36 @@ def _ocr_lines(crop, min_side=64):
 _NUMBER_RE  = re.compile(r"(\d{1,4})\s*/\s*(\d{1,4})")
 _SETCODE_RE = re.compile(r"\b(?=[A-Z0-9]{2,6}\b)[A-Z0-9]*[A-Z][A-Z0-9]*\b")
 # Words that appear in the name zone but are never the card name: evolution stage
-# badges, rarity/mechanic tags, HP, and other UI text. The evolution badge sits
-# just left of the name and is high-contrast (white-on-dark), so OCR often reads
-# it *before* the name and mangles it (e.g. "BASIC" -> "SIC"). We therefore reject
-# not only exact matches but close fuzzy matches, so a garbled badge token is
-# dropped instead of being mistaken for the name.
+# badges, rarity/mechanic tags, HP, and other UI text. RapidOCR reads these badges
+# cleanly, so an exact match catches them reliably. A *light* fuzzy pass remains as
+# a safety net for the occasional OCR slip, but at a high similarity threshold:
+# the old 0.70 threshold produced false positives on legitimate short Pokemon names
+# (e.g. "Staryu" ~ "vstar" = 0.73, which wrongly discarded the name), so it is
+# tightened here to only reject near-identical mangles.
 _NAME_NOISE = {"hp", "stage", "stage1", "stage2", "basic", "evolves", "from",
                "pokemon", "pokmon", "illus", "no", "the", "ex", "gx", "restored",
                "mega", "break", "vmax", "vstar", "vunion", "tag", "team", "lv",
                "item", "supporter", "stadium", "energy", "legend"}
 
+# Similarity at/above which a token is treated as a mangled noise word. High on
+# purpose (see above) so real names survive; clean badge reads still match exactly.
+_NAME_NOISE_FUZZ = 0.86
+
 
 def _is_name_noise(token):
     """True if `token` is (or closely resembles) a non-name UI/stage/rarity word.
-    Fuzzy so OCR-mangled badges are caught: 'sic'~'basic', '1g'~'gx', etc."""
+    Exact matches are always rejected; a high-threshold fuzzy pass additionally
+    catches near-identical OCR mangles without nuking legitimate short names."""
     t = re.sub(r"[^a-z0-9]", "", str(token or "").lower())
     if not t:
         return True
     if t in _NAME_NOISE:
         return True
     # Only fuzzy-reject short tokens (badges/tags are short); real names rarely
-    # collide, and requiring len>=3 avoids nuking single letters.
+    # collide at this threshold, and requiring len>=3 avoids nuking single letters.
     if len(t) <= 6:
         for w in _NAME_NOISE:
-            if len(w) >= 3 and SequenceMatcher(None, t, w).ratio() >= 0.7:
+            if len(w) >= 3 and SequenceMatcher(None, t, w).ratio() >= _NAME_NOISE_FUZZ:
                 return True
     return False
 
@@ -350,6 +356,19 @@ def _plausible_number(n, m):
     return 1 <= n <= m <= 2000
 
 
+def _pad_serial(nm):
+    """Zero-pad the collector number so the printed number matches the set-total
+    width used by catalogs: '28/162' -> '028/162', '4/102' -> '004/102', while
+    '56/64' stays '56/64'. Left unchanged if it isn't a plain numeric N/M (e.g.
+    promo codes like 'SV107/SV122', which _NUMBER_RE doesn't match)."""
+    m = _NUMBER_RE.fullmatch((nm or "").replace(" ", ""))
+    if not m:
+        return nm or ""
+    n, d = int(m.group(1)), int(m.group(2))
+    width = len(str(d))          # match numerator width to the denominator's
+    return f"{n:0{width}d}/{d}"
+
+
 def _best_number(hits):
     """Vote for the most-seen N/M, folding trailing-zero artifacts (a rarity dot
     or set symbol read as a '0'): 'N/M0' votes merge into 'N/M' when both appear."""
@@ -392,12 +411,12 @@ def _read_number(bgr, band_top=0.90, band_bottom=0.965, corner_frac=0.34):
     top_score = max(sc for _nm, sc in scored)
     tied = [nm for nm, sc in scored if abs(sc - top_score) < 1e-6]
     best = tied[0] if len(set(tied)) == 1 else _best_number(tied)
-    return best, raw
+    return _pad_serial(best), raw
 
 
 def parse_collector_number(text):
     m = _NUMBER_RE.search(text or "")
-    return f"{int(m.group(1))}/{int(m.group(2))}" if m else ""
+    return _pad_serial(f"{int(m.group(1))}/{int(m.group(2))}") if m else ""
 
 
 def parse_set_code(text, drop=""):
