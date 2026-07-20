@@ -12,6 +12,9 @@ python-dotenv>=1.0
 opencv-python-headless>=4.8      # use opencv-python instead if you need GUI/debug windows
 Pillow>=10.0
 numpy>=1.26
+rapidocr
+onnxruntime
+networkx>=2.5.1
 
 # ── Reports & security/networking ──
 reportlab>=4.0                   # PDF financial reports
@@ -20,5 +23,4 @@ requests>=2.31                   # provider / marketplace API calls
 
 # ── Optional (features degrade gracefully if missing) ──
 PyMuPDF>=1.24                    # optional: PDF import/rasterization  (import "fitz")
-pytesseract>=0.3.10             # optional: card OCR — also needs the Tesseract binary
 zeroconf>=0.130                 # optional: advertises the stable <name>.local address
