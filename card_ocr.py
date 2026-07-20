@@ -11,23 +11,24 @@ Pipeline
    unchanged, so this never makes a good capture worse.
 
 2. NAME: read the top "name zone" — the top strip minus the top-right HP box and
-   the top-left evolution icon. The name is the largest text there; we try two
-   binarisations (Otsu suits glossy modern silver nameplates, adaptive suits flat
-   older ones) and keep the tallest word on its line.
+   the top-left evolution icon. The name is the largest text there, so we OCR the
+   zone and keep the tallest recognised line after dropping stage/rarity/UI tokens
+   (e.g. "Basic", "STAGE 1", "HP").
 
-3. NUMBER: scan the FULL-WIDTH bottom band for an N/M collector number. It lives
-   bottom-right on older sets and bottom-left on newer ones, so we search the
-   whole width rather than a fixed corner, and accept only plausible numbers
-   (N <= M). On low-resolution scans the number may be too small to read at all,
-   in which case identification falls back to the name + reference catalog.
+3. NUMBER: scan the two bottom CORNERS for an N/M collector number, skipping the
+   noisy centre of the bottom band (flavour text, weakness/resistance/retreat).
+   The number lives bottom-right on older sets and bottom-left on newer ones, so
+   both corners are read, and only plausible numbers (N <= M) are accepted. The
+   result is zero-padded to the set-total width (e.g. "28/162" -> "028/162"). On
+   low-resolution scans the number may be too small to read at all, in which case
+   identification falls back to the name + reference catalog.
 
-OCR engine: RapidOCR (PP-OCRv5 *mobile* models via ONNX Runtime) — chosen over
-pytesseract for markedly higher accuracy on real card captures (glossy nameplates,
-angled/curved text, low-res collector numbers) while staying light enough for a
-Raspberry Pi. RapidOCR does its own text detection + recognition, so the manual
-binarisation / PSM sweeps the old Tesseract path needed are gone; this module now
-just crops the name/number zones, runs the shared engine, and applies the same
-domain rules (name = largest text, plausible N/M only).
+OCR engine: RapidOCR (PP-OCRv5 *mobile* models via ONNX Runtime) — high accuracy
+on real card captures (glossy nameplates, angled/curved text, low-res collector
+numbers) while staying light enough for a Raspberry Pi. RapidOCR does its own text
+detection + recognition, so this module just crops the name/number zones, runs the
+shared engine, and applies the domain rules (name = largest text, plausible N/M
+only).
 
 Install:  pip install rapidocr onnxruntime
 The PP-OCRv5 mobile det/rec models (~a few MB each) download automatically on the
