@@ -24,6 +24,52 @@ from datetime import datetime, timedelta
 from PIL import Image
 # Same ceiling for Pillow (its default is ~89 MP, far below legitimate scans).
 Image.MAX_IMAGE_PIXELS = _MAX_IMAGE_PIXELS
+import io as _io
+
+# ── Lenient image decoding (OpenCV → Pillow fallback) ──
+# OpenCV 4.13's PNG reader rejects images whose ancillary chunks (iTXt / zTXt /
+# iCCP / eXIf metadata — as embedded by phone cameras, Photoshop/XMP, ICC colour
+# profiles, and many AI tools) exceed libpng's ~8 MB per-chunk cap: cv2.imread /
+# cv2.imdecode then return None and log
+# "grfmt_png.cpp read_chunk chunk data is too large". There is no runtime knob for
+# that limit, so we fall back to Pillow, which decodes such files fine. All image
+# reads in the app go through these two wrappers. The decompression-bomb guards
+# still apply: Pillow honours Image.MAX_IMAGE_PIXELS (set above), and OPENCV's
+# pixel ceiling is unchanged. `_cv2_imread`/`_cv2_imdecode` are captured before the
+# wrappers exist so the fallback can call the originals without recursion.
+_cv2_imread = cv2.imread
+_cv2_imdecode = cv2.imdecode
+
+
+def _pil_to_bgr(im):
+    """PIL image -> 3-channel BGR ndarray (matches cv2 IMREAD_COLOR)."""
+    return cv2.cvtColor(np.array(im.convert("RGB")), cv2.COLOR_RGB2BGR)
+
+
+def _imread(path, flags=cv2.IMREAD_COLOR):
+    """Drop-in cv2.imread with a Pillow fallback on decode failure. Returns an
+    ndarray, or None (like cv2) if the file can't be read by either backend."""
+    img = _cv2_imread(path, flags)
+    if img is not None:
+        return img
+    try:
+        with Image.open(path) as im:
+            return _pil_to_bgr(im)
+    except Exception:
+        return None
+
+
+def _imdecode(buf, flags=cv2.IMREAD_COLOR):
+    """Drop-in cv2.imdecode with a Pillow fallback on decode failure. `buf` is a
+    uint8 ndarray of encoded bytes (as produced by np.frombuffer)."""
+    img = _cv2_imdecode(buf, flags)
+    if img is not None:
+        return img
+    try:
+        with Image.open(_io.BytesIO(bytes(buf))) as im:
+            return _pil_to_bgr(im)
+    except Exception:
+        return None
 from werkzeug.utils import secure_filename
 from models import (db, Product, ScanRecord, ShopConnection, Listing, EmailMonitor,
                     SaleEvent, ReferenceCard, ReferenceSync, TypeReference, AppSetting,
@@ -1970,7 +2016,7 @@ def _load_prepared_type_refs(game):
         abs_path = _abs_record_image_path(r.image_path)
         if not abs_path or not os.path.exists(abs_path):
             continue
-        img = cv2.imread(abs_path)
+        img = _imread(abs_path)
         if img is None:
             continue
         raw.append({"type_name": r.type_name, "region": r.region, "image": img})
@@ -5178,7 +5224,7 @@ def quick_scan_identify():
                        "quickscan_" + datetime.utcnow().strftime("%Y%m%d%H%M%S%f") + ".png")
     try:
         file.save(tmp)
-        bgr = cv2.imread(tmp)
+        bgr = _imread(tmp)
         if bgr is None:
             return jsonify({"status": "error", "message": "Could not read the image."}), 400
         cropped, ok = detect_and_crop_card(bgr, CARD_EDGE_DEFAULT)
@@ -6442,7 +6488,7 @@ def import_single_card():
         # Card photos are small, so decoding one from disk is well within budget.
         aligned_flags = {}
         try:
-            front_img = cv2.imread(front_tmp, cv2.IMREAD_COLOR)
+            front_img = _imread(front_tmp, cv2.IMREAD_COLOR)
             if front_img is None:
                 return jsonify({"status": "error", "message": "Could not read the front image"}), 400
             front_path, front_cropped = _save_single_card_image(front_img, "front", edge_type)
@@ -6453,7 +6499,7 @@ def import_single_card():
             if back and back.filename:
                 back_tmp = os.path.join(upload_dir, "back_upload")
                 back.save(back_tmp)
-                back_img = cv2.imread(back_tmp, cv2.IMREAD_COLOR)
+                back_img = _imread(back_tmp, cv2.IMREAD_COLOR)
                 if back_img is not None:
                     back_path, back_cropped = _save_single_card_image(back_img, "back", edge_type)
                     aligned_flags["back"] = back_cropped
@@ -6638,7 +6684,7 @@ def realign_record_image(record_id):
     if not abs_path or not os.path.exists(abs_path):
         return jsonify({"status": "error", "message": "The image file could not be found on disk."}), 404
 
-    image = cv2.imread(abs_path)
+    image = _imread(abs_path)
     if image is None:
         return jsonify({"status": "error", "message": "Could not read the image for re-alignment."}), 400
 
@@ -8645,7 +8691,7 @@ def type_reference_add():
     record_id = (request.form.get("record_id") or "").strip()
 
     if up and up.filename:
-        img = cv2.imdecode(np.frombuffer(up.read(), np.uint8), cv2.IMREAD_COLOR)
+        img = _imdecode(np.frombuffer(up.read(), np.uint8), cv2.IMREAD_COLOR)
         if img is None:
             return jsonify({"status": "error", "message": "Could not read the uploaded image."}), 400
         if mode == "band":
@@ -8671,7 +8717,7 @@ def type_reference_add():
         abs_path = _abs_record_image_path(record.image_path)
         if not abs_path or not os.path.exists(abs_path) or card_ocr is None:
             return jsonify({"status": "error", "message": "That card has no readable front image."}), 400
-        card = cv2.imread(abs_path)
+        card = _imread(abs_path)
         if card is not None:
             card, _ = card_ocr.normalize_card_image(card)
         icon = card_ocr._extract_type_region(card, region) if card is not None else None
@@ -9098,7 +9144,7 @@ def manual_process_card():
     if not os.path.exists(split_path):
         return jsonify({"status": "error", "message": f"Fallback image not found: {filename}"}), 404
 
-    image = cv2.imread(split_path)
+    image = _imread(split_path)
     if image is None:
         return jsonify({"status": "error", "message": "Could not read fallback image"}), 400
 
@@ -9280,7 +9326,7 @@ def _detect_cut_lines(bgr):
 
 def _detect_cut_lines_for_path(page_image_path):
     """Auto-detect cut lines for a page image on disk; even thirds if unreadable."""
-    bgr = cv2.imread(page_image_path)
+    bgr = _imread(page_image_path)
     if bgr is None:
         return (100 / 3.0, 200 / 3.0, 100 / 3.0, 200 / 3.0)
     return _detect_cut_lines(bgr)
@@ -9307,7 +9353,7 @@ def _split_align_page_tiles(page_image_path, game, album, page, side, edge_type,
         split_path    = os.path.join(app.config["TEMP_SPLIT_FOLDER"], slot_filename)
         piece.save(split_path)
         try:
-            split_cv = cv2.imread(split_path)
+            split_cv = _imread(split_path)
             if split_cv is None:
                 raise ValueError("Could not read split image")
             cropped, ok = detect_and_crop_card(split_cv, edge_type)
@@ -9733,7 +9779,7 @@ def _orb_descriptors_cached(record):
     except Exception:
         pass  # unreadable/stale cache — fall through and recompute
 
-    img = cv2.imread(img_path)
+    img = _imread(img_path)
     if img is None:
         return None
     desc = _orb_descriptors(img)
@@ -9798,7 +9844,7 @@ def _global_descriptor_cached(record):
             return v if getattr(v, "size", 0) == ANN_DIM else None
     except Exception:
         pass
-    img = cv2.imread(img_path)
+    img = _imread(img_path)
     if img is None:
         return None
     v = _global_descriptor(img)
@@ -11433,7 +11479,7 @@ def search_by_image():
         return bad
 
     np_buf    = np.frombuffer(file.read(), np.uint8)
-    query_img = cv2.imdecode(np_buf, cv2.IMREAD_COLOR)
+    query_img = _imdecode(np_buf, cv2.IMREAD_COLOR)
     if query_img is None:
         return jsonify({"status": "error", "message": "Could not decode image"}), 400
 
@@ -11566,7 +11612,7 @@ def _image_source_for_grading(path_value, max_side=1600, jpeg_quality=90):
 
     # Preferred path: decode, downscale, JPEG-encode (small payload).
     try:
-        img = cv2.imread(abs_path)
+        img = _imread(abs_path)
         if img is not None:
             h, w = img.shape[:2]
             scale = max_side / float(max(h, w)) if max(h, w) > max_side else 1.0
@@ -11828,7 +11874,7 @@ def _downscaled_jpeg_bytes(path_value, max_side=1600, jpeg_quality=90):
     if not os.path.exists(abs_path):
         return None
     try:
-        img = cv2.imread(abs_path)
+        img = _imread(abs_path)
         if img is not None:
             h, w = img.shape[:2]
             scale = max_side / float(max(h, w)) if max(h, w) > max_side else 1.0

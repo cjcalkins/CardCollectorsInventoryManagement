@@ -214,7 +214,18 @@ def _to_bgr(image_or_path):
         return image_or_path
     if isinstance(image_or_path, Image.Image):
         return cv2.cvtColor(np.array(image_or_path.convert("RGB")), cv2.COLOR_RGB2BGR)
-    img = cv2.imread(str(image_or_path))
+    path = str(image_or_path)
+    img = cv2.imread(path)
+    if img is None:
+        # OpenCV 4.13's PNG reader rejects images whose ancillary chunks
+        # (iTXt / zTXt / iCCP / eXIf metadata) exceed libpng's ~8 MB per-chunk cap,
+        # returning None. Pillow decodes them fine, so fall back to it; the pixel
+        # ceiling (Image.MAX_IMAGE_PIXELS, set by the host app) still guards bombs.
+        try:
+            with Image.open(path) as im:
+                img = cv2.cvtColor(np.array(im.convert("RGB")), cv2.COLOR_RGB2BGR)
+        except Exception:
+            img = None
     if img is None:
         raise FileNotFoundError(f"Could not read image: {image_or_path}")
     return img
