@@ -41,9 +41,10 @@ except ImportError:
     fitz = None
 
 # card_ocr provides front-image OCR (top/bottom band -> name + N/M collector
-# number) and a matcher against existing records. Imported optionally so the
-# app still boots on installs without pytesseract / the tesseract-ocr binary;
-# the /ocr_identify route reports a clear error instead of crashing.
+# number) and a matcher against existing records. It uses RapidOCR (PP-OCRv5
+# mobile via ONNX Runtime). Imported optionally so the app still boots on installs
+# that haven't run `pip install rapidocr onnxruntime` yet; the /ocr_identify route
+# reports a clear error instead of crashing.
 try:
     import card_ocr
 except Exception:
@@ -5160,8 +5161,8 @@ def quick_scan_identify():
     Does NOT create any inventory record — purely a lookup for CSV export."""
     if card_ocr is None:
         return jsonify({"status": "error",
-                        "message": "OCR isn't installed. Add it with: pip install pytesseract "
-                                   "(plus the tesseract-ocr binary)."}), 503
+                        "message": "OCR isn't installed. Add it with: "
+                                   "pip install rapidocr onnxruntime"}), 503
     file = request.files.get("image")
     if not file or not file.filename:
         return jsonify({"status": "error", "message": "No image provided."}), 400
@@ -7730,8 +7731,8 @@ def ocr_identify(record_id):
     if card_ocr is None:
         return jsonify({
             "status":  "error",
-            "message": "OCR is unavailable: install it with `pip install pytesseract` "
-                       "and the tesseract-ocr binary on the host.",
+            "message": "OCR is unavailable: install it with "
+                       "`pip install rapidocr onnxruntime` on the host.",
         }), 503
 
     abs_path = _abs_record_image_path(record.image_path)
@@ -7751,8 +7752,11 @@ def ocr_identify(record_id):
     if not ocr.get("ocr_available"):
         return jsonify({
             "status":  "error",
-            "message": "The tesseract-ocr binary was not found on the host. "
-                       "Install it (e.g. `apt install tesseract-ocr`) and retry.",
+            "message": "The OCR engine could not be initialised on the host "
+                       "(RapidOCR missing, or its PP-OCRv5 mobile models could not "
+                       "be downloaded on first use). Install with "
+                       "`pip install rapidocr onnxruntime` and ensure network access "
+                       "for the one-time model download, then retry.",
         }), 503
 
     catalog_only = request.args.get("catalog", "").strip().lower() in ("1", "true", "yes")

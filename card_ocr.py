@@ -21,11 +21,33 @@ Pipeline
    (N <= M). On low-resolution scans the number may be too small to read at all,
    in which case identification falls back to the name + reference catalog.
 
-Dependencies: `pip install pytesseract` plus the Tesseract binary
-(Ubuntu: `apt install tesseract-ocr`). Missing binary -> ocr_available=False,
-empty guesses, no exception.
+OCR engine: RapidOCR (PP-OCRv5 *mobile* models via ONNX Runtime) — chosen over
+pytesseract for markedly higher accuracy on real card captures (glossy nameplates,
+angled/curved text, low-res collector numbers) while staying light enough for a
+Raspberry Pi. RapidOCR does its own text detection + recognition, so the manual
+binarisation / PSM sweeps the old Tesseract path needed are gone; this module now
+just crops the name/number zones, runs the shared engine, and applies the same
+domain rules (name = largest text, plausible N/M only).
+
+Install:  pip install rapidocr onnxruntime
+The PP-OCRv5 mobile det/rec models (~a few MB each) download automatically on the
+first OCR call and are then cached; if the engine can't be built (no package, or
+models can't be fetched offline) -> ocr_available=False, empty guesses, no
+exception. The engine is configurable via environment variables (see below) so it
+can be pinned to a bundled version or pointed at pre-downloaded models for fully
+offline / air-gapped deployment.
+
+Environment overrides (all optional):
+    RAPIDOCR_OCR_VERSION  default "PP-OCRv5"   (e.g. "PP-OCRv6", "PP-OCRv4")
+    RAPIDOCR_MODEL_TYPE   default "mobile"     (e.g. "server")
+    RAPIDOCR_ENGINE       default "onnxruntime"
+    RAPIDOCR_REC_LANG     default "en"         (recognition language; e.g. "latin", "ch")
+    RAPIDOCR_DET_LANG     default "ch"         (v5 detection ships language-agnostic as "ch")
+    RAPIDOCR_NUM_THREADS  default unset        (ONNX Runtime intra-op threads; e.g. "4" on a Pi)
+    RAPIDOCR_USE_CLS      default "0"          ("1" to enable 180 deg text-line orientation)
 """
 
+import os
 import re
 from collections import Counter
 from difflib import SequenceMatcher
@@ -34,18 +56,125 @@ import cv2
 import numpy as np
 from PIL import Image
 
+# RapidOCR (PP-OCRv5 mobile via ONNX Runtime). Imported optionally so this module
+# — and the whole app — still boots on installs that haven't run
+# `pip install rapidocr onnxruntime` yet; the engine simply reports unavailable.
 try:
-    import pytesseract
-    from pytesseract import Output
-    _TESS_OK = True
+    from rapidocr import RapidOCR, EngineType, ModelType, OCRVersion, LangDet, LangRec
+    _RAPIDOCR_OK = True
 except Exception:
-    pytesseract = None
-    Output = None
-    _TESS_OK = False
+    RapidOCR = None
+    EngineType = ModelType = OCRVersion = LangDet = LangRec = None
+    _RAPIDOCR_OK = False
 
 
-_NAME_WL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-_NUM_WL  = "0123456789/"
+def _env(name, default):
+    v = os.environ.get(name)
+    v = v.strip() if v else ""
+    return v or default
+
+
+# Enable 180 deg text-line orientation classification (extra model + time). Off by
+# default: the pipeline already deskews/uprights the card, so cls rarely helps.
+_USE_CLS = _env("RAPIDOCR_USE_CLS", "0").lower() in ("1", "true", "yes", "on")
+
+# The shared engine is built lazily on first use (constructing it may trigger a
+# one-time model download) and cached. `_ENGINE_FAILED` latches so we don't retry
+# a hopeless build (e.g. offline with no cached models) on every card.
+_ENGINE = None
+_ENGINE_FAILED = False
+
+
+def _build_engine_params():
+    """RapidOCR config dict. Defaults to PP-OCRv5 *mobile* det+rec on ONNX Runtime;
+    every axis is overridable by environment variable for edge/offline tuning.
+    Note: PP-OCRv5 detection ships only as a language-agnostic 'ch' model, so the
+    detector language stays 'ch' while recognition defaults to English ('en')."""
+    ver        = _env("RAPIDOCR_OCR_VERSION", "PP-OCRv5")
+    model_type = _env("RAPIDOCR_MODEL_TYPE", "mobile")
+    engine     = _env("RAPIDOCR_ENGINE", "onnxruntime")
+    rec_lang   = _env("RAPIDOCR_REC_LANG", "en")
+    det_lang   = _env("RAPIDOCR_DET_LANG", "ch")
+
+    params = {
+        "Global.log_level":   "error",
+        "Det.engine_type":    EngineType(engine),
+        "Det.lang_type":      LangDet(det_lang),
+        "Det.model_type":     ModelType(model_type),
+        "Det.ocr_version":    OCRVersion(ver),
+        "Rec.engine_type":    EngineType(engine),
+        "Rec.lang_type":      LangRec(rec_lang),
+        "Rec.model_type":     ModelType(model_type),
+        "Rec.ocr_version":    OCRVersion(ver),
+    }
+    threads = _env("RAPIDOCR_NUM_THREADS", "")
+    if threads:
+        try:
+            params["EngineConfig.onnxruntime.intra_op_num_threads"] = int(threads)
+        except ValueError:
+            pass
+    return params
+
+
+def _get_engine():
+    """Return the shared RapidOCR engine, building it once on first use. Returns
+    None (never raises) if RapidOCR isn't installed or the engine can't be built,
+    so callers degrade to ocr_available=False instead of crashing."""
+    global _ENGINE, _ENGINE_FAILED
+    if _ENGINE is not None:
+        return _ENGINE
+    if _ENGINE_FAILED or not _RAPIDOCR_OK:
+        return None
+    try:
+        _ENGINE = RapidOCR(params=_build_engine_params())
+    except Exception:
+        _ENGINE_FAILED = True
+        _ENGINE = None
+    return _ENGINE
+
+
+def ocr_available():
+    """True if the OCR engine is (or can be) initialised. Kept as a callable for
+    external callers that want to probe readiness without OCR-ing a card."""
+    return _get_engine() is not None
+
+
+def _ocr_lines(crop, min_side=64):
+    """Run the shared engine on a BGR crop and return one tuple per detected text
+    line: (text, height_px, x_left_px, score). Returns [] when OCR is unavailable
+    or nothing is found. Short crops are upscaled first so thin name/number bands
+    read reliably on the mobile model."""
+    engine = _get_engine()
+    if engine is None or crop is None or getattr(crop, "size", 0) == 0:
+        return []
+    img = crop
+    h = img.shape[0]
+    if 0 < h < min_side:
+        sf = float(min_side) / h
+        img = cv2.resize(img, (max(1, int(img.shape[1] * sf)), int(h * sf)),
+                         interpolation=cv2.INTER_CUBIC)
+    try:
+        res = engine(img, use_cls=_USE_CLS)
+    except Exception:
+        return []
+    txts   = getattr(res, "txts", None)
+    boxes  = getattr(res, "boxes", None)
+    scores = getattr(res, "scores", None)
+    if not txts or boxes is None:
+        return []
+    out = []
+    for i, t in enumerate(txts):
+        try:
+            b = np.asarray(boxes[i], dtype="float32")
+            hgt = float(b[:, 1].max() - b[:, 1].min())
+            xl  = float(b[:, 0].min())
+        except Exception:
+            hgt, xl = 0.0, 0.0
+        sc = float(scores[i]) if scores is not None and i < len(scores) else 0.0
+        out.append(((t or "").strip(), hgt, xl, sc))
+    return out
+
+
 _NUMBER_RE  = re.compile(r"(\d{1,4})\s*/\s*(\d{1,4})")
 _SETCODE_RE = re.compile(r"\b(?=[A-Z0-9]{2,6}\b)[A-Z0-9]*[A-Z][A-Z0-9]*\b")
 # Words that appear in the name zone but are never the card name: evolution stage
@@ -170,46 +299,6 @@ def normalize_card_image(bgr, out_width=1000, debug_dir=None):
 # --------------------------------------------------------------------------- #
 # Name: largest text in the name zone (HP + evo-icon excluded)
 # --------------------------------------------------------------------------- #
-def _name_from_binary(im):
-    """Best name candidate + its anchor height from one binarised name-zone image."""
-    cfg = f"--oem 3 --psm 11 -c tessedit_char_whitelist={_NAME_WL}"
-    try:
-        d = pytesseract.image_to_data(im, config=cfg, output_type=Output.DICT)
-    except Exception:
-        return "", 0.0
-
-    words = []  # (text, height, left, width, center_y)
-    for i, t in enumerate(d["text"]):
-        t = (t or "").strip()
-        if len(t) >= 3 and not _is_name_noise(t):
-            h = d["height"][i]
-            words.append((t, h, d["left"][i], d["width"][i], d["top"][i] + h / 2.0))
-    if not words:
-        return "", 0.0
-
-    max_h = max(w[1] for w in words)
-    tall = [w for w in words if w[1] >= 0.6 * max_h]
-    ref = max(tall, key=lambda w: w[1])
-    ref_cy, ref_h = ref[4], ref[1]
-    line = sorted([w for w in tall if abs(w[4] - ref_cy) <= 0.7 * max_h], key=lambda w: w[2])
-
-    anchor = min(range(len(line)), key=lambda i: abs(line[i][2] - ref[2]))
-    keep = [line[anchor]]
-    for j in range(anchor + 1, len(line)):
-        p = line[j - 1]
-        if line[j][2] - (p[2] + p[3]) <= 1.0 * max_h and line[j][1] >= 0.7 * ref_h:
-            keep.append(line[j])
-        else:
-            break
-    for j in range(anchor - 1, -1, -1):
-        nx = line[j + 1]
-        if nx[2] - (line[j][2] + line[j][3]) <= 1.0 * max_h and line[j][1] >= 0.7 * ref_h:
-            keep.insert(0, line[j])
-        else:
-            break
-    return _clean_name(" ".join(w[0] for w in keep)), ref_h
-
-
 def _strip_name_noise(text):
     """Drop stage/rarity/UI tokens (incl. OCR-mangled ones) from a raw name line,
     e.g. 'sic Panpour' -> 'Panpour'."""
@@ -219,47 +308,28 @@ def _strip_name_noise(text):
 
 
 def _read_name(bgr, top=0.14, x0=0.10, x1=0.80):
-    """Read the card name from the top zone. Two complementary passes over two
-    binarisations: (1) the tallest-word-on-its-line pass (clean on most cards),
-    and (2) a single-line pass with stage/UI tokens stripped, which recovers names
-    the sparse pass fragments and removes the evolution badge sitting to the left
-    of the name. The single-line result is preferred when present because it
-    respects the name's layout instead of picking isolated blobs."""
-    if not _TESS_OK:
-        return "", -1.0
+    """Read the card name from the top zone with RapidOCR. The recogniser reads
+    whole text lines, so instead of re-assembling words we take each detected line,
+    strip stage/rarity/UI tokens (incl. OCR-mangled ones, e.g. the evolution badge
+    to the left of the name), and keep the *tallest* remaining line — the name is
+    the largest text in the zone. Ties break on letter count, then confidence.
+    Returns (name, confidence 0..100); ('', 0.0) if nothing usable is read."""
     H, W = bgr.shape[:2]
     crop = bgr[int(H * 0.02):int(H * top), int(W * x0):int(W * x1)]
-    g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    g = cv2.resize(g, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
-    g = cv2.bilateralFilter(g, 5, 40, 40)
 
-    otsu = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    adap = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                 cv2.THRESH_BINARY, 35, 10)
+    best = None   # ((height, alpha_len, score), cleaned_text, score)
+    for text, hgt, _x, sc in _ocr_lines(crop, min_side=96):
+        cleaned = _strip_name_noise(text)
+        alpha = len(re.sub(r"[^A-Za-z]", "", cleaned))
+        if alpha < 3:
+            continue
+        key = (hgt, alpha, sc)
+        if best is None or key > best[0]:
+            best = (key, cleaned, sc)
 
-    cands = []  # (text, anchor_height, priority)  priority 1 = single-line pass
-    for im in (otsu, adap):
-        nm, h = _name_from_binary(im)
-        if nm:
-            cands.append((nm, h, 0))
-        try:
-            line = pytesseract.image_to_string(
-                im, config=f"--oem 3 --psm 7 -c tessedit_char_whitelist={_NAME_WL}")
-        except Exception:
-            line = ""
-        stripped = _strip_name_noise(line)
-        if len(re.sub(r"[^A-Za-z]", "", stripped)) >= 3:
-            cands.append((stripped, 0.0, 1))
-
-    if not cands:
+    if best is None:
         return "", 0.0
-
-    def alpha_len(s):
-        return len(re.sub(r"[^A-Za-z]", "", s))
-    # Prefer the single-line stripped name, then the one with more real letters,
-    # then the tallest anchor.
-    cands.sort(key=lambda c: (c[2], alpha_len(c[0]), c[1]), reverse=True)
-    return cands[0][0], 0.0
+    return best[1], round(best[2] * 100.0, 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -282,51 +352,36 @@ def _best_number(hits):
 
 def _read_number(bgr, band_top=0.90, band_bottom=0.965, corner_frac=0.34):
     """Return (normalized 'N/M', raw_text). The collector number lives in a bottom
-    CORNER — bottom-left on modern sets, bottom-right on older ones — so we scan
+    CORNER — bottom-left on modern sets, bottom-right on older ones — so we OCR
     only the two corners and skip the centre of the bottom band (where the flavour
-    text and the weakness/resistance/retreat row live). Scanning the full width is
-    what let that central text inject spurious digits. Each corner is read with
-    several upscales/binarisations/PSMs and the most-voted plausible N/M wins."""
-    if not _TESS_OK:
-        return "", ""
+    text and the weakness/resistance/retreat row live, which used to inject spurious
+    digits). RapidOCR reads each corner as text lines; we regex every N/M out of
+    them, keep only plausible ones (1 <= N <= M <= 2000) with their confidence, and
+    pick the highest-confidence value — ties broken by frequency, with the
+    trailing-zero artifact fold (a rarity dot / set symbol read as '0') preserved."""
     H, W = bgr.shape[:2]
     y0, y1 = int(H * band_top), int(H * band_bottom)
     xL, xR = int(W * corner_frac), int(W * (1.0 - corner_frac))
     regions = (bgr[y0:y1, 0:xL], bgr[y0:y1, xR:W])   # bottom-left, bottom-right
 
-    hits, last_raw = [], ""
+    scored, raw_parts = [], []
     for band in regions:
-        if band.size == 0:
-            continue
-        g = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
-        for up in (3, 4):
-            gg = cv2.resize(g, None, fx=up, fy=up, interpolation=cv2.INTER_CUBIC)
-            gg = cv2.bilateralFilter(gg, 7, 50, 50)
-            variants = (
-                cv2.threshold(gg, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
-                cv2.adaptiveThreshold(gg, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 41, 15),
-                cv2.adaptiveThreshold(gg, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 41, 15),
-            )
-            for im in variants:
-                for psm in (7, 11, 6):
-                    cfg = f"--oem 3 --psm {psm} -c tessedit_char_whitelist={_NUM_WL}"
-                    try:
-                        txt = pytesseract.image_to_string(im, config=cfg)
-                    except Exception:
-                        continue
-                    last_raw = txt.strip() or last_raw
-                    for mm in _NUMBER_RE.finditer(txt.replace(" ", "")):
-                        n, m = int(mm.group(1)), int(mm.group(2))
-                        if _plausible_number(n, m):
-                            hits.append(f"{n}/{m}")
-        # A corner that already produced a clear winner ends the search.
-        if hits:
-            _, cnt = Counter(hits).most_common(1)[0]
-            if cnt >= 4:
-                return _best_number(hits), last_raw
-    if hits:
-        return _best_number(hits), last_raw
-    return "", last_raw
+        for text, _h, _x, sc in _ocr_lines(band, min_side=64):
+            if text:
+                raw_parts.append(text)
+            for mm in _NUMBER_RE.finditer(text.replace(" ", "")):
+                n, m = int(mm.group(1)), int(mm.group(2))
+                if _plausible_number(n, m):
+                    scored.append((f"{n}/{m}", sc))
+
+    raw = " ".join(raw_parts).strip()
+    if not scored:
+        return "", raw
+
+    top_score = max(sc for _nm, sc in scored)
+    tied = [nm for nm, sc in scored if abs(sc - top_score) < 1e-6]
+    best = tied[0] if len(set(tied)) == 1 else _best_number(tied)
+    return best, raw
 
 
 def parse_collector_number(text):
@@ -373,19 +428,24 @@ def ocr_card_front(image_or_path, normalize=True, debug_dir=None, game=None, typ
         cv2.imwrite(os.path.join(debug_dir, "band_top.png"), bgr[0:int(H * 0.15), :])
         cv2.imwrite(os.path.join(debug_dir, "band_bottom.png"), bgr[int(H * 0.87):H, :])
 
+    # Build the engine once; if unavailable, name/number come back empty (the
+    # readers degrade gracefully) but type detection — which is colour/template
+    # based, not OCR — still runs.
+    available = _get_engine() is not None
+
     name_guess, conf_top = _read_name(bgr)
     number_guess, raw_bottom = _read_number(bgr)
     set_code_guess = parse_set_code(raw_bottom, drop=number_guess.replace("/", ""))
     type_guess, type_conf = detect_card_type(bgr, game, type_refs)
 
     return {
-        "ocr_available": _TESS_OK,
+        "ocr_available": available,
         "name_guess": name_guess,
         "number_guess": number_guess,
         "set_code_guess": set_code_guess,
         "raw_top": name_guess,
         "raw_bottom": raw_bottom,
-        "conf_top": conf_top,
+        "conf_top": conf_top if name_guess else -1.0,
         "conf_bottom": 100.0 if number_guess else -1.0,
         "type_guess": type_guess,
         "type_confidence": type_conf,
