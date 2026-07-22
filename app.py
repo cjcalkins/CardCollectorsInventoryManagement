@@ -1914,8 +1914,61 @@ def _raw_field(data: dict, keys) -> str:
 # match contributes +0.5 and the card-name similarity contributes up to +0.65, so
 # 0.60 means "a confident combined name + number match" — e.g. an exact number
 # plus even a partial name read, or a near-exact name on its own. Below this the
-# entry is left blank for the person to check by hand. Overridable via env.
-AUTO_IDENTIFY_MIN_SCORE = float(os.environ.get("AUTO_IDENTIFY_MIN_SCORE", "0.60"))
+# entry is left blank for the person to check by hand.
+#
+# This is no longer a fixed number: it's a user setting (Settings → "Auto-accept
+# confidence" slider) persisted in the AppSetting key/value store, so it can be
+# tuned without editing code or restarting. Raise it for fewer wrong auto-fills
+# and more cards left blank; lower it for more hands-off imports at the cost of
+# occasional misidentifications. The AUTO_IDENTIFY_MIN_SCORE env var still works
+# as an override for headless deploys (get_setting prefers the stored value, then
+# the environment, then the default below).
+AUTO_IDENTIFY_MIN_SCORE_KEY     = "AUTO_IDENTIFY_MIN_SCORE"
+AUTO_IDENTIFY_MIN_SCORE_DEFAULT = 0.60
+# Slider bounds. The floor keeps the setting inside the range where a score is
+# still meaningful: match_ocr_to_records only *returns* candidates at >= 0.45, so
+# anything below that would accept whatever the matcher happened to surface.
+AUTO_IDENTIFY_MIN_SCORE_FLOOR   = 0.45
+AUTO_IDENTIFY_MIN_SCORE_CEIL    = 1.00
+
+
+def _coerce_min_score(value, default=AUTO_IDENTIFY_MIN_SCORE_DEFAULT):
+    """Parse a threshold from a setting value / form field / JSON body into a
+    0..1 float, clamped to the slider bounds.
+
+    Accepts either a fraction ("0.75") or a percentage ("75", "75%") so the UI
+    can post whichever is convenient and old env values keep working. Anything
+    unparseable falls back to `default`."""
+    raw = str(value if value is not None else "").strip().rstrip("%").strip()
+    if not raw:
+        return default
+    try:
+        num = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if num > 1.0:                     # given as a percentage (e.g. 75 -> 0.75)
+        num = num / 100.0
+    return max(AUTO_IDENTIFY_MIN_SCORE_FLOOR, min(AUTO_IDENTIFY_MIN_SCORE_CEIL, num))
+
+
+def auto_identify_min_score():
+    """The current auto-accept threshold (0..1). Read fresh on every call so a
+    change made in Settings takes effect on the very next card — no restart."""
+    return _coerce_min_score(get_setting(AUTO_IDENTIFY_MIN_SCORE_KEY, ""),
+                             AUTO_IDENTIFY_MIN_SCORE_DEFAULT)
+
+
+def set_auto_identify_min_score(value):
+    """Persist the auto-accept threshold. Returns the clamped value actually
+    stored, so the caller can echo back what the slider should snap to."""
+    score = _coerce_min_score(value, AUTO_IDENTIFY_MIN_SCORE_DEFAULT)
+    set_setting(AUTO_IDENTIFY_MIN_SCORE_KEY, f"{score:.2f}")
+    return score
+
+
+def auto_identify_min_percent():
+    """The threshold as a whole-number percentage, for display."""
+    return int(round(auto_identify_min_score() * 100))
 
 # ── Card "type" field (e.g. Pokemon energy type) ──
 # Minimum confidence for a VISUAL type guess to auto-fill a record's type field.
@@ -2140,12 +2193,15 @@ def _apply_ocr_candidate(record, cand):
     return updates
 
 
-def auto_identify_record(record, min_score=AUTO_IDENTIFY_MIN_SCORE):
+def auto_identify_record(record, min_score=None):
     """
     OCR a record's front image and, if a candidate matches with sufficient
-    confidence (score >= min_score, default 60% — a strong combined name + N/M
-    match), apply that identity to the record. Otherwise the record is left
-    untouched (blank) for manual entry.
+    confidence (score >= min_score), apply that identity to the record.
+    Otherwise the record is left untouched (blank) for manual entry.
+
+    `min_score` defaults to the "Auto-accept confidence" setting (Settings page
+    slider, 60% out of the box). It is resolved on every call rather than bound
+    at import time, so changing the slider affects the very next card scanned.
 
     This is the same identification the inventory-detail page runs, invoked
     automatically at the end of an import. It never raises and never commits: any
@@ -2161,9 +2217,14 @@ def auto_identify_record(record, min_score=AUTO_IDENTIFY_MIN_SCORE):
     Returns: { identified, reason, score, name, applied: {..},
                type_guess, type_confidence, type_applied: {field, value}|None }
     """
+    # Resolve the user-configured auto-accept threshold now (callers may pass an
+    # explicit override). Reported back in `min_score` so the UI / import summary
+    # can say what bar a card had to clear.
+    min_score = auto_identify_min_score() if min_score is None else _coerce_min_score(min_score)
+
     out = {"identified": False, "reason": "", "score": None, "name": "",
            "applied": {}, "type_guess": "", "type_confidence": 0.0, "type_applied": None,
-           "source": "", "error": ""}
+           "source": "", "error": "", "min_score": min_score}
 
     if card_ocr is None:
         out["reason"] = "ocr_unavailable"
@@ -2227,10 +2288,10 @@ def auto_identify_record(record, min_score=AUTO_IDENTIFY_MIN_SCORE):
             out["reason"] = "apply_failed"
 
     # 1b) External identification fallback — runs whenever the local CATALOG
-    #     lookup didn't clear 60%, using the provider selected in Settings →
+    #     lookup didn't clear the auto-accept threshold, using the provider selected in Settings →
     #     General (Ximilar or CardSight; 'none' disables it). Gated on the
     #     reference-catalog score, NOT the combined list: match_ocr_to_records
-    #     grants a large collector-number bonus, so a scanned card can score >=60%
+    #     grants a large collector-number bonus, so a scanned card can clear the threshold
     #     against an UNRELATED record in the user's own inventory that merely shares
     #     a number (e.g. "25/102"); keying off that combined score used to mark the
     #     card "identified" and silently skip the service. The provider helper
@@ -2253,7 +2314,7 @@ def auto_identify_record(record, min_score=AUTO_IDENTIFY_MIN_SCORE):
     # 1c) Last resort — if neither the catalog nor the external service identified
     #     the card,
     #     fall back to a confident match against the user's OWN existing records
-    #     (e.g. a real duplicate already entered). Applied only if it clears 60%.
+    #     (e.g. a real duplicate already entered). Applied only if it clears the threshold.
     if not out["identified"]:
         rec_top = rec_matches[0] if rec_matches else None   # already sorted desc
         if rec_top is not None and float(rec_top.get("score", 0) or 0) >= min_ok:
@@ -6260,8 +6321,8 @@ def _create_single_card(front_path, back_path, game, album, template,
     Create a blank inventory record for `game` (+optional album/collection) with
     the given front (required) and back (optional) image paths, then OCR-identify
     the FRONT ONLY — the back is never name/serial-checked. A match at or above the
-    auto-identify threshold (60%) is applied and saved; anything less leaves the
-    entry blank for manual entry.
+    auto-identify threshold (the Settings slider, 60% by default) is applied and
+    saved; anything less leaves the entry blank for manual entry.
 
     `storage_type` is 'album' (pages + slots) or 'box' (a flat 1..N run); for a
     box the card is stamped with the next sequential box_number.
@@ -7847,6 +7908,11 @@ def ocr_identify(record_id):
             "match_count":  len(ref_matches),
         },
         "ximilar_error": ximilar_error,
+        # The confidence a candidate must reach to be accepted without asking
+        # (the Settings slider). The UI compares candidates[0].score against this
+        # instead of carrying its own hardcoded number.
+        "auto_accept_score":   auto_identify_min_score(),
+        "auto_accept_percent": auto_identify_min_percent(),
         # Whether this record already has an identity (name or set number). The
         # UI uses this to decide between auto-applying a confident match on a
         # fresh record vs. opening the picker for manual correction.
@@ -9951,8 +10017,11 @@ def search_by_image_page():
 def settings_page():
     """Settings landing page. The gear icon in the top nav points here; the
     former top-level tabs (Templates, Type Icons, Shops, Search by Image,
-    Duplicates) are reached from the sidebar on these pages."""
-    return render_template("settings.html")
+    Duplicates) are reached from the sidebar on these pages.
+
+    `general` carries the inline controls rendered on this page (currently the
+    OCR auto-accept confidence slider)."""
+    return render_template("settings.html", general=_general_status())
 
 
 @app.route("/settings/reference")
@@ -9985,6 +10054,17 @@ def _general_status():
         "identify_provider_label": _identify_provider_label(),
         "identify_provider_env_forced": os.environ.get("IDENTIFY_PROVIDER") is not None,
         "cardsight_key_set": bool(get_api_key("CARDSIGHT_API_KEY")),
+        # OCR auto-accept confidence (the Settings slider). `*_pct` values are
+        # what the slider itself binds to; `env_forced` flags an install that
+        # pins the threshold via the AUTO_IDENTIFY_MIN_SCORE env var and has not
+        # yet overridden it from the UI.
+        "auto_identify_min_score":     auto_identify_min_score(),
+        "auto_identify_min_pct":       auto_identify_min_percent(),
+        "auto_identify_default_pct":   int(round(AUTO_IDENTIFY_MIN_SCORE_DEFAULT * 100)),
+        "auto_identify_floor_pct":     int(round(AUTO_IDENTIFY_MIN_SCORE_FLOOR * 100)),
+        "auto_identify_ceil_pct":      int(round(AUTO_IDENTIFY_MIN_SCORE_CEIL * 100)),
+        "auto_identify_env_forced":    (os.environ.get("AUTO_IDENTIFY_MIN_SCORE") is not None
+                                        and AUTO_IDENTIFY_MIN_SCORE_KEY not in _settings_cache),
         "identify_providers": [
             {"value": "none",      "label": "None (local database only)", "key_set": True},
             {"value": "ximilar",   "label": "Ximilar",   "key_set": bool(get_api_key("XIMILAR_API_TOKEN"))},
@@ -10035,6 +10115,41 @@ def general_ximilar_fallback():
     else:
         msg = "External identification disabled (local database only)."
     return jsonify({"status": "success", "message": msg, "general": _general_status()})
+
+
+@app.route("/settings/general/auto_identify_threshold", methods=["GET", "POST"])
+def general_auto_identify_threshold():
+    """Read (GET) or set (POST) the OCR auto-accept confidence — how sure a match
+    must be before an identification is applied to a card automatically.
+
+    POST body accepts `percent` (0-100) or `value` (0-1); both are clamped to the
+    slider bounds. Takes effect immediately: auto_identify_min_score() is read
+    fresh on every card, so no restart is needed."""
+    if request.method == "GET":
+        return jsonify({"status": "success", "general": _general_status()})
+
+    body = request.get_json(silent=True) or request.form
+    raw = body.get("percent", body.get("value", body.get("threshold", "")))
+    if str(raw).strip() == "":
+        return jsonify({"status": "error",
+                        "message": "No confidence value was supplied.",
+                        "general": _general_status()}), 400
+
+    score = set_auto_identify_min_score(raw)
+    pct = int(round(score * 100))
+    if pct >= 85:
+        hint = " Very strict — expect more cards to come in blank for manual entry."
+    elif pct <= 50:
+        hint = " Fairly permissive — more cards fill in automatically, but check them for mismatches."
+    else:
+        hint = ""
+    return jsonify({
+        "status": "success",
+        "percent": pct,
+        "value": score,
+        "message": f"Auto-accept confidence set to {pct}%.{hint}",
+        "general": _general_status(),
+    })
 
 
 @app.route("/settings/general/identify_provider", methods=["POST"])
@@ -10106,7 +10221,8 @@ _IDENTIFY_SETTINGS_HTML = """<!doctype html>
   <div class="card">
     <h1>Card Identification Service</h1>
     <p class="sub">Choose which external service identifies a card from its front image when the
-       local OCR / catalog lookup can't match it (below 60%). This applies to both auto-import and
+       local OCR / catalog lookup can't match it (below the __MIN_PCT__% auto-accept confidence set on the
+       <a href="/settings">Settings</a> page). This applies to both auto-import and
        the manual &ldquo;Read Card &amp; Find Matches&rdquo; on a card's detail page.</p>
 
     <label class="opt" data-value="none">
@@ -10210,6 +10326,7 @@ def identify_settings_page():
     so it doesn't depend on the theme templates; reachable at /settings/identify."""
     g = _general_status()
     html = (_IDENTIFY_SETTINGS_HTML
+            .replace("__MIN_PCT__", str(g["auto_identify_min_pct"]))
             .replace("__PROVIDER__", g["identify_provider"])
             .replace("__XIMILAR_SET__", "yes" if g["ximilar_key_set"] else "no")
             .replace("__CARDSIGHT_SET__", "yes" if g["cardsight_key_set"] else "no"))
@@ -11761,7 +11878,10 @@ def _apply_ximilar_identification(record, xi, category_id):
         except Exception:
             cands = []
         top = cands[0] if cands else None
-        if top is not None and float(top.get("score", 0) or 0) >= 0.60:
+        # Same auto-accept bar as local OCR (Settings slider), so raising it makes
+        # the provider-seeded catalog re-match stricter too instead of quietly
+        # applying at a fixed 60%.
+        if top is not None and float(top.get("score", 0) or 0) >= auto_identify_min_score():
             applied = _apply_ocr_candidate(record, top)
             if applied:
                 return applied
@@ -11814,8 +11934,9 @@ def _ximilar_identify_candidates(record, category_id):
             )
         except Exception:
             refs = []
+        _min = auto_identify_min_score()
         for r in refs:
-            if float(r.get("score", 0) or 0) >= 0.60:
+            if float(r.get("score", 0) or 0) >= _min:
                 cands.append({**r, "via": "ximilar"})
 
     if not cands:
@@ -12083,8 +12204,9 @@ def _external_identify_candidates(record, category_id):
             )
         except Exception:
             refs = []
+        _min = auto_identify_min_score()
         for r in refs:
-            if float(r.get("score", 0) or 0) >= 0.60:
+            if float(r.get("score", 0) or 0) >= _min:
                 cands.append({**r, "via": provider, "provider_label": label})
 
     if not cands:

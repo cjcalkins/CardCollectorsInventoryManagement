@@ -77,6 +77,68 @@
         }
         .setting-card h5 { font-size: 1.05rem; font-weight: 700; margin-bottom: .2rem; }
         .setting-card p { font-size: .85rem; color: var(--muted); margin-bottom: 0; }
+
+        /* ── Auto-accept confidence slider ── */
+        .tune-card {
+            background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+            padding: 1.35rem 1.5rem; box-shadow: 0 3px 14px rgba(0,0,0,0.05);
+        }
+        .tune-head { display: flex; align-items: flex-start; gap: 1rem; }
+        .tune-head .sc-icon {
+            flex-shrink: 0; width: 48px; height: 48px; border-radius: 12px;
+            display: flex; align-items: center; justify-content: center;
+            background: linear-gradient(135deg, var(--ink) 0%, var(--ink-2) 100%);
+            color: #fff; font-size: 1.15rem;
+        }
+        .tune-card h5 { font-size: 1.05rem; font-weight: 700; margin-bottom: .2rem; }
+        .tune-card .tune-sub { font-size: .85rem; color: var(--muted); margin-bottom: 0; }
+        .tune-readout {
+            margin-left: auto; text-align: right; line-height: 1.1; padding-left: 1rem;
+        }
+        .tune-readout .val { font-size: 2rem; font-weight: 800; font-variant-numeric: tabular-nums; }
+        .tune-readout .cap {
+            font-size: .68rem; text-transform: uppercase; letter-spacing: .06em;
+            color: var(--muted); font-weight: 700;
+        }
+
+        .tune-slider { margin-top: 1.25rem; }
+        .tune-slider input[type=range] {
+            -webkit-appearance: none; appearance: none;
+            width: 100%; height: 8px; border-radius: 999px; background: var(--surface-2);
+            border: 1px solid var(--border); outline: none; cursor: pointer;
+        }
+        .tune-slider input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none; appearance: none;
+            width: 22px; height: 22px; border-radius: 50%; cursor: pointer;
+            background: var(--ink); border: 3px solid var(--surface);
+            box-shadow: 0 1px 6px rgba(0,0,0,0.28);
+        }
+        .tune-slider input[type=range]::-moz-range-thumb {
+            width: 18px; height: 18px; border-radius: 50%; cursor: pointer;
+            background: var(--ink); border: 3px solid var(--surface);
+            box-shadow: 0 1px 6px rgba(0,0,0,0.28);
+        }
+        .tune-slider input[type=range]:focus-visible {
+            box-shadow: 0 0 0 3px color-mix(in srgb, var(--ink) 35%, transparent);
+        }
+        .tune-slider input[type=range]:disabled { opacity: .55; cursor: not-allowed; }
+        .tune-scale {
+            display: flex; justify-content: space-between;
+            font-size: .75rem; color: var(--muted); margin-top: .45rem;
+        }
+        .tune-explain {
+            margin-top: 1rem; font-size: .88rem; color: var(--text-soft);
+            background: var(--surface-2); border: 1px solid var(--border);
+            border-radius: 10px; padding: .7rem .9rem;
+        }
+        .tune-actions { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; margin-top: 1rem; }
+        .tune-actions .tune-msg { font-size: .86rem; font-weight: 600; }
+        .tune-msg.ok { color: var(--success-text, #166534); }
+        .tune-msg.err { color: var(--danger-text, #991b1b); }
+        @media (max-width: 575px) {
+            .tune-head { flex-wrap: wrap; }
+            .tune-readout { margin-left: 0; text-align: left; padding-left: 0; width: 100%; }
+        }
     </style>
     <link rel="stylesheet" href="{{ url_for('static', filename='theme.css') }}">
 </head>
@@ -108,6 +170,45 @@
                 <div class="mb-4">
                     <h2 class="mb-1"><i class="fas fa-gear me-2"></i>Settings</h2>
                     <div class="text-muted">Configure the program and manage your database.</div>
+                </div>
+
+                <div class="tune-card mb-4">
+                    <div class="tune-head">
+                        <div class="sc-icon"><i class="fas fa-wand-magic-sparkles"></i></div>
+                        <div>
+                            <h5>Auto-accept confidence</h5>
+                            <p class="tune-sub">How sure the scanner has to be about a card before it fills the
+                               entry in for you. Below this, the card is left blank for you to identify by hand.</p>
+                        </div>
+                        <div class="tune-readout">
+                            <div class="val" id="tuneVal">{{ general.auto_identify_min_pct }}%</div>
+                            <div class="cap">sure or better</div>
+                        </div>
+                    </div>
+
+                    <div class="tune-slider">
+                        <label class="visually-hidden" for="tuneRange">Auto-accept confidence, percent</label>
+                        <input type="range" id="tuneRange"
+                               min="{{ general.auto_identify_floor_pct }}"
+                               max="{{ general.auto_identify_ceil_pct }}"
+                               step="1"
+                               value="{{ general.auto_identify_min_pct }}"
+                               aria-describedby="tuneExplain">
+                        <div class="tune-scale">
+                            <span>{{ general.auto_identify_floor_pct }}% &middot; fills in more, checks less</span>
+                            <span>{{ general.auto_identify_ceil_pct }}% &middot; only exact matches</span>
+                        </div>
+                    </div>
+
+                    <div class="tune-explain" id="tuneExplain"></div>
+
+                    <div class="tune-actions">
+                        <button type="button" class="btn btn-dark btn-sm px-3" id="tuneSave">Save</button>
+                        <button type="button" class="btn btn-outline-secondary btn-sm px-3" id="tuneReset">
+                            Reset to {{ general.auto_identify_default_pct }}%
+                        </button>
+                        <span class="tune-msg" id="tuneMsg"></span>
+                    </div>
                 </div>
 
                 <div class="row g-4">
@@ -278,5 +379,100 @@
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+    // ── Auto-accept confidence ────────────────────────────────────────────────
+    // Drives the slider that sets how confident an OCR match must be before a
+    // scanned card is identified automatically. Saved to /settings/general/
+    // auto_identify_threshold; the CSRF shim injected by the server attaches the
+    // token to this fetch, so nothing extra is needed here.
+    (function () {
+      var range = document.getElementById('tuneRange');
+      if (!range) return;
+
+      var val     = document.getElementById('tuneVal');
+      var explain = document.getElementById('tuneExplain');
+      var msg     = document.getElementById('tuneMsg');
+      var saveBtn = document.getElementById('tuneSave');
+      var resetBtn= document.getElementById('tuneReset');
+
+      var DEFAULT_PCT = {{ general.auto_identify_default_pct }};
+      var saved       = parseInt(range.value, 10);
+
+      // Fill the track up to the thumb so the current level reads at a glance.
+      function paint() {
+        var min = parseInt(range.min, 10), max = parseInt(range.max, 10);
+        var pct = ((parseInt(range.value, 10) - min) / (max - min)) * 100;
+        range.style.background =
+          'linear-gradient(to right, var(--ink) 0%, var(--ink) ' + pct + '%,' +
+          ' var(--surface-2) ' + pct + '%, var(--surface-2) 100%)';
+      }
+
+      function describe(pct) {
+        if (pct >= 90) {
+          return 'Only near-certain matches are used \u2014 usually an exact card number plus a clean ' +
+                 'name read. Most cards will arrive blank and wait for you.';
+        }
+        if (pct >= 75) {
+          return 'Cautious. A card is filled in when the name and number both read well, so mistakes ' +
+                 'are rare and more cards need a manual look.';
+        }
+        if (pct >= 60) {
+          return 'Balanced \u2014 the recommended setting. A strong name match, or a partial name with an ' +
+                 'exact card number, is enough to fill the entry in.';
+        }
+        return 'Hands-off. Weaker reads are accepted, so far fewer cards come in blank \u2014 review ' +
+               'imports for the occasional wrong card.';
+      }
+
+      function render() {
+        var pct = parseInt(range.value, 10);
+        val.textContent = pct + '%';
+        explain.textContent = describe(pct);
+        saveBtn.disabled = (pct === saved);
+        paint();
+      }
+
+      function status(text, ok) {
+        msg.textContent = text;
+        msg.className = 'tune-msg ' + (ok ? 'ok' : 'err');
+      }
+
+      range.addEventListener('input', function () { msg.textContent = ''; render(); });
+
+      resetBtn.addEventListener('click', function () {
+        range.value = DEFAULT_PCT;
+        msg.textContent = '';
+        render();
+      });
+
+      saveBtn.addEventListener('click', async function () {
+        var pct = parseInt(range.value, 10);
+        saveBtn.disabled = true;
+        status('Saving\u2026', true);
+        try {
+          var res = await fetch('/settings/general/auto_identify_threshold', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ percent: pct })
+          });
+          var data = await res.json();
+          if (res.ok && data.status === 'success') {
+            saved = data.percent;
+            range.value = saved;          // reflect any clamping done server-side
+            render();
+            status(data.message || 'Saved.', true);
+          } else {
+            status(data.message || 'Could not save that value.', false);
+            saveBtn.disabled = false;
+          }
+        } catch (e) {
+          status('Could not reach the server. Check your connection and try again.', false);
+          saveBtn.disabled = false;
+        }
+      });
+
+      render();
+    })();
+    </script>
 </body>
 </html>
