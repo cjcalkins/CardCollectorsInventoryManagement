@@ -1970,6 +1970,72 @@ def auto_identify_min_percent():
     """The threshold as a whole-number percentage, for display."""
     return int(round(auto_identify_min_score() * 100))
 
+
+# Ties are decided at FULL precision: the decimal places matter. Scores arrive
+# rounded to three decimals from match_ocr_to_records, so 0.884 and 0.881 are two
+# different scores and the higher one wins outright — only genuinely identical
+# scores are a tie. The epsilon absorbs float representation error, nothing more.
+_TIE_EPSILON = 1e-9
+
+
+def rank_reference_matches(ref_matches, min_score=None):
+    """
+    Decide whether a set of REFERENCE-CATALOG matches identifies a card.
+
+    This is the single ranking rule, shared by the import auto-identify and the
+    card-detail page so the two can never disagree. Only reference (catalog)
+    matches are considered — matches against the user's own existing records are
+    never used to auto-fill, because the collector-number bonus lets an unrelated
+    card that merely shares a number (e.g. "25/102") outscore the real match.
+
+    Rules, in order:
+      1. The highest-scoring match at or above `min_score` wins. Scores are
+         compared at full precision, so the higher of two close scores (0.884 vs
+         0.881) is the winner rather than a tie.
+      2. If two or more matches share the identical top score, nothing is
+         applied — the card is ambiguous and goes to manual review.
+      3. If nothing reaches `min_score`, nothing is applied.
+
+    Returns a decision dict:
+        { decision: "apply" | "ambiguous" | "below_threshold" | "no_candidates",
+          winner:   the winning candidate, or None,
+          tied:     the tied candidates when decision == "ambiguous",
+          top_score, runner_up_score, min_score }
+    """
+    min_score = auto_identify_min_score() if min_score is None else _coerce_min_score(min_score)
+    out = {"decision": "no_candidates", "winner": None, "tied": [],
+           "top_score": None, "runner_up_score": None, "min_score": min_score}
+
+    ranked = sorted((c for c in (ref_matches or []) if c is not None),
+                    key=lambda c: float(c.get("score", 0) or 0), reverse=True)
+    if not ranked:
+        return out
+
+    top_score = float(ranked[0].get("score", 0) or 0)
+    out["top_score"] = top_score
+    if len(ranked) > 1:
+        out["runner_up_score"] = float(ranked[1].get("score", 0) or 0)
+
+    # Rule 3 — nothing is confident enough. (The epsilon keeps a score that is
+    # exactly the threshold from being rejected by float representation.)
+    if top_score < float(min_score) - _TIE_EPSILON:
+        out["decision"] = "below_threshold"
+        return out
+
+    # Rule 2 — only an identical score ties. A card scoring even 0.001 higher
+    # than the next is a clear winner under rule 1.
+    tied = [c for c in ranked
+            if abs(float(c.get("score", 0) or 0) - top_score) <= _TIE_EPSILON]
+    if len(tied) > 1:
+        out["decision"] = "ambiguous"
+        out["tied"] = tied
+        return out
+
+    # Rule 1 — a single clear winner.
+    out["decision"] = "apply"
+    out["winner"] = ranked[0]
+    return out
+
 # ── Card "type" field (e.g. Pokemon energy type) ──
 # Minimum confidence for a VISUAL type guess to auto-fill a record's type field.
 # Colour-distinct types clear this; ambiguous red-orange/neutral guesses (kept at
@@ -2195,27 +2261,47 @@ def _apply_ocr_candidate(record, cand):
 
 def auto_identify_record(record, min_score=None):
     """
-    OCR a record's front image and, if a candidate matches with sufficient
-    confidence (score >= min_score), apply that identity to the record.
-    Otherwise the record is left untouched (blank) for manual entry.
+    Identify a record from its FRONT image and fill the entry in, or leave it
+    blank for manual review.
+
+    Obtain
+      1. OCR the front image (name + collector number).
+      2. Score that read against the REFERENCE DATA for the game the scan was
+         filed under.
+
+    Rank
+      1. The reference match with the highest percentage, provided it is at or
+         above the configured minimum, is applied automatically.
+      2. If two or more reference matches tie at that top percentage, neither is
+         applied — the entry is left blank for manual review.
+      3. If no reference match reaches the minimum, the entry is left blank for
+         manual review.
+
+    Matches against the user's OWN existing records are deliberately not used to
+    auto-fill: the matcher's collector-number bonus lets an unrelated card that
+    merely shares a number outscore the real one. They remain available in the
+    manual picker on the card-detail page, where a person is choosing.
 
     `min_score` defaults to the "Auto-accept confidence" setting (Settings page
-    slider, 60% out of the box). It is resolved on every call rather than bound
-    at import time, so changing the slider affects the very next card scanned.
+    slider, 60% out of the box), resolved on every call so a change to the slider
+    affects the very next card scanned.
 
-    This is the same identification the inventory-detail page runs, invoked
-    automatically at the end of an import. It never raises and never commits: any
-    OCR/matching problem simply yields identified=False, and the caller decides
-    when to persist.
+    Never raises and never commits: any OCR/matching problem simply yields
+    identified=False, and the caller decides when to persist.
 
-    Separately from the name/serial identity, it also fills the Game's "type"
-    field (e.g. Pokemon energy type) when the card provides one — from the
-    matched reference card if identified, otherwise from a confident VISUAL
-    reading of the type icon. This runs even when there's no identity match,
-    so cards can still be sorted by type.
+    Separately from the identity, it also fills the Game's "type" field (e.g.
+    Pokemon energy type) when the card provides one — from the matched reference
+    card if identified, otherwise from a confident VISUAL reading of the type
+    icon. This runs even when there's no identity match, so cards can still be
+    sorted by type.
 
-    Returns: { identified, reason, score, name, applied: {..},
+    Returns: { identified, reason, score, name, applied: {..}, min_score,
+               runner_up_score, candidates_considered, tied: [..],
                type_guess, type_confidence, type_applied: {field, value}|None }
+
+    `reason` is one of: applied | applied_<provider> | ambiguous_match |
+    below_threshold | no_candidates | no_reference_data | apply_failed |
+    ocr_unavailable | ocr_error | no_front_image | <provider>_error.
     """
     # Resolve the user-configured auto-accept threshold now (callers may pass an
     # explicit override). Reported back in `min_score` so the UI / import summary
@@ -2224,7 +2310,8 @@ def auto_identify_record(record, min_score=None):
 
     out = {"identified": False, "reason": "", "score": None, "name": "",
            "applied": {}, "type_guess": "", "type_confidence": 0.0, "type_applied": None,
-           "source": "", "error": "", "min_score": min_score}
+           "source": "", "error": "", "min_score": min_score,
+           "runner_up_score": None, "candidates_considered": 0, "tied": []}
 
     if card_ocr is None:
         out["reason"] = "ocr_unavailable"
@@ -2251,53 +2338,61 @@ def auto_identify_record(record, min_score=None):
     out["type_guess"] = ocr.get("type_guess", "")
     out["type_confidence"] = ocr.get("type_confidence", 0.0)
 
-    # Reference catalog (rich auto-fill) for this record's game, if synced, plus
-    # any already-identified existing records — same sources as /ocr_identify.
+    # ── Obtain step 2: score the OCR read against this game's REFERENCE DATA ──
     category_id, _ = _resolve_category_for_game(game)
     ref_matches = _reference_candidates_for_ocr(category_id, ocr) if category_id else []
-    rec_matches = card_ocr.match_ocr_to_records(
-        ocr, _build_ocr_candidates(exclude_record_id=record.id))
-    for m in rec_matches:
-        m["source"] = "record"
+    out["candidates_considered"] = len(ref_matches)
 
-    # Best first; reference (catalog) matches precede record matches on ties
-    # (listed first and Python's sort is stable), so a confident catalog hit wins
-    # — it carries set/rarity/TCGplayer data a bare record match can't.
-    combined = sorted(ref_matches + rec_matches, key=lambda c: c.get("score", 0), reverse=True)
-    top = combined[0] if combined else None
+    # ── Rank step: one clear winner over the bar, or leave it blank ──
+    decision = rank_reference_matches(ref_matches, min_score)
+    out["runner_up_score"] = decision["runner_up_score"]
+    if decision["top_score"] is not None:
+        out["score"] = decision["top_score"]
 
-    if top is not None:
-        out["score"] = top.get("score")
-        out["name"] = top.get("name", "")
+    winner = decision["winner"]
+    if winner is not None:
+        out["name"] = winner.get("name", "")
+    elif ref_matches:
+        # Nothing was applied, but report the closest read so the import summary
+        # can show how near the card came. Callers gate the displayed name on
+        # `identified`, so this is diagnostic only and never shown as the answer.
+        best = max(ref_matches, key=lambda c: float(c.get("score", 0) or 0))
+        out["name"] = best.get("name", "")
 
-    min_ok        = float(min_score) - 1e-9
-    ref_top       = ref_matches[0] if ref_matches else None   # already sorted desc
-    ref_top_score = float(ref_top.get("score", 0) or 0) if ref_top else 0.0
-
-    # 1) Prefer a confident CATALOG (reference) match — authoritative, and it
-    #    carries set/rarity/price/type. This is the "local identification" that
-    #    gates the Ximilar fallback in 1b.
-    if ref_top is not None and ref_top_score >= min_ok:
-        applied = _apply_ocr_candidate(record, ref_top)
+    if decision["decision"] == "apply":
+        applied = _apply_ocr_candidate(record, winner)
         if applied:
             out["identified"] = True
             out["reason"] = "applied"
             out["applied"] = applied
-            top = ref_top
+            out["source"] = "reference"
         else:
+            # The catalog row behind the winning match has gone (catalog re-synced
+            # or pruned since scoring). Nothing to apply — treat it as unidentified
+            # so the fallback below still gets its turn.
             out["reason"] = "apply_failed"
+    elif decision["decision"] == "ambiguous":
+        # Rule 2 — two or more reference cards are equally good reads. Picking one
+        # would be a coin flip, so the entry stays blank and both are reported.
+        out["reason"] = "ambiguous_match"
+        out["tied"] = [{"name": c.get("name", ""), "serial": c.get("serial", ""),
+                        "set": c.get("set", ""), "score": c.get("score"),
+                        "product_id": c.get("product_id")}
+                       for c in decision["tied"]]
+    elif decision["decision"] == "below_threshold":
+        out["reason"] = "below_threshold"          # Rule 3
+    else:
+        # No scored candidates at all: either the game's catalog was never synced
+        # or the OCR read matched nothing in it.
+        out["reason"] = "no_reference_data" if not category_id else "no_candidates"
 
-    # 1b) External identification fallback — runs whenever the local CATALOG
-    #     lookup didn't clear the auto-accept threshold, using the provider selected in Settings →
-    #     General (Ximilar or CardSight; 'none' disables it). Gated on the
-    #     reference-catalog score, NOT the combined list: match_ocr_to_records
-    #     grants a large collector-number bonus, so a scanned card can clear the threshold
-    #     against an UNRELATED record in the user's own inventory that merely shares
-    #     a number (e.g. "25/102"); keying off that combined score used to mark the
-    #     card "identified" and silently skip the service. The provider helper
-    #     returns a clear error (missing key, network, out of credits, no match).
+    # ── External identification fallback (opt-in) ──
+    # Runs only when the reference data did NOT produce a confident single match,
+    # using the provider selected in Settings → General. With the provider set to
+    # 'none' — the local-database-only configuration — this is skipped entirely
+    # and the entry is simply left blank, exactly as the rank rules specify.
     _provider = _identify_provider()
-    if not out["identified"] and ref_top_score < min_ok and _provider != "none":
+    if not out["identified"] and _provider != "none":
         xi, xi_err = _external_identify_card_ex(record.image_path)
         if xi:
             applied = _apply_external_identification(record, xi, category_id)
@@ -2308,32 +2403,20 @@ def auto_identify_record(record, min_score=None):
                 out["source"] = _provider
                 out["name"] = applied.get("name") or xi.get("name") or out["name"]
         elif xi_err:
-            out["reason"] = f"{_provider}_error"
             out["error"] = xi_err
+            # Keep the local reason (why the catalog didn't decide) and record the
+            # provider failure alongside it, rather than masking one with the other.
+            if not out["reason"]:
+                out["reason"] = f"{_provider}_error"
 
-    # 1c) Last resort — if neither the catalog nor the external service identified
-    #     the card,
-    #     fall back to a confident match against the user's OWN existing records
-    #     (e.g. a real duplicate already entered). Applied only if it clears the threshold.
-    if not out["identified"]:
-        rec_top = rec_matches[0] if rec_matches else None   # already sorted desc
-        if rec_top is not None and float(rec_top.get("score", 0) or 0) >= min_ok:
-            applied = _apply_ocr_candidate(record, rec_top)
-            if applied:
-                out["identified"] = True
-                out["reason"] = "applied_record"
-                out["applied"] = applied
-                top = rec_top
-        if not out["identified"] and not out["reason"]:
-            out["reason"] = "below_threshold" if top is not None else "no_candidates"
-
-    # 2) Type field — independent of the identity match. Prefer the catalog value
-    #    (authoritative) when we identified a reference card; otherwise use a
-    #    confident visual guess. _apply_ocr_candidate may already have filled it
-    #    from the catalog, in which case _fill_type_field is a no-op.
+    # ── Type field — independent of the identity match ──
+    # Prefer the catalog value (authoritative) when a reference card was applied;
+    # otherwise use a confident visual guess. _apply_ocr_candidate may already
+    # have filled it from the catalog, in which case _fill_type_field is a no-op.
+    # This runs even for ambiguous/blank entries so cards remain sortable by type.
     type_value = ""
-    if out["identified"] and top is not None and top.get("source") == "reference":
-        type_value = _reference_type_value(top.get("product_id"))
+    if out["identified"] and winner is not None and out["source"] == "reference":
+        type_value = _reference_type_value(winner.get("product_id"))
     if not type_value and out["type_confidence"] >= TYPE_MIN_CONFIDENCE:
         type_value = out["type_guess"]
     if type_value:
@@ -6372,6 +6455,12 @@ def _finalize_pdf_pair(front_path, back_path, front_page, back_page, game, album
         "identified":      bool(ident.get("identified")),
         "identified_name": (ident.get("applied") or {}).get("name", "") if ident.get("identified") else "",
         "ident_error":     ident.get("error", ""),
+        # Why the card was (or wasn't) filled in, and how close it came — without
+        # these the UI can't tell "no match" from "tied" from "just below the bar".
+        "ident_reason":    ident.get("reason", ""),
+        "ident_score":     ident.get("score"),
+        "ident_min_score": ident.get("min_score"),
+        "ident_tied":      ident.get("tied", []),
         "card_type":       (ident.get("type_applied") or {}).get("value", ""),
         "image_url":       build_uploaded_file_url(record.image_path),
         "detail_url":      url_for("inventory_detail", record_id=record.id),
@@ -7867,21 +7956,46 @@ def ocr_identify(record_id):
         }), 503
 
     catalog_only = request.args.get("catalog", "").strip().lower() in ("1", "true", "yes")
-    candidates = _build_ocr_candidates(exclude_record_id=record.id, catalog_only=catalog_only)
-    matches = card_ocr.match_ocr_to_records(ocr, candidates)
-    for m in matches:
-        m["source"] = "record"
 
     # Also match against the downloaded tcgcsv catalog for this record's game,
     # if that game has been synced. Reference matches carry rich fields the UI
     # can auto-fill (set, rarity, TCGplayer URL, ...).
     ext = record.extracted_data or {}
     category_id, ref_game = _resolve_category_for_game(ext.get("game", ""))
-    ref_matches = _reference_candidates_for_ocr(category_id, ocr) if category_id else []
+
+    # The old separate "Database Match" action is folded in here: when the image
+    # yields no name and no number (glare, low resolution, a card the detector
+    # couldn't square up), fall back to the identity the user already typed on the
+    # entry and match THAT against the catalog. So one button covers both "read
+    # the card" and "look up what I typed", instead of the person having to know
+    # which of two tools to reach for.
+    lookup = ocr
+    used_typed_fields = False
+    if not (ocr.get("name_guess") or "").strip() and not (ocr.get("number_guess") or "").strip():
+        typed_name   = _raw_field(ext, _NAME_KEYS)
+        typed_serial = _raw_field(ext, _SERIAL_KEYS)
+        if typed_name or typed_serial:
+            lookup = {**ocr, "name_guess": typed_name, "number_guess": typed_serial}
+            used_typed_fields = True
+
+    ref_matches = _reference_candidates_for_ocr(category_id, lookup) if category_id else []
+
+    # Matches against the user's own existing entries. These are offered in the
+    # picker for a person to choose, but never auto-applied — see the note on
+    # rank_reference_matches.
+    candidates = _build_ocr_candidates(exclude_record_id=record.id, catalog_only=catalog_only)
+    matches = card_ocr.match_ocr_to_records(lookup, candidates)
+    for m in matches:
+        m["source"] = "record"
 
     # Combine, sorted best-first, so number-matched cards float to the top
-    # regardless of which source they came from.
+    # regardless of which source they came from. This combined list is for the
+    # PICKER — a person choosing — so it still includes the user's own records.
     combined = sorted(ref_matches + matches, key=lambda c: c.get("score", 0), reverse=True)
+
+    # The automatic decision, by contrast, considers reference data only and
+    # applies the tie / threshold rules. Same function the import path calls.
+    _auto_decision = rank_reference_matches(ref_matches)
 
     # Local-only: OCR + catalog/record matching. External (cloud) identification
     # is a separate, explicit action now — see /cloud_identify. `ximilar_error`
@@ -7907,12 +8021,27 @@ def ocr_identify(record_id):
             "synced":       bool(category_id),
             "match_count":  len(ref_matches),
         },
+        # True when the image was unreadable and the entry's typed Name/Number
+        # were matched against the catalog instead (the folded-in Database Match).
+        "used_typed_fields": used_typed_fields,
         "ximilar_error": ximilar_error,
-        # The confidence a candidate must reach to be accepted without asking
-        # (the Settings slider). The UI compares candidates[0].score against this
-        # instead of carrying its own hardcoded number.
-        "auto_accept_score":   auto_identify_min_score(),
-        "auto_accept_percent": auto_identify_min_percent(),
+        # The auto-accept decision, computed by the SAME rule the import path uses
+        # (rank_reference_matches over reference data only). The page should apply
+        # `winner` when decision == "apply" and otherwise open the picker — it must
+        # not re-derive this from candidates[0], because `candidates` also contains
+        # matches against the user's own records, which never auto-fill.
+        "auto_accept": {
+            "decision":        _auto_decision["decision"],
+            "winner":          _auto_decision["winner"],
+            "tied":            _auto_decision["tied"],
+            "top_score":       _auto_decision["top_score"],
+            "runner_up_score": _auto_decision["runner_up_score"],
+            "min_score":       _auto_decision["min_score"],
+            "min_percent":     int(round(_auto_decision["min_score"] * 100)),
+        },
+        # Kept for older clients that read the bare threshold.
+        "auto_accept_score":   _auto_decision["min_score"],
+        "auto_accept_percent": int(round(_auto_decision["min_score"] * 100)),
         # Whether this record already has an identity (name or set number). The
         # UI uses this to decide between auto-applying a confident match on a
         # fresh record vs. opening the picker for manual correction.
@@ -9518,12 +9647,19 @@ def _finalize_one_card(filename, template_name, blank_fields, collection, storag
         "side":            side,
         "image_url":       build_uploaded_file_url(record.image_path),
         "image_url_back":  build_uploaded_file_url(record.image_path_back) if record.image_path_back else None,
-        "extracted":       extracted,
+        # The record's data AFTER identification — `extracted` is the blank field
+        # dict built before auto-identify ran, so returning it showed empty fields
+        # for cards that had in fact been identified and saved.
+        "extracted":       record.extracted_data or extracted,
         "matched_product": matched_product.product_name if matched_product else "No match",
         "identified":      bool(ident.get("identified")),
         "identified_name": (ident.get("applied") or {}).get("name", "") if ident.get("identified") else "",
         "ident_error":     ident.get("error", ""),
         "ident_source":    ident.get("source", ""),
+        "ident_reason":    ident.get("reason", ""),
+        "ident_score":     ident.get("score"),
+        "ident_min_score": ident.get("min_score"),
+        "ident_tied":      ident.get("tied", []),
         "card_type":       (ident.get("type_applied") or {}).get("value", ""),
     }
 
@@ -12180,8 +12316,16 @@ def _external_identify_card_ex(image_path):
 
 
 def _external_identify_candidates(record, category_id):
-    """(candidates, error) for the manual-identify picker, using the selected
-    provider. Candidates are tagged with the provider so the UI can badge them."""
+    """(candidates, error) for the Cloud Identification button, using the
+    selected provider.
+
+    The result comes ENTIRELY from the cloud provider — the local reference
+    catalog is deliberately not consulted. Cloud Identification is the "ask the
+    service directly" action, kept independent of the reference database so it
+    is a genuine second opinion when the local lookup is wrong or has no data
+    for the game. (`category_id` is accepted for call-signature compatibility
+    and intentionally unused.)
+    """
     provider = _identify_provider()
     if provider == "none":
         return [], ("No external identification service is selected. Choose Ximilar or CardSight "
@@ -12194,36 +12338,21 @@ def _external_identify_candidates(record, category_id):
     if not xi:
         return [], f"{label} read the front image but couldn't confidently identify this card."
 
-    cands = []
-    if category_id and card_ocr is not None:
-        try:
-            refs = _reference_candidates_for_ocr(
-                category_id,
-                {"name_guess": xi.get("name", ""), "number_guess": xi.get("number", "")},
-                limit=3,
-            )
-        except Exception:
-            refs = []
-        _min = auto_identify_min_score()
-        for r in refs:
-            if float(r.get("score", 0) or 0) >= _min:
-                cands.append({**r, "via": provider, "provider_label": label})
-
-    if not cands:
-        cands.append({
-            "source":          provider,      # "ximilar" | "cardsight"
-            "via":             provider,
-            "provider_label":  label,
-            "name":            xi.get("name", ""),
-            "serial":          xi.get("number", ""),
-            "set":             xi.get("set", ""),
-            "rarity":          xi.get("rarity", ""),
-            "game":            (record.extracted_data or {}).get("game", ""),
-            "score":           0.95,
-            "serial_match":    False,
-            "name_similarity": 1.0,
-        })
-    return cands, None
+    return [{
+        "source":          provider,      # "ximilar" | "cardsight"
+        "via":             provider,
+        "provider_label":  label,
+        "name":            xi.get("name", ""),
+        "serial":          xi.get("number", ""),
+        "set":             xi.get("set", ""),
+        "rarity":          xi.get("rarity", ""),
+        "game":            (record.extracted_data or {}).get("game", ""),
+        # The provider reports an identification, not a similarity score; this is
+        # a display value only and never feeds the reference-data ranking rules.
+        "score":           1.0,
+        "serial_match":    False,
+        "name_similarity": 1.0,
+    }], None
 
 
 def _ximilar_condition_records(records, mode="ebay"):

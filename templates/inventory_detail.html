@@ -740,16 +740,12 @@
                     <div class="card-body">
                         <div class="d-flex flex-wrap gap-2">
                             <button class="jtcg-fetch-btn" id="ocrIdentifyBtn" data-bs-toggle="tooltip" data-bs-placement="top"
-                                    title="Reads this card's name and collector number from the front image and matches them against your imported catalog and existing entries — no internet needed. A blank card auto-applies a 100% match; an already-filled card opens the matches in a list for manual correction.">
+                                    title="Reads this card's name and collector number from the front image and matches them against your downloaded reference database — no internet needed. If the image can't be read, it falls back to the Name and Set Number already on this entry. A single match above your auto-accept confidence is applied automatically; ties and weaker reads open the matches in a list to choose from.">
                                 <i class="fas fa-crosshairs me-1"></i>Local OCR Lookup
                             </button>
                             <button class="jtcg-fetch-btn" id="cloudIdentifyBtn" style="background:#0d6efd;" data-bs-toggle="tooltip" data-bs-placement="top"
-                                    title="Skips all local reading and sends the front image directly to your configured identification service (Settings → General: CardSight or Ximilar), returning whatever it recognizes.">
+                                    title="Skips all local reading and your reference database entirely, sending the front image straight to your configured identification service (Settings → General: CardSight or Ximilar) and returning whatever it recognizes.">
                                 <i class="fas fa-cloud me-1"></i>Cloud Identification
-                            </button>
-                            <button class="jtcg-fetch-btn" id="dbMatchBtn" style="background:#198754;" data-bs-toggle="tooltip" data-bs-placement="top"
-                                    title="Uses this entry's Name and Set Number to find the card in your downloaded database, then overwrites this entry's card fields to match it (album, location, and prices are kept). A single exact match is applied automatically; several matches open a chooser.">
-                                <i class="fas fa-database me-1"></i>Database Match
                             </button>
                             <button class="jtcg-fetch-btn" id="tcgLookupBtn" style="background:#6f42c1;" data-bs-toggle="tooltip" data-bs-placement="top"
                                     title="Opens a TCGplayer search in a new tab using this entry's Name and Set Number fields (e.g. “Seaking 28/162”).">
@@ -1874,10 +1870,19 @@
                     </div>
                 </div>
                 <div class="modal-footer justify-content-between">
-                    <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
-                    <button type="button" class="btn btn-success" id="ocrPickerConfirm" disabled>
-                        <i class="fas fa-check me-1"></i>Apply Selected
-                    </button>
+                    <div class="form-check m-0" id="ocrOverwriteWrap" style="display:none;">
+                        <input class="form-check-input" type="checkbox" id="ocrOverwrite" checked>
+                        <label class="form-check-label small text-muted" for="ocrOverwrite">
+                            Replace this entry's card details with the chosen match
+                            <span class="d-block" style="font-size:.78rem;">Album, location, and prices are kept.</span>
+                        </label>
+                    </div>
+                    <div class="d-flex gap-2 ms-auto">
+                        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                        <button type="button" class="btn btn-success" id="ocrPickerConfirm" disabled>
+                            <i class="fas fa-check me-1"></i>Apply Selected
+                        </button>
+                    </div>
                 </div>
             </div>
         </div>
@@ -2275,9 +2280,8 @@
     (function () {
         const identifyBtn = document.getElementById('ocrIdentifyBtn');
         const cloudBtn    = document.getElementById('cloudIdentifyBtn');
-        const dbMatchBtn  = document.getElementById('dbMatchBtn');
         const wrongBtn    = document.getElementById('wrongMatchBtn');
-        if (!identifyBtn && !cloudBtn && !dbMatchBtn && !wrongBtn) return;
+        if (!identifyBtn && !cloudBtn && !wrongBtn) return;
 
         const status      = document.getElementById('ocrStatus');
         const pickerList  = document.getElementById('ocrPickerList');
@@ -2297,11 +2301,11 @@
         function setBtnBusy(btn, label) {
             if (!btn) return;
             if (!BTN_LABELS.has(btn)) BTN_LABELS.set(btn, btn.innerHTML);
-            [identifyBtn, cloudBtn, dbMatchBtn, wrongBtn].forEach(b => { if (b) b.disabled = true; });
+            [identifyBtn, cloudBtn, wrongBtn].forEach(b => { if (b) b.disabled = true; });
             btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>' + label;
         }
         function resetBtns() {
-            [identifyBtn, cloudBtn, dbMatchBtn, wrongBtn].forEach(b => {
+            [identifyBtn, cloudBtn, wrongBtn].forEach(b => {
                 if (!b) return;
                 b.disabled = false;
                 if (BTN_LABELS.has(b)) b.innerHTML = BTN_LABELS.get(b);
@@ -2309,7 +2313,8 @@
         }
 
         let selected = null;  // { reference_product_id } | { source_record_id } | { name, number }
-        let dbMatchMode = false;  // true while a Database Match picker is open -> apply with overwrite
+        const overwriteWrap = document.getElementById('ocrOverwriteWrap');
+        const overwriteBox  = document.getElementById('ocrOverwrite');
 
         pickerList.addEventListener('click', function (e) {
             const row = e.target.closest('.jtcg-picker-item');
@@ -2362,11 +2367,11 @@
                 } else {
                     status.innerHTML = `<div class="alert alert-danger mb-0">
                         <i class="fas fa-exclamation-triangle me-1"></i>${esc(data.message || 'Apply failed.')}</div>`;
-                    resetBtn();
+                    resetBtns();
                 }
             } catch (err) {
                 status.innerHTML = `<div class="alert alert-danger mb-0">Network error: ${esc(err.message)}</div>`;
-                resetBtn();
+                resetBtns();
             }
         }
 
@@ -2374,9 +2379,13 @@
             if (!selected) return;
             getPickerModal().hide();
             pickerModal = null;
-            // A Database Match should replace the entry's fields with the chosen
-            // reference card; OCR/cloud picks keep their merge behaviour.
-            const payload = (dbMatchMode && selected.reference_product_id != null)
+            // On an entry that already has details, picking a match is a correction,
+            // so replace the card fields with the chosen reference card (this is what
+            // the old Database Match button did). Unchecking merges instead, filling
+            // only what's blank. Album, location, and prices are protected server-side.
+            const wantsOverwrite = overwriteWrap && overwriteWrap.style.display !== 'none'
+                                   && overwriteBox && overwriteBox.checked;
+            const payload = (wantsOverwrite && selected.reference_product_id != null)
                 ? { ...selected, overwrite: true }
                 : selected;
             applySelection(payload);
@@ -2392,6 +2401,8 @@
                     ? `<span class="ocr-num-pill"><i class="fas fa-hashtag me-1"></i>number match</span>` : '';
                 if (c.source === 'ximilar' || c.source === 'cardsight') {
                     // External provider read — applied via its raw name/number/set/rarity.
+                    // No percentage: the service reports an identification, not a
+                    // similarity score, so showing "100%" would overstate it.
                     const meta = [c.set, c.rarity, c.serial].filter(Boolean).map(esc).join(' · ');
                     const provLabel = esc(c.provider_label || (c.source === 'cardsight' ? 'CardSight' : 'Ximilar'));
                     return `
@@ -2401,10 +2412,10 @@
                             <input type="radio" class="jtcg-picker-radio" name="ocrPick">
                             <div>
                                 <div class="jtcg-picker-name">${esc(c.name || '(unnamed)')}
-                                    <span class="ocr-src-pill ocr-src-ref"><i class="fas fa-robot me-1"></i>via ${provLabel}</span> ${numPill}</div>
+                                    <span class="ocr-src-pill ocr-src-ref"><i class="fas fa-cloud me-1"></i>${provLabel}</span></div>
                                 <div class="jtcg-picker-meta">${meta || '&nbsp;'}</div>
                             </div>
-                            <span class="jtcg-picker-price">${pct}%</span>
+                            <span class="jtcg-picker-price">identified</span>
                         </div>`;
                 }
                 if (c.source === 'reference') {
@@ -2441,16 +2452,30 @@
             const ocr        = data.ocr || {};
             const ref        = data.reference || {};
             const candidates = data.candidates || [];
+            const auto       = data.auto_accept || null;
 
-            // Auto-apply a 100% match when the record has no identity yet; otherwise
-            // always open the picker so the read is used for manual correction.
-            const top = candidates[0] || null;
-            if (!data.already_populated && top && (top.score || 0) >= 0.999) {
-                const payload = candidatePayload(top);
+            // Show the "replace existing details" option only when there is
+            // something to replace.
+            if (overwriteWrap) {
+                overwriteWrap.style.display = data.already_populated ? '' : 'none';
+                if (overwriteBox) overwriteBox.checked = !!data.already_populated;
+            }
+
+            // ── Auto-accept ────────────────────────────────────────────────────
+            // The server ranks the reference-database matches and decides; the page
+            // does not re-derive this from candidates[0], because `candidates` also
+            // contains matches against your own entries, which never auto-fill.
+            // An entry that already has details always goes to the picker instead,
+            // so an automatic match can never silently overwrite your work.
+            if (!isCloud && auto && auto.decision === 'apply' && auto.winner && !data.already_populated) {
+                const w = auto.winner;
+                const payload = candidatePayload(w);
                 if (payload) {
-                    const num = top.serial ? ' ' + esc(top.serial) : '';
+                    const num = w.serial ? ' ' + esc(w.serial) : '';
+                    const pct = Math.round((w.score || 0) * 100);
                     applySelection(payload,
-                        `<i class="fas fa-bolt me-1"></i>Auto-applied 100% match: <strong>${esc(top.name || 'card')}</strong>${num}.`);
+                        `<i class="fas fa-bolt me-1"></i>Applied <strong>${esc(w.name || 'card')}</strong>${num} `
+                        + `at ${pct}% confidence.`);
                     return;
                 }
             }
@@ -2458,7 +2483,7 @@
             // Subtitle differs by mode.
             if (isCloud) {
                 const label = esc(data.provider_label || 'Cloud service');
-                subtitle.innerHTML = `${label} — ${candidates.length} result${candidates.length !== 1 ? 's' : ''}.`;
+                subtitle.innerHTML = `${label} identified this card. Your reference database was not used.`;
                 if (data.error) {
                     subtitle.innerHTML += `<br><span class="text-warning"><i class="fas fa-triangle-exclamation me-1"></i>${esc(data.error)}</span>`;
                 }
@@ -2466,14 +2491,44 @@
                 const readBits = [];
                 if (ocr.name_guess)   readBits.push(`name “${esc(ocr.name_guess)}”`);
                 if (ocr.number_guess) readBits.push(`number ${esc(ocr.number_guess)}`);
+
+                let lead;
+                if (data.used_typed_fields) {
+                    lead = `Couldn’t read the image — matched this entry’s existing Name and Set Number instead`;
+                } else {
+                    lead = `Read ${readBits.length ? readBits.join(' · ') : '<em>nothing legible</em>'}`;
+                }
+
                 let refNote = '';
                 if (ref.game && ref.synced) {
-                    refNote = ` · matched against <strong>${esc(ref.game)}</strong> reference (${ref.match_count})`;
+                    refNote = ` · <strong>${esc(ref.game)}</strong> reference database (${ref.match_count} match${ref.match_count !== 1 ? 'es' : ''})`;
                 } else if (ref.game) {
-                    refNote = ` · <span class="text-warning">${esc(ref.game)} reference not downloaded — use “Reference Data” on the Inventory page</span>`;
+                    refNote = ` · <span class="text-warning">${esc(ref.game)} reference not downloaded — use “Reference Data” in Settings</span>`;
                 }
-                subtitle.innerHTML = `Read ${readBits.length ? readBits.join(' · ') : '<em>nothing legible</em>'}`
-                    + ` — ${candidates.length} match${candidates.length !== 1 ? 'es' : ''}${refNote}.`;
+
+                // Say why nothing was applied automatically, in the same terms as
+                // the Settings slider, so the outcome is never a mystery.
+                let why = '';
+                if (auto && !data.already_populated) {
+                    const bar = auto.min_percent != null ? auto.min_percent + '%' : 'the minimum';
+                    if (auto.decision === 'ambiguous') {
+                        const n = (auto.tied || []).length;
+                        why = `<br><span class="text-warning"><i class="fas fa-code-branch me-1"></i>`
+                            + `${n} reference cards scored identically — pick the right printing below.</span>`;
+                    } else if (auto.decision === 'below_threshold') {
+                        const top = auto.top_score != null ? Math.round(auto.top_score * 100) + '%' : '—';
+                        why = `<br><span class="text-muted"><i class="fas fa-circle-info me-1"></i>`
+                            + `Best reference match was ${top}, under your ${bar} auto-accept confidence.</span>`;
+                    } else if (auto.decision === 'no_candidates') {
+                        why = `<br><span class="text-muted"><i class="fas fa-circle-info me-1"></i>`
+                            + `Nothing in the reference database matched this read.</span>`;
+                    }
+                } else if (auto && data.already_populated) {
+                    why = `<br><span class="text-muted"><i class="fas fa-circle-info me-1"></i>`
+                        + `This entry already has details, so nothing was applied automatically.</span>`;
+                }
+
+                subtitle.innerHTML = `${lead}${refNote}.${why}`;
             }
 
             // Rows. Local mode offers the raw OCR reading as the first row; cloud mode
@@ -2507,7 +2562,6 @@
             setBtnBusy(btn, busyLabel);
             status.innerHTML = '';
             selected = null;
-            dbMatchMode = false;
             confirmBtn.disabled = true;
             try {
                 const res  = await fetch(url);
@@ -2524,72 +2578,6 @@
                 status.innerHTML = `<div class="alert alert-danger mb-0">Network error: ${esc(err.message)}</div>`;
             }
         }
-
-        // ── Database Match (identify by the typed Name + Number, no OCR) ──
-        function renderDbPicker(data) {
-            const q = data.query || {};
-            // Reuse the reference-card row renderer + apply path: shape our
-            // candidates like the tcgcsv reference candidates it already knows.
-            const cands = (data.candidates || []).map(c => ({
-                source:       'reference',
-                product_id:   c.product_id,
-                name:         c.name,
-                serial:       c.number,
-                set:          c.set,
-                rarity:       c.rarity,
-                market_price: c.market_price,
-                score:        c.score,
-                serial_match: !!c.exact,
-            }));
-            const rows = candidateRows(cands);
-            if (!rows) {
-                status.innerHTML = `<div class="alert alert-warning mb-0"><i class="fas fa-search me-1"></i>`
-                    + `No matching card found in the ${esc(data.game || '')} database for this entry.</div>`;
-                return;
-            }
-            const bits = [];
-            if (q.name)   bits.push(`name “${esc(q.name)}”`);
-            if (q.number) bits.push(`number ${esc(q.number)}`);
-            subtitle.innerHTML = `Matched ${bits.join(' · ') || 'this entry'} against `
-                + `<strong>${esc(data.game || '')}</strong> — ${cands.length} match`
-                + `${cands.length !== 1 ? 'es' : ''}. Pick the correct printing:`;
-            pickerList.innerHTML = rows;
-            getPickerModal().show();
-        }
-
-        async function runDbMatch() {
-            setBtnBusy(dbMatchBtn, 'Matching…');
-            status.innerHTML = '';
-            selected = null;
-            dbMatchMode = true;
-            confirmBtn.disabled = true;
-            try {
-                const res  = await fetch(`/database_match/${recordId}`);
-                const data = await res.json();
-                resetBtns();
-                if (data.status !== 'ok') {
-                    status.innerHTML = `<div class="alert alert-warning mb-0">`
-                        + `<i class="fas fa-exclamation-triangle me-1"></i>${esc(data.message || 'Database match failed.')}</div>`;
-                    return;
-                }
-                // Exactly one exact match -> apply it immediately, overwriting the
-                // entry's fields so it fully matches the reference.
-                if (data.auto_apply) {
-                    const c = data.auto_apply;
-                    const num = c.number ? ' ' + esc(c.number) : '';
-                    applySelection({ reference_product_id: c.product_id, overwrite: true },
-                        `<i class="fas fa-bolt me-1"></i>Auto-applied database match: <strong>${esc(c.name || 'card')}</strong>${num}.`);
-                    return;
-                }
-                // Several / partial matches -> let the user choose.
-                renderDbPicker(data);
-            } catch (err) {
-                resetBtns();
-                status.innerHTML = `<div class="alert alert-danger mb-0">Network error: ${esc(err.message)}</div>`;
-            }
-        }
-
-        if (dbMatchBtn) dbMatchBtn.addEventListener('click', runDbMatch);
 
         // ── Wrong Match: clear the card fields so a fresh match starts clean ──
         if (wrongBtn) wrongBtn.addEventListener('click', async function () {
