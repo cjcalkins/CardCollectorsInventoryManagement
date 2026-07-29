@@ -14724,6 +14724,11 @@ if __name__ == "__main__":
             scheme = "http"
             default_port = 80
 
+    # Only mark the session cookie Secure when we are actually serving HTTPS —
+    # setting it unconditionally would break logins in the supported plain-HTTP
+    # modes (USE_HTTPS=0, or the automatic fallback above).
+    app.config["SESSION_COOKIE_SECURE"] = ssl_context is not None
+
     def _visit_url(host):
         return f"{scheme}://{host}" + ("" if PORT == default_port else f":{PORT}")
 
