@@ -204,6 +204,39 @@ def _peek_image_size(src):
         return None
 
 
+_IMAGE_UPLOAD_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+
+
+def _validated_image_ext(file_storage, default=".jpg"):
+    """Extension to save a user-uploaded image under, or None if the upload must
+    be rejected. The client-supplied extension is only trusted when it's on the
+    image allowlist AND the file's header actually parses as an image — uploads
+    are served same-origin from /uploads, so an .html/.svg file saved with its
+    original extension would execute as script in the viewer's session. Leaves
+    the stream rewound so the caller can still save it."""
+    ext = os.path.splitext(secure_filename(file_storage.filename or ""))[1].lower()
+    if not ext:
+        ext = default
+    if ext not in _IMAGE_UPLOAD_EXTS:
+        return None
+    stream = getattr(file_storage, "stream", None)
+    try:
+        if stream is not None:
+            stream.seek(0)
+        real = _peek_image_size(stream if stream is not None else file_storage)
+    except Exception:
+        real = None
+    finally:
+        try:
+            if stream is not None:
+                stream.seek(0)
+        except Exception:
+            pass
+    if real is None:
+        return None
+    return ext
+
+
 def _guard_image_upload(file_storage):
     """Validate a Werkzeug FileStorage image against decompression-bomb heuristics
     before it is saved or decoded. Raises ImageRejected on a likely bomb / oversized
@@ -6037,10 +6070,10 @@ def storage_upload_image():
     img_folder = os.path.join(app.config["UPLOAD_FOLDER"], "albums")
     os.makedirs(img_folder, exist_ok=True)
 
-    # Preserve original extension; fall back to .jpg
-    _, ext = os.path.splitext(file.filename)
-    if not ext:
-        ext = ".jpg"
+    ext = _validated_image_ext(file)
+    if ext is None:
+        return jsonify({"status": "error",
+                        "message": "Only image files (PNG, JPG, GIF, WebP, BMP) are allowed."}), 415
 
     safe_name = secure_filename(name)
     filename = f"{safe_name}{ext}"
@@ -6066,9 +6099,10 @@ def inventory_upload_game_image():
     game_img_folder = os.path.join(app.config["UPLOAD_FOLDER"], "game_icons")
     os.makedirs(game_img_folder, exist_ok=True)
 
-    _, ext = os.path.splitext(file.filename)
-    if not ext:
-        ext = ".jpg"
+    ext = _validated_image_ext(file)
+    if ext is None:
+        return jsonify({"status": "error",
+                        "message": "Only image files (PNG, JPG, GIF, WebP, BMP) are allowed."}), 415
 
     safe_game = secure_filename(game_name)
     filename = f"{safe_game}{ext}"
@@ -6708,24 +6742,32 @@ def import_single_card():
 
 
 # ====================== FILE ROUTES ======================
+def _no_sniff(resp):
+    """Stop browsers MIME-sniffing user-supplied files into something executable
+    (e.g. treating an uploaded file as HTML) — defense in depth alongside the
+    image-extension allowlist on the upload routes."""
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    return resp
+
+
 @app.route("/uploads/<path:filename>")
 def uploaded_file(filename):
-    return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
+    return _no_sniff(send_from_directory(app.config["UPLOAD_FOLDER"], filename))
 
 
 @app.route("/temp_split/<path:filename>")
 def temp_split_file(filename):
-    return send_from_directory(app.config["TEMP_SPLIT_FOLDER"], filename)
+    return _no_sniff(send_from_directory(app.config["TEMP_SPLIT_FOLDER"], filename))
 
 
 @app.route("/temp_cards/<path:filename>")
 def temp_card_file(filename):
-    return send_from_directory(app.config["TEMP_CARD_FOLDER"], filename)
+    return _no_sniff(send_from_directory(app.config["TEMP_CARD_FOLDER"], filename))
 
 
 @app.route("/temp_pdf/<path:filename>")
 def temp_pdf_file(filename):
-    return send_from_directory(app.config["TEMP_PDF_FOLDER"], filename)
+    return _no_sniff(send_from_directory(app.config["TEMP_PDF_FOLDER"], filename))
 
 
 # ====================== INVENTORY UPDATE ROUTES ======================
@@ -6758,10 +6800,10 @@ def update_scan_image(record_id):
 
     ensure_dirs()
 
-    safe_name = secure_filename(file.filename)
-    stem, ext = os.path.splitext(safe_name)
-    if not ext:
-        ext = ".png"
+    ext = _validated_image_ext(file, default=".png")
+    if ext is None:
+        return jsonify({"status": "error",
+                        "message": "Only image files (PNG, JPG, GIF, WebP, BMP) are allowed."}), 415
 
     suffix = "back" if side == "back" else "front"
     final_name = f"record_{record_id}_{suffix}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}{ext}"
