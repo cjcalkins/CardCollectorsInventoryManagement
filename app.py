@@ -204,6 +204,39 @@ def _peek_image_size(src):
         return None
 
 
+_IMAGE_UPLOAD_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+
+
+def _validated_image_ext(file_storage, default=".jpg"):
+    """Extension to save a user-uploaded image under, or None if the upload must
+    be rejected. The client-supplied extension is only trusted when it's on the
+    image allowlist AND the file's header actually parses as an image — uploads
+    are served same-origin from /uploads, so an .html/.svg file saved with its
+    original extension would execute as script in the viewer's session. Leaves
+    the stream rewound so the caller can still save it."""
+    ext = os.path.splitext(secure_filename(file_storage.filename or ""))[1].lower()
+    if not ext:
+        ext = default
+    if ext not in _IMAGE_UPLOAD_EXTS:
+        return None
+    stream = getattr(file_storage, "stream", None)
+    try:
+        if stream is not None:
+            stream.seek(0)
+        real = _peek_image_size(stream if stream is not None else file_storage)
+    except Exception:
+        real = None
+    finally:
+        try:
+            if stream is not None:
+                stream.seek(0)
+        except Exception:
+            pass
+    if real is None:
+        return None
+    return ext
+
+
 def _guard_image_upload(file_storage):
     """Validate a Werkzeug FileStorage image against decompression-bomb heuristics
     before it is saved or decoded. Raises ImageRejected on a likely bomb / oversized
@@ -2943,6 +2976,13 @@ _AUTH_CSS = """
   .seg input { display:none; } .seg label.on { background:#4f46e5; color:#fff; }
 """
 
+# Minimum length for any account password. Single source of truth for every
+# enforcement point (first-run setup, add-user, password change) and the UI
+# hint text below — the "__MINPW__" token in the auth HTML is substituted with
+# this value. Existing passwords stay valid until changed; raising this does
+# not force-expire anyone.
+MIN_PASSWORD_LEN = 10
+
 _AUTH_SETUP_HTML = ("""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width, initial-scale=1"><title>Create administrator</title>
 <style>""" + _AUTH_CSS + """</style></head><body>
@@ -2950,7 +2990,7 @@ _AUTH_SETUP_HTML = ("""<!doctype html><html lang=en><head><meta charset=utf-8>
   <h1>Welcome &mdash; create your administrator</h1>
   <p class=sub>This is the first account. It gets full access and can create roles and other users.</p>
   <label class=fld for=u>Username</label><input id=u type=text autocomplete=username autofocus>
-  <label class=fld for=p>Password</label><input id=p type=password autocomplete=new-password placeholder="at least 6 characters">
+  <label class=fld for=p>Password</label><input id=p type=password autocomplete=new-password placeholder="at least __MINPW__ characters">
   <label class=fld for=p2>Confirm password</label><input id=p2 type=password autocomplete=new-password>
   <div class=row><button id=go>Create administrator</button></div>
   <div id=msg class=msg></div>
@@ -2961,14 +3001,14 @@ _AUTH_SETUP_HTML = ("""<!doctype html><html lang=en><head><meta charset=utf-8>
   document.getElementById('go').addEventListener('click',async function(){
     var u=document.getElementById('u').value.trim(),p=document.getElementById('p').value,p2=document.getElementById('p2').value;
     if(u.length<3){show('Username needs 3+ characters.',false);return;}
-    if(p.length<6){show('Password needs 6+ characters.',false);return;}
+    if(p.length<__MINPW__){show('Password needs __MINPW__+ characters.',false);return;}
     if(p!==p2){show('Passwords do not match.',false);return;}
     this.disabled=true;
     try{var r=await fetch('/auth/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
       var d=await r.json(); if(d.status==='success'){location.href=d.redirect||'/';} else {show(d.message||'Failed.',false);this.disabled=false;}
     }catch(e){show('Error: '+e.message,false);this.disabled=false;}
   });
-</script></body></html>""")
+</script></body></html>""").replace("__MINPW__", str(MIN_PASSWORD_LEN))
 
 _AUTH_LOGIN_HTML = ("""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width, initial-scale=1"><title>Sign in</title>
@@ -3011,8 +3051,9 @@ def auth_setup_submit():
     body = request.get_json(silent=True) or request.form
     username = str(body.get("username", "")).strip()
     password = str(body.get("password", ""))
-    if len(username) < 3 or len(password) < 6:
-        return jsonify({"status": "error", "message": "Username (3+) and password (6+) required."}), 400
+    if len(username) < 3 or len(password) < MIN_PASSWORD_LEN:
+        return jsonify({"status": "error",
+                        "message": f"Username (3+) and password ({MIN_PASSWORD_LEN}+) required."}), 400
     admin  = Role(name="Administrator", is_admin=True, permissions={})
     editor = Role(name="Editor", is_admin=False, permissions={k: "edit" for k in _RESOURCE_KEYS})
     viewer = Role(name="Viewer", is_admin=False, permissions={k: "view" for k in _RESOURCE_KEYS})
@@ -3107,7 +3148,7 @@ _AUTH_USERS_HTML = ("""<!doctype html><html lang=en><head><meta charset=utf-8>
   <h1 style="font-size:17px;margin-top:26px">Add a user</h1>
   <div class=row style="align-items:flex-end">
     <div><label class=fld for=nu>Username</label><input id=nu type=text style="width:200px"></div>
-    <div><label class=fld for=np>Password</label><input id=np type=password style="width:200px" placeholder="6+ chars"></div>
+    <div><label class=fld for=np>Password</label><input id=np type=password style="width:200px" placeholder="__MINPW__+ chars"></div>
     <div><label class=fld for=nr>Role</label><select id=nr style="width:200px"></select></div>
     <button id=addBtn>Add user</button>
   </div>
@@ -3131,7 +3172,7 @@ _AUTH_USERS_HTML = ("""<!doctype html><html lang=en><head><meta charset=utf-8>
       cb.addEventListener('change',function(){upd(u.id,{active:cb.checked});}); td3.appendChild(cb); tr.appendChild(td3);
       var td4=document.createElement('td');
       var rp=document.createElement('button'); rp.className='sec'; rp.textContent='Reset password'; rp.style.marginRight='6px';
-      rp.addEventListener('click',function(){var p=prompt('New password for '+u.username+' (6+ chars):');if(p){if(p.length<6){show('Password too short.',false);return;}upd(u.id,{password:p});}});
+      rp.addEventListener('click',function(){var p=prompt('New password for '+u.username+' (__MINPW__+ chars):');if(p){if(p.length<__MINPW__){show('Password too short.',false);return;}upd(u.id,{password:p});}});
       var del=document.createElement('button'); del.className='danger'; del.textContent='Delete';
       del.addEventListener('click',function(){if(confirm('Delete user '+u.username+'?'))act('/settings/users/delete',{id:u.id});});
       td4.appendChild(rp); td4.appendChild(del); tr.appendChild(td4); tb.appendChild(tr);
@@ -3146,12 +3187,12 @@ _AUTH_USERS_HTML = ("""<!doctype html><html lang=en><head><meta charset=utf-8>
   function upd(id,patch){patch.id=id;act('/settings/users/update',patch);}
   document.getElementById('addBtn').addEventListener('click',function(){
     var u=document.getElementById('nu').value.trim(),p=document.getElementById('np').value,r=document.getElementById('nr').value;
-    if(u.length<3||p.length<6){show('Username 3+ and password 6+ required.',false);return;}
+    if(u.length<3||p.length<__MINPW__){show('Username 3+ and password __MINPW__+ required.',false);return;}
     act('/settings/users/create',{username:u,password:p,role_id:parseInt(r,10)});
     document.getElementById('nu').value='';document.getElementById('np').value='';
   });
   load();
-</script></body></html>""")
+</script></body></html>""").replace("__MINPW__", str(MIN_PASSWORD_LEN))
 
 
 @app.route("/settings/users")
@@ -3178,8 +3219,9 @@ def users_create():
     body = request.get_json(silent=True) or request.form
     username = str(body.get("username", "")).strip()
     password = str(body.get("password", ""))
-    if len(username) < 3 or len(password) < 6:
-        return jsonify({"status": "error", "message": "Username (3+) and password (6+) required."}), 400
+    if len(username) < 3 or len(password) < MIN_PASSWORD_LEN:
+        return jsonify({"status": "error",
+                        "message": f"Username (3+) and password ({MIN_PASSWORD_LEN}+) required."}), 400
     if User.query.filter(db.func.lower(User.username) == username.lower()).first():
         return jsonify({"status": "error", "message": "That username already exists."}), 409
     rid = body.get("role_id")
@@ -3212,8 +3254,9 @@ def users_update():
         u.active = bool(body["active"])
     pw = str(body.get("password", "") or "")
     if pw:
-        if len(pw) < 6:
-            return jsonify({"status": "error", "message": "Password must be 6+ characters."}), 400
+        if len(pw) < MIN_PASSWORD_LEN:
+            return jsonify({"status": "error",
+                            "message": f"Password must be {MIN_PASSWORD_LEN}+ characters."}), 400
         u.set_password(pw)
     db.session.commit()
     return jsonify({"status": "success"})
@@ -6037,10 +6080,10 @@ def storage_upload_image():
     img_folder = os.path.join(app.config["UPLOAD_FOLDER"], "albums")
     os.makedirs(img_folder, exist_ok=True)
 
-    # Preserve original extension; fall back to .jpg
-    _, ext = os.path.splitext(file.filename)
-    if not ext:
-        ext = ".jpg"
+    ext = _validated_image_ext(file)
+    if ext is None:
+        return jsonify({"status": "error",
+                        "message": "Only image files (PNG, JPG, GIF, WebP, BMP) are allowed."}), 415
 
     safe_name = secure_filename(name)
     filename = f"{safe_name}{ext}"
@@ -6066,9 +6109,10 @@ def inventory_upload_game_image():
     game_img_folder = os.path.join(app.config["UPLOAD_FOLDER"], "game_icons")
     os.makedirs(game_img_folder, exist_ok=True)
 
-    _, ext = os.path.splitext(file.filename)
-    if not ext:
-        ext = ".jpg"
+    ext = _validated_image_ext(file)
+    if ext is None:
+        return jsonify({"status": "error",
+                        "message": "Only image files (PNG, JPG, GIF, WebP, BMP) are allowed."}), 415
 
     safe_game = secure_filename(game_name)
     filename = f"{safe_game}{ext}"
@@ -6708,24 +6752,32 @@ def import_single_card():
 
 
 # ====================== FILE ROUTES ======================
+def _no_sniff(resp):
+    """Stop browsers MIME-sniffing user-supplied files into something executable
+    (e.g. treating an uploaded file as HTML) — defense in depth alongside the
+    image-extension allowlist on the upload routes."""
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    return resp
+
+
 @app.route("/uploads/<path:filename>")
 def uploaded_file(filename):
-    return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
+    return _no_sniff(send_from_directory(app.config["UPLOAD_FOLDER"], filename))
 
 
 @app.route("/temp_split/<path:filename>")
 def temp_split_file(filename):
-    return send_from_directory(app.config["TEMP_SPLIT_FOLDER"], filename)
+    return _no_sniff(send_from_directory(app.config["TEMP_SPLIT_FOLDER"], filename))
 
 
 @app.route("/temp_cards/<path:filename>")
 def temp_card_file(filename):
-    return send_from_directory(app.config["TEMP_CARD_FOLDER"], filename)
+    return _no_sniff(send_from_directory(app.config["TEMP_CARD_FOLDER"], filename))
 
 
 @app.route("/temp_pdf/<path:filename>")
 def temp_pdf_file(filename):
-    return send_from_directory(app.config["TEMP_PDF_FOLDER"], filename)
+    return _no_sniff(send_from_directory(app.config["TEMP_PDF_FOLDER"], filename))
 
 
 # ====================== INVENTORY UPDATE ROUTES ======================
@@ -6758,10 +6810,10 @@ def update_scan_image(record_id):
 
     ensure_dirs()
 
-    safe_name = secure_filename(file.filename)
-    stem, ext = os.path.splitext(safe_name)
-    if not ext:
-        ext = ".png"
+    ext = _validated_image_ext(file, default=".png")
+    if ext is None:
+        return jsonify({"status": "error",
+                        "message": "Only image files (PNG, JPG, GIF, WebP, BMP) are allowed."}), 415
 
     suffix = "back" if side == "back" else "front"
     final_name = f"record_{record_id}_{suffix}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}{ext}"
@@ -14681,6 +14733,11 @@ if __name__ == "__main__":
             USE_HTTPS = False
             scheme = "http"
             default_port = 80
+
+    # Only mark the session cookie Secure when we are actually serving HTTPS —
+    # setting it unconditionally would break logins in the supported plain-HTTP
+    # modes (USE_HTTPS=0, or the automatic fallback above).
+    app.config["SESSION_COOKIE_SECURE"] = ssl_context is not None
 
     def _visit_url(host):
         return f"{scheme}://{host}" + ("" if PORT == default_port else f":{PORT}")
