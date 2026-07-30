@@ -274,6 +274,7 @@
                             </div>
                         </a>
                     </div>
+                    {% if can_view('templates') %}
                     <div class="col-12 col-md-6 col-xl-4">
                         <a href="{{ url_for('templates_page') }}" class="setting-card">
                             <div class="sc-icon"><i class="fas fa-layer-group"></i></div>
@@ -283,6 +284,8 @@
                             </div>
                         </a>
                     </div>
+                    {% endif %}
+                    {% if can_view('import') %}
                     <div class="col-12 col-md-6 col-xl-4">
                         <a href="{{ url_for('type_references_page') }}" class="setting-card">
                             <div class="sc-icon"><i class="fas fa-icons"></i></div>
@@ -292,6 +295,7 @@
                             </div>
                         </a>
                     </div>
+                    {% endif %}
                     <div class="col-12 col-md-6 col-xl-4">
                         <a href="{{ url_for('reference_data_page') }}" class="setting-card">
                             <div class="sc-icon"><i class="fas fa-cloud-arrow-down"></i></div>
@@ -364,6 +368,7 @@
                             </div>
                         </a>
                     </div>
+                    {% if auth_is_admin %}
                     <div class="col-12 col-md-6 col-xl-4">
                         <a href="{{ url_for('reset_page') }}" class="setting-card">
                             <div class="sc-icon" style="background:linear-gradient(135deg,var(--danger-text),var(--danger));"><i class="fas fa-triangle-exclamation"></i></div>
@@ -373,6 +378,7 @@
                             </div>
                         </a>
                     </div>
+                    {% endif %}
                 </div>
             </div>
         </main>
