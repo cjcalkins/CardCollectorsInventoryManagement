@@ -2758,6 +2758,19 @@ def _forbidden(msg):
     return Response(body, status=403, mimetype="text/html")
 
 
+def _require_admin():
+    """Return a 403 Response if the caller is not an administrator, else None.
+    Gates actions that connect to a user-supplied host while replaying a stored
+    secret (mailbox/shop 'Test' + mailbox 'Check'): a non-admin with shops:edit
+    could otherwise repoint the saved host and exfiltrate the stored credential."""
+    if _auth_disabled():
+        return None
+    u = getattr(g, "user", None) or _current_user()
+    if u is not None and u.role and u.role.is_admin:
+        return None
+    return _forbidden("Administrator access is required to test a saved connection.")
+
+
 @app.before_request
 def _auth_gate():
     if _auth_disabled():
@@ -13227,6 +13240,9 @@ def shops_save(marketplace):
 
 @app.route("/shops/test/<marketplace>", methods=["POST"])
 def shops_test(marketplace):
+    denied = _require_admin()
+    if denied:
+        return denied
     if marketplace not in MARKETPLACES:
         return jsonify({"status": "error", "message": "Unknown marketplace"}), 404
     conn = _get_connection(marketplace, create=True)
@@ -14182,6 +14198,9 @@ def shops_email_save():
 
 @app.route("/shops/email/test", methods=["POST"])
 def shops_email_test():
+    denied = _require_admin()
+    if denied:
+        return denied
     m = _get_email_monitor(create=True)
     result = email_monitor.test_imap(_email_cfg(m))
     m.status = "connected" if result.get("ok") else "error"
@@ -14195,6 +14214,9 @@ def shops_email_test():
 
 @app.route("/shops/email/check", methods=["POST"])
 def shops_email_check():
+    denied = _require_admin()
+    if denied:
+        return denied
     m = _get_email_monitor(create=True)
     if not (m.host and m.username and m.password):
         return jsonify({"status": "error", "message": "Configure and save the mailbox first."}), 400
