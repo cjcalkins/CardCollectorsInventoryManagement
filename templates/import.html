@@ -946,7 +946,7 @@
                 {% endfor %}
               </select>
               {% if not templates %}
-              <div class="hint">No games defined yet — <a href="{{ url_for('templates_page') }}">create one</a> first.</div>
+              <div class="hint">{% if can_edit('templates') %}No games defined yet — <a href="{{ url_for('templates_page') }}">create one</a> first.{% else %}No games defined yet — ask an administrator to create one first.{% endif %}</div>
               {% endif %}
             </div>
             <div class="field">
@@ -1065,7 +1065,7 @@
                   {% endfor %}
                 </select>
                 {% if not templates %}
-                <div class="hint">No games defined yet — <a href="{{ url_for('templates_page') }}">create one</a> first.</div>
+                <div class="hint">{% if can_edit('templates') %}No games defined yet — <a href="{{ url_for('templates_page') }}">create one</a> first.{% else %}No games defined yet — ask an administrator to create one first.{% endif %}</div>
                 {% endif %}
               </div>
               <div class="field">
