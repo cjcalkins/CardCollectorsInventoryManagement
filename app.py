@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, render_template, send_from_directory, url_for, redirect, Response, session, g
 import os
+import posixpath
 import re as _re
 # Decoded-image size ceiling, in megapixels. This is the core defense against
 # image "decompression bombs" — a tiny file that declares enormous dimensions and
@@ -2836,7 +2837,9 @@ def _auth_gate():
         return  # read-only path: only requires being signed in
     if resource == "__admin__":
         return _forbidden("Administrator access is required for user and role management.")
-    force_edit = path in _EBAY_OAUTH_WRITE_PATHS
+    # Compare the same rstripped form _resource_for_path uses, so the two agree
+    # on normalization (a trailing-slash variant can't slip past this set).
+    force_edit = path.rstrip("/") in _EBAY_OAUTH_WRITE_PATHS
     need = "edit" if (force_edit or request.method not in ("GET", "HEAD", "OPTIONS")) else "view"
     if not _role_allows(user.role, resource, need):
         label = dict(PROTECTED_RESOURCES).get(resource, resource)
@@ -6817,13 +6820,23 @@ def uploaded_file(filename):
     # /uploads is intentionally open to any signed-in user because every card
     # image is served through it. Migration bundles, however, live under
     # UPLOAD_FOLDER/migration_exports and contain secrets (FLASK_SECRET_KEY, shop
-    # tokens, mailbox password), so gate ONLY that subpath behind 'upgrade' rather
-    # than restricting the whole route.
-    norm = str(filename).replace("\\", "/").lstrip("/")
-    if norm.startswith("migration_exports/") and not _auth_disabled():
-        u = getattr(g, "user", None) or _current_user()
-        if not _role_allows(getattr(u, "role", None), "upgrade", "view"):
-            return _forbidden("Upgrade access is required to download a migration bundle.")
+    # tokens, mailbox password). Bundles are now served by the dedicated,
+    # map-gated upgrade_download route; this block stays as defense in depth so
+    # that bundles reachable via the old /uploads/... URL shape are still gated.
+    # CRITICAL: normalize BEFORE the prefix test — send_from_directory normalizes
+    # afterwards, so a raw check on "cards/../migration_exports/x" (which the file
+    # server resolves back inside the root) would miss it. normpath collapses the
+    # traversal first; .lower() closes the case-insensitive-FS variant.
+    norm = posixpath.normpath(str(filename).replace("\\", "/").lstrip("/"))
+    if norm.lower().startswith("migration_exports/") or norm == ".." or norm.startswith("../"):
+        if not _auth_disabled():
+            u = getattr(g, "user", None) or _current_user()
+            if not _role_allows(getattr(u, "role", None), "upgrade", "view"):
+                return _forbidden("Upgrade access is required to download a migration bundle.")
+        # Prune stale bundles on download too (not just on export), excluding the
+        # one being served, so a single old bundle can't linger indefinitely.
+        _prune_migration_bundles(os.path.join(app.config["UPLOAD_FOLDER"], "migration_exports"),
+                                 keep=os.path.basename(norm))
     return _no_sniff(send_from_directory(app.config["UPLOAD_FOLDER"], filename))
 
 
@@ -11476,12 +11489,16 @@ def _build_migration_bundle(include_reference=False, include_images_manifest=Tru
 MIGRATION_BUNDLE_TTL_SECONDS = 3600
 
 
-def _prune_migration_bundles(out_dir, ttl_seconds=MIGRATION_BUNDLE_TTL_SECONDS):
-    """Delete migration bundles in out_dir older than ttl_seconds. Best-effort."""
+def _prune_migration_bundles(out_dir, ttl_seconds=MIGRATION_BUNDLE_TTL_SECONDS, keep=None):
+    """Delete migration bundles in out_dir older than ttl_seconds. Best-effort.
+    `keep` (a basename) is never deleted — used when pruning during a download so
+    the bundle being served can't be removed out from under the request."""
     try:
         cutoff = datetime.now().timestamp() - ttl_seconds
         for name in os.listdir(out_dir):
             if not (name.startswith("ccim_migration_") and name.endswith(".tar.gz")):
+                continue
+            if keep and name == keep:
                 continue
             p = os.path.join(out_dir, name)
             try:
@@ -11514,12 +11531,26 @@ def upgrade_export():
     return jsonify({
         "status": "success",
         "message": "Migration bundle created.",
-        "download_url": url_for("uploaded_file", filename="migration_exports/" + os.path.basename(tar_path)),
+        "download_url": url_for("upgrade_download", name=os.path.basename(tar_path)),
         "filename": os.path.basename(tar_path),
         "size_bytes": size,
         "size_human": _human_size(size),
         "manifest": manifest,
     })
+
+
+@app.route("/settings/upgrade/download/<name>")
+def upgrade_download(name):
+    """Serve a migration bundle. Gated by the map on the whole /settings/upgrade
+    prefix ('upgrade' resource, seg[1]) — no per-request prefix test to defeat.
+    Three independent layers stop a crafted name: the <name> converter refuses
+    any path with slashes at routing time, basename(secure_filename(...)) strips
+    anything that survives, and the resource map gates access. Bundles are
+    pruned here too so a single old one can't linger past its TTL."""
+    safe = os.path.basename(secure_filename(name))
+    out_dir = os.path.join(app.config["UPLOAD_FOLDER"], "migration_exports")
+    _prune_migration_bundles(out_dir, keep=safe)
+    return _no_sniff(send_from_directory(out_dir, safe))
 
 
 # ============================================================================ #

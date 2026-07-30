@@ -824,6 +824,8 @@
                     </div>
 
                     <!-- ── FIELD TYPE CHANGE section (only shown for custom fields) ── -->
+                    {# update_field_type patches every template with the field, so it needs templates:edit #}
+                    {% if can_edit('templates') %}
                     <div id="fieldTypeSection" class="d-none">
                         <hr class="my-3">
                         <p class="fw-semibold mb-2 small text-muted text-uppercase" style="letter-spacing:.05em;">
@@ -859,6 +861,7 @@
                             <span class="text-muted small ms-2" id="fieldTypeStatus"></span>
                         </div>
                     </div>
+                    {% endif %}
 
                     <div class="alert alert-warning small py-2 mb-0 mt-3" id="bulkEditWarning" style="display:none!important;">
                         <i class="fas fa-triangle-exclamation me-1"></i>
