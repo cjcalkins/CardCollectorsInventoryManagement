@@ -2,15 +2,15 @@
    current item, e.g. {% set ss_active = 'storage' %}{% include '_settings_sidebar.html' %} #}
 <aside class="settings-sidebar">
     <div class="ss-title">Settings</div>
-    <a href="{{ url_for('settings_page') }}" class="ss-link{{ ' active' if ss_active == 'overview' else '' }}"><i class="fas fa-gauge-high"></i><span>Overview</span></a>
-    <a href="{{ url_for('general_page') }}" class="ss-link{{ ' active' if ss_active == 'general' else '' }}"><i class="fas fa-sliders"></i><span>General</span></a>
+    {% if can_view('settings') %}<a href="{{ url_for('settings_page') }}" class="ss-link{{ ' active' if ss_active == 'overview' else '' }}"><i class="fas fa-gauge-high"></i><span>Overview</span></a>{% endif %}
+    {% if can_view('settings') %}<a href="{{ url_for('general_page') }}" class="ss-link{{ ' active' if ss_active == 'general' else '' }}"><i class="fas fa-sliders"></i><span>General</span></a>{% endif %}
     {% if can_view('templates') %}<a href="{{ url_for('templates_page') }}" class="ss-link{{ ' active' if ss_active == 'templates' else '' }}"><i class="fas fa-layer-group"></i><span>Templates</span></a>{% endif %}
     {% if can_view('import') %}<a href="{{ url_for('type_references_page') }}" class="ss-link{{ ' active' if ss_active == 'types' else '' }}"><i class="fas fa-icons"></i><span>Type Icons</span></a>{% endif %}
-    <a href="{{ url_for('shops_page') }}" class="ss-link{{ ' active' if ss_active == 'shops' else '' }}"><i class="fas fa-store"></i><span>Shops</span></a>
-    <a href="{{ url_for('api_keys_page') }}" class="ss-link{{ ' active' if ss_active == 'api' else '' }}"><i class="fas fa-key"></i><span>API Keys</span></a>
-    <a href="{{ url_for('search_by_image_page') }}" class="ss-link{{ ' active' if ss_active == 'search' else '' }}"><i class="fas fa-camera"></i><span>Search by Image</span></a>
-    <a href="{{ url_for('duplicates') }}" class="ss-link{{ ' active' if ss_active == 'duplicates' else '' }}"><i class="fas fa-clone"></i><span>Duplicates</span></a>
-    <a href="{{ url_for('storage_page') }}" class="ss-link{{ ' active' if ss_active == 'storage' else '' }}"><i class="fas fa-hard-drive"></i><span>Storage</span></a>
-    <a href="{{ url_for('upgrade_page') }}" class="ss-link{{ ' active' if ss_active == 'upgrade' else '' }}"><i class="fas fa-arrow-up-right-dots"></i><span>Upgrade</span></a>
+    {% if can_view('shops') %}<a href="{{ url_for('shops_page') }}" class="ss-link{{ ' active' if ss_active == 'shops' else '' }}"><i class="fas fa-store"></i><span>Shops</span></a>{% endif %}
+    {% if can_view('api_keys') %}<a href="{{ url_for('api_keys_page') }}" class="ss-link{{ ' active' if ss_active == 'api' else '' }}"><i class="fas fa-key"></i><span>API Keys</span></a>{% endif %}
+    {% if can_view('image_search') %}<a href="{{ url_for('search_by_image_page') }}" class="ss-link{{ ' active' if ss_active == 'search' else '' }}"><i class="fas fa-camera"></i><span>Search by Image</span></a>{% endif %}
+    {% if can_view('duplicates') %}<a href="{{ url_for('duplicates') }}" class="ss-link{{ ' active' if ss_active == 'duplicates' else '' }}"><i class="fas fa-clone"></i><span>Duplicates</span></a>{% endif %}
+    {% if can_view('storage') %}<a href="{{ url_for('storage_page') }}" class="ss-link{{ ' active' if ss_active == 'storage' else '' }}"><i class="fas fa-hard-drive"></i><span>Storage</span></a>{% endif %}
+    {% if can_view('upgrade') %}<a href="{{ url_for('upgrade_page') }}" class="ss-link{{ ' active' if ss_active == 'upgrade' else '' }}"><i class="fas fa-arrow-up-right-dots"></i><span>Upgrade</span></a>{% endif %}
     {% if auth_is_admin %}<a href="{{ url_for('reset_page') }}" class="ss-link{{ ' active' if ss_active == 'reset' else '' }}" style="color:var(--danger);"><i class="fas fa-triangle-exclamation"></i><span>Reset System</span></a>{% endif %}
 </aside>
