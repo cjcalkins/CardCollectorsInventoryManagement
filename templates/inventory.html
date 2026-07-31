@@ -1446,7 +1446,13 @@
                     .filter(Boolean);
             }
 
-            addDropdownOptionBtn.addEventListener('click', function () {
+            // The field-type controls only exist for templates:edit users (guarded in the
+            // markup above). They are referenced from the middle of this SHARED script
+            // block, so an unguarded deref throws at load and aborts every binding below
+            // it — which would silently kill the whole inventory toolbar for everyone
+            // else. Null-guard in place; do NOT convert these to an early return here,
+            // that would skip the same handlers the throw did.
+            addDropdownOptionBtn?.addEventListener('click', function () {
                 addOptionRow();
             });
 
@@ -1491,6 +1497,10 @@
 
             // ── Show/hide the field type section when a field is selected ──
             function showFieldTypeSection(fieldKey) {
+                // Field-type controls are absent for users without templates:edit. An early
+                // return HERE is safe (and correct — nothing to show) because it skips only
+                // this function, not the shared script block below line 1449.
+                if (!fieldTypeSection) return;
                 // Only show for custom (template) fields, not core fields
                 const CORE_FIELDS = ['album', 'page', 'slot', 'edition', 'finalized'];
                 if (CORE_FIELDS.includes(fieldKey) || !fieldKey) {
@@ -1527,7 +1537,7 @@
             }
 
             // ── Apply field type change to template ──
-            applyFieldTypeBtn.addEventListener('click', async function () {
+            applyFieldTypeBtn?.addEventListener('click', async function () {
                 const fieldKey = fieldSel.value.trim();
                 if (!fieldKey || !selectedFieldType) return;
 
@@ -1646,7 +1656,7 @@
                 valueInput.classList.remove('d-none');
                 valueSel.classList.add('d-none');
                 warningEl.style.setProperty('display', 'none', 'important');
-                fieldTypeSection.classList.add('d-none');
+                fieldTypeSection?.classList.add('d-none');
                 modal.show();
             });
 
