@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, render_template, send_from_directory, url_for, redirect, Response, session, g
 import os
+import posixpath
 import re as _re
 # Decoded-image size ceiling, in megapixels. This is the core defense against
 # image "decompression bombs" — a tiny file that declares enormous dimensions and
@@ -2714,15 +2715,23 @@ def _resource_for_path(path):
         sub = seg[1] if len(seg) > 1 else ""
         if sub in ("users", "roles"):
             return "__admin__"
+        # "reset" is the factory wipe (drops the DB + storage) — admins only, never
+        # the plain "settings" default it would otherwise inherit.
         return {"reference": "reference", "api": "api_keys", "storage": "storage",
                 "network": "network", "identify": "identify", "upgrade": "upgrade",
-                "general": "settings"}.get(sub, "settings")
+                "reset": "__admin__", "general": "settings"}.get(sub, "settings")
     return {
         "inventory": "inventory",
         "albums": "albums", "album": "albums",
         "import": "import", "run_import_split": "import", "manual_process_card": "import",
         "import_single_card": "import", "import_finalize_batch": "import",
         "pdf_open": "import", "pdf_render_page": "import", "pdf_close": "import",
+        # Inventory record actions (buttons on the inventory pages).
+        "update_scan": "inventory", "update_scan_image": "inventory",
+        "realign_record_image": "inventory", "delete_scan": "inventory",
+        "delete_scans": "inventory", "add_custom_field": "inventory",
+        "grade_condition": "inventory", "ocr_apply": "inventory",
+        "wrong_match": "inventory",
         "duplicates": "duplicates",
         "analytics": "analytics", "analytics_page": "analytics",
         "reports": "reports",
@@ -2730,11 +2739,28 @@ def _resource_for_path(path):
         "search_by_image": "image_search", "search_by_image_page": "image_search",
         "reference": "reference",
         "shops": "shops", "shop": "shops",
+        # Shipping blueprint is dormant (unregistered) today; map it now so the gate
+        # covers /shipping/* the moment INTEGRATION.md wires it up. Reuses shops.
+        "shipping": "shops",
         "justtcg_fetch": "pricing", "justtcg_search_manual": "pricing",
         "tcg_save_url": "pricing", "tcg_clear_url": "pricing",
+        "save_tcgplayer_link": "pricing", "collections": "pricing",
+        # Type-icon library is scanner training data — reachable mid-import, so it
+        # rides the resource an importing user has by definition.
+        "types": "import",
         "cloud_identify": "identify", "identify": "identify", "identify_diagnose": "identify",
         "storage": "storage", "upgrade": "upgrade",
+        # update_field_type/hidden rewrite every game template that has the field,
+        # so they are template edits (Chris-approved), not record edits.
         "template": "templates", "template_save": "templates",
+        "template_delete": "templates", "templates": "templates",
+        "template_config": "templates",
+        "update_field_type": "templates", "update_field_hidden": "templates",
+        # First-run system-mode select (/setup, /setup/select) + the orphaned
+        # legacy-field migration: admin-only. At true first-run the gate
+        # short-circuits on _users_exist() before this runs, and the first
+        # account is an admin by construction, so /setup stays reachable then.
+        "setup": "__admin__", "migrate_clean_legacy_fields": "__admin__",
     }.get(head, None)
 
 
@@ -2771,6 +2797,12 @@ def _require_admin():
     return _forbidden("Administrator access is required to test a saved connection.")
 
 
+# GET routes that perform a privileged write and so must require edit despite
+# their method — kept deliberately tiny (the eBay OAuth handshake stores a
+# marketplace token). This is not a general per-route level table.
+_EBAY_OAUTH_WRITE_PATHS = ("/shops/ebay/connect", "/shops/ebay/callback")
+
+
 @app.before_request
 def _auth_gate():
     if _auth_disabled():
@@ -2795,10 +2827,20 @@ def _auth_gate():
         return
     resource = _resource_for_path(path)
     if resource is None:
-        return  # only requires being signed in
+        # Default-deny for mutating requests: an unmapped POST/PUT/PATCH/DELETE is
+        # refused rather than silently allowed, so a route nobody mapped fails
+        # closed. NOTE: the guarantee covers mutating *methods*, not mutating
+        # *actions* — a future GET route with side effects is NOT caught here and
+        # must be mapped or added to _EBAY_OAUTH_WRITE_PATHS-style handling.
+        if request.method not in ("GET", "HEAD", "OPTIONS"):
+            return _forbidden("This action isn't available to your role.")
+        return  # read-only path: only requires being signed in
     if resource == "__admin__":
         return _forbidden("Administrator access is required for user and role management.")
-    need = "edit" if request.method not in ("GET", "HEAD", "OPTIONS") else "view"
+    # Compare the same rstripped form _resource_for_path uses, so the two agree
+    # on normalization (a trailing-slash variant can't slip past this set).
+    force_edit = path.rstrip("/") in _EBAY_OAUTH_WRITE_PATHS
+    need = "edit" if (force_edit or request.method not in ("GET", "HEAD", "OPTIONS")) else "view"
     if not _role_allows(user.role, resource, need):
         label = dict(PROTECTED_RESOURCES).get(resource, resource)
         return _forbidden(f"Your role doesn't have &ldquo;{need}&rdquo; access to {label}.")
@@ -6775,6 +6817,26 @@ def _no_sniff(resp):
 
 @app.route("/uploads/<path:filename>")
 def uploaded_file(filename):
+    # /uploads is intentionally open to any signed-in user because every card
+    # image is served through it. Migration bundles, however, live under
+    # UPLOAD_FOLDER/migration_exports and contain secrets (FLASK_SECRET_KEY, shop
+    # tokens, mailbox password). Bundles are now served by the dedicated,
+    # map-gated upgrade_download route; this block stays as defense in depth so
+    # that bundles reachable via the old /uploads/... URL shape are still gated.
+    # CRITICAL: normalize BEFORE the prefix test — send_from_directory normalizes
+    # afterwards, so a raw check on "cards/../migration_exports/x" (which the file
+    # server resolves back inside the root) would miss it. normpath collapses the
+    # traversal first; .lower() closes the case-insensitive-FS variant.
+    norm = posixpath.normpath(str(filename).replace("\\", "/").lstrip("/"))
+    if norm.lower().startswith("migration_exports/") or norm == ".." or norm.startswith("../"):
+        if not _auth_disabled():
+            u = getattr(g, "user", None) or _current_user()
+            if not _role_allows(getattr(u, "role", None), "upgrade", "view"):
+                return _forbidden("Upgrade access is required to download a migration bundle.")
+        # Prune stale bundles on download too (not just on export), excluding the
+        # one being served, so a single old bundle can't linger indefinitely.
+        _prune_migration_bundles(os.path.join(app.config["UPLOAD_FOLDER"], "migration_exports"),
+                                 keep=os.path.basename(norm))
     return _no_sniff(send_from_directory(app.config["UPLOAD_FOLDER"], filename))
 
 
@@ -11413,11 +11475,39 @@ def _build_migration_bundle(include_reference=False, include_images_manifest=Tru
 
     out_dir = os.path.join(app.config["UPLOAD_FOLDER"], "migration_exports")
     os.makedirs(out_dir, exist_ok=True)
+    # Prune stale bundles so exported secrets don't accumulate on disk.
+    _prune_migration_bundles(out_dir)
     tar_path = os.path.join(out_dir, f"ccim_migration_{stamp}.tar.gz")
     with tarfile.open(tar_path, "w:gz") as tar:
         tar.add(bundle_dir, arcname=os.path.basename(bundle_dir))
     shutil.rmtree(work, ignore_errors=True)
     return tar_path, manifest
+
+
+# Migration bundles are meant to be downloaded promptly and discarded; anything
+# older than this is pruned on the next export so exported secrets don't linger.
+MIGRATION_BUNDLE_TTL_SECONDS = 3600
+
+
+def _prune_migration_bundles(out_dir, ttl_seconds=MIGRATION_BUNDLE_TTL_SECONDS, keep=None):
+    """Delete migration bundles in out_dir older than ttl_seconds. Best-effort.
+    `keep` (a basename) is never deleted — used when pruning during a download so
+    the bundle being served can't be removed out from under the request."""
+    try:
+        cutoff = datetime.now().timestamp() - ttl_seconds
+        for name in os.listdir(out_dir):
+            if not (name.startswith("ccim_migration_") and name.endswith(".tar.gz")):
+                continue
+            if keep and name == keep:
+                continue
+            p = os.path.join(out_dir, name)
+            try:
+                if os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 @app.route("/settings/upgrade")
@@ -11441,12 +11531,26 @@ def upgrade_export():
     return jsonify({
         "status": "success",
         "message": "Migration bundle created.",
-        "download_url": url_for("uploaded_file", filename="migration_exports/" + os.path.basename(tar_path)),
+        "download_url": url_for("upgrade_download", name=os.path.basename(tar_path)),
         "filename": os.path.basename(tar_path),
         "size_bytes": size,
         "size_human": _human_size(size),
         "manifest": manifest,
     })
+
+
+@app.route("/settings/upgrade/download/<name>")
+def upgrade_download(name):
+    """Serve a migration bundle. Gated by the map on the whole /settings/upgrade
+    prefix ('upgrade' resource, seg[1]) — no per-request prefix test to defeat.
+    Three independent layers stop a crafted name: the <name> converter refuses
+    any path with slashes at routing time, basename(secure_filename(...)) strips
+    anything that survives, and the resource map gates access. Bundles are
+    pruned here too so a single old one can't linger past its TTL."""
+    safe = os.path.basename(secure_filename(name))
+    out_dir = os.path.join(app.config["UPLOAD_FOLDER"], "migration_exports")
+    _prune_migration_bundles(out_dir, keep=safe)
+    return _no_sniff(send_from_directory(out_dir, safe))
 
 
 # ============================================================================ #

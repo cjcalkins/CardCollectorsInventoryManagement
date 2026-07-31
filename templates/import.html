@@ -915,11 +915,13 @@
         <i class="fas fa-id-card"></i> Single Card (front &amp; back)
       </button>
     </div>
+    {% if can_view('import') %}
     <div style="max-width:760px; margin:-12px auto 20px; text-align:right;">
       <a href="{{ url_for('type_references_page') }}" class="small text-decoration-none" title="Teach the scanner each game's type icons">
         <i class="fas fa-shapes me-1"></i>Manage type icons
       </a>
     </div>
+    {% endif %}
 
     <!-- ===================== SINGLE CARD IMPORT ===================== -->
     <section class="panel hidden" id="modeSingle" style="max-width: 760px; margin: 0 auto 24px;">
