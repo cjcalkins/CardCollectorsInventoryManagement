@@ -42,7 +42,7 @@ routes in the first place. MEDIUM on the "adjacent findings present in source?"
 block: those are substring checks over a source window, and all three have
 misreported in BOTH directions before being scoped (see the comment there).
 """
-import ast, os, re, sys, glob, shlex, subprocess, tempfile
+import ast, os, re, sys, glob, subprocess, tarfile, tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _args import (EX_CONTROL, EX_FINDING, EX_OK, pinned, repo_root,
@@ -270,17 +270,39 @@ NEGATIVE_CONTROL_REF = "aad3368b7a6128a5066a29622531da4c2cde7cf0"   # F3 fix + i
 
 
 def materialize(ref):
-    """Extract `ref` into a temp dir. Returns (app_py_path, repo_root) or raises."""
+    """Extract `ref` into a temp dir. Returns (app_py_path, repo_root) or raises.
+
+    NO SHELL AND NO PIPE, deliberately. This used to be
+    `git archive REF | tar -x -C DEST` under `shell=True`, and a pipeline's
+    returncode is the LAST command's -- so `proc.returncode` reported tar's
+    status and never git's. Measured on this repo:
+
+        git archive <absent ref>            rc 128   <- the real answer
+        git archive <absent ref> | tar -x   rc 2     <- what the check saw
+
+    It happened to refuse anyway, because tar also fails on an empty stream and
+    because the `app.py` check below is a second backstop. That is the shape
+    this whole directory exists to reject: the failure was caught by luck, and
+    a git failure that emits a valid tar prefix before dying would have come
+    back rc 0 with a partially materialized control. `git archive -o` writes
+    the file itself, so the returncode inspected is the one that matters, and
+    `tarfile` removes the dependency on an external tar.
+    """
     pinned(ref)
     # -C the checkout this TOOL lives in, not the tree under test: the target may
     # be a bare app.py copied somewhere with no history at all, and the control
     # has to be obtainable independently of what it is being pointed at.
     dest = tempfile.mkdtemp(prefix=f"nc-{ref}-")
-    proc = subprocess.run(f"git -C {shlex.quote(CONTROL_REPO)} archive {shlex.quote(ref)} "
-                          f"| tar -x -C {shlex.quote(dest)}",
-                          shell=True, capture_output=True, text=True)
+    tar_path = os.path.join(dest, "control.tar")
+    proc = subprocess.run(["git", "-C", CONTROL_REPO, "archive",
+                           "--format=tar", "-o", tar_path, ref],
+                          capture_output=True, text=True)
     if proc.returncode != 0:
-        raise RuntimeError(f"git archive {ref} failed: {proc.stderr.strip()[:200]}")
+        raise RuntimeError(f"git archive {ref} failed (rc {proc.returncode}): "
+                           f"{proc.stderr.strip()[:200]}")
+    with tarfile.open(tar_path) as tf:
+        tf.extractall(dest)
+    os.remove(tar_path)
     app_py = os.path.join(dest, "app.py")
     if not os.path.exists(app_py):
         raise RuntimeError(f"{ref} contains no app.py")
