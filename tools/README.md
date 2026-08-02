@@ -24,11 +24,35 @@ and reports nothing. Silence must never read as clean.
 reach. A clean result is only as wide as the question the tool asks, and reading
 it as broader is how several of these defects survived their first review.
 
+**Nothing checked must never exit 0.** No targets, a glob that matched nothing, a
+directory with no templates, a named file that could not be read — every one of
+those exits non-zero. Exit 0 means the tool proved it discriminates *and then*
+looked at something. A run over an empty set is indistinguishable from a clean
+run by status alone, which is the same weakness as a check that cannot fail.
+
+### Exit codes
+
+| code | meaning |
+|------|---------|
+| 0 | clean — the self-test passed **and** at least one target was read |
+| 1 | a real finding, or a named target that could not be read |
+| 2 | a control was unobtainable — **nothing was reported**, this is not a pass |
+| 64 | usage error: bad flag, no targets, or paths that expanded to nothing |
+
+`2` is reserved for "I could not prove I discriminate" so a wrapper keying on
+status can tell it from a mistyped argument. Both are non-zero; only 0 is a pass.
+
+Measure that status directly. `tool.py … | tail -4; echo $?` reports **`tail`'s**
+status, not the tool's — that misread nearly produced a false finding against
+these tools on the day they landed.
+
 ## The checkers
 
 ### `check_template_parse.py` — Jinja parse + inline JS parse, together
 
+    tools/check_template_parse.py --help
     tools/check_template_parse.py --self-test
+    tools/check_template_parse.py templates/          # directory, walked for *.html
     tools/check_template_parse.py templates/*.html
 
 Run on every template you touch, **including comment-only diffs**.
@@ -51,6 +75,7 @@ that needs a browser.
 
 ### `check_guard_derefs.py` — permission guards that null an element still dereferenced
 
+    tools/check_guard_derefs.py templates/            # or individual files
     tools/check_guard_derefs.py templates/*.html
 
 A `{% if can_edit(...) %}` around an element removes it for unprivileged users. If
@@ -70,5 +95,9 @@ not report — pointing it there and reading green is coverage that isn't there.
 ## Adding one
 
 Keep the contract: a self-test with a control from history that must fail, a
-non-zero exit when the control is unobtainable, and a docstring saying what the
-tool is blind to.
+non-zero exit when the control is unobtainable, a non-zero exit when the run
+covered nothing, and a docstring saying what the tool is blind to.
+
+And give it a `--help`. These two shipped without one and answered a traceback —
+a poor first reply from a tool whose whole purpose is to be trusted by people who
+did not write it.

@@ -14,7 +14,7 @@ Method (static, no browser):
        unsafe     = `x.addEventListener(`, `x.classList`, `x.textContent`, `x.value` ...
   4. report unsafe derefs, and whether they sit at script top level (run at load)
 
-Usage: check_guard_derefs.py <template.html> [<template.html> ...]
+Usage: check_guard_derefs.py <template.html|dir> [...]   (--help for exit codes)
 """
 import os, re, subprocess, sys, tempfile
 
@@ -51,11 +51,20 @@ def script_blocks(lines):
     return out
 
 
-def run(paths, quiet=False):
+def run(paths, quiet=False, unreadable=None):
+    """unreadable, if given, collects paths we were told to check and could not
+    open. The caller must treat a non-empty list as a failure: a target that was
+    named and then skipped is a hole in the answer, not an absence of findings."""
     problems = 0
     _p = (lambda *a, **k: None) if quiet else print
     for path in paths:
-        text = open(path).read()
+        try:
+            text = open(path).read()
+        except OSError as exc:
+            _p(f"\n{path}: CANNOT READ - {exc}")
+            if unreadable is not None:
+                unreadable.append(path)
+            continue
         lines = text.splitlines()
         blocks = guarded_blocks(text)
         scopes = script_blocks(lines)
@@ -219,10 +228,69 @@ def self_test():
           f"(>= {SELF_TEST_MIN}), so the checker discriminates")
 
 
+EX_USAGE = 64  # sysexits EX_USAGE. Deliberately NOT 2 -- exit 2 is reserved for
+               # "the control was unobtainable, so nothing was certified", and a
+               # wrapper keying on status must be able to tell those apart.
+
+USAGE = """usage: check_guard_derefs.py PATH [PATH ...]
+
+Finds elements removed by a Jinja permission guard that JS still dereferences
+without a null check. PATH may be a file or a directory (walked for *.html).
+
+The known-answer self-test runs on every invocation.
+
+CANNOT SEE: JS-conditional sites or class selectors. See tools/README.md.
+
+exit 0  clean, and the self-test passed
+exit 1  unsafe deref found
+exit 2  control unobtainable -- NOTHING was reported
+exit 64 usage error, including paths that expanded to no templates
+"""
+
+
+def expand_paths(paths):
+    """Accept files or directories; walk directories for templates."""
+    out = []
+    for p in paths:
+        if os.path.isdir(p):
+            for root, _dirs, files in os.walk(p):
+                out.extend(os.path.join(root, f) for f in sorted(files)
+                           if f.endswith(".html"))
+        else:
+            out.append(p)
+    return out
+
+
 def main():
+    argv = sys.argv[1:]
+    if "-h" in argv or "--help" in argv:
+        print(USAGE)
+        sys.exit(0)
+    unknown = [a for a in argv if a.startswith("-")]
+    if unknown:
+        print("unknown option(s): %s\n" % " ".join(unknown))
+        print(USAGE)
+        sys.exit(EX_USAGE)
+    # This tool has no self-test-only mode, so zero targets means it would print
+    # "no unsafe derefs" having opened nothing. That is a green over an empty set
+    # -- the exact shape of a check that cannot fail.
+    if not argv:
+        print("no targets.\n")
+        print(USAGE)
+        sys.exit(EX_USAGE)
+    paths = expand_paths(argv)
+    if not paths:
+        print("%s expanded to no *.html files -- nothing would be checked.\n"
+              % " ".join(argv))
+        sys.exit(EX_USAGE)
     self_test()
-    problems = run(sys.argv[1:])
+    unreadable = []
+    problems = run(paths, unreadable=unreadable)
     print()
+    if unreadable:
+        print(f"RESULT: {len(unreadable)} named target(s) could not be read — "
+              f"this run does not cover them")
+        sys.exit(1)
     if problems:
         print(f"RESULT: {problems} unsafe deref(s) of guard-removed elements — "
               f"the page throws for users the guard applies to")

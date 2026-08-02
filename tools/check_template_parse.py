@@ -37,9 +37,13 @@ cannot rot the way a fixture file would. A checker nobody has watched fail is no
 evidence; this one proves it discriminates before it certifies anything.
 
 USAGE
+    tools/check_template_parse.py --help
     tools/check_template_parse.py --self-test
+    tools/check_template_parse.py templates/            (directory, walked)
     tools/check_template_parse.py templates/*.html
-Exit 0 all clear, 1 a file failed, 2 a control failed (nothing was reported).
+Exit 0 all clear, 1 a file failed, 2 a control failed (nothing was reported),
+64 a usage error -- which includes a path that expanded to no templates, so a
+glob that matched nothing can never come back looking clean.
 """
 import os
 import re
@@ -155,8 +159,66 @@ def self_test():
     return True
 
 
+EX_USAGE = 64  # sysexits EX_USAGE. Deliberately NOT 2: exit 2 means "I could not
+               # prove I discriminate", and a wrapper keying on status must not
+               # read a mistyped flag as that. Both are non-zero, which is the
+               # invariant that matters -- only a proven-clean run returns 0.
+
+USAGE = """usage: check_template_parse.py [--self-test] [PATH ...]
+
+Parse-checks Jinja templates: the Jinja parse and node --check on the inline
+<script> bodies, together, plus a detector for a Jinja delimiter inside a //
+comment. PATH may be a file or a directory (walked for *.html).
+
+The known-answer self-test runs on EVERY invocation -- you cannot use this tool
+without first proving it still discriminates. --self-test runs it with no targets.
+
+exit 0  clean, and the self-test passed
+exit 1  a file failed to parse, or a named target could not be read
+exit 2  a control was unobtainable -- NOTHING was reported
+exit 64 usage error, including paths that expanded to no templates
+"""
+
+
+def expand_paths(paths):
+    """Accept files or directories; walk directories for templates."""
+    out = []
+    for p in paths:
+        if os.path.isdir(p):
+            for root, _dirs, files in os.walk(p):
+                out.extend(os.path.join(root, f) for f in sorted(files)
+                           if f.endswith(".html"))
+        else:
+            out.append(p)
+    return out
+
+
 def main():
-    args = [a for a in sys.argv[1:] if a != "--self-test"]
+    argv = sys.argv[1:]
+    if "-h" in argv or "--help" in argv:
+        print(USAGE)
+        return 0
+    unknown = [a for a in argv if a.startswith("-") and a != "--self-test"]
+    if unknown:
+        print("unknown option(s): %s\n" % " ".join(unknown))
+        print(USAGE)
+        return EX_USAGE
+
+    given = [a for a in argv if a != "--self-test"]
+    # No targets is only ever legitimate under an explicit --self-test. Bare
+    # `tool.py` -- or a wrapper whose glob matched nothing -- must not exit 0,
+    # or checking nothing reads exactly like checking everything and finding it
+    # clean. Same reason an unobtainable control fails instead of skipping.
+    if not given and "--self-test" not in argv:
+        print("no targets. Pass templates, or --self-test to run the controls alone.\n")
+        print(USAGE)
+        return EX_USAGE
+    args = expand_paths(given)
+    if given and not args:
+        print("%s expanded to no *.html files -- nothing would be checked.\n"
+              % " ".join(given))
+        return EX_USAGE
+
     if not self_test():
         print("Refusing to report.")
         return 2
@@ -164,9 +226,17 @@ def main():
         return 0
     rc = 0
     for path in args:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            if not check_source(fh.read(), path):
-                rc = 1
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                src = fh.read()
+        except OSError as exc:
+            # A target we were told to check and could not read is a failure, not
+            # a skip -- the caller named it expecting an answer about it.
+            print("\n%s: CANNOT READ - %s" % (path, exc))
+            rc = 1
+            continue
+        if not check_source(src, path):
+            rc = 1
     return rc
 
 
