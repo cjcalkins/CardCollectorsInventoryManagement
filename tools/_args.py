@@ -103,10 +103,21 @@ _override_announced = False
 
 
 def repo_root():
-    """The checkout this file lives in. Never $HOME, never the cwd."""
-    own = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    """The checkout this file lives in. Never $HOME, never the cwd.
+
+    realpath, not abspath: putting a tool on $PATH by symlinking `tools/` is an
+    ordinary thing to do with something advertised as "anyone can run this",
+    and abspath leaves the link in the path, so the grandparent is the link's
+    directory rather than the checkout. Both sides of the CCIM_REPO comparison
+    are resolved too -- an override that is a symlink to this same tree changes
+    nothing, and a warning that fires on a no-op teaches people to skim it.
+    """
+    own = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
     override = os.environ.get("CCIM_REPO")
-    if not override or os.path.abspath(override) == own:
+    if not override:
+        return own
+    override = os.path.realpath(override)
+    if override == own:
         return own
     global _override_announced
     if not _override_announced:
