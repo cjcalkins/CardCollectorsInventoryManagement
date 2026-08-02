@@ -43,17 +43,41 @@ involved, it was that the output looked identical to a correct run -- so when
 the override is in force the tools say so, once, on stderr. Cross-tree
 resolution is allowed here; silent cross-tree resolution is not.
 
-A CONTROL MUST BE A PINNED SHA
-------------------------------
-Never `main~3`, `origin/main`, a branch or a tag. The harm from resolving a
-control in the wrong tree is confined to trees that lack the commit only
-because an immutable SHA names the same bytes everywhere it exists at all. A
-symbolic ref resolves to a *different commit* per tree, so the self-test would
-pass against the wrong bytes and the tool would return a wrong answer on a
-checkout that has everything. That confinement is a property of the refs, not
-of this module -- it has to be maintained by whoever adds the next control.
+A CONTROL MUST BE A FULL 40-CHAR SHA
+------------------------------------
+Never `main~3`, `origin/main`, a branch, a tag -- and never an abbreviation.
+The harm from resolving a control in the wrong tree is confined to trees that
+lack the commit only because an immutable SHA names the same bytes everywhere
+it exists at all. A ref resolves to a *different commit* per tree, so the
+self-test would pass against the wrong bytes and the tool would return a wrong
+answer on a checkout that has everything.
+
+An abbreviated SHA is not exempt, and that is the part that is not obvious:
+git resolves a name through the REF NAMESPACE BEFORE it treats the name as an
+object, so an abbreviation is a symbolic ref the moment anything is named that.
+
+    clone that HAS the control, plus a branch named f3eb259:
+      git show f3eb259:templates/inventory.html          md5 3bc72f59  the BRANCH
+      git show f3eb259e30e5...:templates/inventory.html  md5 cb1ead65  the control
+      stderr: "warning: refname 'f3eb259' is ambiguous."   <- and the callers
+                                                              discard stderr
+    branch named the FULL 40-hex, same lookup:
+      git show 72380402cb22...cdbd:templates/import.html  -> the COMMIT
+
+Git ignores a 40-hex ref by design -- "it will be ignored when you just specify
+40-hex" -- so only the full form is outside the ref namespace and cannot be
+shadowed. git_show() enforces this rather than trusting each caller, because
+every control in this repo passes through it: a tool cannot add an unpinned
+control without going through the one function that refuses them.
+
+Do not weaken this into a warning. When it was first demonstrated the shadowed
+lookup happened to return a *fixed* template and the caller's `>= 13` threshold
+caught it -- that was the direction the substitution went, not a property of
+the check. A shadow pointing at any tree that satisfies the threshold passes
+silently on the wrong bytes.
 """
 import os
+import re
 import subprocess
 import sys
 
@@ -83,12 +107,33 @@ def repo_root():
     return override
 
 
+# Lowercase only, which is stricter than git needs and deliberately so. Git's
+# 40-hex rule is case-insensitive -- a branch named the UPPERCASE 40-hex is also
+# ignored, verified -- so refusing uppercase buys no safety, it just keeps every
+# control in this repo in the one form `git rev-parse` emits. The refusal is in
+# the safe direction either way.
+PINNED_RE = re.compile(r"[0-9a-f]{40}\Z")
+
+
 def git_show(ref, path):
     """`git show ref:path` against this tool's own checkout.
+
+    Refuses outright if `ref` is not a full 40-char SHA -- see the module
+    docstring. That is an exit rather than a None because the two are different
+    diagnoses: None means "this tree does not have the control", which is a fact
+    about the checkout, while an unpinned ref is a defect in the tool itself and
+    no caller should be able to soften it into a missing-control message.
 
     Returns the file's text, or None if the control is unobtainable -- callers
     must translate None into exit 2, never into a skip.
     """
+    if not PINNED_RE.match(ref):
+        print("CONTROL NOT PINNED: %r is not a full 40-char SHA. Git resolves a "
+              "name through\nthe ref namespace before treating it as an object, so "
+              "a branch or tag of that\nname would silently shadow the control and "
+              "the self-test would run on the\nwrong bytes." % ref)
+        print("Refusing to certify — the control cannot be trusted to be the control.")
+        sys.exit(EX_CONTROL)
     p = subprocess.run(["git", "-C", repo_root(), "show", "%s:%s" % (ref, path)],
                        capture_output=True, text=True)
     return p.stdout if p.returncode == 0 else None

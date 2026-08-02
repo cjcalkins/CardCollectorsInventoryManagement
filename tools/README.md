@@ -59,15 +59,27 @@ same defect and it is not obvious: git resolves a name through the ref namespace
       git show f3eb259e30e5...:templates/inventory.html    -> the control
 
 Git ignores a 40-hex ref by design — *"it will be ignored when you just specify
-40-hex"* — so only the full form cannot be shadowed. This is enforced in code
-(`PINNED_RE`), not asserted here: a checker whose control ref is not 40 hex
-characters refuses with exit 2 before it reads anything.
+40-hex"* — so only the full form is outside the ref namespace and cannot be
+shadowed.
 
-Worth knowing why the enforcement is not "belt and braces": when this was
-demonstrated, the shadowed lookup happened to return a *fixed* template and the
-guard checker's `>= 13` threshold caught it. That was the direction the
-substitution went, not a property of the check — a shadow pointing at any tree
-with 13+ unsafe derefs passes silently on the wrong bytes.
+**Enforced in `_args.git_show`, which is the one place every control passes
+through**, not in each checker. A tool cannot add an unpinned control without
+going through the function that refuses them, and a tool written later inherits
+the rule without anyone remembering it. It first shipped as a copy in each of
+the two checkers that already obeyed it and absent from the three that did not —
+the same divergence `_args.py` exists to end, repeated in miniature.
+
+Refusal is an exit, not a `None` return, because the two are different
+diagnoses. `None` means *this checkout does not have the control* — a fact about
+the tree. An unpinned ref is a defect in the tool, and no caller should be able
+to soften it into a missing-control message.
+
+Worth knowing why this is enforced rather than noted: when it was demonstrated,
+the shadowed lookup happened to return a *fixed* template and the guard
+checker's `>= 13` threshold caught it. That was the direction the substitution
+went, not a property of the check — a shadow pointing at any tree that satisfies
+the threshold passes silently on the wrong bytes. A rule enforced by luck reads
+exactly like one that is enforced.
 
 **Name what the checker cannot see.** Each docstring says what is outside its
 reach. A clean result is only as wide as the question the tool asks, and reading
@@ -91,9 +103,19 @@ run by status alone, which is the same weakness as a check that cannot fail.
 `2` is reserved for "I could not prove I discriminate" so a wrapper keying on
 status can tell it from a mistyped argument. Both are non-zero; only 0 is a pass.
 
-Measure that status directly. `tool.py … | tail -4; echo $?` reports **`tail`'s**
-status, not the tool's — that misread nearly produced a false finding against
-these tools on the day they landed.
+Measure that status directly, and read `$?` before anything else runs.
+
+    tool.py … | tail -4; echo $?              <- tail's status, not the tool's
+    printf '%s %s\n' "$(basename $t)" "$?"    <- basename's status; the command
+                                                 substitution runs first and
+                                                 clobbers $? before it expands
+    rc=$(tool.py …); echo $?                  <- fine, but rc holds stdout
+
+Both of the first two produced a wrong number against these very tools — the
+first nearly a false finding on the day they landed, the second a battery of
+thirteen cases that all read `EXIT=0`, including the four that had just been
+made to exit 64. **Assign `rc=$?` on the very next line and print `$rc`.** A
+harness that misreads the status turns every code in the table above into 0.
 
 ## The checkers
 
@@ -160,6 +182,10 @@ anywhere because `sys.path[0]` is the script's own directory, and
 file lives in. Do not reach for `$HOME` or the cwd; both shipped here and both
 were wrong, in opposite directions. Declare any tool-specific flag with
 `extra_flags=("--your-flag",)` rather than trimming argv at the call site.
+
+Fetch your control **only** through `_args.git_show`. It is what enforces the
+40-hex rule, so a control read by a private `subprocess.run(["git", ...])` is a
+control nobody checked.
 
 And give it a `--help`. These two shipped without one and answered a traceback —
 a poor first reply from a tool whose whole purpose is to be trusted by people who

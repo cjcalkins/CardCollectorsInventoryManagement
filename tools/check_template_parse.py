@@ -68,18 +68,16 @@ STMT_RE = re.compile(r"\{%.*?%\}", re.S)
 # and would parse while still meaning something nobody intended.
 COMMENT_TAG_RE = re.compile(r"^\s*//.*(\{%|\{\{)")
 
-# FULL 40-char SHAs, not abbreviations. An abbreviated control goes through git's
-# ref-resolution order FIRST, so a branch or tag of the same name silently wins:
-# `git show f3eb259:path` with a branch named f3eb259 present returns the BRANCH's
-# file, exit 0, with the ambiguity warning on stderr only -- which this tool
-# discards. Git ignores a 40-hex ref by design ("it will be ignored when you just
-# specify 40-hex"), so only the full form cannot be shadowed. See PINNED_RE.
+# FULL 40-char SHAs, never abbreviations -- _args.git_show refuses anything else,
+# so this is enforced rather than remembered. An abbreviated control goes through
+# git's ref-resolution order FIRST, so a branch or tag of that name silently wins
+# and returns its own bytes with exit 0, the ambiguity warning on stderr only --
+# which this tool discards. Git ignores a 40-hex ref by design ("it will be ignored
+# when you just specify 40-hex"), so only the full form is outside that namespace.
 SELF_TEST_CASES = [("72380402cb22b13cc23a85bdf754b46eb7e8cdbd",
                     "templates/import.html", False),
                    ("eb86bd41c4d630d42f7538863c70ca52b1fc16c6",
                     "templates/import.html", True)]
-
-PINNED_RE = re.compile(r"[0-9a-f]{40}\Z")
 
 
 def node_check(js):
@@ -148,12 +146,6 @@ def check_source(src, label, out=True):
 def self_test():
     """Prove the checker discriminates before it is allowed to certify anything."""
     print("SELF-TEST -- known answers from this repo's history")
-    for commit, path, _want in SELF_TEST_CASES:
-        if not PINNED_RE.match(commit):
-            print("  CONTROL NOT PINNED: %r is not a full 40-char SHA, so a ref of"
-                  % commit)
-            print("  the same name would shadow it silently. Refusing to certify.")
-            return False
     for commit, path, want_clean in SELF_TEST_CASES:
         # Against the checkout this FILE lives in. The bare `git show` this
         # replaces resolved against the CWD, so invoking the tool by absolute

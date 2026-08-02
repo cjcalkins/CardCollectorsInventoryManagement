@@ -196,15 +196,13 @@ def run(paths, quiet=False, unreadable=None):
     return problems
 
 
-# FULL 40-char SHA, not an abbreviation. `git show f3eb259:path` with a branch
-# named f3eb259 present resolves the BRANCH, exit 0, ambiguity warning on stderr
-# only -- and this tool discards stderr. Demonstrated: the shadowed lookup returned
-# a fixed inventory.html and the threshold below caught it (0 derefs, expected >=13)
-# -- but that was the direction of the substitution, not a property of the check. A
-# shadow pointing at any tree with >=13 derefs passes silently on the wrong bytes.
+# FULL 40-char SHA, never an abbreviation -- _args.git_show refuses anything else,
+# so this is enforced rather than remembered. Why it has to be: git resolves a name
+# through the ref namespace BEFORE treating it as an object, so a branch named
+# f3eb259 would answer `git show f3eb259:path` with the BRANCH's bytes, exit 0,
+# ambiguity warning on stderr only -- and this tool discards stderr.
 SELF_TEST_REF  = "f3eb259e30e54505eed94b9376c0c2ad5c4fd0e3"   # item-8 regression present
 SELF_TEST_FILE = "templates/inventory.html"
-PINNED_RE      = re.compile(r"[0-9a-f]{40}\Z")
 SELF_TEST_MIN  = 13                              # 13 reachable derefs; the other 5 are
                                                  # forEach bodies, classified not counted
 
@@ -215,11 +213,6 @@ def self_test():
     is reconstructed from git rather than from a .scratch worktree anyone could prune.
     A control that cannot be obtained is treated as a failed control, not a skip —
     silently skipping is how a mandatory check becomes a no-op."""
-    if not PINNED_RE.match(SELF_TEST_REF):
-        print(f"CONTROL NOT PINNED: {SELF_TEST_REF!r} is not a full 40-char SHA, so a "
-              f"ref of the same name would shadow it silently.")
-        print("Refusing to certify — the control cannot be trusted to be the control.")
-        sys.exit(_args.EX_CONTROL)
     # The control comes from the checkout this FILE lives in -- not $HOME (inert on
     # every other machine, and cross-tree on its author's) and not the cwd. See the
     # _args module docstring: both wrong answers shipped here, in opposite directions.
