@@ -301,7 +301,16 @@ def materialize(ref):
         raise RuntimeError(f"git archive {ref} failed (rc {proc.returncode}): "
                            f"{proc.stderr.strip()[:200]}")
     with tarfile.open(tar_path) as tf:
-        tf.extractall(dest)
+        # `filter="data"` becomes the default in 3.14 and warns when omitted from
+        # 3.12; it is backported as far as 3.10.12/3.11.4, so hasattr is what keeps
+        # this working on an interpreter that predates it. The point is not safety
+        # here -- this archive is git's own output of this repo, which carries no
+        # symlinks and no absolute paths, so `data` extracts byte-identically. The
+        # point is that the omitted argument prints a DeprecationWarning to stderr
+        # on a newer interpreter, and a stray stderr line in this directory is a
+        # line someone has to rule out as a finding.
+        kw = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
+        tf.extractall(dest, **kw)
     os.remove(tar_path)
     app_py = os.path.join(dest, "app.py")
     if not os.path.exists(app_py):
