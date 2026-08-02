@@ -9713,12 +9713,16 @@ def _finalize_one_card(filename, template_name, blank_fields, collection, storag
     # alters the two disagree — the check passes, then the move raises FileNotFoundError.
     # It is also an existence oracle for arbitrary paths via os.path.exists. Idempotent on
     # the server-generated slot_<...> names the PDF importer passes (verified).
+    # Keep the caller's original name for the diagnostic echo: the joins use the
+    # sanitized value, but an error row should identify the item the caller submitted
+    # -- and agree with import_finalize_batch's own except handler, which echoes raw.
+    raw_name = filename
     filename = secure_filename(filename)
     if not filename:
-        return {"filename": filename, "status": "error", "message": "Aligned card image not found"}
+        return {"filename": raw_name, "status": "error", "message": "Aligned card image not found"}
     temp_image_path = os.path.join(app.config["TEMP_CARD_FOLDER"], filename)
     if not os.path.exists(temp_image_path):
-        return {"filename": filename, "status": "error", "message": "Aligned card image not found"}
+        return {"filename": raw_name, "status": "error", "message": "Aligned card image not found"}
 
     filename_fields = parse_card_filename(filename)
     extracted = {**blank_fields, **filename_fields}
