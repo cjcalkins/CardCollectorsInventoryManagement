@@ -2184,6 +2184,32 @@
       // badgeClass, badgeText and clickHint are static literals in every branch —
       // left unescaped deliberately.
       const tileUrl = externalOrRelativeUrl(item.url);
+      // DO NOT make any element in this template conditional without first making its
+      // consumers null-safe. Elsewhere in this file a URL that fails the scheme gate
+      // renders no element at all (see the `openUrl ?` / `thumbUrl ?` / `openCardUrl ?`
+      // sites); that rule is deliberately NOT applied here, and applying it breaks the
+      // page. Every element below is fetched with querySelector and dereferenced with
+      // no null check, so omitting one throws and takes out the whole tile grid.
+      // Keyed on constructs, not line numbers, because line numbers go stale:
+      //
+      //   <img>              buildTile:        img.addEventListener('click', ...)
+      //                      manual-adjust replace path (the querySelector(
+      //                      '[data-filename=...]') block): oldImg.cloneNode(true)
+      //                      and oldImg.parentNode.replaceChild(...)
+      //   .manual-adjust-btn buildTile:        manualBtn.addEventListener('click', ...)
+      //                      NOTE the `if (manualBtn)` null check lives in the replace
+      //                      path, a DIFFERENT function. buildTile's own deref is
+      //                      unguarded — do not read that guard as covering this one.
+      //   .badge             replace path:     badge.textContent, badge.className
+      //                      (badgeClass is 'badge...' in all four branches, so this
+      //                      selector always matches)
+      //   .hint              replace path:     length-checked — the only safe one
+      //
+      // An empty src="" is the safer failure: it fetches nothing and executes nothing,
+      // whereas a missing element is the null-deref class that broke inventory.html.
+      // This applies to any reason for omitting an element — scheme gate, permission
+      // guard, or feature flag. A Jinja {% if can_edit(...) %} around .manual-adjust-btn
+      // would fail exactly the same way.
       tile.innerHTML = `
         <img
           src="${esc(tileUrl)}"
