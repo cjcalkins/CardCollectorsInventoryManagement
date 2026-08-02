@@ -1485,6 +1485,10 @@
             singleResult.style.display = 'flex';
             singleResult.style.flexDirection = 'column';
             singleResult.style.alignItems = 'stretch';
+            // data.count and data.identified_count left unescaped: verified ints at the
+            // producer (app.py:6652 len(cards), :6653 sum(...)), single producer, and
+            // "mode": "pdf" occurs once. Not "arithmetic" — `|| 0` coerces nothing, so a
+            // string would survive it; the disposition rests on the producer, not the shape.
             singleResult.innerHTML = `
               <div class="single-result-body" style="width:100%">
                 <div class="single-result-title">${data.count} card(s) imported from PDF — ${idc} identified, ${Math.max(0, data.count - idc)} blank</div>
@@ -1520,7 +1524,7 @@
                 <div class="single-result-title">Card #${esc(data.record_id)} added to inventory ${idBadge}${typeChip}</div>
                 <div class="hint" style="margin:0;">${idHint}</div>
                 <div class="actions" style="margin-top:10px;">
-                  <a href="${esc(openCardUrl)}" class="btn-primary" style="text-decoration:none;display:inline-flex;align-items:center;">Open card</a>
+                  ${openCardUrl ? `<a href="${esc(openCardUrl)}" class="btn-primary" style="text-decoration:none;display:inline-flex;align-items:center;">Open card</a>` : ''}
                   <button type="button" class="btn-secondary" id="singleAddAnother">Add another</button>
                 </div>
               </div>`;
