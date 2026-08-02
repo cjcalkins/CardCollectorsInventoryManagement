@@ -2208,8 +2208,11 @@
       // An empty src="" is the safer failure: it fetches nothing and executes nothing,
       // whereas a missing element is the null-deref class that broke inventory.html.
       // This applies to any reason for omitting an element — scheme gate, permission
-      // guard, or feature flag. A Jinja {% if can_edit(...) %} around .manual-adjust-btn
-      // would fail exactly the same way.
+      // guard, or feature flag. A Jinja "if can_edit" permission block around
+      // .manual-adjust-btn would fail exactly the same way.
+      //
+      // Do NOT write that tag literally here: Jinja parses statement tags inside JS
+      // comments too, so a literal one in this comment breaks the whole template.
       tile.innerHTML = `
         <img
           src="${esc(tileUrl)}"
