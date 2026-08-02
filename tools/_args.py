@@ -56,13 +56,25 @@ An abbreviated SHA is not exempt, and that is the part that is not obvious:
 git resolves a name through the REF NAMESPACE BEFORE it treats the name as an
 object, so an abbreviation is a symbolic ref the moment anything is named that.
 
-    clone that HAS the control, plus a branch named f3eb259:
-      git show f3eb259:templates/inventory.html          md5 3bc72f59  the BRANCH
-      git show f3eb259e30e5...:templates/inventory.html  md5 cb1ead65  the control
-      stderr: "warning: refname 'f3eb259' is ambiguous."   <- and the callers
-                                                              discard stderr
-    branch named the FULL 40-hex, same lookup:
-      git show 72380402cb22...cdbd:templates/import.html  -> the COMMIT
+Measured by ref type in a clone that HAS the control, every ref pointed at
+main. Control bytes md5 cb1ead65; main's bytes md5 3bc72f59:
+
+    lightweight TAG named "f3eb259"        -> 3bc72f59   SHADOWED
+    branch       named "f3eb259"           -> 3bc72f59   SHADOWED
+    lightweight TAG named the lc 40-hex    -> cb1ead65   ignored
+    annotated   TAG named the lc 40-hex    -> cb1ead65   ignored
+    lightweight TAG named the UC 40-hex    -> cb1ead65   ignored
+    branch       named the 40-hex          -> cb1ead65   ignored
+    stderr on every shadowed row: "warning: refname 'f3eb259' is ambiguous."
+                                  <- and the callers discard stderr
+
+Two things that matter more than the branch case usually quoted. The immunity
+is a property of the NAME, not the ref type -- annotated and lightweight tags
+are ignored at 40-hex exactly as branches are. And **a tag is the plausible
+accident**: nobody creates a branch called `aad3368` on purpose, but a release
+or checkpoint tag named after a short SHA is an ordinary thing to find in a
+repo somebody else maintains. The hazard does not require anyone to do
+anything strange.
 
 Git ignores a 40-hex ref by design -- "it will be ignored when you just specify
 40-hex" -- so only the full form is outside the ref namespace and cannot be

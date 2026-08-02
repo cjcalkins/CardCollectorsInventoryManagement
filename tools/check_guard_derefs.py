@@ -198,9 +198,10 @@ def run(paths, quiet=False, unreadable=None):
 
 # FULL 40-char SHA, never an abbreviation -- _args.git_show refuses anything else,
 # so this is enforced rather than remembered. Why it has to be: git resolves a name
-# through the ref namespace BEFORE treating it as an object, so a branch named
-# f3eb259 would answer `git show f3eb259:path` with the BRANCH's bytes, exit 0,
-# ambiguity warning on stderr only -- and this tool discards stderr.
+# through the ref namespace BEFORE treating it as an object, so a branch OR TAG
+# named f3eb259 would answer `git show f3eb259:path` with that ref's bytes, exit
+# 0, ambiguity warning on stderr only -- and this tool discards stderr. A tag is
+# the plausible one; see the _args docstring for the measured ref-type matrix.
 SELF_TEST_REF  = "f3eb259e30e54505eed94b9376c0c2ad5c4fd0e3"   # item-8 regression present
 SELF_TEST_FILE = "templates/inventory.html"
 SELF_TEST_MIN  = 13                              # 13 reachable derefs; the other 5 are

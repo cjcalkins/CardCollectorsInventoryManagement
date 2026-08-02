@@ -51,12 +51,19 @@ checkout, so the control stops being the control. An *abbreviated* SHA has the
 same defect and it is not obvious: git resolves a name through the ref namespace
 **before** treating it as an object, so a ref of the same name silently wins.
 
-    repo with a branch named f3eb259, control abbreviated to "f3eb259":
-      git show f3eb259:templates/inventory.html   -> the BRANCH's file, exit 0
+    repo with a ref named f3eb259, control abbreviated to "f3eb259":
+      git show f3eb259:templates/inventory.html   -> the REF's file, exit 0
       stderr: "warning: refname 'f3eb259' is ambiguous."   <- and the tools
                                                              discard stderr
-    the full 40-char form, same repo, same branch present:
+    the full 40-char form, same repo, same ref present:
       git show f3eb259e30e5...:templates/inventory.html    -> the control
+
+Measured by ref type: branches *and* tags shadow an abbreviation, and branches,
+lightweight tags and annotated tags are all ignored at 40 hex — the immunity is
+a property of the name, not the ref type. **A tag is the plausible accident.**
+Nobody creates a branch called `aad3368` on purpose; a release or checkpoint tag
+named after a short SHA is an ordinary thing to find in a repo somebody else
+maintains.
 
 Git ignores a 40-hex ref by design — *"it will be ignored when you just specify
 40-hex"* — so only the full form is outside the ref namespace and cannot be
