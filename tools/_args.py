@@ -79,8 +79,16 @@ anything strange.
 Git ignores a 40-hex ref by design -- "it will be ignored when you just specify
 40-hex" -- so only the full form is outside the ref namespace and cannot be
 shadowed. git_show() enforces this rather than trusting each caller, because
-every control in this repo passes through it: a tool cannot add an unpinned
-control without going through the one function that refuses them.
+almost every control in this repo passes through it: a tool cannot add an
+unpinned control without going through the one function that refuses them.
+
+Almost, and the exception is the reason `pinned()` is public. Reading a control
+is not the only way to reach git: `verify_rbac_branch.py` materializes its
+negative control with `git archive`, which resolves through the ref namespace
+exactly as `git show` does and never touches `git_show()`. So it calls
+`pinned()` itself. A rule enforced on only some of the paths that reach git is
+a rule enforced by luck, which is the same objection that moved the check out
+of the two checkers in the first place.
 
 Do not weaken this into a warning. When it was first demonstrated the shadowed
 lookup happened to return a *fixed* template and the caller's `>= 13` threshold
@@ -138,6 +146,25 @@ def repo_root():
 PINNED_RE = re.compile(r"[0-9a-f]{40}\Z")
 
 
+def pinned(ref):
+    """Exit 2 unless `ref` is a full 40-hex SHA. See the module docstring.
+
+    `git_show()` calls this, so a tool that reads its control the ordinary way
+    inherits the rule and never has to name it. Call it directly only if you
+    reach git some other way -- `git archive`, `git cat-file`, a bare
+    `subprocess` -- because those resolve through the ref namespace too and
+    they do not come through here.
+    """
+    if not PINNED_RE.match(ref or ""):
+        print("CONTROL NOT PINNED: %r is not a full 40-char SHA. Git resolves a "
+              "name through\nthe ref namespace before treating it as an object, so "
+              "a branch or tag of that\nname would silently shadow the control and "
+              "the self-test would run on the\nwrong bytes." % (ref,))
+        print("Refusing to certify — the control cannot be trusted to be the control.")
+        sys.exit(EX_CONTROL)
+    return ref
+
+
 def git_show(ref, path):
     """`git show ref:path` against this tool's own checkout.
 
@@ -148,15 +175,12 @@ def git_show(ref, path):
     no caller should be able to soften it into a missing-control message.
 
     Returns the file's text, or None if the control is unobtainable -- callers
-    must translate None into exit 2, never into a skip.
+    must translate None into exit 2, never into a skip. An unpinned `ref` does
+    not come back as None: it exits 2 here, because "I read something that was
+    not the control" and "I could not read the control" are the same claim and
+    only the second one is detectable downstream.
     """
-    if not PINNED_RE.match(ref):
-        print("CONTROL NOT PINNED: %r is not a full 40-char SHA. Git resolves a "
-              "name through\nthe ref namespace before treating it as an object, so "
-              "a branch or tag of that\nname would silently shadow the control and "
-              "the self-test would run on the\nwrong bytes." % ref)
-        print("Refusing to certify — the control cannot be trusted to be the control.")
-        sys.exit(EX_CONTROL)
+    pinned(ref)
     p = subprocess.run(["git", "-C", repo_root(), "show", "%s:%s" % (ref, path)],
                        capture_output=True, text=True)
     return p.stdout if p.returncode == 0 else None
@@ -173,6 +197,46 @@ def require(module, tool):
         print("An absent dependency means the self-test never ran. That is a "
               "failed control, not a clean run.")
         sys.exit(EX_CONTROL)
+
+
+def _split_flags(argv, usage, extra_flags):
+    """-h/--help exits 0, an undeclared flag exits 64, the rest come back.
+
+    Both entry points below go through here so there is exactly one answer to
+    "what counts as a flag" in this directory. Two of these tools had their own
+    copy of these nine lines and the copies had already drifted.
+    """
+    if "-h" in argv or "--help" in argv:
+        print(usage)
+        sys.exit(EX_OK)
+    unknown = [a for a in argv if a.startswith("-") and a not in extra_flags]
+    if unknown:
+        print("unknown option(s): %s\n" % " ".join(unknown))
+        print(usage)
+        sys.exit(EX_USAGE)
+    return [a for a in argv if a not in extra_flags]
+
+
+def single_target(argv, usage, default, extra_flags=()):
+    """One optional target path, for the checkers that examine a single file.
+
+    Returns `default` when none is named -- so these tools always have
+    something to look at and can never take the "checked nothing, exited 0"
+    path that `targets()` guards against. A named target that cannot be read
+    is the CALLER's finding (exit 1), not a usage error: naming a file is a
+    question about that file, and answering "bad syntax" would be a different
+    question.
+
+    The default must name what it resolved to in the tool's own output. A green
+    that does not say which file it examined is the same shape as a green over
+    an empty set.
+    """
+    paths = _split_flags(argv, usage, extra_flags)
+    if len(paths) > 1:
+        print("one target at a time.\n")
+        print(usage)
+        sys.exit(EX_USAGE)
+    return paths[0] if paths else default
 
 
 def targets(argv, usage, exts=(".html",), allow_empty=False, extra_flags=()):
@@ -199,16 +263,7 @@ def targets(argv, usage, exts=(".html",), allow_empty=False, extra_flags=()):
     removing it: a tool that returns [] here must still not exit 0 unless its
     own flag did the work.
     """
-    if "-h" in argv or "--help" in argv:
-        print(usage)
-        sys.exit(EX_OK)
-    unknown = [a for a in argv if a.startswith("-") and a not in extra_flags]
-    if unknown:
-        print("unknown option(s): %s\n" % " ".join(unknown))
-        print(usage)
-        sys.exit(EX_USAGE)
-
-    paths = [a for a in argv if a not in extra_flags]
+    paths = _split_flags(argv, usage, extra_flags)
     if not paths:
         if allow_empty:
             return []
