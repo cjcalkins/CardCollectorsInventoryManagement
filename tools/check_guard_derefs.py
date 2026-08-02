@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Catch the class of defect Director found at inventory.html:828.
 
 A presence/absence check ("is the control hidden for users without the right?")

@@ -4,6 +4,24 @@ Static checkers for defect classes that have actually shipped here. They live in
 the repo, not in one person's workspace, so that a reviewer, a merger and an
 author can all run the same check and get the same answer.
 
+> **KNOWN GAP, being fixed on this branch — the sentence above is not yet true of
+> the code.** The files moved into the repo; their *control lookup* did not.
+> `check_guard_derefs.py` resolves the control out of a hardcoded
+> `~/.buzz/REPOS/...`, and `check_template_parse.py` runs a bare `git show`
+> against the **cwd**. Neither asks the checkout the script itself lives in, so
+> both give a different answer depending on who runs them and from where —
+> exactly the weakness this directory exists to end. Demonstrated, not assumed:
+>
+>     shallow clone WITHOUT f3eb259 in its history, real $HOME:
+>       "self-test OK — control f3eb259 reports 13 unsafe deref(s)"   exit 0
+>
+> The clone cannot produce that control at all; the proof was read out of another
+> checkout entirely and the audited tree was then certified against it. Because
+> the control is a pinned SHA the *bytes* agree wherever both trees have it — the
+> sharp edge is a tree that does **not** (shallow clone, fork, a machine with no
+> `~/.buzz`), where the tool is either permanently inert or green off a repo it
+> never looked at. Both are one line once `tools/_args.py:repo_root()` lands.
+
 That placement is the point. Every one of these was written after something got
 through, and for a while they existed only where their author could run them —
 so a green from them was not independently reproducible, which is the same
@@ -72,6 +90,12 @@ Controls: `7238040:templates/import.html` must FAIL (the commit that broke main)
 
 Does not see: runtime behaviour. A template that parses can still throw on load —
 that needs a browser.
+
+Does not see, in the *named detector*: a `//` that is not at the start of a line.
+`a = 1;  // {% if x %}` is missed by the by-name check. The Jinja parse still
+fails the file, which is the division worth remembering — **the parse is the
+completeness claim, the detector is only the diagnostic that names the cause.**
+Any blindness listed here is a gap in the explanation, not in the coverage.
 
 ### `check_guard_derefs.py` — permission guards that null an element still dereferenced
 
