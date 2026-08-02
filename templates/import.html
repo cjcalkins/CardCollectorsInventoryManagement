@@ -1249,6 +1249,44 @@
   </div>
 
   <script>
+    // Escape before any interpolation into innerHTML. This file had no escaping at
+    // all; the fields below reach innerHTML raw. `filename` comes straight from the
+    // /import_finalize_batch request body and is echoed back even on the failure
+    // path, and `identified_name` / `card_type` / `extracted` carry uploaded-CSV and
+    // OCR content. Same helper as shops.html and the escHtml idiom in
+    // inventory_detail.html. Escapes both quote styles, not just <>&, because this
+    // file interpolates into attributes (src="…", href="…", alt="…") where a payload
+    // breaks out by closing the quote and never needs a '<' of its own.
+    function esc(s) {
+        return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;')
+                              .replace(/>/g,'&gt;').replace(/"/g,'&quot;')
+                              .replace(/'/g,'&#39;');
+    }
+
+    // Entity escaping CANNOT neutralise a scheme: `javascript:alert(1)` contains no
+    // & < > " ' and passes esc() through completely unchanged, still a live URL. So a
+    // URL attribute needs its scheme checked, not escaped.
+    //
+    // DEFENCE IN DEPTH HERE, not a closed hole. All four URL fields in this file are
+    // produced by url_for(...) or by build_uploaded_file_url, whose
+    // normalize_to_upload_relative returns a value verbatim only when it starts
+    // http:// or https:// and otherwise falls through to url_for — an upstream
+    // two-scheme allowlist. So no script scheme can currently reach these sinks.
+    // This makes the guarantee local and testable instead of depending on a Python
+    // helper three call-hops away that no template test covers.
+    //
+    // NOT a same-origin check: it returns non-empty for any http(s) host, because
+    // build_uploaded_file_url deliberately passes external image URLs through. Do not
+    // reuse it to validate a redirect target ('?next=') — use a same-origin test.
+    // '//evil.com' and '/\evil.com' are both rejected: browsers normalise '\' to '/',
+    // so a leading '/\' resolves protocol-relative and leaves the origin.
+    function externalOrRelativeUrl(u) {
+        const s = String(u ?? '').trim();
+        if (/^https?:\/\//i.test(s)) return s;
+        if (/^\/(?![\/\\])/.test(s)) return s;
+        return '';
+    }
+
     // ====================== IMPORT MODE TOGGLE ======================
     // Two ways to import: a full 9-pocket page (3x3 split) or a single card
     // (front + optional back). The toggle just shows/hides the two panels.
@@ -1433,15 +1471,16 @@
             const idc = data.identified_count || 0;
             const rows = (data.cards || []).map(c => {
               const badge = c.identified
-                ? `<span class="badge ok">Identified${c.identified_name ? ' — ' + c.identified_name : ''}</span>`
+                ? `<span class="badge ok">Identified${c.identified_name ? ' — ' + esc(c.identified_name) : ''}</span>`
                 : `<span class="badge info">Blank — manual entry</span>`;
               const pages = c.back_page
-                ? `pages ${c.front_page} / ${c.back_page}`
-                : `page ${c.front_page} (no back)`;
-              const tchip = c.card_type ? ` <span class="badge info">${c.card_type}</span>` : '';
-              return `<div class="ocr-item"><strong>Card #${c.record_id}</strong>
+                ? `pages ${esc(c.front_page)} / ${esc(c.back_page)}`
+                : `page ${esc(c.front_page)} (no back)`;
+              const tchip = c.card_type ? ` <span class="badge info">${esc(c.card_type)}</span>` : '';
+              const openUrl = externalOrRelativeUrl(c.detail_url);
+              return `<div class="ocr-item"><strong>Card #${esc(c.record_id)}</strong>
                         <span class="hint" style="margin:0">${pages}</span> ${badge}${tchip}
-                        &nbsp;<a href="${c.detail_url}">open</a></div>`;
+                        ${openUrl ? `&nbsp;<a href="${esc(openUrl)}">open</a>` : ''}</div>`;
             }).join('');
             singleResult.style.display = 'flex';
             singleResult.style.flexDirection = 'column';
@@ -1456,25 +1495,32 @@
                 </div>
               </div>`;
           } else {
-            const frontThumb = data.image_url
-              ? `<img src="${data.image_url}" alt="Card front">` : '';
+            // image_url is the one URL field here an uploader can influence: a CSV
+            // "Photo URL" column is stored and returned verbatim when it starts
+            // http(s). That external-host question is separate from escaping and is
+            // on the audit's standing list; the scheme gate is what belongs here.
+            const thumbUrl = externalOrRelativeUrl(data.image_url);
+            const frontThumb = thumbUrl
+              ? `<img src="${esc(thumbUrl)}" alt="Card front">` : '';
             const idBadge = data.identified
-              ? `<span class="badge ok">Identified${data.identified_name ? ' — ' + data.identified_name : ''}</span>`
+              ? `<span class="badge ok">Identified${data.identified_name ? ' — ' + esc(data.identified_name) : ''}</span>`
               : `<span class="badge info">Blank — manual entry</span>`;
-            const typeChip = data.card_type ? ` <span class="badge info">Type: ${data.card_type}</span>` : '';
+            const typeChip = data.card_type ? ` <span class="badge info">Type: ${esc(data.card_type)}</span>` : '';
             const idHint = data.identified
               ? 'Fields were filled in automatically from a confident match. Open the card to review.'
               : 'No confident match, so the entry was left blank. Open its detail page to fill in fields or run Identify.';
             singleResult.style.flexDirection = '';
             singleResult.style.alignItems = '';
             singleResult.style.display = 'flex';
+            // idHint is a static literal in both branches — left unescaped deliberately.
+            const openCardUrl = externalOrRelativeUrl(data.detail_url);
             singleResult.innerHTML = `
               ${frontThumb}
               <div class="single-result-body">
-                <div class="single-result-title">Card #${data.record_id} added to inventory ${idBadge}${typeChip}</div>
+                <div class="single-result-title">Card #${esc(data.record_id)} added to inventory ${idBadge}${typeChip}</div>
                 <div class="hint" style="margin:0;">${idHint}</div>
                 <div class="actions" style="margin-top:10px;">
-                  <a href="${data.detail_url}" class="btn-primary" style="text-decoration:none;display:inline-flex;align-items:center;">Open card</a>
+                  <a href="${esc(openCardUrl)}" class="btn-primary" style="text-decoration:none;display:inline-flex;align-items:center;">Open card</a>
                   <button type="button" class="btn-secondary" id="singleAddAnother">Add another</button>
                 </div>
               </div>`;
@@ -2131,18 +2177,21 @@
       tile.dataset.filename = item.filename;
       tile.dataset.status = normalizedStatus;
 
+      // badgeClass, badgeText and clickHint are static literals in every branch —
+      // left unescaped deliberately.
+      const tileUrl = externalOrRelativeUrl(item.url);
       tile.innerHTML = `
         <img
-          src="${item.url}"
-          alt="Card slot ${item.slot}"
+          src="${esc(tileUrl)}"
+          alt="Card slot ${esc(item.slot)}"
           loading="lazy"
           class="clickable-fallback"
         >
         <div class="card-meta">
-          <strong>Slot ${item.slot}</strong>
-          <div>${item.filename}</div>
+          <strong>Slot ${esc(item.slot)}</strong>
+          <div>${esc(item.filename)}</div>
           <span class="${badgeClass}">${badgeText}</span>
-          <div class="hint">${normalizedStatus}</div>
+          <div class="hint">${esc(normalizedStatus)}</div>
           ${clickHint}
           <div class="actions">
             <button type="button" class="btn-secondary manual-adjust-btn">Manual Adjust</button>
@@ -2331,6 +2380,9 @@
       let summaryText = `${ok.length} card(s) imported — ${idCount} auto-identified, `
         + `${Math.max(0, fronts.length - idCount)} left blank for manual entry`;
       if (backs.length) summaryText += `, ${backs.length} back page(s) (no ID check)`;
+      // Left unescaped deliberately: summaryText is built entirely from array lengths
+      // and Math.max above — arithmetic, no server or user string reaches it. Wrapping
+      // it would make the diff look thorough while saying something untrue about it.
       summary.innerHTML = `<strong>${summaryText}.</strong>`;
       ocrResults.appendChild(summary);
 
@@ -2339,19 +2391,23 @@
         div.className = 'ocr-item';
         let badge;
         if (item.status !== 'success') {
-          badge = `<span class="badge warn">${item.status}</span>`;
+          badge = `<span class="badge warn">${esc(item.status)}</span>`;
         } else if (item.side === 'back') {
           badge = `<span class="badge info">Back page — no ID check</span>`;
         } else if (item.identified) {
-          const nm = item.identified_name ? ` — ${item.identified_name}` : '';
+          const nm = item.identified_name ? ` — ${esc(item.identified_name)}` : '';
           badge = `<span class="badge ok">Identified${nm}</span>`;
         } else {
           badge = `<span class="badge info">Blank — manual entry</span>`;
         }
-        const tchip = item.card_type ? ` <span class="badge info">Type: ${item.card_type}</span>` : '';
+        const tchip = item.card_type ? ` <span class="badge info">Type: ${esc(item.card_type)}</span>` : '';
+        // JSON.stringify escapes JSON, not HTML: it handles quotes and backslashes
+        // and leaves < > / untouched, so markup inside an extracted field survives it
+        // intact and parses as markup here. Stringify THEN esc() — the stringify is
+        // for readability, the esc() is the sanitiser.
         div.innerHTML = `
-          <strong>${item.filename}</strong> ${badge}${tchip}
-          <div class="hint">${JSON.stringify(item.extracted, null, 2)}</div>
+          <strong>${esc(item.filename)}</strong> ${badge}${tchip}
+          <div class="hint">${esc(JSON.stringify(item.extracted, null, 2))}</div>
         `;
         ocrResults.appendChild(div);
       });
