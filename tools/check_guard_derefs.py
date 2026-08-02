@@ -17,7 +17,10 @@ Method (static, no browser):
 
 Usage: check_guard_derefs.py <template.html|dir> [...]   (--help for exit codes)
 """
-import os, re, subprocess, sys, tempfile
+import os, re, sys, tempfile
+
+import _args   # sys.path[0] is this script's own directory, so this resolves
+               # wherever the tool is invoked from and by whatever path.
 
 DEREF = re.compile(
     r"\b(?P<var>[A-Za-z_$][\w$]*)\s*\.\s*"
@@ -193,8 +196,15 @@ def run(paths, quiet=False, unreadable=None):
     return problems
 
 
-SELF_TEST_REF  = "f3eb259"                       # item-8 regression present
+# FULL 40-char SHA, not an abbreviation. `git show f3eb259:path` with a branch
+# named f3eb259 present resolves the BRANCH, exit 0, ambiguity warning on stderr
+# only -- and this tool discards stderr. Demonstrated: the shadowed lookup returned
+# a fixed inventory.html and the threshold below caught it (0 derefs, expected >=13)
+# -- but that was the direction of the substitution, not a property of the check. A
+# shadow pointing at any tree with >=13 derefs passes silently on the wrong bytes.
+SELF_TEST_REF  = "f3eb259e30e54505eed94b9376c0c2ad5c4fd0e3"   # item-8 regression present
 SELF_TEST_FILE = "templates/inventory.html"
+PINNED_RE      = re.compile(r"[0-9a-f]{40}\Z")
 SELF_TEST_MIN  = 13                              # 13 reachable derefs; the other 5 are
                                                  # forEach bodies, classified not counted
 
@@ -205,17 +215,22 @@ def self_test():
     is reconstructed from git rather than from a .scratch worktree anyone could prune.
     A control that cannot be obtained is treated as a failed control, not a skip —
     silently skipping is how a mandatory check becomes a no-op."""
-    repo = os.environ.get("CCIM_REPO",
-                          os.path.expanduser("~/.buzz/REPOS/CardCollectorsInventoryManagement"))
-    proc = subprocess.run(["git", "-C", repo, "show", f"{SELF_TEST_REF}:{SELF_TEST_FILE}"],
-                          capture_output=True, text=True)
-    if proc.returncode != 0:
+    if not PINNED_RE.match(SELF_TEST_REF):
+        print(f"CONTROL NOT PINNED: {SELF_TEST_REF!r} is not a full 40-char SHA, so a "
+              f"ref of the same name would shadow it silently.")
+        print("Refusing to certify — the control cannot be trusted to be the control.")
+        sys.exit(_args.EX_CONTROL)
+    # The control comes from the checkout this FILE lives in -- not $HOME (inert on
+    # every other machine, and cross-tree on its author's) and not the cwd. See the
+    # _args module docstring: both wrong answers shipped here, in opposite directions.
+    src = _args.git_show(SELF_TEST_REF, SELF_TEST_FILE)
+    if src is None:
         print(f"SELF-TEST UNAVAILABLE: cannot read {SELF_TEST_REF}:{SELF_TEST_FILE} "
-              f"from {repo}: {proc.stderr.strip()[:160]}")
+              f"from this tool's own checkout {_args.repo_root()}")
         print("Refusing to certify — nothing has demonstrated this checker can fail.")
-        sys.exit(2)
+        sys.exit(_args.EX_CONTROL)
     with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False) as fh:
-        fh.write(proc.stdout)
+        fh.write(src)
         ctl = fh.name
     n = run([ctl], quiet=True)
     os.unlink(ctl)
@@ -224,14 +239,10 @@ def self_test():
               f"expected >= {SELF_TEST_MIN}.")
         print("The checker has lost the ability to see the defect it exists to find. "
               "Refusing to certify.")
-        sys.exit(2)
+        sys.exit(_args.EX_CONTROL)
     print(f"self-test OK — control {SELF_TEST_REF} reports {n} unsafe deref(s) "
           f"(>= {SELF_TEST_MIN}), so the checker discriminates")
 
-
-EX_USAGE = 64  # sysexits EX_USAGE. Deliberately NOT 2 -- exit 2 is reserved for
-               # "the control was unobtainable, so nothing was certified", and a
-               # wrapper keying on status must be able to tell those apart.
 
 USAGE = """usage: check_guard_derefs.py PATH [PATH ...]
 
@@ -249,41 +260,13 @@ exit 64 usage error, including paths that expanded to no templates
 """
 
 
-def expand_paths(paths):
-    """Accept files or directories; walk directories for templates."""
-    out = []
-    for p in paths:
-        if os.path.isdir(p):
-            for root, _dirs, files in os.walk(p):
-                out.extend(os.path.join(root, f) for f in sorted(files)
-                           if f.endswith(".html"))
-        else:
-            out.append(p)
-    return out
-
-
 def main():
-    argv = sys.argv[1:]
-    if "-h" in argv or "--help" in argv:
-        print(USAGE)
-        sys.exit(0)
-    unknown = [a for a in argv if a.startswith("-")]
-    if unknown:
-        print("unknown option(s): %s\n" % " ".join(unknown))
-        print(USAGE)
-        sys.exit(EX_USAGE)
-    # This tool has no self-test-only mode, so zero targets means it would print
-    # "no unsafe derefs" having opened nothing. That is a green over an empty set
-    # -- the exact shape of a check that cannot fail.
-    if not argv:
-        print("no targets.\n")
-        print(USAGE)
-        sys.exit(EX_USAGE)
-    paths = expand_paths(argv)
-    if not paths:
-        print("%s expanded to no *.html files -- nothing would be checked.\n"
-              % " ".join(argv))
-        sys.exit(EX_USAGE)
+    # This tool has no self-test-only mode, so allow_empty stays False: zero
+    # targets would otherwise print "no unsafe derefs" having opened nothing --
+    # a green over an empty set, the exact shape of a check that cannot fail.
+    # _args.targets handles -h/--help, unknown flags, directory walks and the
+    # expanded-to-nothing case, all with the shared exit codes.
+    paths = _args.targets(sys.argv[1:], USAGE)
     self_test()
     unreadable = []
     problems = run(paths, unreadable=unreadable)

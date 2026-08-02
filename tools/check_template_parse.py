@@ -51,6 +51,9 @@ import subprocess
 import sys
 import tempfile
 
+import _args   # sys.path[0] is this script's own directory, so this resolves
+               # wherever the tool is invoked from and by whatever path.
+
 SCRIPT_RE = re.compile(r"<script\b([^>]*)>(.*?)</script>", re.S | re.I)
 
 # Jinja is not JS. {{ expr }} yields a VALUE so it becomes an identifier token;
@@ -65,8 +68,18 @@ STMT_RE = re.compile(r"\{%.*?%\}", re.S)
 # and would parse while still meaning something nobody intended.
 COMMENT_TAG_RE = re.compile(r"^\s*//.*(\{%|\{\{)")
 
-SELF_TEST_CASES = [("7238040", "templates/import.html", False),
-                   ("eb86bd4", "templates/import.html", True)]
+# FULL 40-char SHAs, not abbreviations. An abbreviated control goes through git's
+# ref-resolution order FIRST, so a branch or tag of the same name silently wins:
+# `git show f3eb259:path` with a branch named f3eb259 present returns the BRANCH's
+# file, exit 0, with the ambiguity warning on stderr only -- which this tool
+# discards. Git ignores a 40-hex ref by design ("it will be ignored when you just
+# specify 40-hex"), so only the full form cannot be shadowed. See PINNED_RE.
+SELF_TEST_CASES = [("72380402cb22b13cc23a85bdf754b46eb7e8cdbd",
+                    "templates/import.html", False),
+                   ("eb86bd41c4d630d42f7538863c70ca52b1fc16c6",
+                    "templates/import.html", True)]
+
+PINNED_RE = re.compile(r"[0-9a-f]{40}\Z")
 
 
 def node_check(js):
@@ -132,19 +145,25 @@ def check_source(src, label, out=True):
     return ok
 
 
-def git_show(commit, path):
-    p = subprocess.run(["git", "show", "%s:%s" % (commit, path)],
-                       capture_output=True, text=True)
-    return p.stdout if p.returncode == 0 else None
-
-
 def self_test():
     """Prove the checker discriminates before it is allowed to certify anything."""
     print("SELF-TEST -- known answers from this repo's history")
+    for commit, path, _want in SELF_TEST_CASES:
+        if not PINNED_RE.match(commit):
+            print("  CONTROL NOT PINNED: %r is not a full 40-char SHA, so a ref of"
+                  % commit)
+            print("  the same name would shadow it silently. Refusing to certify.")
+            return False
     for commit, path, want_clean in SELF_TEST_CASES:
-        src = git_show(commit, path)
+        # Against the checkout this FILE lives in. The bare `git show` this
+        # replaces resolved against the CWD, so invoking the tool by absolute
+        # path from outside the tree refused on a checkout where the control
+        # was perfectly reachable -- and pointed at a sibling checkout of this
+        # repo it would have answered from the wrong tree instead.
+        src = _args.git_show(commit, path)
         if src is None:
-            print("  UNOBTAINABLE: %s:%s -- cannot prove this checker still" % (commit, path))
+            print("  UNOBTAINABLE: %s:%s from %s -- cannot prove this checker still"
+                  % (commit, path, _args.repo_root()))
             print("  discriminates. A control that cannot be obtained must FAIL, never skip.")
             return False
         got_clean = check_source(src, "%s:%s" % (commit, path), out=False)
@@ -158,11 +177,6 @@ def self_test():
     print("  self-test OK -- fails on the commit that broke main, passes on the fix\n")
     return True
 
-
-EX_USAGE = 64  # sysexits EX_USAGE. Deliberately NOT 2: exit 2 means "I could not
-               # prove I discriminate", and a wrapper keying on status must not
-               # read a mistyped flag as that. Both are non-zero, which is the
-               # invariant that matters -- only a proven-clean run returns 0.
 
 USAGE = """usage: check_template_parse.py [--self-test] [PATH ...]
 
@@ -180,48 +194,27 @@ exit 64 usage error, including paths that expanded to no templates
 """
 
 
-def expand_paths(paths):
-    """Accept files or directories; walk directories for templates."""
-    out = []
-    for p in paths:
-        if os.path.isdir(p):
-            for root, _dirs, files in os.walk(p):
-                out.extend(os.path.join(root, f) for f in sorted(files)
-                           if f.endswith(".html"))
-        else:
-            out.append(p)
-    return out
-
-
 def main():
     argv = sys.argv[1:]
-    if "-h" in argv or "--help" in argv:
-        print(USAGE)
-        return 0
-    unknown = [a for a in argv if a.startswith("-") and a != "--self-test"]
-    if unknown:
-        print("unknown option(s): %s\n" % " ".join(unknown))
-        print(USAGE)
-        return EX_USAGE
-
-    given = [a for a in argv if a != "--self-test"]
+    # allow_empty because --self-test legitimately runs with no targets; the
+    # guarantee that a run covering nothing never exits 0 moves here rather than
+    # disappearing -- see the `if not args` arm below. extra_flags declares
+    # --self-test legal so _args does not reject it as an unknown option; this
+    # tool still reads the flag off argv itself.
+    args = _args.targets(argv, USAGE, allow_empty=True,
+                         extra_flags=("--self-test",))
     # No targets is only ever legitimate under an explicit --self-test. Bare
     # `tool.py` -- or a wrapper whose glob matched nothing -- must not exit 0,
     # or checking nothing reads exactly like checking everything and finding it
     # clean. Same reason an unobtainable control fails instead of skipping.
-    if not given and "--self-test" not in argv:
+    if not args and "--self-test" not in argv:
         print("no targets. Pass templates, or --self-test to run the controls alone.\n")
         print(USAGE)
-        return EX_USAGE
-    args = expand_paths(given)
-    if given and not args:
-        print("%s expanded to no *.html files -- nothing would be checked.\n"
-              % " ".join(given))
-        return EX_USAGE
+        return _args.EX_USAGE
 
     if not self_test():
         print("Refusing to report.")
-        return 2
+        return _args.EX_CONTROL
     if not args:
         return 0
     rc = 0

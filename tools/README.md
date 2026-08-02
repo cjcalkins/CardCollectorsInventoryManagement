@@ -4,23 +4,30 @@ Static checkers for defect classes that have actually shipped here. They live in
 the repo, not in one person's workspace, so that a reviewer, a merger and an
 author can all run the same check and get the same answer.
 
-> **KNOWN GAP, being fixed on this branch — the sentence above is not yet true of
-> the code.** The files moved into the repo; their *control lookup* did not.
-> `check_guard_derefs.py` resolves the control out of a hardcoded
-> `~/.buzz/REPOS/...`, and `check_template_parse.py` runs a bare `git show`
-> against the **cwd**. Neither asks the checkout the script itself lives in, so
-> both give a different answer depending on who runs them and from where —
-> exactly the weakness this directory exists to end. Demonstrated, not assumed:
+> **That sentence was not true of the code until this commit, and the shallow
+> clone below is the standing test that keeps it true.** The files moved into the
+> repo; their *control lookup* did not. `check_guard_derefs.py` read its control
+> out of a hardcoded `~/.buzz/REPOS/...` and `check_template_parse.py` ran a bare
+> `git show` against the **cwd**. One depth-1 clone, which has none of the
+> controls, answers it better than prose can:
 >
->     shallow clone WITHOUT f3eb259 in its history, real $HOME:
->       "self-test OK — control f3eb259 reports 13 unsafe deref(s)"   exit 0
+>     BEFORE   check_guard_derefs.py   EXIT=0  "self-test OK — control f3eb259
+>                                               reports 13 unsafe deref(s)"
+>              check_template_parse.py EXIT=2  "UNOBTAINABLE: 7238040:..."
 >
-> The clone cannot produce that control at all; the proof was read out of another
-> checkout entirely and the audited tree was then certified against it. Because
-> the control is a pinned SHA the *bytes* agree wherever both trees have it — the
-> sharp edge is a tree that does **not** (shallow clone, fork, a machine with no
-> `~/.buzz`), where the tool is either permanently inert or green off a repo it
-> never looked at. Both are one line once `tools/_args.py:repo_root()` lands.
+> Same clone, same command shape, same missing controls — **one tool refused
+> honestly and the other certified itself against a commit it does not have.** The
+> only difference was how each answered "which checkout?". Both now ask
+> `_args.repo_root()`, which answers from the script's own location:
+>
+>     AFTER    both tools               EXIT=2  "...from this tool's own checkout
+>                                                /tmp/ccim-shallow2"
+>
+> **Run the AFTER pair in a depth-1 clone before trusting any change to control
+> resolution.** It has a second half that is easy to drop: back in a full
+> checkout both tools must still return 0 and report. A tool that always refuses
+> passes the shallow clone for the wrong reason, and that green is
+> indistinguishable from a real one.
 
 That placement is the point. Every one of these was written after something got
 through, and for a while they existed only where their author could run them —
@@ -37,6 +44,30 @@ away from the defect it was cut from.
 **A control that cannot be obtained must FAIL, never skip.** If the control
 commit is missing or the tool's dependency is absent, the checker exits non-zero
 and reports nothing. Silence must never read as clean.
+
+**A control must be a FULL 40-character SHA, never a symbolic ref and never an
+abbreviation.** A branch or tag resolves to a different commit in a different
+checkout, so the control stops being the control. An *abbreviated* SHA has the
+same defect and it is not obvious: git resolves a name through the ref namespace
+**before** treating it as an object, so a ref of the same name silently wins.
+
+    repo with a branch named f3eb259, control abbreviated to "f3eb259":
+      git show f3eb259:templates/inventory.html   -> the BRANCH's file, exit 0
+      stderr: "warning: refname 'f3eb259' is ambiguous."   <- and the tools
+                                                             discard stderr
+    the full 40-char form, same repo, same branch present:
+      git show f3eb259e30e5...:templates/inventory.html    -> the control
+
+Git ignores a 40-hex ref by design — *"it will be ignored when you just specify
+40-hex"* — so only the full form cannot be shadowed. This is enforced in code
+(`PINNED_RE`), not asserted here: a checker whose control ref is not 40 hex
+characters refuses with exit 2 before it reads anything.
+
+Worth knowing why the enforcement is not "belt and braces": when this was
+demonstrated, the shadowed lookup happened to return a *fixed* template and the
+guard checker's `>= 13` threshold caught it. That was the direction the
+substitution went, not a property of the check — a shadow pointing at any tree
+with 13+ unsafe derefs passes silently on the wrong bytes.
 
 **Name what the checker cannot see.** Each docstring says what is outside its
 reach. A clean result is only as wide as the question the tool asks, and reading
@@ -85,8 +116,9 @@ human run one and skip the other, on exactly the diff shape where skipping feels
 safest. Also flags the specific hazard by name: a Jinja delimiter inside a `//`
 comment.
 
-Controls: `7238040:templates/import.html` must FAIL (the commit that broke main),
-`eb86bd4:templates/import.html` must PASS (the fix).
+Controls (full SHAs, per the clause above): `72380402cb22…:templates/import.html`
+must FAIL (the commit that broke main), `eb86bd41c4d6…:templates/import.html`
+must PASS (the fix).
 
 Does not see: runtime behaviour. A template that parses can still throw on load —
 that needs a browser.
@@ -108,7 +140,7 @@ throws at load and every handler after it dies — silently, for exactly the use
 the guard was meant to protect. Presence/absence testing cannot catch this,
 because absence is what breaks it.
 
-Control: `f3eb259` must report its known unsafe derefs.
+Control: `f3eb259e30e5…:templates/inventory.html` must report >= 13 unsafe derefs.
 
 Does not see: **JS-conditional sites.** It keys on Jinja guard blocks and the ids
 inside them, so an element made conditional by a JS ternary, or referenced by
@@ -121,6 +153,13 @@ not report — pointing it there and reading green is coverage that isn't there.
 Keep the contract: a self-test with a control from history that must fail, a
 non-zero exit when the control is unobtainable, a non-zero exit when the run
 covered nothing, and a docstring saying what the tool is blind to.
+
+Take argv, the exit codes and the repo from `_args`. `import _args` works from
+anywhere because `sys.path[0]` is the script's own directory, and
+`_args.git_show()` resolves against `_args.repo_root()` — the checkout this
+file lives in. Do not reach for `$HOME` or the cwd; both shipped here and both
+were wrong, in opposite directions. Declare any tool-specific flag with
+`extra_flags=("--your-flag",)` rather than trimming argv at the call site.
 
 And give it a `--help`. These two shipped without one and answered a traceback —
 a poor first reply from a tool whose whole purpose is to be trusted by people who
