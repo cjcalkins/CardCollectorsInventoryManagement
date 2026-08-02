@@ -2072,7 +2072,7 @@
             });
 
             if (!changes.length) {
-                showToast(`Layout saved for <em>${game}</em>!`);
+                showToast(`Layout saved for <em>${escHtml(game)}</em>!`);
                 setLayoutMode(false);
                 return;
             }
@@ -2106,7 +2106,7 @@
                 console.error('Some fields could not be hidden/shown:', failed);
                 showToast(`Couldn't update ${failed.length} of ${changes.length} field(s). See console.`, 'fa-triangle-exclamation');
             } else {
-                showToast(`Layout saved for <em>${game}</em>!`);
+                showToast(`Layout saved for <em>${escHtml(game)}</em>!`);
             }
 
             // Reload so the normal (non-layout) view reflects the new hidden set.

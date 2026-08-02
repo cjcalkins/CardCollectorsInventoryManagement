@@ -555,10 +555,44 @@
         };
         const MK_KEYS = Object.keys(MK_LABELS);
 
+        // Escape before any interpolation into innerHTML. Server strings here carry
+        // inbound email subjects, uploaded-CSV rows and card names, none of which are
+        // sanitized server-side. Matches the escHtml/esc idiom in inventory_detail.html.
+        // Escapes both quote styles, not just <>&: this file interpolates into
+        // attributes (src="…", href="…"), where a payload breaks out by closing the
+        // quote and never needs a '<' of its own. ' is escaped too so a future
+        // single-quoted attribute is safe by default rather than by review.
+        function esc(s) {
+            return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;')
+                                  .replace(/>/g,'&gt;').replace(/"/g,'&quot;')
+                                  .replace(/'/g,'&#39;');
+        }
+
+        // Entity escaping CANNOT neutralise a scheme: `javascript:alert(1)` contains no
+        // & < > " ' and passes esc() through completely unchanged, still a live URL. So
+        // an external href needs its scheme checked, not escaped — esc() alone there
+        // would read as handled while shipping the vector. Allowlist: http(s) and
+        // site-relative only; anything else returns '' and the caller renders no link.
+        // '//evil.com' and '/\evil.com' are both rejected: browsers normalise '\' to '/',
+        // so a leading '/\' resolves protocol-relative and leaves the origin.
+        //
+        // NOT a same-origin check. It returns non-empty for any http(s) host, because
+        // linking out to a marketplace listing is this sink's whole purpose. Do not
+        // reuse it to validate a redirect target ('?next=') — use a same-origin test.
+        function externalOrRelativeUrl(u) {
+            const s = String(u ?? '').trim();
+            if (/^https?:\/\//i.test(s)) return s;
+            if (/^\/(?![\/\\])/.test(s)) return s;
+            return '';
+        }
+
+        // msg is escaped here rather than at the ~9 call sites that pass server text,
+        // so a new caller cannot reintroduce the hole by forgetting. No caller passes
+        // markup — checked before adding this.
         function toast(msg, ok = true) {
             const el = document.createElement('div');
             el.className = `toast align-items-center text-bg-${ok ? 'success' : 'danger'} border-0 show`;
-            el.innerHTML = `<div class="d-flex"><div class="toast-body">${msg}</div>
+            el.innerHTML = `<div class="d-flex"><div class="toast-body">${esc(msg)}</div>
                 <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button></div>`;
             document.getElementById('toastArea').appendChild(el);
             setTimeout(() => el.remove(), 5000);
@@ -572,7 +606,7 @@
                 banner.innerHTML = `<div class="alert alert-success alert-dismissible">eBay account connected.
                     <button class="btn-close" data-bs-dismiss="alert"></button></div>`;
             } else if (p.get('ebay_error')) {
-                banner.innerHTML = `<div class="alert alert-danger alert-dismissible">eBay: ${p.get('ebay_error')}
+                banner.innerHTML = `<div class="alert alert-danger alert-dismissible">eBay: ${esc(p.get('ebay_error'))}
                     <button class="btn-close" data-bs-dismiss="alert"></button></div>`;
             }
         })();
@@ -605,7 +639,7 @@
                 const res = await fetch(`/shops/test/${mk}`, { method: 'POST' });
                 const data = await res.json();
                 document.getElementById('status-' + mk).innerHTML =
-                    `<span class="${data.connected ? 'text-success' : 'text-danger'}">${data.message}</span>`;
+                    `<span class="${data.connected ? 'text-success' : 'text-danger'}">${esc(data.message)}</span>`;
                 setPill(mk, data.connected ? 'connected' : 'error');
                 CONNECTED[mk] = !!data.connected;
                 toast(data.message, data.connected);
@@ -641,7 +675,12 @@
                               ${connected ? '' : 'disabled title="Connect this shop first"'}>Push</button>`;
                 }
             } else if ((s === 'active' || s === 'draft') && info.listing_id) {
-                const link = info.url ? `<a href="${info.url}" target="_blank" class="btn btn-outline-secondary mini-btn ms-1"><i class="fas fa-arrow-up-right-from-square"></i></a>` : '';
+                // listing.external_url comes from a marketplace API response and from a
+                // request payload (app.py:13523/13612) — not url_for-generated, so the
+                // scheme is checked first. esc() then handles attribute breakout; the
+                // scheme check is what makes it safe, the escape is not sufficient alone.
+                const safeLink = externalOrRelativeUrl(info.url);
+                const link = safeLink ? `<a href="${esc(safeLink)}" target="_blank" rel="noopener noreferrer" class="btn btn-outline-secondary mini-btn ms-1"><i class="fas fa-arrow-up-right-from-square"></i></a>` : '';
                 const endLabel = (mk === 'tcgplayer' && s === 'draft') ? 'Clear' : 'End';
                 btns = `${link}<button class="btn btn-outline-danger mini-btn ms-1 row-unlist" data-listing="${info.listing_id}">${endLabel}</button>`;
             }
@@ -656,12 +695,12 @@
             }
             body.innerHTML = rows.map(r => {
                 const mkCells = MK_KEYS.map(mk => `<td class="mk-cell text-center" data-mk="${mk}" data-record="${r.record_id}">${statusBadge(mk, r.listings[mk])}</td>`).join('');
-                const img = r.image_url ? `<img src="${r.image_url}" class="listing-thumb">` : `<div class="listing-thumb"></div>`;
+                const img = r.image_url ? `<img src="${esc(r.image_url)}" class="listing-thumb">` : `<div class="listing-thumb"></div>`;
                 return `<tr data-record="${r.record_id}">
                     <td><input type="checkbox" class="row-check" value="${r.record_id}" ${selected.has(r.record_id) ? 'checked' : ''}></td>
                     <td>${img}</td>
-                    <td><a href="${r.detail_url}" class="text-decoration-none fw-semibold">${r.name}</a>
-                        <div class="text-muted small">${[r.game, r.set].filter(Boolean).join(' · ')}</div></td>
+                    <td><a href="${esc(r.detail_url)}" class="text-decoration-none fw-semibold">${esc(r.name)}</a>
+                        <div class="text-muted small">${esc([r.game, r.set].filter(Boolean).join(' · '))}</div></td>
                     <td class="text-end">$${(r.price || 0).toFixed(2)}</td>
                     <td class="text-center">${r.quantity}</td>
                     ${mkCells}
@@ -841,7 +880,7 @@
                 </div>`;
                 if (d.skipped.length) {
                     const rows = d.skipped.slice(0, 50).map(s =>
-                        `<tr><td>${s.name}</td><td class="text-muted">${s.reason}</td></tr>`).join('');
+                        `<tr><td>${esc(s.name)}</td><td class="text-muted">${esc(s.reason)}</td></tr>`).join('');
                     html += `<details class="mt-2"><summary class="small text-danger">${d.skipped.length} item(s) can't be listed yet</summary>
                         <table class="table table-sm mt-2 mb-0"><thead><tr><th>Item</th><th>Reason</th></tr></thead><tbody>${rows}</tbody></table>
                         <div class="form-text">Most fixes: match the card to a TCGplayer product so it has a TCGplayer Id, or set a market/fallback price.</div></details>`;
@@ -851,7 +890,7 @@
                 }
                 box.innerHTML = html;
             } catch (err) {
-                box.innerHTML = `<div class="text-danger small">Preview failed: ${err.message}</div>`;
+                box.innerHTML = `<div class="text-danger small">Preview failed: ${esc(err.message)}</div>`;
             }
         }
 
@@ -913,7 +952,7 @@
         function renderImportResult(d) {
             const box = document.getElementById('tcgImportResult');
             if (d.status !== 'success') {
-                box.innerHTML = `<div class="text-danger small">${d.message || 'Import failed.'}</div>`;
+                box.innerHTML = `<div class="text-danger small">${esc(d.message || 'Import failed.')}</div>`;
                 return;
             }
             const applied = d.mode === 'apply';
@@ -936,7 +975,9 @@
             const tbl = (title, arr, cols) => {
                 if (!arr || !arr.length) return '';
                 const head = cols.map(c => `<th>${c.h}</th>`).join('');
-                const body = arr.map(x => `<tr>${cols.map(c => `<td>${c.f(x)}</td>`).join('')}</tr>`).join('');
+                // Escaped here, not in each c.f, so a new column can't reintroduce the hole.
+                // title/c.h stay raw: both are call-site literals, never data.
+                const body = arr.map(x => `<tr>${cols.map(c => `<td>${esc(c.f(x))}</td>`).join('')}</tr>`).join('');
                 return `<details class="mt-2"><summary class="small">${title}</summary>
                     <table class="table table-sm mt-2 mb-0"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></details>`;
             };
@@ -960,7 +1001,7 @@
                 renderImportResult(d);
                 return d;
             } catch (err) {
-                box.innerHTML = `<div class="text-danger small">Request failed: ${err.message}</div>`;
+                box.innerHTML = `<div class="text-danger small">Request failed: ${esc(err.message)}</div>`;
                 return null;
             }
         }
@@ -1024,7 +1065,7 @@
             await fetch('/shops/email/save', { method: 'POST', body: emailFormData() });
             const d = await (await fetch('/shops/email/test', { method: 'POST' })).json();
             document.getElementById('status-email').innerHTML =
-                `<span class="${d.connected ? 'text-success' : 'text-danger'}">${d.message}</span>`;
+                `<span class="${d.connected ? 'text-success' : 'text-danger'}">${esc(d.message)}</span>`;
             setEmailPill(d.connected ? 'connected' : 'error');
             toast(d.message, d.connected);
             btn.disabled = false; btn.innerHTML = orig;
@@ -1038,11 +1079,11 @@
             const d = await res.json();
             const box = document.getElementById('emResult');
             if (d.status !== 'success') {
-                box.innerHTML = `<div class="alert alert-danger py-2 small mb-0">${d.message}</div>`;
+                box.innerHTML = `<div class="alert alert-danger py-2 small mb-0">${esc(d.message)}</div>`;
                 setEmailPill('error');
             } else {
                 const s = d.summary;
-                let html = `<div class="alert alert-success py-2 small mb-2">${d.message}</div>
+                let html = `<div class="alert alert-success py-2 small mb-2">${esc(d.message)}</div>
                     <div class="d-flex flex-wrap gap-4 mb-2">
                         <div><span class="fs-5 fw-bold text-success">${s.processed}</span> <span class="text-muted small">sold &amp; delisted</span></div>
                         <div><span class="fs-6 fw-bold text-secondary">${s.unmatched}</span> <span class="text-muted small">unmatched</span></div>
@@ -1053,9 +1094,9 @@
                 (s.details || []).forEach(o => (o.items || []).forEach(it => {
                     const badge = { processed: 'text-success', unmatched: 'text-danger', duplicate: 'text-muted', unparsed: 'text-warning' }[it.status] || '';
                     let extra = it.status === 'processed'
-                        ? ` → ${it.remaining} left${(it.delisted || []).length ? ', delisted ' + it.delisted.filter(x => x.ok).map(x => x.marketplace).join(', ') : ''}`
-                        : (it.reason ? ` (${it.reason})` : '');
-                    lines.push(`<tr><td>${o.order_id || '—'}</td><td>${it.title}</td><td class="${badge}">${it.status}${extra}</td></tr>`);
+                        ? ` → ${esc(it.remaining)} left${(it.delisted || []).length ? ', delisted ' + esc(it.delisted.filter(x => x.ok).map(x => x.marketplace).join(', ')) : ''}`
+                        : (it.reason ? ` (${esc(it.reason)})` : '');
+                    lines.push(`<tr><td>${esc(o.order_id || '—')}</td><td>${esc(it.title)}</td><td class="${badge}">${esc(it.status)}${extra}</td></tr>`);
                 }));
                 if (lines.length) {
                     html += `<table class="table table-sm mb-0"><thead><tr><th>Order</th><th>Item</th><th>Result</th></tr></thead><tbody>${lines.join('')}</tbody></table>`;
