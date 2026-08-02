@@ -9459,6 +9459,16 @@ def manual_process_card():
     if not filename:
         return jsonify({"status": "error", "message": "Missing filename"}), 400
 
+    # `filename` is request-body-controlled and is joined onto TEMP_SPLIT_FOLDER (read)
+    # and TEMP_CARD_FOLDER (cv2.imwrite) below; os.path.join drops the base on an
+    # absolute path and honours ../, so a raw name escapes the folder. secure_filename
+    # strips both forms and is idempotent on the slot_<...> names _split_align_page_tiles
+    # generates (verified). Same guard as move_temp_card_to_inventory (app.py:791).
+    # Reassigned so the echoed url/filename point at the file actually written.
+    filename = secure_filename(filename)
+    if not filename:
+        return jsonify({"status": "error", "message": "Invalid filename"}), 400
+
     if not isinstance(points, list) or len(points) != 4:
         return jsonify({"status": "error", "message": "Exactly 4 points are required"}), 400
 
@@ -9696,6 +9706,16 @@ def _finalize_one_card(filename, template_name, blank_fields, collection, storag
     auto-identified; backs merge onto the matching pocket. Raises InventoryCapError
     if the cap is hit. Returns a result dict. Shared by /import_finalize_batch and
     the background PDF importer."""
+    # `filename` is an element of the request-body `filenames` list on the
+    # /import_finalize_batch path. Sanitize before the join: without it, this existence
+    # check runs against TEMP_CARD_FOLDER/<raw> while move_temp_card_to_inventory below
+    # (app.py:791) operates on TEMP_CARD_FOLDER/<sanitized>, so for any name the sanitiser
+    # alters the two disagree — the check passes, then the move raises FileNotFoundError.
+    # It is also an existence oracle for arbitrary paths via os.path.exists. Idempotent on
+    # the server-generated slot_<...> names the PDF importer passes (verified).
+    filename = secure_filename(filename)
+    if not filename:
+        return {"filename": filename, "status": "error", "message": "Aligned card image not found"}
     temp_image_path = os.path.join(app.config["TEMP_CARD_FOLDER"], filename)
     if not os.path.exists(temp_image_path):
         return {"filename": filename, "status": "error", "message": "Aligned card image not found"}
