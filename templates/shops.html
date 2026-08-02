@@ -573,11 +573,16 @@
         // an external href needs its scheme checked, not escaped — esc() alone there
         // would read as handled while shipping the vector. Allowlist: http(s) and
         // site-relative only; anything else returns '' and the caller renders no link.
-        // '//evil.com' is deliberately rejected — protocol-relative, not site-relative.
-        function safeUrl(u) {
+        // '//evil.com' and '/\evil.com' are both rejected: browsers normalise '\' to '/',
+        // so a leading '/\' resolves protocol-relative and leaves the origin.
+        //
+        // NOT a same-origin check. It returns non-empty for any http(s) host, because
+        // linking out to a marketplace listing is this sink's whole purpose. Do not
+        // reuse it to validate a redirect target ('?next=') — use a same-origin test.
+        function externalOrRelativeUrl(u) {
             const s = String(u ?? '').trim();
             if (/^https?:\/\//i.test(s)) return s;
-            if (/^\/(?!\/)/.test(s)) return s;
+            if (/^\/(?![\/\\])/.test(s)) return s;
             return '';
         }
 
@@ -674,7 +679,7 @@
                 // request payload (app.py:13523/13612) — not url_for-generated, so the
                 // scheme is checked first. esc() then handles attribute breakout; the
                 // scheme check is what makes it safe, the escape is not sufficient alone.
-                const safeLink = safeUrl(info.url);
+                const safeLink = externalOrRelativeUrl(info.url);
                 const link = safeLink ? `<a href="${esc(safeLink)}" target="_blank" rel="noopener noreferrer" class="btn btn-outline-secondary mini-btn ms-1"><i class="fas fa-arrow-up-right-from-square"></i></a>` : '';
                 const endLabel = (mk === 'tcgplayer' && s === 'draft') ? 'Clear' : 'End';
                 btns = `${link}<button class="btn btn-outline-danger mini-btn ms-1 row-unlist" data-listing="${info.listing_id}">${endLabel}</button>`;
