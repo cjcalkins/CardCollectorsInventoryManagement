@@ -13757,7 +13757,13 @@ def shops_unlist():
     if not listing:
         return jsonify({"status": "error", "message": "Listing not found."}), 404
     conn = _get_connection(listing.marketplace)
-    if not conn:
+    # `enabled`, not just `conn`. This is the one token-replay route that tested only
+    # for the row's existence: push (shops_push), pull (shops_pull) and the sale
+    # fan-out (_mark_record_sold) all require enabled, and a disabled connection is
+    # exactly what "an administrator has not vouched for this destination" means now
+    # that changing store_domain clears the flag. Without this line, disconnecting on
+    # host change would still leave end_listing willing to send the token there.
+    if not conn or not conn.enabled:
         return jsonify({"status": "error", "message": "Marketplace not connected."}), 400
     provider = get_provider(listing.marketplace, conn, persist=_shop_persist)
     result = provider.end_listing(listing)
