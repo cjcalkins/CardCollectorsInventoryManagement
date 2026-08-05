@@ -13499,6 +13499,7 @@ def shops_save(marketplace):
     conn = _get_connection(marketplace, create=True)
     cfg = dict(conn.config or {})
 
+    host_changed = False
     for field in MARKETPLACES[marketplace]["fields"]:
         k = field["key"]
         submitted = request.form.get(k, None)
@@ -13509,12 +13510,32 @@ def shops_save(marketplace):
         # For secret fields, an empty submission means "keep what's stored".
         if is_secret and submitted == "":
             continue
+        # Compare before the write, or the old value is already gone.
+        if field.get("host") and str(cfg.get(k, "") or "") != submitted:
+            host_changed = True
         cfg[k] = submitted
 
     conn.config = cfg
+    if host_changed:
+        # Saving a secret and saving a destination are different acts. Only an
+        # administrator can connect a shop (/shops/test is _require_admin-gated, and it
+        # is the sole thing that sets enabled=True), but this route is shops:edit — so
+        # without this a non-admin could keep the stored token, repoint store_domain at
+        # a host they control, and inherit the administrator's "connected" state. Every
+        # replay site then sends the token to them: push, pull, unlist, sale sync.
+        # Un-connecting here revokes that inheritance at the source, which is why this
+        # is the fix rather than adding _require_admin to each replay route — the next
+        # route someone adds is covered too.
+        conn.enabled = False
+        conn.status = "disconnected"
+        conn.status_detail = "Destination changed — test the connection again before syncing."
+        conn.connected_at = None
     conn.updated_at = datetime.utcnow()
     db.session.commit()
-    return jsonify({"status": "success", "message": f"{MARKETPLACES[marketplace]['label']} settings saved."})
+    msg = f"{MARKETPLACES[marketplace]['label']} settings saved."
+    if host_changed:
+        msg += " The destination changed, so the shop was disconnected — test it again to re-enable syncing."
+    return jsonify({"status": "success", "message": msg})
 
 
 @app.route("/shops/test/<marketplace>", methods=["POST"])

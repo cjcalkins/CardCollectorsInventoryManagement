@@ -56,7 +56,13 @@ MARKETPLACES = {
         "oauth": False,
         "blurb": "Sync inventory to your Shopify store as products. Uses a custom-app Admin API token.",
         "fields": [
-            {"key": "store_domain", "label": "Store domain", "placeholder": "your-store.myshopify.com", "type": "text"},
+            # "host": True marks a field that decides WHERE the stored credential is
+            # sent. Changing one un-connects the shop (see shops_save), because a
+            # connection an administrator vouched for must not silently carry its token
+            # to a different destination. Flagged on the field rather than in a list
+            # elsewhere so that adding a host-bearing field to any provider makes the
+            # question unavoidable — same reason "secret" lives here.
+            {"key": "store_domain", "label": "Store domain", "placeholder": "your-store.myshopify.com", "type": "text", "host": True},
             {"key": "access_token", "label": "Admin API access token", "placeholder": "shpat_…", "type": "password", "secret": True},
             {"key": "location_id", "label": "Inventory location ID (optional)", "placeholder": "auto-detected", "type": "text", "optional": True},
         ],
