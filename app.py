@@ -2761,6 +2761,22 @@ def _resource_for_path(path):
         # short-circuits on _users_exist() before this runs, and the first
         # account is an admin by construction, so /setup stays reachable then.
         "setup": "__admin__", "migrate_clean_legacy_fields": "__admin__",
+        # ── Reads that nothing mapped, and so were reachable by any signed-in account
+        # regardless of role. Each rides the resource that already governs the data it
+        # hands back:
+        # /sold is literally the same view function as /inventory (two @app.route
+        # decorators on one def), and records_summary/game_fields enumerate record
+        # fields, so all three are inventory reads.
+        "sold": "inventory", "records_summary": "inventory", "game_fields": "inventory",
+        # The bulk-price UI asks which records still need a price, then fetches each
+        # through justtcg_fetch — which is already "pricing", so gating the first step
+        # any lower would protect nothing.
+        "justtcg_missing_ids": "pricing", "justtcg_search": "pricing",
+        # Identify-and-propose reads ride the resource of the apply step they feed:
+        # both hand their choice to /ocr_apply, which is "inventory", and both work
+        # from data the caller can already see (local OCR, local tcgcsv catalog).
+        # cloud_identify stays "identify" because it spends an external API key.
+        "ocr_identify": "inventory", "database_match": "inventory",
     }.get(head, None)
 
 
