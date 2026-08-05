@@ -13630,13 +13630,25 @@ def shops_disconnect(marketplace):
     return jsonify({"status": "success", "message": "Disconnected."})
 
 
+# Session key holding the one-time OAuth `state` nonce for the eBay handshake.
+# It lives in the session (a signed cookie) rather than the database because it
+# must identify THIS BROWSER, not this installation: the whole point is to prove
+# the callback belongs to a flow that this session started.
+_EBAY_STATE_KEY = "ebay_oauth_state"
+
+
 @app.route("/shops/ebay/connect")
 def shops_ebay_connect():
     conn = _get_connection("ebay", create=True)
     provider = get_provider("ebay", conn, persist=_shop_persist)
     if provider._need("client_id", "ru_name"):
         return redirect(url_for("shops_page") + "?ebay_error=Set+App+ID+and+RuName+first")
-    return redirect(provider.authorize_url(state="ebay"))
+    # A fresh unguessable nonce per handshake. The previous value was the constant
+    # "ebay", which authenticates nothing: every installation sent the same one, so
+    # a callback carrying it proved only that the attacker had read this source.
+    state = _secrets.token_urlsafe(32)
+    session[_EBAY_STATE_KEY] = state
+    return redirect(provider.authorize_url(state=state))
 
 
 @app.route("/shops/ebay/callback")
@@ -13644,9 +13656,30 @@ def shops_ebay_callback():
     code = request.args.get("code", "")
     err = request.args.get("error_description") or request.args.get("error")
     if err:
+        # The handshake ended at eBay's end; drop the nonce rather than leave a live
+        # one waiting in the session.
+        session.pop(_EBAY_STATE_KEY, None)
         return redirect(url_for("shops_page") + "?ebay_error=" + urllib.parse.quote(err))
     if not code:
         return redirect(url_for("shops_page") + "?ebay_error=No+authorization+code+returned")
+
+    # Only exchange a code that came back from a handshake THIS session started.
+    # Without this the callback accepted any code from anyone: an attacker who
+    # obtained an authorization code for their own eBay account only had to get a
+    # signed-in shops:edit user to load this URL, and the app would store the
+    # attacker's tokens as the installation's connection — after which every push
+    # sent this inventory to the attacker's store.
+    #
+    # pop, not get: a callback URL is single-use, so replaying the same one cannot
+    # connect a second time. compare_digest because this is an equality check on a
+    # secret. SESSION_COOKIE_SAMESITE is "Lax", and the return from eBay is a
+    # top-level GET navigation, so the session cookie is still sent — which is what
+    # makes a session-held nonce workable here at all.
+    expected = session.pop(_EBAY_STATE_KEY, "")
+    got = request.args.get("state", "")
+    if not expected or not got or not _hmac.compare_digest(str(expected), str(got)):
+        return redirect(url_for("shops_page") + "?ebay_error=" + urllib.parse.quote(
+            "This eBay sign-in didn't start from this browser. Open the Shops page and connect again."))
 
     conn = _get_connection("ebay", create=True)
     provider = get_provider("ebay", conn, persist=_shop_persist)
