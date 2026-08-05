@@ -2784,17 +2784,28 @@ def _forbidden(msg):
     return Response(body, status=403, mimetype="text/html")
 
 
-def _require_admin():
+def _require_admin(msg="Administrator access is required to test a saved connection."):
     """Return a 403 Response if the caller is not an administrator, else None.
-    Gates actions that connect to a user-supplied host while replaying a stored
-    secret (mailbox/shop 'Test' + mailbox 'Check'): a non-admin with shops:edit
-    could otherwise repoint the saved host and exfiltrate the stored credential."""
+
+    Gates actions whose damage is not captured by any single resource permission:
+      - connecting to a user-supplied host while replaying a stored secret
+        (mailbox/shop 'Test' + mailbox 'Check') — a non-admin with shops:edit could
+        otherwise repoint the saved host and exfiltrate the stored credential;
+      - handing the caller a migration bundle, which is a plaintext dump of every
+        stored credential (see _build_migration_bundle).
+    `msg` is the 403 text, so each call site can say which action it refused."""
     if _auth_disabled():
         return None
     u = getattr(g, "user", None) or _current_user()
     if u is not None and u.role and u.role.is_admin:
         return None
-    return _forbidden("Administrator access is required to test a saved connection.")
+    return _forbidden(msg)
+
+
+# Shared 403 text for the migration-bundle routes, so the export, the download and
+# the legacy /uploads path all refuse with the same sentence.
+_BUNDLE_ADMIN_MSG = ("Administrator access is required to export or download a migration "
+                     "bundle: it contains stored credentials in plaintext.")
 
 
 # GET routes that perform a privileged write and so must require edit despite
@@ -6829,10 +6840,14 @@ def uploaded_file(filename):
     # traversal first; .lower() closes the case-insensitive-FS variant.
     norm = posixpath.normpath(str(filename).replace("\\", "/").lstrip("/"))
     if norm.lower().startswith("migration_exports/") or norm == ".." or norm.startswith("../"):
-        if not _auth_disabled():
-            u = getattr(g, "user", None) or _current_user()
-            if not _role_allows(getattr(u, "role", None), "upgrade", "view"):
-                return _forbidden("Upgrade access is required to download a migration bundle.")
+        # Admin, NOT _role_allows(..., "upgrade", "view"). Two reasons: the bundle is a
+        # plaintext credential dump, so it should never have hung off an ordinary
+        # grantable resource; and dropping "upgrade" from PROTECTED_RESOURCES would not
+        # have revoked it, because _role_allows reads the role's own stored permissions
+        # dict — every role created before this change still carries "upgrade": "edit".
+        denied = _require_admin(_BUNDLE_ADMIN_MSG)
+        if denied:
+            return denied
         # Prune stale bundles on download too (not just on export), excluding the
         # one being served, so a single old bundle can't linger indefinitely.
         _prune_migration_bundles(os.path.join(app.config["UPLOAD_FOLDER"], "migration_exports"),
@@ -11352,6 +11367,19 @@ def _migration_tables():
     ]
 
 
+# app_settings keys that are never written into a migration bundle.
+# FLASK_SECRET_KEY signs the session cookie, so anyone holding it can mint a cookie for
+# any uid and become an administrator. It is also the one setting the target install has
+# no reason to inherit: carrying it across would carry live session cookies with it,
+# which is the opposite of what a migration wants. The target generates its own on first
+# start (see the __main__ block) and everyone signs in once.
+# The marketplace tokens and mailbox password in shop_connections/email_monitors are NOT
+# redacted — re-authenticating every shop is a real migration failure, and those are what
+# the bundle is for. They are covered by the administrator gate on the export/download
+# routes and by the manifest's "treat this bundle as a secret" note.
+_MIGRATION_REDACTED_SETTINGS = frozenset({"FLASK_SECRET_KEY"})
+
+
 def _row_to_dict(row):
     """Serialize an ORM row to a JSON-safe dict using its table columns."""
     out = {}
@@ -11383,9 +11411,11 @@ def _capacity_status():
     }
 
 
-def _stream_table_jsonl(model, fh, batch=2000):
+def _stream_table_jsonl(model, fh, batch=2000, skip=None):
     """Write every row of `model` to an open text file as JSON lines, using
-    keyset iteration so memory stays flat for very large tables."""
+    keyset iteration so memory stays flat for very large tables. `skip`, if given,
+    is called with each row and omits it when it returns True; skipped rows are
+    not counted, so the manifest's row_counts reports what the file contains."""
     n = 0
     last_id = 0
     has_int_pk = hasattr(model, "id")
@@ -11395,13 +11425,17 @@ def _stream_table_jsonl(model, fh, batch=2000):
                     .order_by(model.id).limit(batch).all())
             if not rows:
                 break
-            for r in rows:
+            last_id = rows[-1].id          # set before filtering: an all-skipped
+            for r in rows:                 # batch must still advance the cursor
+                if skip and skip(r):
+                    continue
                 fh.write(json.dumps(_row_to_dict(r), default=str) + "\n")
-            n += len(rows)
-            last_id = rows[-1].id
+                n += 1
             db.session.expunge_all()   # release hydrated objects
     else:
         for r in model.query.all():
+            if skip and skip(r):
+                continue
             fh.write(json.dumps(_row_to_dict(r), default=str) + "\n")
             n += 1
     return n
@@ -11457,8 +11491,11 @@ def _build_migration_bundle(include_reference=False, include_images_manifest=Tru
         if rebuildable and not include_reference:
             counts[stem] = "skipped (rebuildable from tcgcsv.com)"
             continue
+        skip = None
+        if model is AppSetting:
+            skip = lambda row: getattr(row, "key", None) in _MIGRATION_REDACTED_SETTINGS
         with open(os.path.join(bundle_dir, f"{stem}.jsonl"), "w", encoding="utf-8") as fh:
-            counts[stem] = _stream_table_jsonl(model, fh)
+            counts[stem] = _stream_table_jsonl(model, fh, skip=skip)
 
     image_count = 0
     if include_images_manifest:
@@ -11492,6 +11529,9 @@ def _build_migration_bundle(include_reference=False, include_images_manifest=Tru
             "current file path to a suggested object-storage key; run the importer's image "
             "sync against images_source_dir.",
             "shop_connections and email_monitors may contain credentials — treat this bundle as a secret.",
+            "FLASK_SECRET_KEY is deliberately excluded from app_settings: it signs session "
+            "cookies, and the target install generates its own on first start. Everyone "
+            "signs in again after the migration — that is expected, not a fault.",
         ],
     }
     with open(os.path.join(bundle_dir, "manifest.json"), "w", encoding="utf-8") as fh:
@@ -11546,6 +11586,12 @@ def upgrade_status():
 
 @app.route("/settings/upgrade/export", methods=["POST"])
 def upgrade_export():
+    # The route map only requires the 'upgrade' resource here, and the auto-created
+    # Editor role holds edit on every resource — so without this the bundle (every
+    # marketplace token, the mailbox password) is reachable by a non-admin.
+    denied = _require_admin(_BUNDLE_ADMIN_MSG)
+    if denied:
+        return denied
     include_reference = str(request.form.get("include_reference", "")).lower() in ("1", "true", "yes", "on")
     try:
         tar_path, manifest = _build_migration_bundle(include_reference=include_reference)
@@ -11565,12 +11611,17 @@ def upgrade_export():
 
 @app.route("/settings/upgrade/download/<name>")
 def upgrade_download(name):
-    """Serve a migration bundle. Gated by the map on the whole /settings/upgrade
-    prefix ('upgrade' resource, seg[1]) — no per-request prefix test to defeat.
-    Three independent layers stop a crafted name: the <name> converter refuses
-    any path with slashes at routing time, basename(secure_filename(...)) strips
-    anything that survives, and the resource map gates access. Bundles are
-    pruned here too so a single old one can't linger past its TTL."""
+    """Serve a migration bundle. Three independent layers stop a crafted name: the
+    <name> converter refuses any path with slashes at routing time,
+    basename(secure_filename(...)) strips anything that survives, and the resource
+    map gates the whole /settings/upgrade prefix ('upgrade' resource, seg[1]) — no
+    per-request prefix test to defeat. That map entry is NOT sufficient on its own,
+    though: 'upgrade' is an ordinary grantable resource, so administrator status is
+    required separately below. Bundles are pruned here too so a single old one
+    can't linger past its TTL."""
+    denied = _require_admin(_BUNDLE_ADMIN_MSG)
+    if denied:
+        return denied
     safe = os.path.basename(secure_filename(name))
     out_dir = os.path.join(app.config["UPLOAD_FOLDER"], "migration_exports")
     _prune_migration_bundles(out_dir, keep=safe)
