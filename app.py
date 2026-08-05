@@ -2778,6 +2778,26 @@ def _admin_count():
         return 0
 
 
+def _session_auth_hash(u):
+    """A token tying a session to the password it was issued under.
+
+    Derived from the stored password hash, so changing the password changes this
+    and every session minted under the old one stops matching. It is keyed with
+    the app secret and truncated because it is a comparison token that travels in
+    the cookie, not a credential -- and it is NOT the stored hash itself.
+
+    This is deliberately derived rather than stored in a new column: a column
+    would need a migration, and migrations on this app only run from the __main__
+    block, so a WSGI deployment would come up with the column missing and every
+    login broken. Nothing to migrate cannot fail to migrate.
+    """
+    key = app.config.get("SECRET_KEY") or ""
+    if isinstance(key, str):
+        key = key.encode("utf-8")
+    return _hmac.new(key, (u.password_hash or "").encode("utf-8"),
+                     _hashlib.sha256).hexdigest()[:32]
+
+
 def _current_user():
     uid = session.get("uid")
     if not uid:
@@ -2787,6 +2807,14 @@ def _current_user():
     except Exception:
         u = None
     if u is None or not u.active:
+        return None
+    # A session is only valid for the password it was issued under. Without this,
+    # changing the password of an account you believe is compromised does nothing
+    # to the attacker: their stolen cookie keeps working for the full signature
+    # lifetime. Deactivating the user already took effect immediately (above);
+    # changing the password did not.
+    got = session.get("sauth")
+    if not isinstance(got, str) or not _hmac.compare_digest(got, _session_auth_hash(u)):
         return None
     return u
 
@@ -3267,6 +3295,7 @@ def auth_setup_submit():
     db.session.add(u)
     db.session.commit()
     session["uid"] = u.id
+    session["sauth"] = _session_auth_hash(u)
     return jsonify({"status": "success", "redirect": url_for("index")})
 
 
@@ -3327,6 +3356,7 @@ def auth_login_submit():
         return jsonify({"status": "error", "message": "Invalid username or password."}), 401
     _login_clear(key)
     session["uid"] = u.id
+    session["sauth"] = _session_auth_hash(u)
     return jsonify({"status": "success",
                     "redirect": _same_origin_next(body.get("next"), url_for("index"))})
 
@@ -3334,6 +3364,7 @@ def auth_login_submit():
 @app.route("/auth/logout")
 def auth_logout():
     session.pop("uid", None)
+    session.pop("sauth", None)
     return redirect(url_for("auth_login_page"))
 
 
@@ -3460,6 +3491,11 @@ def users_update():
                             "message": f"Password must be {MIN_PASSWORD_LEN}+ characters."}), 400
         u.set_password(pw)
     db.session.commit()
+    if pw and u.id == session.get("uid"):
+        # Every other session for this user is now invalid, which is the point.
+        # Re-stamp the one making the request so an admin changing their own
+        # password is not logged out by their own action.
+        session["sauth"] = _session_auth_hash(u)
     return jsonify({"status": "success"})
 
 
