@@ -13499,6 +13499,7 @@ def shops_save(marketplace):
     conn = _get_connection(marketplace, create=True)
     cfg = dict(conn.config or {})
 
+    host_changed = False
     for field in MARKETPLACES[marketplace]["fields"]:
         k = field["key"]
         submitted = request.form.get(k, None)
@@ -13509,12 +13510,32 @@ def shops_save(marketplace):
         # For secret fields, an empty submission means "keep what's stored".
         if is_secret and submitted == "":
             continue
+        # Compare before the write, or the old value is already gone.
+        if field.get("host") and str(cfg.get(k, "") or "") != submitted:
+            host_changed = True
         cfg[k] = submitted
 
     conn.config = cfg
+    if host_changed:
+        # Saving a secret and saving a destination are different acts. Only an
+        # administrator can connect a shop (/shops/test is _require_admin-gated, and it
+        # is the sole thing that sets enabled=True), but this route is shops:edit — so
+        # without this a non-admin could keep the stored token, repoint store_domain at
+        # a host they control, and inherit the administrator's "connected" state. Every
+        # replay site then sends the token to them: push, pull, unlist, sale sync.
+        # Un-connecting here revokes that inheritance at the source, which is why this
+        # is the fix rather than adding _require_admin to each replay route — the next
+        # route someone adds is covered too.
+        conn.enabled = False
+        conn.status = "disconnected"
+        conn.status_detail = "Destination changed — test the connection again before syncing."
+        conn.connected_at = None
     conn.updated_at = datetime.utcnow()
     db.session.commit()
-    return jsonify({"status": "success", "message": f"{MARKETPLACES[marketplace]['label']} settings saved."})
+    msg = f"{MARKETPLACES[marketplace]['label']} settings saved."
+    if host_changed:
+        msg += " The destination changed, so the shop was disconnected — test it again to re-enable syncing."
+    return jsonify({"status": "success", "message": msg})
 
 
 @app.route("/shops/test/<marketplace>", methods=["POST"])
@@ -13736,7 +13757,13 @@ def shops_unlist():
     if not listing:
         return jsonify({"status": "error", "message": "Listing not found."}), 404
     conn = _get_connection(listing.marketplace)
-    if not conn:
+    # `enabled`, not just `conn`. This is the one token-replay route that tested only
+    # for the row's existence: push (shops_push), pull (shops_pull) and the sale
+    # fan-out (_mark_record_sold) all require enabled, and a disabled connection is
+    # exactly what "an administrator has not vouched for this destination" means now
+    # that changing store_domain clears the flag. Without this line, disconnecting on
+    # host change would still leave end_listing willing to send the token there.
+    if not conn or not conn.enabled:
         return jsonify({"status": "error", "message": "Marketplace not connected."}), 400
     provider = get_provider(listing.marketplace, conn, persist=_shop_persist)
     result = provider.end_listing(listing)
@@ -14452,6 +14479,7 @@ def _email_public_view(m):
 def shops_email_save():
     m = _get_email_monitor(create=True)
     f = request.form
+    old_host, old_port = (m.host or ""), (m.port or 993)
     m.host = f.get("host", m.host or "").strip()
     m.username = f.get("username", m.username or "").strip()
     pw = f.get("password", None)
@@ -14471,8 +14499,21 @@ def shops_email_save():
         m.poll_interval = max(int(f.get("poll_interval") or 0), 0)
     except ValueError:
         m.poll_interval = 0
+    # Same shape as a shop's store_domain: /shops/email/test is _require_admin-gated
+    # and is the only thing that sets enabled=True, but this route is shops:edit and
+    # kept the stored password on a blank submission. Repointing host or port would
+    # otherwise inherit that blessing, and the background poller -- which runs with no
+    # user at all -- would log in to the new server with the saved mailbox password.
+    host_changed = (m.host or "") != old_host or (m.port or 993) != old_port
+    if host_changed:
+        m.enabled = False
+        m.status = "disconnected"
+        m.status_detail = "Server changed — test the connection again before polling."
     db.session.commit()
-    return jsonify({"status": "success", "message": "Email monitor settings saved."})
+    msg = "Email monitor settings saved."
+    if host_changed:
+        msg += " The server changed, so polling was disabled — test it again to re-enable."
+    return jsonify({"status": "success", "message": msg})
 
 
 @app.route("/shops/email/test", methods=["POST"])
