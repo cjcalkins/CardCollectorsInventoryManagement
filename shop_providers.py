@@ -44,6 +44,66 @@ SHOPIFY_API_VERSION = "2026-01"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Redirects must not carry credentials to another origin
+# ──────────────────────────────────────────────────────────────────────────────
+# urllib follows up to 10 redirects silently, and the stdlib's redirect_request
+# rebuilds the follow-up request keeping every header except the two content ones:
+#
+#     CONTENT_HEADERS = ("content-length", "content-type")
+#     newheaders = {k: v for k, v in req.headers.items()
+#                   if k.lower() not in CONTENT_HEADERS}
+#
+# So a 302 from any upstream re-sends X-Shopify-Access-Token, Authorization,
+# X-API-Key or X-ManaPool-Access-Token to whatever host the Location names —
+# including an http:// one. That is true even for the providers whose hostnames are
+# hardcoded, because the hazard is the *response*, not the URL we chose: a
+# compromised or MITM'd upstream only has to answer with a redirect.
+#
+# An ALLOWLIST rather than a list of credential header names, deliberately. A
+# denylist has to be updated every time a provider adds a token header, and the
+# person adding it is not thinking about redirects. Anything not named here is
+# dropped when the origin changes, so a new header is protected by default.
+_REDIRECT_SAFE_HEADERS = frozenset({
+    "accept", "accept-encoding", "accept-language", "user-agent",
+})
+
+
+def _redirect_keeps_origin(old_url, new_url):
+    """True when following old->new stays on the same scheme+host+port.
+
+    An https->http step on the SAME host counts as a change: the credential would
+    go out in cleartext, which is the thing being prevented. http->https is not a
+    downgrade, but it is still a different origin, so it is treated the same way —
+    losing a header on an upgrade is a failed request, not a leak."""
+    a, b = urllib.parse.urlsplit(old_url), urllib.parse.urlsplit(new_url)
+    return (a.scheme.lower(), a.hostname or "", a.port) == \
+           (b.scheme.lower(), b.hostname or "", b.port)
+
+
+class _CredentialStrippingRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Drops non-benign headers when a redirect leaves the original origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is None or _redirect_keeps_origin(req.full_url, new.full_url):
+            return new
+        # Request.add_header capitalises keys ("X-Api-Key"), so compare lowered.
+        for name in list(new.headers):
+            if name.lower() not in _REDIRECT_SAFE_HEADERS:
+                del new.headers[name]
+        return new
+
+
+# Installed globally, on purpose: urlopen() uses the module-level opener, so this
+# one call covers every outbound request in the process — shop_providers,
+# shipping_providers and the JustTCG/Ximilar/CardSight calls in app.py — including
+# any added later. Building a private opener here instead would protect this file
+# and quietly leave the other nine call sites exactly as they are.
+urllib.request.install_opener(
+    urllib.request.build_opener(_CredentialStrippingRedirectHandler))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # UI metadata — drives the connector cards / config forms on the Shops page.
 # `secret: True` fields are never echoed back to the browser in plain text.
 # ──────────────────────────────────────────────────────────────────────────────
