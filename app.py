@@ -2784,17 +2784,28 @@ def _forbidden(msg):
     return Response(body, status=403, mimetype="text/html")
 
 
-def _require_admin():
+def _require_admin(msg="Administrator access is required to test a saved connection."):
     """Return a 403 Response if the caller is not an administrator, else None.
-    Gates actions that connect to a user-supplied host while replaying a stored
-    secret (mailbox/shop 'Test' + mailbox 'Check'): a non-admin with shops:edit
-    could otherwise repoint the saved host and exfiltrate the stored credential."""
+
+    Gates actions whose damage is not captured by any single resource permission:
+      - connecting to a user-supplied host while replaying a stored secret
+        (mailbox/shop 'Test' + mailbox 'Check') — a non-admin with shops:edit could
+        otherwise repoint the saved host and exfiltrate the stored credential;
+      - handing the caller a migration bundle, which is a plaintext dump of every
+        stored credential (see _build_migration_bundle).
+    `msg` is the 403 text, so each call site can say which action it refused."""
     if _auth_disabled():
         return None
     u = getattr(g, "user", None) or _current_user()
     if u is not None and u.role and u.role.is_admin:
         return None
-    return _forbidden("Administrator access is required to test a saved connection.")
+    return _forbidden(msg)
+
+
+# Shared 403 text for the migration-bundle routes, so the export, the download and
+# the legacy /uploads path all refuse with the same sentence.
+_BUNDLE_ADMIN_MSG = ("Administrator access is required to export or download a migration "
+                     "bundle: it contains stored credentials in plaintext.")
 
 
 # GET routes that perform a privileged write and so must require edit despite
@@ -6829,10 +6840,14 @@ def uploaded_file(filename):
     # traversal first; .lower() closes the case-insensitive-FS variant.
     norm = posixpath.normpath(str(filename).replace("\\", "/").lstrip("/"))
     if norm.lower().startswith("migration_exports/") or norm == ".." or norm.startswith("../"):
-        if not _auth_disabled():
-            u = getattr(g, "user", None) or _current_user()
-            if not _role_allows(getattr(u, "role", None), "upgrade", "view"):
-                return _forbidden("Upgrade access is required to download a migration bundle.")
+        # Admin, NOT _role_allows(..., "upgrade", "view"). Two reasons: the bundle is a
+        # plaintext credential dump, so it should never have hung off an ordinary
+        # grantable resource; and dropping "upgrade" from PROTECTED_RESOURCES would not
+        # have revoked it, because _role_allows reads the role's own stored permissions
+        # dict — every role created before this change still carries "upgrade": "edit".
+        denied = _require_admin(_BUNDLE_ADMIN_MSG)
+        if denied:
+            return denied
         # Prune stale bundles on download too (not just on export), excluding the
         # one being served, so a single old bundle can't linger indefinitely.
         _prune_migration_bundles(os.path.join(app.config["UPLOAD_FOLDER"], "migration_exports"),
@@ -11546,6 +11561,12 @@ def upgrade_status():
 
 @app.route("/settings/upgrade/export", methods=["POST"])
 def upgrade_export():
+    # The route map only requires the 'upgrade' resource here, and the auto-created
+    # Editor role holds edit on every resource — so without this the bundle (every
+    # marketplace token, the mailbox password) is reachable by a non-admin.
+    denied = _require_admin(_BUNDLE_ADMIN_MSG)
+    if denied:
+        return denied
     include_reference = str(request.form.get("include_reference", "")).lower() in ("1", "true", "yes", "on")
     try:
         tar_path, manifest = _build_migration_bundle(include_reference=include_reference)
@@ -11565,12 +11586,17 @@ def upgrade_export():
 
 @app.route("/settings/upgrade/download/<name>")
 def upgrade_download(name):
-    """Serve a migration bundle. Gated by the map on the whole /settings/upgrade
-    prefix ('upgrade' resource, seg[1]) — no per-request prefix test to defeat.
-    Three independent layers stop a crafted name: the <name> converter refuses
-    any path with slashes at routing time, basename(secure_filename(...)) strips
-    anything that survives, and the resource map gates access. Bundles are
-    pruned here too so a single old one can't linger past its TTL."""
+    """Serve a migration bundle. Three independent layers stop a crafted name: the
+    <name> converter refuses any path with slashes at routing time,
+    basename(secure_filename(...)) strips anything that survives, and the resource
+    map gates the whole /settings/upgrade prefix ('upgrade' resource, seg[1]) — no
+    per-request prefix test to defeat. That map entry is NOT sufficient on its own,
+    though: 'upgrade' is an ordinary grantable resource, so administrator status is
+    required separately below. Bundles are pruned here too so a single old one
+    can't linger past its TTL."""
+    denied = _require_admin(_BUNDLE_ADMIN_MSG)
+    if denied:
+        return denied
     safe = os.path.basename(secure_filename(name))
     out_dir = os.path.join(app.config["UPLOAD_FOLDER"], "migration_exports")
     _prune_migration_bundles(out_dir, keep=safe)
