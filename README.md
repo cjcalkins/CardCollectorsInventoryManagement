@@ -152,10 +152,22 @@ python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 
 # 3. Install dependencies
-pip install -r requirements.txt
+pip install -r requirements.lock   # exact versions this app is tested against
+# or:  pip install -r requirements.txt   # latest compatible, may drift
 
 # 4. (Optional) create a .env file for configuration — see below
 ```
+
+**Which file to use.** `requirements.lock` pins every package to a version this app has
+actually been run against, so two installs get the same app. `requirements.txt` states
+only minimum versions, and minimums drift: resolving it today already brings in **seven
+packages a major version above** what those minimums describe (numpy 1→2, opencv 4→5,
+reportlab 4→5, cryptography 42→50, Pillow 10→12, networkx 2→3, plus rapidocr and
+onnxruntime, which until recently had no constraint at all).
+
+Use the lock for anything you depend on. Use `requirements.txt` when you deliberately
+want current versions — and if that combination works, refresh the lock from it (the
+command is in the lock file's header) so the next person inherits a tested set.
 
 ---
 
