@@ -14712,11 +14712,40 @@ def _port_bindable(port):
         s.close()
 
 
+# SPKI SHA-256 of keypairs that are known to be public and must never be served.
+# The 2048-bit RSA key below was committed here in 65e455c4 (2026-07-14) and removed in
+# 0787925 (2026-07-29) by a delete-commit, NOT a history rewrite — so it stays recoverable
+# from the published history (`git show 65e455c4:certs/cardcollector.key`) and is
+# compromised permanently. Its certificate is valid until 2036-07-11 and
+# _ensure_self_signed_cert used to reuse any existing pair unconditionally, so without
+# this check every clone still holding that pair would serve the public key for another
+# decade. Fingerprinting the keypair rather than the file means a re-encoded or
+# reformatted copy still matches. This is a digest of the PUBLIC key: not itself secret.
+_COMPROMISED_SPKI_SHA256 = frozenset({
+    "70a937e51a82f344b24305c7b57c2e2bb7e016f8a66aa8ab3113a55e0816f427",
+})
+
+
+def _spki_sha256(key_pem):
+    """SHA-256 over the DER SubjectPublicKeyInfo of a PEM private key, or None if the
+    bytes are not a readable private key."""
+    from cryptography.hazmat.primitives import serialization
+    try:
+        key = serialization.load_pem_private_key(key_pem, password=None)
+    except Exception:
+        return None
+    return _hashlib.sha256(key.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo)).hexdigest()
+
+
 def _ensure_self_signed_cert(cert_dir, hostnames, ips):
     """Generate (once) and reuse a persistent self-signed certificate covering the
     given hostnames + IPs, so the app can be served over HTTPS on the LAN — which
     browsers require before they'll allow camera (getUserMedia) access from any
-    machine other than the server itself. Returns (cert_path, key_path)."""
+    machine other than the server itself. A pair whose key is in
+    _COMPROMISED_SPKI_SHA256 is discarded and regenerated rather than reused.
+    Returns (cert_path, key_path)."""
     import datetime as _dt
     import ipaddress
     from cryptography import x509
@@ -14728,7 +14757,28 @@ def _ensure_self_signed_cert(cert_dir, hostnames, ips):
     cert_path = os.path.join(cert_dir, "cardcollector.crt")
     key_path = os.path.join(cert_dir, "cardcollector.key")
     if os.path.exists(cert_path) and os.path.exists(key_path):
-        return cert_path, key_path
+        try:
+            with open(key_path, "rb") as f:
+                fingerprint = _spki_sha256(f.read())
+        except OSError:
+            fingerprint = None
+        # Only a POSITIVE match discards the pair. An unreadable or unparseable key gives
+        # None, which is not in the set, so it is reused exactly as before — a transient
+        # read error must not churn a legitimate certificate on every boot.
+        if fingerprint not in _COMPROMISED_SPKI_SHA256:
+            return cert_path, key_path
+        print("[https] SECURITY: this certificate's private key was published in the "
+              "repository's git history and is public. Discarding it.")
+        print("[https] Generating a fresh keypair — devices that accepted the old "
+              "certificate will show the one-time warning again.")
+        for stale in (key_path, cert_path):
+            try:
+                os.remove(stale)
+            except OSError as exc:
+                # Fail loudly rather than serve it: the caller falls back to plain HTTP,
+                # which is safer than HTTPS whose key anyone can download.
+                raise RuntimeError(f"refusing to serve a known-public key, and {stale} "
+                                   f"could not be removed ({exc})")
 
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     cn = hostnames[0] if hostnames else "cardcollector.local"
