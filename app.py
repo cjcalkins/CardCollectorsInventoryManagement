@@ -2703,9 +2703,20 @@ def _role_allows(role, resource, need):
     return _PERM_RANK.get(have, 0) >= _PERM_RANK.get(need, 1)
 
 
+# Returned for paths whose GET responses are deliberately readable by every signed-in
+# user, whatever their role: every card image is served through /uploads (uploaded_file
+# says so), and the temp servers hand back in-flight scan images while an import or a
+# quick scan is running. This is a distinct value rather than None so the gate can tell
+# "deliberately public" apart from "nobody mapped this" — the two now fail differently,
+# and a sentinel keeps that decision in the one function that parses the path instead of
+# a second prefix test that could disagree with this one about what a path means.
+PUBLIC_READ = "__public_read__"
+
+
 def _resource_for_path(path):
     """Map a request path to a protected resource key, '__admin__' for the user/role
-    manager, or None for endpoints that only require being signed in."""
+    manager, PUBLIC_READ for the deliberately-open file servers, or None when nothing
+    maps the path — which the gate treats as a refusal, not as permission."""
     p = (path or "/").rstrip("/")
     seg = [s for s in p.split("/") if s]
     if not seg:
@@ -2761,9 +2772,9 @@ def _resource_for_path(path):
         # short-circuits on _users_exist() before this runs, and the first
         # account is an admin by construction, so /setup stays reachable then.
         "setup": "__admin__", "migrate_clean_legacy_fields": "__admin__",
-        # ── Reads that nothing mapped, and so were reachable by any signed-in account
-        # regardless of role. Each rides the resource that already governs the data it
-        # hands back:
+        # ── Reads that were previously unmapped, and so were reachable by any
+        # signed-in account regardless of role. Each rides the resource that already
+        # governs the data it hands back:
         # /sold is literally the same view function as /inventory (two @app.route
         # decorators on one def), and records_summary/game_fields enumerate record
         # fields, so all three are inventory reads.
@@ -2777,6 +2788,9 @@ def _resource_for_path(path):
         # from data the caller can already see (local OCR, local tcgcsv catalog).
         # cloud_identify stays "identify" because it spends an external API key.
         "ocr_identify": "inventory", "database_match": "inventory",
+        # Deliberately readable by any signed-in user — see PUBLIC_READ.
+        "uploads": PUBLIC_READ, "temp_cards": PUBLIC_READ,
+        "temp_split": PUBLIC_READ, "temp_pdf": PUBLIC_READ,
     }.get(head, None)
 
 
@@ -2853,15 +2867,23 @@ def _auth_gate():
     if user.role and user.role.is_admin:
         return
     resource = _resource_for_path(path)
+    if resource == PUBLIC_READ:
+        # The file servers, open to any signed-in user by design. Reads only: none of
+        # them defines a mutating method today, and if one is ever added it has to be
+        # mapped to a real resource like anything else rather than inheriting this.
+        if request.method in ("GET", "HEAD", "OPTIONS"):
+            return
+        return _forbidden("This action isn't available to your role.")
     if resource is None:
-        # Default-deny for mutating requests: an unmapped POST/PUT/PATCH/DELETE is
-        # refused rather than silently allowed, so a route nobody mapped fails
-        # closed. NOTE: the guarantee covers mutating *methods*, not mutating
-        # *actions* — a future GET route with side effects is NOT caught here and
-        # must be mapped or added to _EBAY_OAUTH_WRITE_PATHS-style handling.
-        if request.method not in ("GET", "HEAD", "OPTIONS"):
-            return _forbidden("This action isn't available to your role.")
-        return  # read-only path: only requires being signed in
+        # Default-deny in BOTH directions. This used to refuse unmapped *mutating*
+        # methods and wave unmapped reads through on nothing but a valid session,
+        # which meant a page nobody remembered to map was readable by every account:
+        # /sold, the second route on the /inventory view, served the full listing —
+        # names, serials and prices — to a role with every resource set to "none".
+        # Forgetting to map a route is now a 403 instead of a silent disclosure.
+        # NOTE: this still keys on the METHOD for the message only. The real
+        # guarantee is that an unmapped path is refused however it is requested.
+        return _forbidden("This isn't available to your role.")
     if resource == "__admin__":
         return _forbidden("Administrator access is required for user and role management.")
     # Compare the same rstripped form _resource_for_path uses, so the two agree
