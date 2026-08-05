@@ -307,6 +307,31 @@ def _reject_if_bomb(*file_storages):
         return jsonify({"status": "error", "message": str(exc)}), 413
 
 
+def _same_origin_next(nxt, fallback):
+    """Return `nxt` if it is a site-relative path the browser cannot resolve off this
+    origin; otherwise `fallback`. For post-login "?next=" style redirect targets.
+
+    Two things make this harder than "starts with / and not //":
+
+    1. Browsers DELETE ASCII tab, LF and CR from a URL before parsing it (WHATWG URL:
+       "Remove all ASCII tab or newline from input"). So the string this function
+       inspects is not the string the browser resolves. "/<tab>/evil.com" reads as a
+       path here and lands on https://evil.com/ there. They are stripped first, and
+       the STRIPPED value is what gets returned -- validating one string and handing
+       back another is how this check would go quietly out of sync with itself.
+    2. A backslash starts an authority just like a slash, because the parser treats
+       \\ as / for special schemes. So "/\\evil.com" and "/\\/evil.com" are
+       protocol-relative too, not paths.
+
+    Verified against a real WHATWG parser rather than reasoned about: of the payload
+    shapes tried, this admits none that resolve to another origin, and still admits
+    "/a/b?x=1#f", "/ /x", "/%2f/x" and "/%5cx", which are ordinary same-origin paths."""
+    s = str(nxt or "").translate({0x09: None, 0x0A: None, 0x0D: None})
+    if not s.startswith("/") or s[1:2] in ("/", "\\"):
+        return fallback
+    return s
+
+
 def _external_http_url(u):
     """Return `u` if it is an absolute http(s) URL, else "". For values that reach an
     href/src, where the danger is the SCHEME rather than the characters.
@@ -3247,10 +3272,8 @@ def auth_login_submit():
         return jsonify({"status": "error", "message": "Invalid username or password."}), 401
     _login_clear(key)
     session["uid"] = u.id
-    nxt = str(body.get("next", "") or url_for("index"))
-    if not nxt.startswith("/") or nxt.startswith("//"):   # open-redirect guard
-        nxt = url_for("index")
-    return jsonify({"status": "success", "redirect": nxt})
+    return jsonify({"status": "success",
+                    "redirect": _same_origin_next(body.get("next"), url_for("index"))})
 
 
 @app.route("/auth/logout")
