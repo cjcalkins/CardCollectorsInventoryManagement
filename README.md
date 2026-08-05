@@ -229,6 +229,7 @@ All configuration is via environment variables (a `.env` file is supported). Com
 | `PORT_FALLBACK`           | `8443` / `5005`    | Port used if the primary port can't bind. |
 | `SECRET_KEY`              | *(auto-persisted)* | Flask session secret. Auto-generated and stored if unset. |
 | `SESSION_COOKIE_SECURE`   | *(unset)*          | Mark the session cookie `Secure`. **Set this to `1` when running behind a TLS-terminating proxy** (gunicorn/uWSGI + nginx): the app sees plain HTTP there and cannot tell. Running `python app.py` over HTTPS turns it on by itself. Leave unset for plain HTTP — a `Secure` cookie on an `http://` origin is never sent back, which looks like "login does nothing". |
+| `IMAP_ALLOW_INSECURE_TLS` | *(unset)*          | Accept an IMAP server certificate that isn't trusted or doesn't match the hostname. **Only set this for your own mail server with a self-signed certificate** — it disables the check that stops anything on the network path from impersonating your mail provider and collecting the mailbox password. It does **not** allow an unencrypted connection: a server that won't start TLS is still refused. |
 | `DISABLE_AUTH`            | *(unset)*          | Kill-switch to disable authentication entirely. |
 | `FLASK_DEBUG`             | `0`                | Enable the Werkzeug debugger/reloader (local dev only — unsafe on a LAN). |
 | `DATABASE_URL`            | SQLite file        | SQLAlchemy database URL. |
