@@ -2837,6 +2837,11 @@ def _role_allows(role, resource, need):
 # a second prefix test that could disagree with this one about what a path means.
 PUBLIC_READ = "__public_read__"
 
+# Reachable by every signed-in account whatever its role, because the route acts on
+# nobody but the caller and takes no user id. Distinct from PUBLIC_READ, which is
+# read-only by design: this one must permit a POST.
+SELF_SERVICE = "__self_service__"
+
 
 def _resource_for_path(path):
     """Map a request path to a protected resource key, '__admin__' for the user/role
@@ -2844,6 +2849,11 @@ def _resource_for_path(path):
     maps the path — which the gate treats as a refusal, not as permission."""
     p = (path or "/").rstrip("/")
     seg = [s for s in p.split("/") if s]
+    # Matched as a WHOLE PATH, not by first segment. A segment rule would hand every
+    # future /account/* route to every role by inheritance, which is the failure this
+    # map's default-deny exists to prevent.
+    if p == "/account/password":
+        return SELF_SERVICE
     if not seg:
         return "templates"
     head = seg[0]
@@ -2999,6 +3009,11 @@ def _auth_gate():
         if request.method in ("GET", "HEAD", "OPTIONS"):
             return
         return _forbidden("This action isn't available to your role.")
+    if resource == SELF_SERVICE:
+        # Every signed-in account, including one whose role grants nothing anywhere:
+        # a person must be able to change their own password without an administrator.
+        # Admins already returned above. The route enforces the "own" part.
+        return
     if resource is None:
         # Default-deny in BOTH directions. This used to refuse unmapped *mutating*
         # methods and wave unmapped reads through on nothing but a valid session,
@@ -3117,11 +3132,19 @@ _CSRF_SCRIPT = ("<script>(function(){var T=\"__CSRF__\";"
                 "var i=document.createElement('input');i.type='hidden';i.name='csrf_token';i.value=T;f.appendChild(i);},true);"
                 "})();</script>")
 
-_LOGOUT_FLOAT = ('<a href="/auth/logout" title="Sign out (%s)" '
-                 'style="position:fixed;bottom:16px;right:16px;z-index:2147483000;'
-                 'background:#111827;color:#fff;padding:8px 14px;border-radius:999px;'
-                 'font:600 13px system-ui,-apple-system,Segoe UI,Roboto,sans-serif;'
-                 'text-decoration:none;box-shadow:0 3px 12px rgba(0,0,0,.3);opacity:.92">'
+_FLOAT_STYLE = ('position:fixed;bottom:16px;z-index:2147483000;'
+                'background:#111827;color:#fff;padding:8px 14px;border-radius:999px;'
+                'font:600 13px system-ui,-apple-system,Segoe UI,Roboto,sans-serif;'
+                'text-decoration:none;box-shadow:0 3px 12px rgba(0,0,0,.3);opacity:.92')
+
+# The password page is the only way a non-administrator can reach it: /settings is
+# role-gated, so a link there would be invisible to exactly the people who need it.
+# This block is already injected on every signed-in page, so it is the one place that
+# reaches every account.
+_LOGOUT_FLOAT = ('<a href="/account/password" title="Change your password" '
+                 'style="' + _FLOAT_STYLE + ';right:120px">&#128273; Password</a>'
+                 '<a href="/auth/logout" title="Sign out (%s)" '
+                 'style="' + _FLOAT_STYLE + ';right:16px">'
                  '&#10150; Sign out</a>')
 
 
@@ -3361,6 +3384,105 @@ def auth_login_submit():
                     "redirect": _same_origin_next(body.get("next"), url_for("index"))})
 
 
+# ---- Self-service password change (any signed-in account, own password only) ----
+_ACCOUNT_PW_HTML = ("""<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width, initial-scale=1"><title>Change password</title>
+<style>""" + _AUTH_CSS + """</style></head><body>
+<div class=card>
+  <h1>Change your password</h1>
+  <p class=sub>Signed in as <b>__USER__</b>. This changes your own password only &mdash;
+     an administrator changes anyone else&rsquo;s from Manage users.</p>
+  <label class=fld for=c>Current password</label>
+  <input id=c type=password autocomplete=current-password autofocus>
+  <label class=fld for=n>New password (__MINPW__+ characters)</label>
+  <input id=n type=password autocomplete=new-password>
+  <label class=fld for=n2>Confirm new password</label>
+  <input id=n2 type=password autocomplete=new-password>
+  <div class=row><button id=go>Change password</button></div>
+  <div id=msg class=msg></div>
+  <div class=links><a href="/">Back to the app</a><a href="/auth/logout">Sign out</a></div>
+</div>
+<script>
+  var msg=document.getElementById('msg');
+  function show(t,ok){msg.textContent=t;msg.className='msg show '+(ok?'ok':'err');}
+  async function submit(){
+    var b=document.getElementById('go');b.disabled=true;
+    try{
+      var r=await fetch('/account/password',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({current_password:document.getElementById('c').value,
+                             new_password:document.getElementById('n').value,
+                             confirm_password:document.getElementById('n2').value})});
+      var d=await r.json();
+      if(d.status==='success'){
+        show(d.message||'Password changed.',true);
+        document.getElementById('c').value='';document.getElementById('n').value='';document.getElementById('n2').value='';
+      } else { show(d.message||'Could not change the password.',false); }
+    }catch(e){ show('Error: '+e.message,false); }
+    b.disabled=false;
+  }
+  document.getElementById('go').addEventListener('click',submit);
+  document.getElementById('n2').addEventListener('keydown',function(e){if(e.key==='Enter')submit();});
+</script></body></html>""")
+
+
+@app.route("/account/password", methods=["GET"])
+def account_password_page():
+    u = _current_user()
+    if u is None:
+        return redirect(url_for("auth_login_page", next="/account/password"))
+    name = (u.username or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return _ACCOUNT_PW_HTML.replace("__USER__", name).replace("__MINPW__", str(MIN_PASSWORD_LEN))
+
+
+@app.route("/account/password", methods=["POST"])
+def account_password_change():
+    """Change the CALLER'S password. Deliberately takes no user id.
+
+    An id parameter here would be an authorization decision made from request data on
+    a route every signed-in account can reach -- the shape that put ten paths at the
+    mercy of the permission map before. The account changed is whichever one the
+    session already proved, and there is no argument that can redirect it.
+    """
+    u = _current_user()
+    if u is None:
+        return jsonify({"status": "error", "auth_required": True,
+                        "message": "Sign in required."}), 401
+    body = request.get_json(silent=True) or request.form
+    current = str(body.get("current_password", "") or "")
+    new = str(body.get("new_password", "") or "")
+    confirm = str(body.get("confirm_password", "") or "")
+
+    # Re-authenticate. A hijacked session should not be able to lock the real owner
+    # out, so the current password is required -- and guessing it is throttled on the
+    # same counter as the login form.
+    key = _login_throttle_key(u.username)
+    if _login_is_locked(key):
+        return jsonify({"status": "error",
+                        "message": "Too many failed attempts. Wait a few minutes and try again."}), 429
+    if not u.check_password(current):
+        _login_record_fail(key)
+        return jsonify({"status": "error", "message": "Your current password is incorrect."}), 403
+    _login_clear(key)
+
+    if len(new) < MIN_PASSWORD_LEN:
+        return jsonify({"status": "error",
+                        "message": f"The new password must be at least {MIN_PASSWORD_LEN} characters."}), 400
+    if new != confirm:
+        return jsonify({"status": "error", "message": "The new passwords do not match."}), 400
+    if new == current:
+        return jsonify({"status": "error",
+                        "message": "The new password must be different from your current one."}), 400
+
+    u.set_password(new)
+    db.session.commit()
+    # Every OTHER session for this account is now invalid, which is the whole point of
+    # changing a password you believe someone else knows. Re-stamp this one so the
+    # person doing it is not signed out by their own action.
+    session["sauth"] = _session_auth_hash(u)
+    return jsonify({"status": "success",
+                    "message": "Password changed. Any other sessions signed in as you have been signed out."})
+
+
 @app.route("/auth/logout")
 def auth_logout():
     session.pop("uid", None)
@@ -3385,7 +3507,7 @@ _AUTH_USERS_HTML = ("""<!doctype html><html lang=en><head><meta charset=utf-8>
     <button id=addBtn>Add user</button>
   </div>
   <div id=msg class=msg></div>
-  <div class=links><a href="/settings/roles">Manage roles</a><a href="/settings">All settings</a><a href="/auth/logout">Sign out</a></div>
+  <div class=links><a href="/settings/roles">Manage roles</a><a href="/account/password">My password</a><a href="/settings">All settings</a><a href="/auth/logout">Sign out</a></div>
 </div>
 <script>
   var msg=document.getElementById('msg');
