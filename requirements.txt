@@ -12,8 +12,12 @@ python-dotenv>=1.0
 opencv-python-headless>=4.8      # use opencv-python instead if you need GUI/debug windows
 Pillow>=10.0
 numpy>=1.26
-rapidocr
-onnxruntime
+# These two carried NO constraint at all, so `pip install` would take a future major
+# without anything to notice it. Floors match the versions the app is tested against
+# (see requirements.lock); they are a floor and not a ceiling, so this still does not
+# stop a major landing — requirements.lock is what makes an install reproducible.
+rapidocr>=3.9
+onnxruntime>=1.23
 networkx>=2.5.1
 
 # ── Reports & security/networking ──
