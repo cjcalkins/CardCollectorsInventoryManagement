@@ -15,8 +15,10 @@ Config dict keys:
     sender_filter, subject_filter, mark_seen
 """
 
+import os
 import re
 import imaplib
+import ssl
 import email
 from email.header import decode_header, make_header
 
@@ -63,6 +65,46 @@ def _imap_reject(**fields):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# TLS
+# ──────────────────────────────────────────────────────────────────────────────
+# imaplib builds its SSL context with ssl._create_stdlib_context(), which IS
+# ssl._create_unverified_context -- check_hostname False, verify_mode CERT_NONE.
+# That applies to BOTH IMAP4_SSL (the "Use SSL" toggle) and IMAP4.starttls(), so
+# neither path authenticated the server: anything on the network path could present
+# a self-signed certificate and be handed the mailbox password. We pass an explicit
+# verifying context instead of relying on the stdlib default.
+_INSECURE_TLS_ENV = "IMAP_ALLOW_INSECURE_TLS"
+
+
+def _allow_insecure_tls():
+    return str(os.environ.get(_INSECURE_TLS_ENV, "")).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _tls_context():
+    """Verifying context, unless the operator has explicitly opted out.
+
+    The opt-out exists for a self-hosted mail server with a self-signed
+    certificate, which is a real deployment rather than a hypothetical one. It is
+    an environment variable rather than a form field on purpose: turning off
+    certificate checking should be a deliberate act by whoever runs the server,
+    not a switch an inventory:edit user can find in the UI.
+    """
+    if _allow_insecure_tls():
+        return ssl._create_unverified_context()
+    return ssl.create_default_context()
+
+
+def _tls_error(host, exc):
+    """Certificate failures get their own message. The generic connection error
+    sends the operator looking at firewalls and ports for a problem that is
+    neither."""
+    return (f"TLS verification failed for {host} — {exc}. The server's certificate "
+            f"is not trusted or does not match the hostname. If this is your own "
+            f"mail server with a self-signed certificate, set {_INSECURE_TLS_ENV}=1 "
+            f"on the app process to accept it.")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Connection
 # ──────────────────────────────────────────────────────────────────────────────
 def _connect(cfg):
@@ -87,15 +129,34 @@ def _connect(cfg):
 
     try:
         if cfg.get("use_ssl", True):
-            conn = imaplib.IMAP4_SSL(host, port, timeout=DEFAULT_TIMEOUT)
+            conn = imaplib.IMAP4_SSL(host, port, timeout=DEFAULT_TIMEOUT,
+                                     ssl_context=_tls_context())
         else:
             conn = imaplib.IMAP4(host, port, timeout=DEFAULT_TIMEOUT)
-            try:
-                conn.starttls()
-            except Exception:
-                pass  # server may not support STARTTLS; continue plaintext
+    except ssl.SSLError as exc:
+        return None, _tls_error(host, exc)
     except Exception as exc:
         return None, f"Could not connect to {host}:{port} — {exc}"
+
+    if not cfg.get("use_ssl", True):
+        # This used to be `except Exception: pass  # continue plaintext`. Every way
+        # STARTTLS can fail -- not offered, refused, or a certificate we do not
+        # trust -- is indistinguishable from an attacker stripping it, and the
+        # next thing on this socket is the mailbox password. Fail closed.
+        try:
+            conn.starttls(ssl_context=_tls_context())
+        except ssl.SSLError as exc:
+            _safe_logout(conn)
+            return None, _tls_error(host, exc)
+        except Exception as exc:
+            _safe_logout(conn)
+            if _allow_insecure_tls():
+                return None, (f"Could not start TLS with {host}:{port} — {exc}. "
+                              f"{_INSECURE_TLS_ENV} disables certificate checking, "
+                              f"not the requirement for an encrypted connection.")
+            return None, (f"{host}:{port} would not upgrade to an encrypted "
+                          f"connection ({exc}), so the mailbox password was not "
+                          f"sent. Enable SSL and use the TLS port (usually 993).")
 
     try:
         conn.login(user, pwd)
