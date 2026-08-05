@@ -2057,8 +2057,26 @@
                         .map(el => el.dataset.fieldKey);
         }
 
-        function showToast(msg, icon = 'fa-check-circle') {
-            if (msg) toast.innerHTML = `<i class="fas ${icon} me-2"></i>${msg}`;
+        // msg and em are TEXT, never markup. They are appended as text nodes, so
+        // there is no escaping contract for a caller to get wrong and no way for a
+        // value to become an element -- this sink is the one that produced a live
+        // stored XSS, and it did so because the burden sat on every call site.
+        // Use "{}" in msg to mark where em should appear, italicised.
+        function showToast(msg, icon = 'fa-check-circle', em = null) {
+            if (msg) {
+                const i = document.createElement('i');
+                // icon lands in a class attribute; it is a literal at every call site
+                // today, and this keeps it that way if one ever stops being one.
+                i.className = 'fas ' + String(icon).replace(/[^A-Za-z0-9_-]/g, '') + ' me-2';
+                const [before, after] = String(msg).split('{}');
+                const nodes = [i, document.createTextNode(before)];
+                if (em !== null && after !== undefined) {
+                    const e = document.createElement('em');
+                    e.textContent = em;
+                    nodes.push(e, document.createTextNode(after));
+                }
+                toast.replaceChildren(...nodes);
+            }
             toast.classList.add('show');
             clearTimeout(toast._timer);
             toast._timer = setTimeout(() => toast.classList.remove('show'), 2200);
@@ -2079,7 +2097,7 @@
             });
 
             if (!changes.length) {
-                showToast(`Layout saved for <em>${escHtml(game)}</em>!`);
+                showToast('Layout saved for {}!', 'fa-check-circle', game);
                 setLayoutMode(false);
                 return;
             }
@@ -2113,7 +2131,7 @@
                 console.error('Some fields could not be hidden/shown:', failed);
                 showToast(`Couldn't update ${failed.length} of ${changes.length} field(s). See console.`, 'fa-triangle-exclamation');
             } else {
-                showToast(`Layout saved for <em>${escHtml(game)}</em>!`);
+                showToast('Layout saved for {}!', 'fa-check-circle', game);
             }
 
             // Reload so the normal (non-layout) view reflects the new hidden set.
