@@ -14479,6 +14479,7 @@ def _email_public_view(m):
 def shops_email_save():
     m = _get_email_monitor(create=True)
     f = request.form
+    old_host, old_port = (m.host or ""), (m.port or 993)
     m.host = f.get("host", m.host or "").strip()
     m.username = f.get("username", m.username or "").strip()
     pw = f.get("password", None)
@@ -14498,8 +14499,21 @@ def shops_email_save():
         m.poll_interval = max(int(f.get("poll_interval") or 0), 0)
     except ValueError:
         m.poll_interval = 0
+    # Same shape as a shop's store_domain: /shops/email/test is _require_admin-gated
+    # and is the only thing that sets enabled=True, but this route is shops:edit and
+    # kept the stored password on a blank submission. Repointing host or port would
+    # otherwise inherit that blessing, and the background poller -- which runs with no
+    # user at all -- would log in to the new server with the saved mailbox password.
+    host_changed = (m.host or "") != old_host or (m.port or 993) != old_port
+    if host_changed:
+        m.enabled = False
+        m.status = "disconnected"
+        m.status_detail = "Server changed — test the connection again before polling."
     db.session.commit()
-    return jsonify({"status": "success", "message": "Email monitor settings saved."})
+    msg = "Email monitor settings saved."
+    if host_changed:
+        msg += " The server changed, so polling was disabled — test it again to re-enable."
+    return jsonify({"status": "success", "message": msg})
 
 
 @app.route("/shops/email/test", methods=["POST"])
