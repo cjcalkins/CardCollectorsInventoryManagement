@@ -142,9 +142,22 @@ except (TypeError, ValueError):
 if _max_upload_mb > 0:
     app.config["MAX_CONTENT_LENGTH"] = _max_upload_mb * 1024 * 1024
 
-# Harden session cookies if sessions are ever introduced.
+# Session cookie hardening. The session is load-bearing, not hypothetical: it carries
+# the signed-in user id, the CSRF token and the eBay OAuth nonce.
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+# Secure must be decided HERE, at import, because that is the only code that runs under
+# every launch method. The __main__ block below also sets it, but a WSGI server
+# (gunicorn/uWSGI/mod_wsgi) imports this module and never executes __main__ — so the
+# flag used to be left at Flask's default of False for exactly the deployments most
+# likely to be on a real network.
+#
+# Defaults OFF so the supported plain-HTTP modes keep working out of the box: marking
+# the cookie Secure on an http:// origin means the browser never sends it back, which
+# presents as "login silently does nothing". Behind a TLS-terminating proxy the app
+# sees plain http and cannot infer this, so it has to be told.
+app.config["SESSION_COOKIE_SECURE"] = (
+    os.environ.get("SESSION_COOKIE_SECURE", "").strip().lower() in ("1", "true", "yes", "on"))
 
 
 @app.after_request
@@ -15205,10 +15218,15 @@ if __name__ == "__main__":
             scheme = "http"
             default_port = 80
 
-    # Only mark the session cookie Secure when we are actually serving HTTPS —
-    # setting it unconditionally would break logins in the supported plain-HTTP
-    # modes (USE_HTTPS=0, or the automatic fallback above).
-    app.config["SESSION_COOKIE_SECURE"] = ssl_context is not None
+    # Serving HTTPS ourselves is proof the cookie can be Secure, so turn it on. This
+    # only ever raises the flag: assigning `ssl_context is not None` outright would
+    # also LOWER it, silently discarding an explicit SESSION_COOKIE_SECURE=1 whenever
+    # this launcher fell back to plain HTTP. Refusing to honour a security setting the
+    # operator deliberately set is worse than the broken login it would cause, and the
+    # broken login is at least visible. Plain-HTTP modes keep the import-time default
+    # of off unless that variable says otherwise.
+    if ssl_context is not None:
+        app.config["SESSION_COOKIE_SECURE"] = True
 
     def _visit_url(host):
         return f"{scheme}://{host}" + ("" if PORT == default_port else f":{PORT}")

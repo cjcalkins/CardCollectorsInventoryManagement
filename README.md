@@ -216,6 +216,7 @@ All configuration is via environment variables (a `.env` file is supported). Com
 | `PORT`                    | `443` / `80`       | Listening port (HTTPS / HTTP default). |
 | `PORT_FALLBACK`           | `8443` / `5005`    | Port used if the primary port can't bind. |
 | `SECRET_KEY`              | *(auto-persisted)* | Flask session secret. Auto-generated and stored if unset. |
+| `SESSION_COOKIE_SECURE`   | *(unset)*          | Mark the session cookie `Secure`. **Set this to `1` when running behind a TLS-terminating proxy** (gunicorn/uWSGI + nginx): the app sees plain HTTP there and cannot tell. Running `python app.py` over HTTPS turns it on by itself. Leave unset for plain HTTP — a `Secure` cookie on an `http://` origin is never sent back, which looks like "login does nothing". |
 | `DISABLE_AUTH`            | *(unset)*          | Kill-switch to disable authentication entirely. |
 | `FLASK_DEBUG`             | `0`                | Enable the Werkzeug debugger/reloader (local dev only — unsafe on a LAN). |
 | `DATABASE_URL`            | SQLite file        | SQLAlchemy database URL. |
