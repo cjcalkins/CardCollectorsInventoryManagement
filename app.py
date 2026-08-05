@@ -14622,6 +14622,17 @@ def _email_public_view(m):
 def shops_email_save():
     m = _get_email_monitor(create=True)
     f = request.form
+    # Refuse a line break before it is stored, so the operator sees why. Every one of
+    # these reaches an IMAP command, and imaplib validates none of them -- see
+    # email_monitor._imap_reject, which repeats the check at the point of use because
+    # rows saved before this existed still have to be handled.
+    bad = email_monitor._imap_reject(
+        username=f.get("username", ""), password=f.get("password", ""),
+        folder=f.get("folder", ""),
+        **{"sender filter": f.get("sender_filter", ""),
+           "subject filter": f.get("subject_filter", "")})
+    if bad:
+        return jsonify({"status": "error", "message": bad}), 400
     old_host, old_port = (m.host or ""), (m.port or 993)
     m.host = f.get("host", m.host or "").strip()
     m.username = f.get("username", m.username or "").strip()
