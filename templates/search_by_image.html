@@ -378,6 +378,13 @@
     function escHtml(s) {
         return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
+    // Mirrors _external_http_url() on the server. escHtml is not a substitute: it
+    // neutralises markup characters and leaves the scheme untouched, so it does
+    // nothing at an href.
+    function externalHttpUrl(u) {
+        const s = String(u ?? '').trim();
+        return /^https?:\/\//i.test(s) ? s : '';
+    }
     function fmt(n) { return n != null ? '$' + parseFloat(n).toFixed(2) : null; }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -621,7 +628,12 @@
         }
 
         const linkEl = document.getElementById('jtcg-result-link');
-        linkEl.href = card.url || 'https://justtcg.com';
+        // card.url is whatever the JustTCG response carried; nothing between that API
+        // and this assignment checks it. An href takes a scheme, so a hostile or
+        // compromised upstream could put javascript: here — and unlike the innerHTML
+        // sinks above, escaping would not help, because this is a property assignment
+        // and there is no markup to escape. Falls back to the existing literal.
+        linkEl.href = externalHttpUrl(card.url) || 'https://justtcg.com';
 
         jtcgResultPanel.style.display = 'block';
         jtcgPickerWrap.style.display  = 'none';

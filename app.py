@@ -307,6 +307,23 @@ def _reject_if_bomb(*file_storages):
         return jsonify({"status": "error", "message": str(exc)}), 413
 
 
+def _external_http_url(u):
+    """Return `u` if it is an absolute http(s) URL, else "". For values that reach an
+    href/src, where the danger is the SCHEME rather than the characters.
+
+    Escaping does not help at this sink and it is worth being explicit about why:
+    Jinja autoescaping (and the templates' esc()) stop a value from breaking OUT of the
+    attribute, which is a different attack. They leave "javascript:alert(1)" exactly as
+    it is, and it is still a working href. Only an allowlist of schemes closes it.
+
+    Trim first, then lower, because leading whitespace and mixed case are both accepted
+    by browsers in a URL scheme. Relative URLs are deliberately NOT allowed here: every
+    caller is rendering a link OUT to a marketplace, so "" (render no link) is the
+    correct answer for anything else."""
+    s = str(u or "").strip()
+    return s if s.lower().startswith(("http://", "https://")) else ""
+
+
 def _csv_safe(v):
     """Neutralize spreadsheet formula injection: a cell that begins with = + - @ or
     a control char is prefixed with an apostrophe so Excel/Sheets/Numbers treat it
@@ -2917,6 +2934,8 @@ def _inject_auth():
         "auth_enabled": not _auth_disabled(),
         "can_view": (lambda r: _perm_check(r, "view")),
         "can_edit": (lambda r: _perm_check(r, "edit")),
+        # Templates rendering a stored URL into an href must pass it through this.
+        "external_http_url": _external_http_url,
     }
 
 
@@ -6914,8 +6933,12 @@ def update_scan(record_id):
     record = ScanRecord.query.get_or_404(record_id)
     data = request.get_json() or {}
     new_data = data.get("extracted_data", {})
-    # Strip legacy/internal keys that should never be stored as editable fields
-    for hidden in ("card_lookup", "__roi_fields_used"):
+    # Strip legacy/internal keys that should never be stored as editable fields.
+    # tcgplayer_link is here because it is not a field: it is a URL that gets rendered
+    # into an href, and /save_tcgplayer_link already refuses anything that is not
+    # http(s). This route merged the whole extracted_data dict, so it was a second,
+    # unvalidated door onto the same key -- the scheme check was on the wrong one.
+    for hidden in ("card_lookup", "__roi_fields_used", "tcgplayer_link"):
         new_data.pop(hidden, None)
     record.extracted_data = {**(record.extracted_data or {}), **new_data}
     db.session.commit()
