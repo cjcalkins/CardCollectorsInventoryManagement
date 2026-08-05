@@ -127,10 +127,52 @@ app = Flask(__name__, template_folder="templates")
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 # ── Security hardening ──
-# Stable secret for any signed cookies/sessions (none today, but future-proof and
-# needed by some extensions). Override with SECRET_KEY to keep it stable across
-# restarts; otherwise a fresh random key is used each launch.
-app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or os.urandom(24).hex()
+def _persisted_secret_key():
+    """Read (or create once) the session-signing key kept beside the application.
+
+    This exists because the key has to be the same in every process. The __main__
+    block below keeps a copy in app_settings, which works when the app is launched
+    with `python app.py` — but a WSGI server imports this module and never runs that
+    block, so under gunicorn every worker used to mint its own os.urandom() key. A
+    session or CSRF token issued by one worker is then rejected by the next, which
+    presents as random logouts and "your session's security token expired" on a form
+    that was filled in seconds ago. It also meant every restart logged everyone out.
+
+    A file rather than the database because this runs at import, before db.create_all()
+    and load_settings() have had a chance to run under any launch method. Reaching for
+    the DB here would be an ordering hazard for the sake of a value that does not need
+    to be in the DB.
+
+    os.path.dirname(__file__) rather than BASE_DIR: that constant is defined further
+    down this file and does not exist yet. instance/ is Flask's conventional spot for
+    per-deployment state and is already gitignored (twice: /instance/ and *.key).
+    0600 because anyone who reads this file can mint a session cookie for any user."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "instance",
+                        "session_secret.key")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            existing = fh.read().strip()
+        if existing:
+            return existing
+    except OSError:
+        pass
+    key = os.urandom(32).hex()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # Create with 0600 already set rather than chmod-ing after: writing first and
+        # tightening second leaves a window where the key is world-readable.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(key)
+    except OSError:
+        # Read-only deployment: fall back to a per-process key. Single-worker still
+        # works; multi-worker degrades to the old behaviour rather than failing to boot.
+        pass
+    return key
+
+
+# Env wins, so a container or systemd unit can inject the key without any file.
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or _persisted_secret_key()
 
 # Cap request bodies to blunt memory/disk exhaustion from oversized uploads.
 # High-DPI PDF/image imports are expected, so the default is generous and tunable
@@ -15121,9 +15163,14 @@ if __name__ == "__main__":
         # is generated once and stored in app_settings.
         _sk = os.environ.get("SECRET_KEY")
         if not _sk:
+            # An existing install's stored key still wins, so upgrading to the
+            # import-time file does NOT invalidate anyone's session.
             _sk = get_setting("FLASK_SECRET_KEY", "")
             if not _sk:
-                _sk = os.urandom(32).hex()
+                # Adopt the key already loaded at import instead of minting a second
+                # one, so the file and app_settings hold the same value from here on
+                # and it stops mattering which launch path a given start took.
+                _sk = app.config["SECRET_KEY"]
                 try:
                     set_setting("FLASK_SECRET_KEY", _sk)
                 except Exception:
