@@ -30,6 +30,39 @@ _CONDITIONS = [
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# IMAP command safety
+# ──────────────────────────────────────────────────────────────────────────────
+# imaplib does NOT validate its arguments. Read from the installed runtime,
+# IMAP4._command builds the wire bytes as
+#
+#     data = data + b' ' + arg      ...      self.send(data + CRLF)
+#
+# with no check for CR or LF anywhere, and IMAP4._quote (which login uses for the
+# password) escapes only backslash and double-quote. So a CRLF inside ANY of these
+# values ends the current command line and starts a new one that the server executes
+# as ours -- 'INBOX"\r\nZ1 DELETE "Archive' is two commands, not one folder name.
+#
+# All five reachable values are covered, not just the two the audit named. Note that
+# IMAP4.login passes the USERNAME through unquoted, so it is the least protected of
+# the lot despite looking like the most ordinary.
+_IMAP_FORBIDDEN = ("\r", "\n", "\x00")
+
+
+def _imap_reject(**fields):
+    """Return an error string naming the first field carrying a control character
+    that would break out of its IMAP command, or None when all are safe.
+
+    Reject rather than strip: silently removing characters from a folder name
+    selects a DIFFERENT mailbox than the operator asked for, and quietly reading
+    the wrong inbox is a worse outcome than a visible error."""
+    for name, value in fields.items():
+        if any(ch in str(value or "") for ch in _IMAP_FORBIDDEN):
+            return (f"The {name} contains a line break or control character, which "
+                    f"cannot be sent to an IMAP server. Remove it and save again.")
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Connection
 # ──────────────────────────────────────────────────────────────────────────────
 def _connect(cfg):
@@ -40,6 +73,12 @@ def _connect(cfg):
     if not host or not user or not pwd:
         missing = [k for k, v in (("host", host), ("username", user), ("password", pwd)) if not v]
         return None, f"Missing: {', '.join(missing)}"
+
+    # Checked here rather than only at the save route, because these values also
+    # arrive from rows saved before this check existed.
+    bad = _imap_reject(username=user, password=pwd)
+    if bad:
+        return None, bad
 
     try:
         port = int(cfg.get("port") or (993 if cfg.get("use_ssl", True) else 143))
@@ -85,6 +124,10 @@ def test_imap(cfg):
     if err:
         return {"ok": False, "message": err}
     folder = str(cfg.get("folder", "INBOX") or "INBOX")
+    bad = _imap_reject(folder=folder)
+    if bad:
+        _safe_logout(conn)
+        return {"ok": False, "message": bad}
     try:
         typ, data = conn.select(f'"{folder}"', readonly=True)
         if typ != "OK":
@@ -121,6 +164,14 @@ def fetch_sale_emails(cfg, since_uid=0, limit=FETCH_LIMIT):
         return {"ok": False, "message": err, "emails": [], "max_uid": since_uid}
 
     folder = str(cfg.get("folder", "INBOX") or "INBOX")
+    # The search filters are checked here too: they reach conn.uid("SEARCH", ...)
+    # below, which is the same unvalidated _command path as select().
+    bad = _imap_reject(folder=folder,
+                       **{"sender filter": cfg.get("sender_filter", ""),
+                          "subject filter": cfg.get("subject_filter", "")})
+    if bad:
+        _safe_logout(conn)
+        return {"ok": False, "message": bad, "emails": [], "max_uid": since_uid}
     mark_seen = bool(cfg.get("mark_seen", True))
     emails, max_uid = [], since_uid
     try:
