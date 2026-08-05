@@ -4400,7 +4400,10 @@ def _builder_csv(groups):
 
     buf = _io.StringIO()
     w = _csv.writer(buf)
-    w.writerow(header)
+    # The header is user-influenced, not just the body: `ordered` above is built from
+    # extracted_data.keys(), and /update_scan lets an inventory:edit user name a field
+    # whatever they like. The fixed strings around it are unaffected by _csv_safe.
+    w.writerow([_csv_safe(h) for h in header])
     for label, i in flat:
         r = recs.get(i)
         if not r:
@@ -4732,7 +4735,9 @@ def analytics_export():
     w = _csv.writer(buf)
     group_label = next((d["label"] for d in _analytics_available_dimensions([])
                         if d["key"] == p["group_by"]), p["group_by"] or "All")
-    w.writerow([group_label] + [m["label"] for m in result["metrics"]])
+    # group_label falls back to p["group_by"], which _analytics_params only .strip()s --
+    # unlike "source" it is not checked against a whitelist, so it is request data.
+    w.writerow([_csv_safe(group_label)] + [_csv_safe(m["label"]) for m in result["metrics"]])
     for row in result["rows"]:
         w.writerow([_csv_safe(row["group"])] + [_csv_safe(row["values"][m["key"]]) for m in result["metrics"]])
     w.writerow([])
@@ -5985,8 +5990,9 @@ def inventory_export_csv():
     output = io.StringIO()
     writer = csv.writer(output, lineterminator="\r\n")
 
-    # Header row
-    writer.writerow([label for label, _ in columns])
+    # Header row. The labels are derived from the caller's `columns` parameter
+    # (entry_<field> -> "<Field>"), and .title() does not disarm a leading "=".
+    writer.writerow([_csv_safe(label) for label, _ in columns])
 
     # Data rows
     for record in records:
@@ -14126,9 +14132,12 @@ def shops_tcgplayer_export_csv():
 
     buf = _io.StringIO()
     writer = _csv.DictWriter(buf, fieldnames=TCGPLAYER_CSV_COLUMNS, extrasaction="ignore")
-    writer.writeheader()
+    writer.writeheader()   # fieldnames are a module constant, so the header is literal
     for row in rows:
-        writer.writerow(row["csv"])
+        # Product Line / Set Name / Product Name come from extracted_data via
+        # _tcgplayer_rows, so every cell is user-influenced. Keys are left alone so
+        # extrasaction="ignore" still matches on fieldnames.
+        writer.writerow({k: _csv_safe(v) for k, v in row["csv"].items()})
     csv_text = buf.getvalue()
 
     # Side effects: backfill the TCGplayer Id + mark a draft listing.
