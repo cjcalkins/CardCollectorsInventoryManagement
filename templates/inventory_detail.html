@@ -758,7 +758,14 @@
                 <!-- end OCR Identify panel -->
 
                 <!-- ==================== TCGPLAYER LINK PANEL ==================== -->
-                {% set tcg_link = record.extracted_data.get('tcgplayer_link') or (record.extracted_data.get('tcgplayer') or {}).get('url') or '' %}
+                {# external_http_url, not escaping: this value lands in an href below, so
+                   the scheme is what matters and autoescaping does nothing to it. Applied
+                   here rather than at the href so the {% if tcg_link %} further down also
+                   sees the sanitised value -- a rejected URL then renders the "no link
+                   set" branch instead of a dead anchor, and does not get round-tripped
+                   back into the edit input either. Also cleans rows that were poisoned
+                   before /update_scan stopped accepting this key. #}
+                {% set tcg_link = external_http_url(record.extracted_data.get('tcgplayer_link') or (record.extracted_data.get('tcgplayer') or {}).get('url') or '') %}
                 <div class="card detail-card" id="tcgLinkCard">
                     <div class="card-header bg-light d-flex justify-content-between align-items-center">
                         <strong><i class="fas fa-tag me-2"></i>TCGPlayer Link</strong>
@@ -2675,9 +2682,17 @@
             return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;')
                                   .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
         }
+        // Mirrors _external_http_url() on the server. esc() above is not a substitute:
+        // it stops a value breaking out of the attribute and leaves the scheme alone,
+        // so "javascript:..." survives it intact and still works as an href.
+        function externalHttpUrl(u) {
+            const s = String(u ?? '').trim();
+            return /^https?:\/\//i.test(s) ? s : '';
+        }
         function showEdit() { edit.style.display = ''; view.style.display = 'none'; input.focus(); input.select(); }
         function showView() { edit.style.display = 'none'; view.style.display = ''; }
-        function renderView(url) {
+        function renderView(rawUrl) {
+            const url = externalHttpUrl(rawUrl);
             if (url) {
                 view.innerHTML = `<a href="${esc(url)}" target="_blank" rel="noopener" id="tcgLinkAnchor" class="text-break">`
                     + `<i class="fas fa-external-link-alt me-1"></i><span id="tcgLinkText">${esc(url)}</span></a>`;
