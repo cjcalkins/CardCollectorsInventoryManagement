@@ -11915,6 +11915,13 @@ def _move_db_slot(new_path):
 
 @app.route("/settings/storage/update", methods=["POST"])
 def storage_update():
+    # Relocating where the app keeps its data is an operator action, not an editing
+    # one. The route map only requires the grantable 'storage' resource, and the
+    # setup wizard seeds the Editor role with edit on every resource — so without
+    # this a non-admin could repoint UPLOAD_FOLDER and read whatever lands under it.
+    denied = _require_admin("Administrator access is required to move a storage location.")
+    if denied:
+        return denied
     slot = (request.form.get("slot") or "").strip()
     new_path = (request.form.get("path") or "").strip()
     if slot not in STORAGE_SLOTS:
