@@ -64,3 +64,18 @@ certs/
 *.pfx
 .env.*
 !.env.sample
+
+# Migration bundles, matched by NAME rather than by location — the same reasoning as
+# the key patterns above. These carry FLASK_SECRET_KEY, marketplace OAuth tokens and
+# the mailbox password (app.py:7010 says so), and today they are ignored only because
+# UPLOAD_FOLDER happens to default to uploads/. /settings/storage lets an admin
+# repoint that root at any folder that is not an ancestor of the app — including one
+# INSIDE the repo, e.g. ./card_data — and the bundles were committable from there.
+# This repo has already published secrets once by committing them.
+migration_exports/
+ccim_migration_*.tar.gz
+
+# Local storage layout written next to app.py. Not a secret, but it describes this
+# install's directory paths and is never meant to be shared. Root-anchored so it
+# cannot swallow a same-named file elsewhere in the tree.
+/storage_config.json
