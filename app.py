@@ -11805,6 +11805,49 @@ def _migrate_tree(src, dst):
     shutil.rmtree(src, ignore_errors=True)
 
 
+# Slots whose contents are served over HTTP: /uploads/<path> reads UPLOAD_FOLDER and
+# /temp_cards, /temp_split, /temp_pdf read the temp subfolders — all of them to ANY
+# signed-in user, which uploaded_file documents as deliberate ("every card image is
+# served through it"). So wherever these two roots point, everything underneath them
+# becomes downloadable. Relocating them is not merely a storage preference; it moves a
+# disclosure boundary. "roi" is excluded because no route serves it: templates are read
+# through load_template, which confines them with _within_dir.
+_HTTP_SERVED_SLOTS = ("uploads", "temp")
+
+
+def _storage_target_conflict(slot, target):
+    """Reject a storage destination that would publish files which are not card images.
+    Returns an operator-facing error string, or None when the target is acceptable.
+
+    One invariant, checked from both directions: a served root must not contain the
+    application source or the database, and the database must not be placed inside a
+    served root. Without it, slot=uploads&path=. repoints UPLOAD_FOLDER at BASE_DIR and
+    GET /uploads/inventory.db hands the whole database — password hashes, API keys,
+    marketplace tokens — to any signed-in user.
+
+    Deliberately a containment test rather than a blocklist of scary directories: the
+    question is not whether the target looks dangerous, it is whether anything that must
+    stay private ends up underneath something the web server will serve."""
+    roots = app.config.get("STORAGE_ROOTS", {}) or {}
+    db_path = roots.get("db", "")
+    if slot in _HTTP_SERVED_SLOTS:
+        # _within_dir(base, target) is "target is inside base", so the target root is
+        # the base here: we are asking what the new root would come to contain.
+        if _within_dir(target, BASE_DIR):
+            return ("That location contains the application's own files, which would "
+                    "become downloadable by any signed-in user. Pick a dedicated folder.")
+        if db_path and _within_dir(target, db_path):
+            return ("That location contains the database, which would become "
+                    "downloadable by any signed-in user. Pick a dedicated folder.")
+    elif slot == "db":
+        for served in _HTTP_SERVED_SLOTS:
+            root = roots.get(served, "")
+            if root and _within_dir(root, target):
+                return (f"That location is inside the {served} folder, whose contents are "
+                        "downloadable by any signed-in user. Pick a folder outside it.")
+    return None
+
+
 def _move_folder_slot(slot, new_path):
     """Relocate a folder slot (uploads/temp/roi): copy its owned subfolders to
     the new root, delete the originals, then repoint the live + persisted
@@ -11815,6 +11858,11 @@ def _move_folder_slot(slot, new_path):
 
     if os.path.abspath(old_root) == os.path.abspath(new_root):
         return {"status": "success", "message": "Location unchanged.", "needs_restart": False}
+
+    # Before makedirs, so a refused target doesn't leave an empty directory behind.
+    conflict = _storage_target_conflict(slot, new_root)
+    if conflict:
+        return {"status": "error", "message": conflict}
 
     os.makedirs(new_root, exist_ok=True)
     if not os.access(new_root, os.W_OK):
@@ -11860,6 +11908,13 @@ def _move_db_slot(new_path):
 
     if new_abs == old_path:
         return {"status": "success", "message": "Location unchanged.", "needs_restart": False}
+
+    # The other direction of the same invariant: don't drop the database inside a
+    # folder the web server hands out. Checked before makedirs so a refused target
+    # doesn't leave an empty directory behind.
+    conflict = _storage_target_conflict("db", new_abs)
+    if conflict:
+        return {"status": "error", "message": conflict}
 
     new_dir = os.path.dirname(new_abs) or BASE_DIR
     os.makedirs(new_dir, exist_ok=True)
@@ -11915,6 +11970,13 @@ def _move_db_slot(new_path):
 
 @app.route("/settings/storage/update", methods=["POST"])
 def storage_update():
+    # Relocating where the app keeps its data is an operator action, not an editing
+    # one. The route map only requires the grantable 'storage' resource, and the
+    # setup wizard seeds the Editor role with edit on every resource — so without
+    # this a non-admin could repoint UPLOAD_FOLDER and read whatever lands under it.
+    denied = _require_admin("Administrator access is required to move a storage location.")
+    if denied:
+        return denied
     slot = (request.form.get("slot") or "").strip()
     new_path = (request.form.get("path") or "").strip()
     if slot not in STORAGE_SLOTS:
