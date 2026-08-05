@@ -38,6 +38,11 @@ import urllib.request
 import urllib.parse
 import urllib.error
 from datetime import datetime, timedelta
+# Imported as a bare name ON PURPOSE. Both Cardmarket request builders assign a local
+# called `xml`, so `import xml.sax.saxutils` and a `xml.sax.saxutils.escape(...)` call
+# inside them would resolve to that local -- Python marks `xml` local for the whole
+# function body, so it would raise UnboundLocalError before the document is even built.
+from xml.sax.saxutils import escape as _xml_escape
 
 DEFAULT_TIMEOUT = 30
 SHOPIFY_API_VERSION = "2026-01"
@@ -987,15 +992,32 @@ class CardmarketProvider(ShopProvider):
         is_foil = "true" if payload.get("foil") else "false"
         price = f"{float(payload.get('price') or 0):.2f}"
         count = int(payload.get("quantity") or 1)
+        # Every interpolated TEXT value is escaped, not just the one that is currently
+        # attacker-controlled. product_id comes from extracted_data, which /update_scan
+        # lets an inventory:edit user write freely, so without this a value like
+        # "1</idProduct><idLanguage>7</idLanguage><comments>" rewrites a document that
+        # is then signed with the operator's OAuth credentials -- the signature covers
+        # the OAuth parameters, not the body.
+        #
+        # sku is app-generated (SHOP_SKU_PREFIX + record.id) and cond is a CONDITION_MAP
+        # *value* rather than the caller's grade label, so neither is reachable today.
+        # They are escaped anyway because escaping an app-generated string costs nothing,
+        # and the alternative is that whoever changes where sku comes from has to
+        # rediscover this. count/price are already int()/float()-coerced above and need
+        # no escaping; the remaining tags are literals.
+        #
+        # Escaping rather than int()-coercing product_id: escaping cannot reject a value
+        # Cardmarket would have accepted, and it is the same treatment the string fields
+        # need anyway. A hostile id survives as inert text and the API refuses it.
         xml = (
             '<?xml version="1.0" encoding="UTF-8"?>'
             "<request><article>"
-            f"<idProduct>{product_id}</idProduct>"
+            f"<idProduct>{_xml_escape(product_id)}</idProduct>"
             "<idLanguage>1</idLanguage>"
-            f"<comments>{sku}</comments>"
+            f"<comments>{_xml_escape(str(sku))}</comments>"
             f"<count>{count}</count>"
             f"<price>{price}</price>"
-            f"<condition>{cond}</condition>"
+            f"<condition>{_xml_escape(str(cond))}</condition>"
             f"<isFoil>{is_foil}</isFoil>"
             "<isSigned>false</isSigned><isPlayset>false</isPlayset>"
             "</article></request>"
@@ -1016,8 +1038,12 @@ class CardmarketProvider(ShopProvider):
         id_article = (listing.extra or {}).get("id_article") or listing.external_id
         if not id_article:
             return {"ok": False, "message": "No Cardmarket article id on record."}
+        # id_article reaches here from the DB, but its provenance runs back to the user:
+        # push() stores external_id as str(art or product_id), so when Cardmarket does
+        # not return an idArticle the fallback is the caller's own product_id. Escaped
+        # for that path. count is int()-coerced inline.
         xml = ('<?xml version="1.0" encoding="UTF-8"?>'
-               f"<request><article><idArticle>{id_article}</idArticle>"
+               f"<request><article><idArticle>{_xml_escape(str(id_article))}</idArticle>"
                f"<count>{int(listing.quantity or 1)}</count></article></request>")
         url = f"{self._base()}/output.json/stock"
         headers = self._oauth_header("DELETE", url)
