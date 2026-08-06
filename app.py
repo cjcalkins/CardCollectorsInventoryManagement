@@ -7759,11 +7759,31 @@ def save_tcgplayer_link(record_id):
     })
 
 
+def _detach_record_references(record_ids):
+    """Null the soft links other tables keep to these records before deletion.
+
+    sale_events.record_id and order_items.record_id are audit/fulfillment
+    rows documented to outlive the inventory record (both columns nullable by
+    design), but neither has an ORM cascade or a DB-level ON DELETE action —
+    so with PRAGMA foreign_keys=ON, deleting a sold or ordered record raised
+    FOREIGN KEY constraint failed (HTTP 500). Listings are unaffected: their
+    relationship carries delete-orphan cascade. Runs inside the caller's
+    transaction, so the detach and the delete commit together."""
+    if not record_ids:
+        return
+    SaleEvent.query.filter(SaleEvent.record_id.in_(record_ids)).update(
+        {"record_id": None}, synchronize_session=False)
+    from shipping_models import OrderItem
+    OrderItem.query.filter(OrderItem.record_id.in_(record_ids)).update(
+        {"record_id": None}, synchronize_session=False)
+
+
 @app.route("/delete_scan/<int:record_id>", methods=["POST"])
 def delete_scan(record_id):
     record = ScanRecord.query.get_or_404(record_id)
     image_path      = record.image_path
     image_path_back = record.image_path_back
+    _detach_record_references([record.id])
     db.session.delete(record)
     db.session.commit()
     remove_file_if_exists(image_path)
@@ -7784,6 +7804,7 @@ def delete_scans():
         return jsonify({"status": "error", "message": "No matching records found"}), 404
 
     image_paths = [r.image_path for r in records] + [r.image_path_back for r in records]
+    _detach_record_references([r.id for r in records])
     for record in records:
         db.session.delete(record)
     db.session.commit()
