@@ -481,6 +481,10 @@ def load_storage_config():
             if isinstance(v, str) and v.strip():
                 cfg[k] = v.strip()
         pending = [p for p in (data.get("pending_deletions") or []) if isinstance(p, str)]
+        mv = data.get("pending_db_move")
+        if isinstance(mv, dict) and isinstance(mv.get("src"), str) \
+                and isinstance(mv.get("dst"), str):
+            cfg["pending_db_move"] = {"src": mv["src"], "dst": mv["dst"]}
     except (OSError, ValueError):
         pass
     cfg["pending_deletions"] = pending
@@ -491,6 +495,8 @@ def save_storage_config(cfg):
     """Persist the storage config atomically."""
     out = {k: cfg.get(k, DEFAULT_STORAGE[k]) for k in DEFAULT_STORAGE}
     out["pending_deletions"] = list(cfg.get("pending_deletions") or [])
+    if cfg.get("pending_db_move"):
+        out["pending_db_move"] = cfg["pending_db_move"]
     tmp = STORAGE_CONFIG_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(out, fh, indent=2)
@@ -12974,22 +12980,22 @@ def _move_db_slot(new_path):
     except OSError as exc:
         return {"status": "error", "message": f"Copy failed: {exc}"}
 
-    # Persist the new location and queue the old files for deletion on next
-    # start (safe once we're provably running on the new copy).
+    # Persist the new location and stage the move. NOT a deletion queue: the
+    # live engine never repoints (Flask-SQLAlchemy builds engines at init), so
+    # every write between now and the restart lands in the OLD file. The next
+    # start re-copies it — carrying those writes — before deleting it (see
+    # finalize_pending_db_move). The copy above just proved the target
+    # writable and staged an initial snapshot.
     STORAGE["db"] = new_path
-    pend = list(STORAGE.get("pending_deletions") or [])
-    for sfx in ("", "-wal", "-shm"):
-        s = old_path + sfx
-        if os.path.exists(s):
-            pend.append(s)
-    STORAGE["pending_deletions"] = pend
+    STORAGE["pending_db_move"] = {"src": old_path, "dst": new_abs}
     save_storage_config(STORAGE)
     apply_storage_config(STORAGE)  # updates the URI for the next start
 
     return {"status": "success", "needs_restart": True,
             "message": (f"Database copied to {new_abs}. Restart the app to switch to it — "
-                        "until you restart, changes still write to the old file, which is "
-                        "removed automatically on the next start.")}
+                        "until you restart, changes keep writing to the current file; the "
+                        "restart carries them over to the new location and then removes "
+                        "the old file.")}
 
 
 @app.route("/settings/storage/update", methods=["POST"])
@@ -13027,9 +13033,55 @@ def storage_update():
     return jsonify(result), code
 
 
+def finalize_pending_db_move():
+    """Complete a DB relocation staged by _move_db_slot. MUST run at startup
+    before anything opens a database (it is called ahead of init_db in
+    __main__): the old file took every write made after the move, so it is
+    re-copied — SQLite sidecars included — over the staged snapshot, and only
+    then deleted. On any copy failure the record stays for the next start and
+    nothing is deleted; the staged (stale) copy remains a valid database."""
+    mv = STORAGE.get("pending_db_move") or {}
+    src, dst = mv.get("src"), mv.get("dst")
+    if not (src and dst):
+        return
+    src_abs, dst_abs = os.path.abspath(src), os.path.abspath(dst)
+    current_db = os.path.abspath(_sqlite_uri_to_path(app.config["SQLALCHEMY_DATABASE_URI"]))
+    # Superseded move: if the configured DB is the old path again (the operator
+    # moved back before restarting), touching the files would destroy the live
+    # database. Drop the record and leave everything alone.
+    if current_db == src_abs or src_abs == dst_abs:
+        STORAGE.pop("pending_db_move", None)
+        try:
+            save_storage_config(STORAGE)
+        except OSError:
+            pass
+        return
+    try:
+        if os.path.exists(src_abs):
+            for sfx in ("", "-wal", "-shm"):
+                s, d = src_abs + sfx, dst_abs + sfx
+                if os.path.exists(s):
+                    shutil.copy2(s, d)
+                elif os.path.exists(d):
+                    os.remove(d)   # stale sidecar from the staging snapshot
+            for sfx in ("", "-wal", "-shm"):
+                s = src_abs + sfx
+                if os.path.exists(s):
+                    os.remove(s)
+    except OSError:
+        return   # retry on the next start; old file untouched
+    STORAGE.pop("pending_db_move", None)
+    try:
+        save_storage_config(STORAGE)
+    except OSError:
+        pass
+
+
 def process_pending_deletions():
     """Remove files queued for deletion by a previous DB move, now that we're
-    running on the new location. Called once at startup."""
+    running on the new location. Called once at startup. Kept for configs
+    written before staged moves (finalize_pending_db_move) replaced this
+    queue for the DB slot."""
     pend = list(STORAGE.get("pending_deletions") or [])
     if not pend:
         return
@@ -16380,8 +16432,10 @@ def _ensure_self_signed_cert(cert_dir, hostnames, ips):
 
 
 if __name__ == "__main__":
-    # Complete any deferred cleanup from a previous DB relocation now that we're
-    # (re)starting on the current configured database.
+    # Complete a staged DB relocation FIRST — before init_db opens anything —
+    # so writes made after the move (which land in the old file) are carried
+    # over; then run any legacy deferred deletions.
+    finalize_pending_db_move()
     process_pending_deletions()
 
     init_db()
