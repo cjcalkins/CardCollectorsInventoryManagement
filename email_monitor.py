@@ -25,6 +25,13 @@ from email.header import decode_header, make_header
 DEFAULT_TIMEOUT = 30
 FETCH_LIMIT = 50
 
+# Consecutive UID FETCH failures per message, in memory. After FETCH_SKIP_AFTER
+# refusals the message is treated as permanently unfetchable and skipped (with
+# a note in the result message) so it cannot block the mailbox behind it
+# forever. A restart just grants another round of attempts.
+_FETCH_FAILS = {}
+FETCH_SKIP_AFTER = 3
+
 _CONDITIONS = [
     "near mint", "lightly played", "moderately played", "heavily played",
     "damaged", "mint", "excellent", "good", "played", "poor",
@@ -214,6 +221,35 @@ def _search_criteria(cfg):
     return crit
 
 
+def mailbox_top_uid(cfg):
+    """Highest existing UID in the configured folder, or None on any failure.
+
+    Used to bootstrap the poll cursor when the monitor has never run
+    (last_uid == 0): without this, the oldest-first fetch window would walk
+    the mailbox's ENTIRE history and process every historical sale
+    notification as a new sale. Read-only; no flags are touched."""
+    conn, err = _connect(cfg)
+    if err:
+        return None
+    folder = str(cfg.get("folder", "INBOX") or "INBOX")
+    if _imap_reject(folder=folder):
+        _safe_logout(conn)
+        return None
+    try:
+        typ, _ = conn.select(f'"{folder}"', readonly=True)
+        if typ != "OK":
+            return None
+        typ, data = conn.uid("SEARCH", None, "ALL")
+        if typ != "OK":
+            return None
+        uids = [int(u) for u in (data[0].split() if data and data[0] else [])]
+        return max(uids) if uids else 0
+    except Exception:
+        return None
+    finally:
+        _safe_logout(conn)
+
+
 def fetch_sale_emails(cfg, since_uid=0, limit=FETCH_LIMIT):
     """
     Fetch messages matching the sender/subject filters with UID > since_uid.
@@ -252,13 +288,25 @@ def fetch_sale_emails(cfg, since_uid=0, limit=FETCH_LIMIT):
         # The remainder is picked up on the next poll.
         uids = uids[:limit]
 
+        skipped = []
         for uid in uids:
             typ, msgdata = conn.uid("FETCH", str(uid), "(RFC822)")
             if typ != "OK" or not msgdata or not msgdata[0]:
                 # Stop, don't skip: a later success would push max_uid past
                 # this message and it would never be fetched again. Return
-                # what we have; this UID is retried on the next poll.
-                break
+                # what we have; this UID is retried on the next poll — unless
+                # the server has now refused it FETCH_SKIP_AFTER times, in
+                # which case it is permanently unfetchable (oversized/corrupt)
+                # and stopping forever would block every email behind it.
+                fails = _FETCH_FAILS.get(uid, 0) + 1
+                _FETCH_FAILS[uid] = fails
+                if fails < FETCH_SKIP_AFTER:
+                    break
+                _FETCH_FAILS.pop(uid, None)
+                skipped.append(uid)
+                max_uid = max(max_uid, uid)
+                continue
+            _FETCH_FAILS.pop(uid, None)
             raw = msgdata[0][1]
             parsed = _parse_message(raw)
             parsed["uid"] = uid
@@ -270,7 +318,9 @@ def fetch_sale_emails(cfg, since_uid=0, limit=FETCH_LIMIT):
                 except Exception:
                     pass
 
-        return {"ok": True, "message": f"Fetched {len(emails)} message(s).",
+        note = (f" Skipped {len(skipped)} unfetchable message(s) "
+                f"(uid {', '.join(map(str, skipped))}).") if skipped else ""
+        return {"ok": True, "message": f"Fetched {len(emails)} message(s).{note}",
                 "emails": emails, "max_uid": max_uid}
     except Exception as exc:
         return {"ok": False, "message": f"Fetch error — {exc}", "emails": [], "max_uid": since_uid}

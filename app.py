@@ -3177,8 +3177,8 @@ def _resource_for_path(path):
         "search_by_image": "image_search", "search_by_image_page": "image_search",
         "reference": "reference",
         "shops": "shops", "shop": "shops",
-        # Shipping blueprint is dormant (unregistered) today; map it now so the gate
-        # covers /shipping/* the moment INTEGRATION.md wires it up. Reuses shops.
+        # Shipping blueprint is registered at startup (see register_blueprint
+        # further down); /shipping/* rides the shops permission.
         "shipping": "shops",
         "justtcg_fetch": "pricing", "justtcg_search_manual": "pricing",
         "tcg_save_url": "pricing", "tcg_clear_url": "pricing",
@@ -5217,20 +5217,35 @@ def _analytics_value_rows(source, f_game, f_template, search, group_by):
     else:
         gexpr = ScanRecord.id   # placeholder; the group is the constant "All"
 
-    q = (db.session.query(gexpr, _json_field("intake_price"),
+    # json_extract flattens JSON booleans to 0/1, but the Python path bucketed
+    # them as "False"/"True" (legacy boolean holographic values exist in the
+    # wild — there is a migration route for them). Select json_type alongside
+    # on SQLite so true/false keep their old labels.
+    from sqlalchemy import literal
+    generic_key = bool(group_by) and group_by not in ("__status__", "template")
+    if generic_key and db.engine.dialect.name == "sqlite":
+        gtype = _f.json_type(ScanRecord.extracted_data, "$." + group_by)
+    else:
+        gtype = literal(None)
+
+    q = (db.session.query(gexpr, gtype, _json_field("intake_price"),
                           _json_field("current_value"), _json_field("sold_price"))
          .filter(*_analytics_conditions(source, f_game, f_template)))
     if search:
         q = q.filter(_scan_search_condition(search))
 
     out = []
-    for gv, ip, cv, sp in q.all():
+    for gv, gt, ip, cv, sp in q.all():
         if not group_by:
             g = "All"
         elif group_by == "__status__":
             g = "Held" if bool(gv) else "Sold"
         elif group_by == "template":
             g = gv or "—"
+        elif gt == "true":
+            g = "True"
+        elif gt == "false":
+            g = "False"
         else:
             g = (str(gv).strip() if gv is not None else "") or "—"
         out.append((g, ip, cv, sp))
@@ -5349,15 +5364,33 @@ def _collection_counts(records):
 def _collection_groups_sql():
     """[(collection_key, display_name, count)] over every active record
     (held+sold), grouped in SQL — replaces hydrating the whole table to read
-    one JSON key. Display name is the MIN of the trimmed raw values sharing a
+    one JSON key.
+
+    Grouped by the RAW value in SQL and merged by Python .strip().lower():
+    SQLite's lower()/trim() are ASCII-only ('ÉLITE' -> 'Élite', newlines kept),
+    so a SQL-lowered key diverges from CollectionPrice.name_key and the other
+    Python-lowered keys, splitting non-ASCII collections and zeroing their lot
+    cost attribution. Display name is the MIN of the raw spellings sharing a
     key (deterministic; the old first-seen pick was query-order arbitrary)."""
     from sqlalchemy import func as _f
-    raw = _f.trim(_f.cast(_json_field("collection"), db.String))
-    key = _f.lower(raw)
-    rows = (db.session.query(key, _f.min(raw), _f.count())
+    raw = _json_field("collection")
+    rows = (db.session.query(raw, _f.count())
             .filter(*_analytics_conditions("all", "", ""))
-            .group_by(key).all())
-    return [(k, disp, n) for k, disp, n in rows if k]
+            .group_by(raw).all())
+    merged = {}
+    for disp, n in rows:
+        disp = str(disp).strip() if disp is not None else ""
+        if not disp:
+            continue
+        k = disp.lower()
+        cur = merged.get(k)
+        if cur is None:
+            merged[k] = [disp, n]
+        else:
+            cur[1] += n
+            if disp < cur[0]:
+                cur[0] = disp
+    return [(k, disp, n) for k, (disp, n) in merged.items()]
 
 
 def _record_effective_cost(rec, lot_prices, lot_counts):
@@ -5588,12 +5621,20 @@ def _report_now():
     return now.replace(tzinfo=None)
 
 
-def _local_to_utc_naive(dt, tz=None):
+_TZ_UNSET = object()   # "no zone passed" sentinel: None must mean machine-local
+
+
+def _local_to_utc_naive(dt, tz=_TZ_UNSET):
     """Convert a naive report-zone datetime to naive UTC, honouring that
     zone's DST at that moment. Report windows are wall-clock calendar (that is
     what their labels promise); every stored timestamp (scan_date, sales_log
-    "at", sold_at) is naive UTC — so the WINDOW converts, never the data."""
-    tz = tz if tz is not None else _report_tz()
+    "at", sold_at) is naive UTC — so the WINDOW converts, never the data.
+
+    Pass an explicit tz (which may be None = machine local, from one
+    _report_tz() read) to convert several bounds in the SAME zone; omitting it
+    reads the setting fresh."""
+    if tz is _TZ_UNSET:
+        tz = _report_tz()
     if tz is None:
         return dt.astimezone(timezone.utc).replace(tzinfo=None)
     return dt.replace(tzinfo=tz).astimezone(timezone.utc).replace(tzinfo=None)
@@ -5686,7 +5727,10 @@ def _report_build(start, end, label, period_type):
     # stored timestamps are naive UTC. Compare in UTC or a late-evening scan
     # lands in the neighbouring day/week/month. The dict below still reports
     # the local bounds.
-    q_start, q_end = _local_to_utc_naive(start), _local_to_utc_naive(end)
+    # One zone read for both bounds: each conversion re-reading the setting
+    # would let a mid-request save produce a window with mixed zones.
+    _tz = _report_tz()
+    q_start, q_end = _local_to_utc_naive(start, _tz), _local_to_utc_naive(end, _tz)
 
     # Two scoped loads replace the single full-table hydration. The
     # acquisitions, strategies, and unrealized passes all filter
@@ -7372,9 +7416,19 @@ def _container_max_int(album_key, json_key):
     """max(CAST(extracted_data->json_key AS INTEGER)) over one container, in
     SQL. Replaces the shape that hydrated every row of the container to read
     one JSON int — called once per created card, that made a k-card box
-    import O(k^2). CAST of non-numeric text yields 0/NULL, matching the old
-    int()-or-0 tolerance for the integer values these keys actually hold."""
+    import O(k^2). On SQLite, CAST of non-numeric text yields 0/NULL, matching
+    the old int()-or-0 tolerance; other backends raise on a bad cast, so they
+    keep the tolerant Python loop over a narrow projection instead."""
     from sqlalchemy import func as _f, Integer
+    if db.engine.dialect.name != "sqlite":
+        mx = 0
+        for (v,) in (db.session.query(_json_field(json_key))
+                     .filter(ScanRecord.album_key == album_key).all()):
+            try:
+                mx = max(mx, int(v or 0))
+            except (TypeError, ValueError):
+                pass
+        return mx
     v = (db.session.query(_f.max(_f.cast(_json_field(json_key), Integer)))
          .filter(ScanRecord.album_key == album_key).scalar())
     try:
@@ -8481,8 +8535,9 @@ def update_field_hidden():
 @app.route("/records_summary")
 def records_summary():
     """
-    Lightweight summary of all records for the copy-from dropdown
-    on the inventory detail page. Strips internal OCR keys.
+    Lightweight summary of all records (id/label/sub only) for the copy-from
+    dropdown on the inventory detail page. Per-record fields are served by
+    /records_summary/<id>/data, which strips the internal OCR keys.
     """
     rows = (
         ScanRecord.query
@@ -14413,7 +14468,7 @@ def _sellable_conditions():
     return (
         _f.coalesce(ScanRecord.is_catalog, False) == False,  # noqa: E712
         db.or_(empty_flag.is_(None),
-               _f.lower(_f.cast(empty_flag, db.String)).notin_(("true", "1"))),
+               _f.lower(_f.trim(_f.cast(empty_flag, db.String))).notin_(("true", "1"))),
     )
 
 
@@ -15588,6 +15643,36 @@ def shops_email_test():
 
 
 @app.route("/shops/email/check", methods=["POST"])
+def _email_cursor_bootstrap(m):
+    """Initialize the UID cursor to the mailbox's current top when the monitor
+    has never run (last_uid 0/None). Returns a status message when a bootstrap
+    happened (the caller must NOT fetch this pass), else None.
+
+    This is the guard against history replay: the oldest-first fetch window
+    walks forward from the cursor, so a zero cursor on a mailbox with months
+    of old sale notifications would process every one of them as a NEW sale —
+    decrementing inventory and delisting on other marketplaces. Only mail
+    arriving after the monitor is connected gets processed. Guarding at the
+    fetch sites (poller + manual check) covers every entry point, however the
+    monitor row came to be enabled."""
+    if int(m.last_uid or 0) > 0:
+        return None
+    top = email_monitor.mailbox_top_uid(_email_cfg(m))
+    if top is None:
+        m.status = "error"
+        m.status_detail = "Could not read the mailbox to initialize the cursor."
+        m.last_checked = utcnow()
+        db.session.commit()
+        return "Could not reach the mailbox; will retry."
+    m.last_uid = top
+    m.last_checked = utcnow()
+    m.status = "connected"
+    m.status_detail = (f"Cursor initialized at the current mailbox top (uid {top}); "
+                       "watching for new sales from here on.")
+    db.session.commit()
+    return m.status_detail
+
+
 def shops_email_check():
     denied = _require_admin()
     if denied:
@@ -15595,6 +15680,13 @@ def shops_email_check():
     m = _get_email_monitor(create=True)
     if not (m.host and m.username and m.password):
         return jsonify({"status": "error", "message": "Configure and save the mailbox first."}), 400
+
+    boot = _email_cursor_bootstrap(m)
+    if boot is not None:
+        ok = (m.status == "connected")
+        return jsonify({"status": "success" if ok else "error", "message": boot,
+                        "summary": {"emails": 0, "processed": 0, "unmatched": 0,
+                                    "duplicate": 0, "unparsed": 0, "details": []}}), (200 if ok else 502)
 
     res = email_monitor.fetch_sale_emails(_email_cfg(m), since_uid=m.last_uid or 0)
     if not res.get("ok"):
@@ -15664,6 +15756,10 @@ def _email_poll_once():
         return 60
     interval = max(int(m.poll_interval or 60), 15)
 
+    boot = _email_cursor_bootstrap(m)
+    if boot is not None:
+        return interval
+
     res = email_monitor.fetch_sale_emails(_email_cfg(m), since_uid=m.last_uid or 0)
     m.last_checked = utcnow()
     if not res.get("ok"):
@@ -15704,6 +15800,10 @@ def _email_poll_once():
             cursor = max(cursor, uid)
 
     m.last_uid = cursor
+    # Re-stamp: the pre-loop assignment is discarded by the rollback a failing
+    # email triggers, which left "last checked" stale on exactly the passes
+    # that need to look alive.
+    m.last_checked = utcnow()
     if failure:
         m.status = "error"
         m.status_detail = failure[:500]
@@ -16252,7 +16352,11 @@ def _ensure_self_signed_cert(cert_dir, hostnames, ips):
             san.append(x509.IPAddress(ipaddress.ip_address(ip)))
         except ValueError:
             pass
-    now = _dt.utcnow()
+    # utcnow() is models.utcnow — NOT _dt.utcnow: _dt is the datetime MODULE
+    # (aliased above), and the sed that retired datetime.utcnow corrupted this
+    # one aliased call site into an AttributeError. cryptography treats naive
+    # datetimes as UTC, so the value is unchanged.
+    now = utcnow()
     cert = (x509.CertificateBuilder()
             .subject_name(name).issuer_name(name)
             .public_key(key.public_key())
