@@ -15503,7 +15503,11 @@ def migrate_add_search_fts():
                     f"INSERT INTO {fts}({fts}, rowid, {col}) VALUES ('delete', old.id, old.{col}); "
                     f"INSERT INTO {fts}(rowid, {col}) VALUES (new.id, new.{col}); END")
                 n_base = conn.exec_driver_sql(f"SELECT count(*) FROM {base}").fetchone()[0]
-                n_fts = conn.exec_driver_sql(f"SELECT count(*) FROM {fts}").fetchone()[0]
+                # count(*) on an external-content FTS table is answered from the
+                # CONTENT table, so it can never detect a stale/empty index. The
+                # _docsize shadow table counts what is actually indexed.
+                n_fts = conn.exec_driver_sql(
+                    f"SELECT count(*) FROM {fts}_docsize").fetchone()[0]
                 if n_base != n_fts:
                     conn.exec_driver_sql(f"INSERT INTO {fts}({fts}) VALUES ('rebuild')")
         _FTS_READY.clear()   # re-probe: tables may have just appeared
