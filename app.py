@@ -1608,13 +1608,26 @@ _REFERENCE_APPLY_MAP = {
 }
 
 
-def _reference_upsert(rec):
+def _reference_upsert(rec, cache=None):
     """Insert or update a ReferenceCard from a normalized tcgcsv product dict
-    (see ref_sync.normalize_product). Keyed on the upstream productId."""
-    existing = ReferenceCard.query.filter_by(product_id=rec["product_id"]).first()
+    (see ref_sync.normalize_product). Keyed on the upstream productId.
+
+    cache: optional {product_id: ReferenceCard} the caller preloaded for its
+    whole payload. When given it replaces the per-row lookup entirely — one
+    SELECT per sync instead of one per card — and rows created here are added
+    to it so a duplicate productId later in the same payload updates the row
+    instead of inserting twice (the same net behavior autoflush gave the
+    per-row lookup)."""
+    pid = rec["product_id"]
+    if cache is not None:
+        existing = cache.get(pid)
+    else:
+        existing = ReferenceCard.query.filter_by(product_id=pid).first()
     if existing is None:
-        existing = ReferenceCard(product_id=rec["product_id"])
+        existing = ReferenceCard(product_id=pid)
         db.session.add(existing)
+        if cache is not None:
+            cache[pid] = existing
     existing.category_id  = rec["category_id"]
     existing.group_id     = rec["group_id"]
     existing.game         = rec["game"]
@@ -2800,7 +2813,8 @@ _EVENT_DETAILS = frozenset({
     "", "by_admin", "self_service", "role_changed", "activated", "deactivated",
     "password_reset", "role_and_password", "bad_password", "unknown_user", "inactive_user",
 })
-EVENT_LOG_KEEP = 5000          # rows retained; the oldest are pruned on write
+EVENT_LOG_KEEP = 5000          # rows retained; the oldest are pruned periodically
+_EVENT_PRUNE_EVERY = 64        # prune once per this many writes (amortized)
 _EVENT_TABLE_READY = {"ok": False}
 
 
@@ -2854,7 +2868,13 @@ def log_security_event(action, actor=None, target=None, detail="",
         )
         db.session.add(row)
         db.session.commit()
-        _prune_security_events()
+        # Amortized prune: every write used to COUNT the whole table. The id
+        # is monotonic (SQLite rowids never reuse a deleted max), so gating on
+        # it prunes once per _EVENT_PRUNE_EVERY writes; the table stays within
+        # EVENT_LOG_KEEP + _EVENT_PRUNE_EVERY rows instead of exactly
+        # EVENT_LOG_KEEP, and the other writes cost nothing extra.
+        if row.id is None or row.id % _EVENT_PRUNE_EVERY == 0:
+            _prune_security_events()
     except Exception:
         try:
             db.session.rollback()
@@ -2864,11 +2884,12 @@ def log_security_event(action, actor=None, target=None, detail="",
 
 def _prune_security_events():
     """Keep the newest EVENT_LOG_KEEP rows. Unbounded growth is its own availability
-    problem on a device with a small disk, which is what this app often runs on."""
+    problem on a device with a small disk, which is what this app often runs on.
+
+    The cutoff query below is also the "is there anything to prune" check: it
+    returns NULL until the table exceeds EVENT_LOG_KEEP rows, so the COUNT(*)
+    that used to precede it was pure overhead."""
     try:
-        n = db.session.query(SecurityEvent.id).count()
-        if n <= EVENT_LOG_KEEP:
-            return
         cutoff = (db.session.query(SecurityEvent.id)
                   .order_by(SecurityEvent.id.desc())
                   .offset(EVENT_LOG_KEEP).limit(1).scalar())
@@ -9121,8 +9142,17 @@ def _reference_sync_one_group(category_id, category_name, group_id, group_name, 
     if replace:
         ReferenceCard.query.filter_by(category_id=category_id, group_id=group_id).delete()
         db.session.flush()
+    # One SELECT for the whole set instead of one per card: preload every
+    # existing row for this payload's productIds (chunked under SQLite's
+    # bound-parameter limit) and hand the map to the upserts.
+    pids = [rec["product_id"] for rec in cards]
+    cache = {}
+    for i in range(0, len(pids), 500):
+        for rc in ReferenceCard.query.filter(
+                ReferenceCard.product_id.in_(pids[i:i + 500])).all():
+            cache[rc.product_id] = rc
     for rec in cards:
-        _reference_upsert(rec)
+        _reference_upsert(rec, cache=cache)
 
     rs = ReferenceSync.query.filter_by(category_id=category_id).first()
     if rs is None:
