@@ -9851,12 +9851,19 @@ def reference_upload_csv():
 # attribute, ...). Populate it by uploading an icon image or capturing one from a
 # scanned card; type detection then matches a card's icon against this library.
 def _known_games_for_types():
-    """Distinct games seen in inventory + defined templates, for the picker."""
-    games = set()
-    for rec in ScanRecord.query.all():
-        g = str((rec.extracted_data or {}).get("game") or "").strip()
-        if g and not _is_catalog_only(rec.extracted_data or {}):
-            games.add(g)
+    """Distinct games seen in inventory + defined templates, for the picker.
+
+    One DISTINCT over the JSON game key (case preserved — a set of raw
+    trimmed strings, exactly what the old full-table loop collected) with
+    catalog rows excluded via the derived column, instead of hydrating every
+    record to read one field."""
+    from sqlalchemy import func as _f
+    game_raw = _f.trim(_f.cast(_json_field("game"), db.String))
+    games = {g for (g,) in
+             db.session.query(game_raw.distinct())
+               .filter(_f.coalesce(ScanRecord.is_catalog, False) == False)  # noqa: E712
+               .all()
+             if g}
     for t in get_template_names():
         games.add(t.replace("_", " "))
     return sorted(games, key=str.lower)
