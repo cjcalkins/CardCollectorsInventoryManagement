@@ -174,8 +174,63 @@ def _money(value, default=0.0):
         return default
 
 
+# Full names -> postal codes for every value in _US_STATES/_CA_PROVINCES.
+# Exists because marketplace exports write "Minnesota" as readily as "MN", and
+# a blind [:2] truncation turns it into Michigan — wrong-but-valid, so it
+# passes validation and prints on real postage. Keys are upper-case with
+# periods stripped and whitespace collapsed (see normalize_state).
+_STATE_NAME_TO_CODE = {
+    "ALABAMA": "AL", "ALASKA": "AK", "ARIZONA": "AZ", "ARKANSAS": "AR",
+    "CALIFORNIA": "CA", "COLORADO": "CO", "CONNECTICUT": "CT", "DELAWARE": "DE",
+    "DISTRICT OF COLUMBIA": "DC", "FLORIDA": "FL", "GEORGIA": "GA", "HAWAII": "HI",
+    "IDAHO": "ID", "ILLINOIS": "IL", "INDIANA": "IN", "IOWA": "IA", "KANSAS": "KS",
+    "KENTUCKY": "KY", "LOUISIANA": "LA", "MAINE": "ME", "MARYLAND": "MD",
+    "MASSACHUSETTS": "MA", "MICHIGAN": "MI", "MINNESOTA": "MN", "MISSISSIPPI": "MS",
+    "MISSOURI": "MO", "MONTANA": "MT", "NEBRASKA": "NE", "NEVADA": "NV",
+    "NEW HAMPSHIRE": "NH", "NEW JERSEY": "NJ", "NEW MEXICO": "NM", "NEW YORK": "NY",
+    "NORTH CAROLINA": "NC", "NORTH DAKOTA": "ND", "OHIO": "OH", "OKLAHOMA": "OK",
+    "OREGON": "OR", "PENNSYLVANIA": "PA", "RHODE ISLAND": "RI", "SOUTH CAROLINA": "SC",
+    "SOUTH DAKOTA": "SD", "TENNESSEE": "TN", "TEXAS": "TX", "UTAH": "UT",
+    "VERMONT": "VT", "VIRGINIA": "VA", "WASHINGTON": "WA", "WEST VIRGINIA": "WV",
+    "WISCONSIN": "WI", "WYOMING": "WY",
+    "AMERICAN SAMOA": "AS", "GUAM": "GU", "NORTHERN MARIANA ISLANDS": "MP",
+    "PUERTO RICO": "PR", "VIRGIN ISLANDS": "VI", "US VIRGIN ISLANDS": "VI",
+    "ALBERTA": "AB", "BRITISH COLUMBIA": "BC", "MANITOBA": "MB",
+    "NEW BRUNSWICK": "NB", "NEWFOUNDLAND AND LABRADOR": "NL", "NOVA SCOTIA": "NS",
+    "NORTHWEST TERRITORIES": "NT", "NUNAVUT": "NU", "ONTARIO": "ON",
+    "PRINCE EDWARD ISLAND": "PE", "QUEBEC": "QC", "SASKATCHEWAN": "SK", "YUKON": "YT",
+}
+
+
+def normalize_state(value):
+    """Trim/upper a state and map full names to their postal code.
+
+    Never blind-truncates: an unknown long value comes back trimmed (capped to
+    the column's 10 chars) so _validate_destination rejects it by name instead
+    of a colliding two-letter prefix shipping to the wrong state."""
+    s = " ".join(str(value or "").replace(".", " ").split()).upper()
+    if len(s) <= 2:
+        return s
+    return _STATE_NAME_TO_CODE.get(s, s[:10])
+
+
+def normalize_country(value, default="US"):
+    """Map the common US/CA spellings to their two-letter codes.
+
+    "United States" was previously [:2]'d into the meaningless "UN"; other
+    values keep the old trim-and-truncate behaviour."""
+    c = " ".join(str(value or "").replace(".", " ").split()).upper()
+    if not c:
+        return default
+    if c in ("US", "USA") or c.startswith("UNITED STATES"):
+        return "US"
+    if c in ("CA", "CAN", "CANADA"):
+        return "CA"
+    return c[:2]
+
+
 def _clean_state(value):
-    return str(value or "").strip().upper()[:2]
+    return normalize_state(value)
 
 
 def _validate_destination(order):

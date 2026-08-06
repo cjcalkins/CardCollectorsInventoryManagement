@@ -43,7 +43,7 @@ from models import db, ShopConnection, ScanRecord, SaleEvent
 from shipping_models import Order, OrderItem, Shipment
 from shipping_providers import (
     SHIPPING_PROVIDERS, SHIPPING_SECRET_FIELDS, ENVELOPE_SIZES,
-    get_shipping_provider, _validate_destination,
+    get_shipping_provider, _validate_destination, normalize_state, normalize_country,
 )
 
 shipping_bp = Blueprint("shipping", __name__)
@@ -254,9 +254,9 @@ def ensure_order_from_sale(parsed, source="tcgplayer", sale_events=None):
         order.address1 = addr.get("address1") or None
         order.address2 = addr.get("address2") or None
         order.city = addr.get("city") or None
-        order.state = (addr.get("state") or "")[:2].upper() or None
+        order.state = normalize_state(addr.get("state")) or None
         order.zipcode = addr.get("zip") or None
-        order.country = (addr.get("country") or "US")[:2].upper()
+        order.country = normalize_country(addr.get("country"))
 
     db.session.add(order)
     db.session.flush()
@@ -417,9 +417,9 @@ def _apply_order_form(o, f):
     o.address1 = (f.get("address1", o.address1 or "") or "").strip() or None
     o.address2 = (f.get("address2", o.address2 or "") or "").strip() or None
     o.city = (f.get("city", o.city or "") or "").strip() or None
-    o.state = (f.get("state", o.state or "") or "").strip().upper()[:2] or None
+    o.state = normalize_state(f.get("state", o.state or "")) or None
     o.zipcode = (f.get("zipcode", o.zipcode or "") or "").strip() or None
-    o.country = ((f.get("country", o.country or "US") or "US").strip().upper() or "US")[:2]
+    o.country = normalize_country(f.get("country", o.country or "US"))
     o.email = (f.get("email", o.email or "") or "").strip() or None
     o.phone = (f.get("phone", o.phone or "") or "").strip() or None
     if f.get("notes") is not None:
@@ -628,12 +628,11 @@ def shipping_import_csv():
                 setattr(order, attr, v[:cap])
         st = _row_get(head, index, "state")
         if st:
-            order.state = st.upper()[:2]
+            order.state = normalize_state(st)
         country = _row_get(head, index, "country")
         if country:
             # Exports write "US" or "United States" interchangeably.
-            c = country.strip().upper()
-            order.country = "US" if c.startswith("UNITED STATES") or c == "USA" else c[:2]
+            order.country = normalize_country(country)
         sp = _row_get(head, index, "shipping_paid")
         if sp:
             try:
