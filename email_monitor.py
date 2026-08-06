@@ -246,12 +246,19 @@ def fetch_sale_emails(cfg, since_uid=0, limit=FETCH_LIMIT):
 
         uids = [int(u) for u in (data[0].split() if data and data[0] else [])]
         uids = sorted(u for u in uids if u > int(since_uid or 0))
-        uids = uids[-limit:]  # cap work; newest window
+        # Cap work per poll with the OLDEST window: max_uid is a high-water
+        # mark the caller persists, so taking the newest slice would advance
+        # it past every older unfetched message and orphan them permanently.
+        # The remainder is picked up on the next poll.
+        uids = uids[:limit]
 
         for uid in uids:
             typ, msgdata = conn.uid("FETCH", str(uid), "(RFC822)")
             if typ != "OK" or not msgdata or not msgdata[0]:
-                continue
+                # Stop, don't skip: a later success would push max_uid past
+                # this message and it would never be fetched again. Return
+                # what we have; this UID is retried on the next poll.
+                break
             raw = msgdata[0][1]
             parsed = _parse_message(raw)
             parsed["uid"] = uid
