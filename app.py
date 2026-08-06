@@ -6859,17 +6859,24 @@ def game_fields():
         return jsonify({"fields": [], "albums": []})
 
     # The indexed game_key column carries the same strip/lower normalization
-    # this comparison applied in Python — only the game's own rows load.
-    records = (ScanRecord.query
-               .filter(ScanRecord.game_key == game.strip().lower())
-               .all())
+    # this comparison applied in Python. Field discovery runs on a bounded
+    # newest-500 sample — the same tradeoff _render_inventory_fast already
+    # made for the inventory page — instead of hydrating the game's whole
+    # set; albums come from one DISTINCT on the JSON key (case preserved,
+    # whitespace-only values dropped rather than surfacing as "").
+    from sqlalchemy import func as _f
+    gk = game.strip().lower()
+    sample = (ScanRecord.query
+              .filter(ScanRecord.game_key == gk)
+              .order_by(ScanRecord.scan_date.desc(), ScanRecord.id.desc())
+              .limit(500).all())
+    fields = discover_entry_fields(sample)
 
-    fields = discover_entry_fields(records)
-    albums = sorted({
-        str((r.extracted_data or {}).get("album", "")).strip()
-        for r in records
-        if (r.extracted_data or {}).get("album")
-    })
+    album_raw = _f.trim(_f.cast(_json_field("album"), db.String))
+    albums = sorted({a for (a,) in
+                     db.session.query(album_raw.distinct())
+                       .filter(ScanRecord.game_key == gk).all()
+                     if a})
     return jsonify({"fields": fields, "albums": albums})
 
 
