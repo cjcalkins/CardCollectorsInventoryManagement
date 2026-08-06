@@ -10881,6 +10881,12 @@ def _run_pdf_import(flask_app, job_id, pdf_path, page_count, params):
         except Exception as exc:
             job["status"] = "error"
             job["error"] = f"Could not load game '{game}': {exc}"
+            # This return is BEFORE the main try/finally below, so it must do
+            # the finally's file cleanup itself or the whole PDF leaks.
+            try:
+                os.remove(pdf_path)
+            except OSError:
+                pass
             return
 
         try:
@@ -10948,9 +10954,23 @@ def import_start_pdf():
 
     form = request.form if len(request.form) else (request.get_json(silent=True) or {})
 
+    # Everything checkable WITHOUT the file happens before the upload is
+    # written: each rejection below used to leave a full copy of the PDF in
+    # TEMP_PDF_FOLDER with no cleanup path and no sweeper — a few retries of a
+    # big binder scan could fill a small disk.
+    game  = str(form.get("game", "")).strip()
+    album = str(form.get("album", "")).strip()
+    if not game or not album:
+        return jsonify({"status": "error", "message": "Game and storage are required."}), 400
+    with _PDF_JOBS_LOCK:   # advisory precheck; re-checked atomically at registration
+        for j in _PDF_JOBS.values():
+            if j["status"] == "running":
+                return jsonify({"status": "already_running", **_pdf_job_snapshot(j)})
+
     pdf_path = None
     upload = request.files.get("pdf") or request.files.get("image")
-    if upload and upload.filename:
+    owned_upload = bool(upload and upload.filename)
+    if owned_upload:
         batch_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         pdf_path = os.path.join(app.config["TEMP_PDF_FOLDER"], f"upload_{batch_id}.pdf")
         upload.save(pdf_path)
@@ -10960,10 +10980,16 @@ def import_start_pdf():
     if not pdf_path or not os.path.exists(pdf_path):
         return jsonify({"status": "error", "message": "PDF not available — please re-select it."}), 400
 
-    game  = str(form.get("game", "")).strip()
-    album = str(form.get("album", "")).strip()
-    if not game or not album:
-        return jsonify({"status": "error", "message": "Game and storage are required."}), 400
+    def _discard_upload():
+        # Only a fresh upload this request wrote. A batch_id file belongs to
+        # /pdf_open's flow (its /pdf_close cleans up), and deleting it here
+        # would break re-trying an open batch.
+        if owned_upload:
+            try:
+                os.remove(pdf_path)
+            except OSError:
+                pass
+
     storage_type = str(form.get("storage_type", "album") or "album").strip().lower()
     edge_type    = normalize_card_edge_type(form.get("card_edge_type"))
     collection   = _clean_collection(form.get("collection"))
@@ -10980,10 +11006,13 @@ def import_start_pdf():
         page_count = doc.page_count
         doc.close()
     except Exception as exc:
+        _discard_upload()
         return jsonify({"status": "error", "message": f"Could not read PDF: {exc}"}), 500
     if page_count < 1:
+        _discard_upload()
         return jsonify({"status": "error", "message": "PDF has no pages."}), 400
     if page_count > MAX_PDF_PAGES:
+        _discard_upload()
         return jsonify({"status": "error",
                         "message": f"PDF has {page_count} pages, over the {MAX_PDF_PAGES}-page limit. "
                                    f"Split it, or raise MAX_PDF_PAGES."}), 413
@@ -10992,6 +11021,8 @@ def import_start_pdf():
     with _PDF_JOBS_LOCK:
         for j in _PDF_JOBS.values():
             if j["status"] == "running":
+                # Lost the race since the precheck: still no leftover file.
+                _discard_upload()
                 return jsonify({"status": "already_running", **_pdf_job_snapshot(j)})
         job = {"job_id": job_id, "game": game, "status": "running",
                "total_pages": page_count, "pages_done": 0, "cards": 0, "identified": 0,
