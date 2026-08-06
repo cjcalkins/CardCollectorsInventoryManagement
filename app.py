@@ -5525,11 +5525,21 @@ def _report_build(start, end, label, period_type):
                               ScanRecord.scan_date < end)
                       .order_by(ScanRecord.id)   # rowid order, like the old full scan
                       .all())
+    # Existence probe for sales_log, per dialect. The portable accessor
+    # (extracted_data["sales_log"]) is a trap on SQLite: it compiles to
+    # JSON_QUOTE(JSON_EXTRACT(...)), and JSON_QUOTE turns SQL NULL into the
+    # string 'null' -- so IS NOT NULL matched every row and the narrowing
+    # was a no-op. Plain json_extract returns real NULL for a missing key.
+    if db.engine.dialect.name == "sqlite":
+        has_sales_log = _f.json_extract(
+            ScanRecord.extracted_data, "$.sales_log").isnot(None)
+    else:
+        has_sales_log = ScanRecord.extracted_data["sales_log"].isnot(None)
     sales_candidates = (ScanRecord.query
                         .filter(*base_conds,
                                 db.or_(
                                     _f.coalesce(ScanRecord.is_held, True) == False,  # noqa: E712
-                                    ScanRecord.extracted_data["sales_log"].isnot(None)))
+                                    has_sales_log))
                         .order_by(ScanRecord.id)   # rowid order, like the old full scan
                         .all())
 
