@@ -5523,12 +5523,14 @@ def _report_build(start, end, label, period_type):
                               ScanRecord.scan_date.isnot(None),
                               ScanRecord.scan_date >= start,
                               ScanRecord.scan_date < end)
+                      .order_by(ScanRecord.id)   # rowid order, like the old full scan
                       .all())
     sales_candidates = (ScanRecord.query
                         .filter(*base_conds,
                                 db.or_(
                                     _f.coalesce(ScanRecord.is_held, True) == False,  # noqa: E712
                                     ScanRecord.extracted_data["sales_log"].isnot(None)))
+                        .order_by(ScanRecord.id)   # rowid order, like the old full scan
                         .all())
 
     # ── Acquisitions in period, grouped by collection ──
