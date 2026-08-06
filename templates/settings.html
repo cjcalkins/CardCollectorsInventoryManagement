@@ -314,6 +314,17 @@
                             </div>
                         </a>
                     </div>
+                    {% if can_view('shops') %}
+                    <div class="col-12 col-md-6 col-xl-4">
+                        <a href="/shipping" class="setting-card">
+                            <div class="sc-icon"><i class="fas fa-box-open"></i></div>
+                            <div>
+                                <h5>Shipping</h5>
+                                <p>Buy postage, print labels per order, and follow USPS tracking to delivery.</p>
+                            </div>
+                        </a>
+                    </div>
+                    {% endif %}
                     <div class="col-12 col-md-6 col-xl-4">
                         <a href="{{ url_for('api_keys_page') }}" class="setting-card">
                             <div class="sc-icon"><i class="fas fa-key"></i></div>
