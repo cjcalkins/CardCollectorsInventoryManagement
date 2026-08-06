@@ -5120,13 +5120,17 @@ def _analytics_conditions(source, f_game, f_template):
     return conds
 
 
-def _json_field(key):
-    """extracted_data[key] as a SQL expression. Dialect-gated: the portable
-    accessor JSON_QUOTEs NULL into 'null' on SQLite (see _report_build)."""
+def _json_field(*keys):
+    """extracted_data[key][...] as a SQL expression (nested keys allowed).
+    Dialect-gated: the portable accessor JSON_QUOTEs NULL into 'null' on
+    SQLite (see _report_build)."""
     from sqlalchemy import func as _f
     if db.engine.dialect.name == "sqlite":
-        return _f.json_extract(ScanRecord.extracted_data, "$." + key)
-    return ScanRecord.extracted_data[key].as_string()
+        return _f.json_extract(ScanRecord.extracted_data, "$." + ".".join(keys))
+    expr = ScanRecord.extracted_data
+    for k in keys[:-1]:
+        expr = expr[k]
+    return expr[keys[-1]].as_string()
 
 
 def _analytics_filtered_records(source, f_game, f_template, search):
@@ -8566,42 +8570,20 @@ def justtcg_missing_ids():
     Used by the bulk-fetch UI to know which records still need pricing.
     Only includes records that have a card name, so the fetch is likely to succeed.
     """
-    rows = (
-        ScanRecord.query
-        .with_entities(ScanRecord.id, ScanRecord.extracted_data)
-        .order_by(ScanRecord.id.asc())
-        .all()
-    )
-
-    missing = []
-    for row_id, extracted_data in rows:
-        if isinstance(extracted_data, dict):
-            data = extracted_data
-        else:
-            try:
-                data = json.loads(extracted_data or "{}")
-            except (ValueError, TypeError):
-                data = {}
-
-        # Catalog-only records (CSV import) aren't owned inventory — skip them
-        if _is_catalog_only(data):
-            continue
-
-        # Must have a usable card name or the fetch will fail immediately
-        card_name = (
-            data.get("product_name") or data.get("name") or
-            data.get("card_name")    or data.get("title") or ""
-        ).strip()
-        if not card_name:
-            continue
-
-        # Check whether a market price is already present
-        tcg = data.get("tcgplayer") or {}
-        prices = tcg.get("prices") or {}
-        market = prices.get("market")
-        if market is None or market == "":
-            missing.append(row_id)
-
+    # Every check the old full-table loop made is derivable in SQL: catalog
+    # via the derived is_catalog column, "has a usable card name" via name_key
+    # (the mapper stores _get_name over exactly the key order this route
+    # tested), and the market probe as a json_extract path — NULL for a
+    # missing path, '' for an empty string, both "missing". Ids only.
+    from sqlalchemy import func as _f
+    market = _json_field("tcgplayer", "prices", "market")
+    rows = (db.session.query(ScanRecord.id)
+            .filter(_f.coalesce(ScanRecord.is_catalog, False) == False,  # noqa: E712
+                    ScanRecord.name_key.isnot(None),
+                    db.or_(market.is_(None), market == ""))
+            .order_by(ScanRecord.id.asc())
+            .all())
+    missing = [r.id for r in rows]
     return jsonify({"ids": missing, "count": len(missing)})
 
 
