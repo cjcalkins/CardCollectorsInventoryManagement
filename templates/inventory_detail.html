@@ -1708,7 +1708,19 @@
             copyDropdown.classList.remove('d-none');
         }
 
-        function selectCopySource(record) {
+        async function selectCopySource(record) {
+            // /records_summary is id/label/sub only now; the record's fields
+            // arrive here, once, when it is actually picked.
+            if (record.data === undefined) {
+                try {
+                    const res = await fetch(`/records_summary/${record.id}/data`);
+                    const d   = await res.json();
+                    record.data = (d && d.data) || {};
+                } catch (e) {
+                    record.data = {};
+                    copyStatus.innerHTML = `<div class="alert alert-danger py-1 mb-0">Could not load that entry's fields.</div>`;
+                }
+            }
             selectedSource = record;
             copySearchInput.value = `#${record.id} — ${record.label}`;
             copyDropdown.classList.add('d-none');

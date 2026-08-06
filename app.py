@@ -4552,17 +4552,22 @@ def _inventory_base_conditions(f_game, f_album, f_template, view_catalog, held_s
 
 
 def _render_inventory_fast(f_game, f_album, f_template, view_catalog,
-                           page, per_page, sort_col, sort_dir, held_state=None):
+                           page, per_page, sort_col, sort_dir, held_state=None,
+                           search=""):
     """
     Fast Inventory path: de-duplicate and paginate entirely in SQL using the
     dup_hash column and window functions, loading only the page's ~50 rows
-    instead of the whole filtered set. Used for the default (recency) view;
-    the caller falls back to the Python path for free-text search and arbitrary
-    field sorts. Raises on any DB error so the caller can fall back safely.
+    instead of the whole filtered set. Used for the default (recency) view,
+    with or without a free-text search (the same _scan_search_condition the
+    Python path uses, so both return identical sets); the caller falls back
+    to the Python path only for arbitrary field sorts. Raises on any DB error
+    so the caller can fall back safely.
     """
     from sqlalchemy import select, func, cast, String, and_
 
     conds = _inventory_base_conditions(f_game, f_album, f_template, view_catalog, held_state)
+    if search:
+        conds = list(conds) + [_scan_search_condition(search)]
 
     # Group key: dup_hash for finalized rows; a per-row token for the rest so
     # unfinalized records never merge together.
@@ -4644,7 +4649,7 @@ def _render_inventory_fast(f_game, f_album, f_template, view_catalog,
         "inventory.html",
         records=pagination.items,
         pagination=pagination,
-        search="",
+        search=search,
         f_game=f_game,
         f_album=f_album,
         f_template=f_template,
@@ -6380,16 +6385,19 @@ def inventory():
     page = max(page, 1)
     per_page = max(1, min(per_page, 200))
 
-    # ---- Fast path: default (recency) view with no free-text search ----------
-    # De-dup + paginate in SQL so only the page's rows load. Any arbitrary field
-    # sort or search falls through to the Python path below (which handles the
-    # full range of sort keys). The fast path is guarded: if the denormalized
-    # columns aren't present yet (e.g. mid-upgrade), we fall back transparently.
+    # ---- Fast path: default (recency) view, with or without free-text search --
+    # De-dup + paginate in SQL so only the page's rows load. Searches route
+    # here too (the filter clause is shared with the Python path); only an
+    # arbitrary field sort falls through to the Python path below, which
+    # handles the full range of sort keys. The fast path is guarded: if the
+    # denormalized columns aren't present yet (e.g. mid-upgrade), we fall
+    # back transparently.
     effective_sort_early = sort_col[len("entry_"):] if sort_col.startswith("entry_") else sort_col
-    if not search and not effective_sort_early:
+    if not effective_sort_early:
         try:
             return _render_inventory_fast(
-                f_game, f_album, f_template, view_catalog, page, per_page, sort_col, sort_dir, held_state)
+                f_game, f_album, f_template, view_catalog, page, per_page, sort_col, sort_dir,
+                held_state, search=search)
         except Exception:
             db.session.rollback()  # fall back to the proven Python grouping path
 
@@ -8377,19 +8385,30 @@ def records_summary():
             f"s{data.get('slot','')}" if data.get("slot") else "",
         ] if p]
 
-        clean_data = {
-            k: v for k, v in data.items()
-            if not k.startswith("__ocr_") and k != "__roi_fields_used"
-        }
-
         records.append({
             "id":    row_id,
             "label": str(label).strip(),
             "sub":   " · ".join(parts),
-            "data":  clean_data,
+            # No "data" here on purpose: shipping every record's full
+            # extracted_data made this response grow to tens of MB. The
+            # dropdown fetches one record's fields on selection instead
+            # (/records_summary/<id>/data).
         })
 
     return jsonify({"records": records})
+
+
+@app.route("/records_summary/<int:record_id>/data")
+def record_summary_data(record_id):
+    """One record's cleaned fields for the copy-from dropdown, fetched when a
+    source is picked (records_summary itself is id/label/sub only)."""
+    rec = ScanRecord.query.get(record_id)
+    if rec is None:
+        return jsonify({"status": "error", "message": "Record not found"}), 404
+    data = rec.extracted_data or {}
+    clean = {k: v for k, v in data.items()
+             if not k.startswith("__ocr_") and k != "__roi_fields_used"}
+    return jsonify({"status": "success", "id": rec.id, "data": clean})
 
 
 # ====================== JUSTTCG ROUTES ======================
@@ -14274,14 +14293,30 @@ def _connection_public_view(conn, marketplace):
     }
 
 
-def _sellable_records_query():
-    """Owned inventory only — exclude catalog-only reference rows and blank slots."""
-    # Catalog rows drop out in SQL (is_catalog mirrors _is_catalog_only by
-    # derivation); the "empty slot" flag has no derived column, so that check
-    # stays in Python on the narrowed set.
+def _sellable_conditions():
+    """SQL share of the sellable-inventory filter: not catalog (derived
+    column), not an empty slot (JSON flag; dialect-gated json_extract because
+    the portable accessor JSON_QUOTEs NULL into 'null' on SQLite). The flag is
+    written as the string "true" or a JSON true, so both spellings are
+    excluded."""
     from sqlalchemy import func as _f
+    if db.engine.dialect.name == "sqlite":
+        empty_flag = _f.json_extract(ScanRecord.extracted_data, "$.empty")
+    else:
+        empty_flag = ScanRecord.extracted_data["empty"].as_string()
+    return (
+        _f.coalesce(ScanRecord.is_catalog, False) == False,  # noqa: E712
+        db.or_(empty_flag.is_(None),
+               _f.lower(_f.cast(empty_flag, db.String)).notin_(("true", "1"))),
+    )
+
+
+def _sellable_records_query():
+    """Owned inventory only — exclude catalog-only reference rows and blank
+    slots. Filtering happens in SQL (_sellable_conditions); the Python
+    re-check stays as a cheap belt-and-braces pass over the narrowed set."""
     records = (ScanRecord.query
-               .filter(_f.coalesce(ScanRecord.is_catalog, False) == False)  # noqa: E712
+               .filter(*_sellable_conditions())
                .order_by(ScanRecord.scan_date.desc(), ScanRecord.id.desc()).all())
     out = []
     for r in records:
@@ -14477,19 +14512,36 @@ def shops_ebay_callback():
 
 @app.route("/shops/listings")
 def shops_listings():
-    """Paginated inventory with per-marketplace listing status (JSON for the table)."""
-    page = max(int(request.args.get("page", 1) or 1), 1)
-    per_page = min(max(int(request.args.get("per_page", 25) or 25), 1), 100)
+    """Paginated inventory with per-marketplace listing status (JSON for the table).
+
+    Filter/count/paginate in SQL and hydrate only the page: the old shape
+    loaded every sellable record AND every listing row, built a display dict
+    per record, then sliced the list in Python — page/per_page saved nothing."""
+    page = max(request.args.get("page", 1, type=int) or 1, 1)
+    per_page = min(max(request.args.get("per_page", 25, type=int) or 25, 1), 100)
     only_marketplace = request.args.get("marketplace", "")
     unlisted_only = request.args.get("unlisted", "") == "1"
 
-    records = _sellable_records_query()
+    q = ScanRecord.query.filter(*_sellable_conditions())
 
-    # Pre-index listings by (record_id, marketplace)
-    all_listings = Listing.query.all()
+    if unlisted_only and only_marketplace in MARKETPLACES:
+        # "Unlisted" = no listing row for that shop, or one still not_listed.
+        listed = (db.session.query(Listing.id)
+                  .filter(Listing.record_id == ScanRecord.id,
+                          Listing.marketplace == only_marketplace,
+                          Listing.status != "not_listed"))
+        q = q.filter(~listed.exists())
+
+    total = q.order_by(None).count()
+    records = (q.order_by(ScanRecord.scan_date.desc(), ScanRecord.id.desc())
+                .limit(per_page).offset((page - 1) * per_page).all())
+
+    # One IN query for the page's listings instead of Listing.query.all().
     idx = {}
-    for lst in all_listings:
-        idx[(lst.record_id, lst.marketplace)] = lst
+    if records:
+        page_ids = [r.id for r in records]
+        for lst in Listing.query.filter(Listing.record_id.in_(page_ids)).all():
+            idx[(lst.record_id, lst.marketplace)] = lst
 
     def record_row(r):
         data = r.extracted_data or {}
@@ -14501,7 +14553,7 @@ def shops_listings():
                 "listing_id": lst.id if lst else None,
                 "url": lst.external_url if lst else "",
                 "price": lst.price if lst else None,
-            } if True else None
+            }
         return {
             "record_id": r.id,
             "name": _record_display_name(r),
@@ -14514,18 +14566,9 @@ def shops_listings():
             "listings": row_listings,
         }
 
-    rows = [record_row(r) for r in records]
-
-    if unlisted_only and only_marketplace in MARKETPLACES:
-        rows = [row for row in rows if row["listings"][only_marketplace]["status"] == "not_listed"]
-
-    total = len(rows)
-    start = (page - 1) * per_page
-    page_rows = rows[start:start + per_page]
-
     return jsonify({
         "status": "success",
-        "rows": page_rows,
+        "rows": [record_row(r) for r in records],
         "page": page,
         "per_page": per_page,
         "total": total,
@@ -15214,9 +15257,14 @@ def _mark_record_sold(record, sold_qty, source, order_id, sold_price=None):
     return {"record_id": record.id, "remaining": remaining, "delisted": results}
 
 
-def _match_email_item_to_record(item, source="tcgplayer"):
-    """Resolve a parsed sale line to a single ScanRecord, else (None, reason)."""
-    records = _sellable_records_query()
+def _match_email_item_to_record(item, source="tcgplayer", records=None):
+    """Resolve a parsed sale line to a single ScanRecord, else (None, reason).
+
+    `records`: the sellable set to match against. _process_sale_email loads it
+    once and passes it per line — the old shape re-hydrated the whole table
+    for every item on the order, on the poller's timer."""
+    if records is None:
+        records = _sellable_records_query()
 
     tid = str(item.get("tcgplayer_id") or "").strip()
     if tid:
@@ -15246,9 +15294,15 @@ def _match_email_item_to_record(item, source="tcgplayer"):
     if refined:
         cands = refined
 
-    # Prefer records actually listed on the source marketplace.
-    listed = [r for r in cands
-              if (_listing_for(r.id, source) and _listing_for(r.id, source).status in ("active", "draft"))]
+    # Prefer records actually listed on the source marketplace. One IN query
+    # over the (small) candidate set — this used to call _listing_for twice
+    # per candidate, each a SELECT.
+    listed_ids = {row.record_id for row in
+                  db.session.query(Listing.record_id)
+                    .filter(Listing.record_id.in_([r.id for r in cands]),
+                            Listing.marketplace == source,
+                            Listing.status.in_(("active", "draft"))).all()}
+    listed = [r for r in cands if r.id in listed_ids]
     if listed:
         cands = listed
 
@@ -15276,6 +15330,7 @@ def _process_sale_email(parsed, source="tcgplayer"):
         return out
 
     created_events = []
+    sellable = _sellable_records_query()   # one load for the whole email
     for item in items:
         title = (item.get("name") or "").strip() or "(unknown)"
         if item.get("set"):
@@ -15286,7 +15341,7 @@ def _process_sale_email(parsed, source="tcgplayer"):
             out["items"].append({"title": title, "status": "duplicate"})
             continue
 
-        rec, conf = _match_email_item_to_record(item, source)
+        rec, conf = _match_email_item_to_record(item, source, records=sellable)
         ev = SaleEvent(source=source, order_id=order_id, item_title=title,
                        qty=int(item.get("qty", 1)), price=item.get("price"),
                        record_id=rec.id if rec else None, email_subject=subject,
