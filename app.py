@@ -1860,16 +1860,38 @@ _OCR_NAME_NOISE = frozenset({
 # needs three); otherwise the original scan runs unchanged.
 _FTS_READY = {}   # {table_name: bool}, probed once per process
 
+# Lightweight handles for the FTS virtual tables (not in db.metadata, so
+# create_all/drop_all never touch them). Using Core constructs here means
+# .like() gets a fresh anonymous bindparam per call — two conditions in one
+# statement can never collide the way fixed-name text() params silently do.
+from sqlalchemy import table as _sa_lite_table, column as _sa_lite_column
+_scan_search_t = _sa_lite_table("scan_search", _sa_lite_column("rowid"),
+                                _sa_lite_column("extracted_data"))
+_ref_search_t = _sa_lite_table("ref_search", _sa_lite_column("rowid"),
+                               _sa_lite_column("name"))
+
 
 def _fts_ready(table):
+    """Is the FTS table actually usable on this connection?
+
+    A real probe query on a dedicated connection, not a sqlite_master lookup:
+    a DB file can carry the FTS tables while the runtime's SQLite lacks the
+    fts5 module or trigram tokenizer (e.g. the same collection opened on an
+    older Pi build), and on non-SQLite backends the tables never exist at
+    all. Any failure caches False — searches then use the portable LIKE scan
+    for the rest of the process, which returns identical rows, just slower.
+    migrate_add_search_fts() clears the cache after (re)creating the tables.
+    """
     if table not in _FTS_READY:
         try:
-            row = db.session.execute(
-                db.text("SELECT 1 FROM sqlite_master WHERE type='table' AND name=:n"),
-                {"n": table}).first()
-            _FTS_READY[table] = row is not None
+            if db.engine.dialect.name != "sqlite":
+                _FTS_READY[table] = False
+            else:
+                with db.engine.connect() as conn:
+                    conn.exec_driver_sql(f"SELECT rowid FROM {table} LIMIT 0")
+                _FTS_READY[table] = True
         except Exception:
-            return False   # transient failure: fall back, don't cache
+            _FTS_READY[table] = False
     return _FTS_READY[table]
 
 
@@ -1878,8 +1900,8 @@ def _scan_search_condition(search):
     pattern = f"%{search}%"
     if len(search) >= 3 and _fts_ready("scan_search"):
         return ScanRecord.id.in_(
-            db.text("SELECT rowid FROM scan_search WHERE extracted_data LIKE :scanpat")
-              .bindparams(scanpat=pattern))
+            db.select(_scan_search_t.c.rowid)
+              .where(_scan_search_t.c.extracted_data.like(pattern)))
     return ScanRecord.extracted_data.cast(db.Text).ilike(pattern)
 
 
@@ -1888,8 +1910,8 @@ def _ref_name_condition(fragment):
     pattern = f"%{fragment}%"
     if len(fragment) >= 3 and _fts_ready("ref_search"):
         return ReferenceCard.id.in_(
-            db.text("SELECT rowid FROM ref_search WHERE name LIKE :refpat")
-              .bindparams(refpat=pattern))
+            db.select(_ref_search_t.c.rowid)
+              .where(_ref_search_t.c.name.like(pattern)))
     return ReferenceCard.name.ilike(pattern)
 
 
