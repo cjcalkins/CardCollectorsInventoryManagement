@@ -81,6 +81,21 @@ def _provider(provider_key):
     return get_shipping_provider(provider_key, conn, persist=_persist), conn
 
 
+def _connected_provider_keys():
+    """Providers whose connection is enabled — the only shipments worth the
+    bounded tracking budget. _refresh_shipment early-returns on a disconnected
+    provider WITHOUT stamping last_tracked_at (a disconnect must not fake a
+    poll), so queries that select "due" shipments have to exclude them here or
+    those rows match forever and starve the working provider's shipments out
+    of the LIMIT."""
+    keys = []
+    for k in SHIPPING_PROVIDERS:
+        conn = _get_connection(k)
+        if conn is not None and conn.enabled:
+            keys.append(k)
+    return keys
+
+
 def _connection_public_view(conn, provider_key):
     """Config safe for the browser: secrets become a set/unset flag."""
     meta = SHIPPING_PROVIDERS[provider_key]
@@ -922,7 +937,10 @@ def shipping_track_one(shipment_id):
                         "tracking_percent": s.tracking_percent,
                         "delivery_date": s.delivery_date or "",
                         "events": s.events or [],
-                        "last_tracked_at": s.last_tracked_at.strftime("%Y-%m-%d %H:%M"),
+                        # None until the first successful poll — e.g. a refresh
+                        # clicked while the provider is disconnected.
+                        "last_tracked_at": (s.last_tracked_at.strftime("%Y-%m-%d %H:%M")
+                                            if s.last_tracked_at else ""),
                     },
                     "order_status": s.order.status if s.order else ""})
 
@@ -946,8 +964,15 @@ def shipping_track_refresh():
     except ValueError:
         min_age = 30
 
+    enabled = _connected_provider_keys()
+    if not enabled:
+        return jsonify({"status": "success",
+                        "message": "No shipping provider is connected.",
+                        "checked": 0, "moved": 0, "failed": 0})
+
     cutoff = datetime.utcnow() - timedelta(minutes=min_age)
     q = (Shipment.query.join(Order, Shipment.order_id == Order.id)
+         .filter(Shipment.provider.in_(enabled))
          .filter(Shipment.status.in_(("purchased", "created")))
          .filter(Order.status.in_(_ACTIVE_STATUSES))
          .filter(db.or_(Shipment.last_tracked_at.is_(None), Shipment.last_tracked_at <= cutoff))
@@ -999,8 +1024,12 @@ def start_tracking_poller(app, interval_minutes=180):
             time.sleep(max(interval_minutes, 15) * 60)
             try:
                 with app.app_context():
+                    enabled = _connected_provider_keys()
+                    if not enabled:
+                        continue
                     cutoff = datetime.utcnow() - timedelta(minutes=60)
                     rows = (Shipment.query.join(Order, Shipment.order_id == Order.id)
+                            .filter(Shipment.provider.in_(enabled))
                             .filter(Shipment.status.in_(("purchased", "created")))
                             .filter(Order.status.in_(_ACTIVE_STATUSES))
                             .filter(db.or_(Shipment.last_tracked_at.is_(None),
