@@ -5500,16 +5500,52 @@ def _record_sale_in_period(rec, start, end):
 
 def _report_build(start, end, label, period_type):
     """Aggregate everything for the period into a plain dict (money as floats)."""
-    from sqlalchemy import func as _f, and_
+    from sqlalchemy import func as _f
     money = _analytics_money
-    records = ScanRecord.query.filter(and_(
+
+    # Two scoped loads replace the single full-table hydration. The
+    # acquisitions, strategies, and unrealized passes all filter
+    # start <= scan_date < end, so they read period_records (served by the
+    # indexed scan_date). The sales pass and the undated counter read
+    # sales_candidates — exactly the rows _record_sale_in_period can return
+    # a sale for: it uses sales_log entries regardless of held state, and
+    # falls back to sold_at/sold_price only for not-held rows, so a held row
+    # without a sales_log can never produce a sale; the undated counter's
+    # own conditions (not held, no sales_log, ...) are a subset of the same
+    # candidate set. The JSON probe uses the portable column accessor, not
+    # json_extract(), so a Postgres deployment keeps working.
+    base_conds = (
         _f.coalesce(ScanRecord.is_catalog, False) == False,   # noqa: E712
         _f.coalesce(ScanRecord.is_archived, False) == False,  # noqa: E712
-    )).all()
+    )
+    period_records = (ScanRecord.query
+                      .filter(*base_conds,
+                              ScanRecord.scan_date.isnot(None),
+                              ScanRecord.scan_date >= start,
+                              ScanRecord.scan_date < end)
+                      .order_by(ScanRecord.id)   # rowid order, like the old full scan
+                      .all())
+    # Existence probe for sales_log, per dialect. The portable accessor
+    # (extracted_data["sales_log"]) is a trap on SQLite: it compiles to
+    # JSON_QUOTE(JSON_EXTRACT(...)), and JSON_QUOTE turns SQL NULL into the
+    # string 'null' -- so IS NOT NULL matched every row and the narrowing
+    # was a no-op. Plain json_extract returns real NULL for a missing key.
+    if db.engine.dialect.name == "sqlite":
+        has_sales_log = _f.json_extract(
+            ScanRecord.extracted_data, "$.sales_log").isnot(None)
+    else:
+        has_sales_log = ScanRecord.extracted_data["sales_log"].isnot(None)
+    sales_candidates = (ScanRecord.query
+                        .filter(*base_conds,
+                                db.or_(
+                                    _f.coalesce(ScanRecord.is_held, True) == False,  # noqa: E712
+                                    has_sales_log))
+                        .order_by(ScanRecord.id)   # rowid order, like the old full scan
+                        .all())
 
     # ── Acquisitions in period, grouped by collection ──
     acq, acq_tot = {}, {"count": 0, "intake": 0.0, "market": 0.0, "sold_count": 0, "sold_value": 0.0}
-    for rec in records:
+    for rec in period_records:
         d = rec.scan_date
         if not (d and start <= d < end):
             continue
@@ -5542,7 +5578,7 @@ def _report_build(start, end, label, period_type):
     # ── Sales in period, grouped by shop/source ──
     sales, sales_tot = {}, {"count": 0, "revenue": 0.0, "cost": 0.0, "profit": 0.0}
     sale_items, undated = [], 0
-    for rec in records:
+    for rec in sales_candidates:
         s = _record_sale_in_period(rec, start, end)
         if s is None:
             data = rec.extracted_data or {}
@@ -5570,7 +5606,7 @@ def _report_build(start, end, label, period_type):
 
     # ── Strategies (explicit tag if present, else derived from holding behavior) ──
     strat = {}
-    for rec in records:
+    for rec in period_records:
         d = rec.scan_date
         if not (d and start <= d < end):
             continue
@@ -5600,7 +5636,7 @@ def _report_build(start, end, label, period_type):
 
     # ── Unrealized gain on held items acquired this period ──
     unrealized = 0.0
-    for rec in records:
+    for rec in period_records:
         d = rec.scan_date
         if d and start <= d < end and _held_from(rec.extracted_data or {}):
             data = rec.extracted_data or {}
