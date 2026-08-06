@@ -3882,6 +3882,26 @@ def users_list():
     })
 
 
+def _req_int(value):
+    """Request-supplied id as an int, or None when absent/non-numeric.
+    The admin routes treat a malformed id like a missing one (404/400)
+    instead of the ValueError 500 a bare int() produced."""
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _req_bool(value):
+    """Request-supplied boolean. JSON booleans pass through; form-encoded
+    strings parse by content — bool("false") is True, which made a
+    form-encoded deactivate request ACTIVATE the account (and the audit
+    log recorded the activation)."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 @app.route("/settings/users/create", methods=["POST"])
 def users_create():
     body = request.get_json(silent=True) or request.form
@@ -3893,7 +3913,12 @@ def users_create():
     if User.query.filter(db.func.lower(User.username) == username.lower()).first():
         return jsonify({"status": "error", "message": "That username already exists."}), 409
     rid = body.get("role_id")
-    role = Role.query.get(int(rid)) if rid else None
+    role = None
+    if rid not in (None, ""):
+        rid_int = _req_int(rid)
+        role = Role.query.get(rid_int) if rid_int is not None else None
+        if role is None:
+            return jsonify({"status": "error", "message": "No such role."}), 400
     u = User(username=username, role_id=(role.id if role else None), active=True)
     u.set_password(password)
     db.session.add(u)
@@ -3905,24 +3930,38 @@ def users_create():
 @app.route("/settings/users/update", methods=["POST"])
 def users_update():
     body = request.get_json(silent=True) or request.form
-    u = User.query.get(int(body.get("id", 0) or 0))
+    uid = _req_int(body.get("id"))
+    u = User.query.get(uid) if uid is not None else None
     if u is None:
         return jsonify({"status": "error", "message": "No such user."}), 404
+
+    # Resolve the requested role ONCE, and prove it exists before anything is
+    # assigned: role_id is a real FK with PRAGMA foreign_keys=ON, so the old
+    # unchecked assignment surfaced a nonexistent role as an IntegrityError
+    # 500 at commit with no rollback.
+    new_role = None
+    if body.get("role_id") not in (None, ""):
+        rid = _req_int(body.get("role_id"))
+        new_role = Role.query.get(rid) if rid is not None else None
+        if new_role is None:
+            return jsonify({"status": "error", "message": "No such role."}), 400
+    new_active = _req_bool(body["active"]) if "active" in body else None
+
     # Guard against removing the last active administrator.
     currently_admin = bool(u.role and u.role.is_admin and u.active)
     if currently_admin:
-        new_role = Role.query.get(int(body["role_id"])) if body.get("role_id") else u.role
-        will_admin = bool(new_role and new_role.is_admin)
-        will_active = bool(body["active"]) if "active" in body else u.active
+        eff_role = new_role if new_role is not None else u.role
+        will_admin = bool(eff_role and eff_role.is_admin)
+        will_active = new_active if new_active is not None else u.active
         if (not (will_admin and will_active)) and _admin_count() <= 1:
             return jsonify({"status": "error",
                             "message": "This is the only administrator — keep at least one."}), 400
-    changed_role = bool(body.get("role_id")) and int(body["role_id"]) != u.role_id
-    changed_active = "active" in body and bool(body["active"]) != bool(u.active)
-    if body.get("role_id"):
-        u.role_id = int(body["role_id"])
-    if "active" in body:
-        u.active = bool(body["active"])
+    changed_role = new_role is not None and new_role.id != u.role_id
+    changed_active = new_active is not None and new_active != bool(u.active)
+    if new_role is not None:
+        u.role_id = new_role.id
+    if new_active is not None:
+        u.active = new_active
     pw = str(body.get("password", "") or "")
     if pw:
         if len(pw) < MIN_PASSWORD_LEN:
@@ -3942,14 +3981,15 @@ def users_update():
     if changed_role or changed_active:
         log_security_event("user_updated", actor=actor, target=u,
                            detail=("role_changed" if changed_role
-                                   else "activated" if bool(body.get("active")) else "deactivated"))
+                                   else "activated" if new_active else "deactivated"))
     return jsonify({"status": "success"})
 
 
 @app.route("/settings/users/delete", methods=["POST"])
 def users_delete():
     body = request.get_json(silent=True) or request.form
-    u = User.query.get(int(body.get("id", 0) or 0))
+    uid = _req_int(body.get("id"))
+    u = User.query.get(uid) if uid is not None else None
     if u is None:
         return jsonify({"status": "error", "message": "No such user."}), 404
     if u.role and u.role.is_admin and u.active and _admin_count() <= 1:
@@ -4143,7 +4183,8 @@ def roles_save():
              for k in _RESOURCE_KEYS}
     rid = body.get("id")
     if rid:
-        r = Role.query.get(int(rid))
+        rid_int = _req_int(rid)
+        r = Role.query.get(rid_int) if rid_int is not None else None
         if r is None:
             return jsonify({"status": "error", "message": "No such role."}), 404
         # Don't let the last administrator lose admin.
@@ -4168,7 +4209,8 @@ def roles_save():
 @app.route("/settings/roles/delete", methods=["POST"])
 def roles_delete():
     body = request.get_json(silent=True) or {}
-    r = Role.query.get(int(body.get("id", 0) or 0))
+    rid = _req_int(body.get("id"))
+    r = Role.query.get(rid) if rid is not None else None
     if r is None:
         return jsonify({"status": "error", "message": "No such role."}), 404
     if User.query.filter_by(role_id=r.id).count() > 0:
