@@ -16252,7 +16252,11 @@ def _ensure_self_signed_cert(cert_dir, hostnames, ips):
             san.append(x509.IPAddress(ipaddress.ip_address(ip)))
         except ValueError:
             pass
-    now = _dt.utcnow()
+    # utcnow() is models.utcnow — NOT _dt.utcnow: _dt is the datetime MODULE
+    # (aliased above), and the sed that retired datetime.utcnow corrupted this
+    # one aliased call site into an AttributeError. cryptography treats naive
+    # datetimes as UTC, so the value is unchanged.
+    now = utcnow()
     cert = (x509.CertificateBuilder()
             .subject_name(name).issuer_name(name)
             .public_key(key.public_key())
