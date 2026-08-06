@@ -1434,7 +1434,18 @@ def find_existing_record_for_key(game, album, page, slot):
     if not (game and album and page and slot):
         return None
 
-    for record in ScanRecord.query.all():
+    # Narrow to the album's rows with the indexed keys first — a normalized
+    # match is a strict superset of the raw comparisons below, so this can
+    # never exclude a row the old full-table scan would have returned — then
+    # confirm with exactly the same raw comparisons as before.
+    candidates = (
+        ScanRecord.query
+        .filter(ScanRecord.game_key == str(game).strip().lower(),
+                ScanRecord.album_key == str(album).strip().lower())
+        .order_by(ScanRecord.id)
+        .all()
+    )
+    for record in candidates:
         data = record.extracted_data or {}
         if (
             str(data.get("game",  "")).strip() == game  and
@@ -6401,34 +6412,29 @@ def inventory_filter_options():
     """
     view_catalog = request.args.get("catalog", "").strip() in ("1", "true", "yes")
 
-    rows = (
-        ScanRecord.query
-        .with_entities(ScanRecord.extracted_data, ScanRecord.template_used)
-        .all()
-    )
+    # Aggregate in SQL: DISTINCT over the trimmed raw JSON values keeps the
+    # display casing the dropdowns show, while the catalog scope filters on the
+    # indexed is_catalog mirror of _is_catalog_only — no row hydration, no
+    # per-row JSON parsing in Python.
+    catalog_cond = db.func.coalesce(ScanRecord.is_catalog, False) == bool(view_catalog)
 
-    games = set()
-    albums = set()
-    templates = set()
+    def _distinct_json(path):
+        expr = db.func.trim(db.func.json_extract(ScanRecord.extracted_data, path))
+        q = (db.session.query(expr)
+             .filter(catalog_cond, expr.isnot(None), expr != "")
+             .distinct())
+        return {str(v) for (v,) in q}
 
-    for extracted_data, template_used in rows:
-        if isinstance(extracted_data, dict):
-            data = extracted_data
-        else:
-            try:
-                data = json.loads(extracted_data or "{}")
-            except (ValueError, TypeError):
-                data = {}
-
-        if _is_catalog_only(data) != view_catalog:
-            continue
-
-        if data.get("game"):
-            games.add(str(data["game"]).strip())
-        if data.get("album"):
-            albums.add(str(data["album"]).strip())
-        if template_used:
-            templates.add(str(template_used).strip())
+    games = _distinct_json("$.game")
+    albums = _distinct_json("$.album")
+    templates = {
+        str(t).strip()
+        for (t,) in (db.session.query(ScanRecord.template_used)
+                     .filter(catalog_cond,
+                             ScanRecord.template_used.isnot(None),
+                             ScanRecord.template_used != "")
+                     .distinct())
+    }
 
     return jsonify({
         "games":     sorted(g for g in games     if g),
@@ -6526,29 +6532,32 @@ def inventory_detail(record_id):
 
     current_game = (record.extracted_data or {}).get("game", "")
 
-    # Fetch all records that share the same game value, ordered DESC.
-    # We work in Python so we avoid JSON-in-SQL portability issues with SQLite.
-    game_records = (
-        ScanRecord.query
-        .order_by(ScanRecord.scan_date.desc(), ScanRecord.id.desc())
-        .all()
-    )
-    game_records = [
-        r for r in game_records
-        if (r.extracted_data or {}).get("game", "") == current_game
-    ]
+    # Neighbors scoped to the same game via the indexed game_key column
+    # (normalized like every other game filter), ordered like the inventory
+    # list: scan_date DESC, id DESC, wrapping at both ends. Row-value
+    # comparisons walk the (scan_date, id) ordering directly instead of
+    # loading the whole table to find one position in it.
+    from sqlalchemy import tuple_ as _sa_tuple
 
-    # Find the position of the current record in this ordered list
-    current_index = next(
-        (i for i, r in enumerate(game_records) if r.id == record.id), None
-    )
-
-    if current_index is not None and len(game_records) > 1:
-        # Previous = one step earlier in DESC order (index - 1), wrap to last
-        prev_record = game_records[(current_index - 1) % len(game_records)]
-        # Next = one step later in DESC order (index + 1), wrap to first
-        next_record = game_records[(current_index + 1) % len(game_records)]
-    else:
+    _gkey = str(current_game or "").strip().lower() or None
+    game_cond = (ScanRecord.game_key.is_(None) if _gkey is None
+                 else ScanRecord.game_key == _gkey)
+    _pos = (record.scan_date, record.id)
+    base = ScanRecord.query.filter(game_cond)
+    # Previous in DESC order = the smallest row strictly above this one.
+    prev_record = (base.filter(_sa_tuple(ScanRecord.scan_date, ScanRecord.id) > _pos)
+                   .order_by(ScanRecord.scan_date.asc(), ScanRecord.id.asc())
+                   .first())
+    if prev_record is None:  # wrap to the last entry of the DESC list
+        prev_record = base.order_by(ScanRecord.scan_date.asc(), ScanRecord.id.asc()).first()
+    # Next in DESC order = the largest row strictly below this one.
+    next_record = (base.filter(_sa_tuple(ScanRecord.scan_date, ScanRecord.id) < _pos)
+                   .order_by(ScanRecord.scan_date.desc(), ScanRecord.id.desc())
+                   .first())
+    if next_record is None:  # wrap to the first entry of the DESC list
+        next_record = base.order_by(ScanRecord.scan_date.desc(), ScanRecord.id.desc()).first()
+    if prev_record is not None and prev_record.id == record.id:
+        # Wrapped straight back to this record: it is its game's only entry.
         prev_record = None
         next_record = None
 
@@ -6559,34 +6568,27 @@ def inventory_detail(record_id):
     finalized = data.get("finalized", False)
     is_final = finalized is True or str(finalized).strip().lower() == "true"
 
-    stack_locations = []  # list of dicts: {id, album, page, slot, record_id}
-    if is_final:
-        name   = _get_name(data)
-        serial = _get_serial(data)
-        edition = _get_edition(data)
-        holo   = str(data.get("holographic", "")).strip().lower()
-
-        # Fetch all finalized records and filter to the same group key
-        all_records = ScanRecord.query.order_by(ScanRecord.scan_date.asc(), ScanRecord.id.asc()).all()
-        for r in all_records:
-            if r.id == record.id:
-                continue
+    stack_locations = []  # list of dicts: {record_id, album, page, slot}
+    if is_final and record.dup_hash:
+        # dup_hash IS this stack's identity — sha1(name|serial|edition|holo),
+        # computed only for finalized records and kept current by the mapper
+        # events. An indexed lookup on it returns exactly the rows the old
+        # full-table scan matched field-by-field.
+        members = (
+            ScanRecord.query
+            .filter(ScanRecord.dup_hash == record.dup_hash,
+                    ScanRecord.id != record.id)
+            .order_by(ScanRecord.scan_date.asc(), ScanRecord.id.asc())
+            .all()
+        )
+        for r in members:
             rdata = r.extracted_data or {}
-            rfin = rdata.get("finalized", False)
-            if not (rfin is True or str(rfin).strip().lower() == "true"):
-                continue
-            if (
-                _get_name(rdata)   == name
-                and _get_serial(rdata) == serial
-                and _get_edition(rdata) == edition
-                and str(rdata.get("holographic", "")).strip().lower() == holo
-            ):
-                stack_locations.append({
-                    "record_id": r.id,
-                    "album": rdata.get("album", ""),
-                    "page":  rdata.get("page",  ""),
-                    "slot":  rdata.get("slot",  ""),
-                })
+            stack_locations.append({
+                "record_id": r.id,
+                "album": rdata.get("album", ""),
+                "page":  rdata.get("page",  ""),
+                "slot":  rdata.get("slot",  ""),
+            })
 
     # Load the template that was used for this record so we can render
     # fields with the correct input type (text / dropdown / boolean).
