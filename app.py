@@ -72,7 +72,7 @@ def _imdecode(buf, flags=cv2.IMREAD_COLOR):
     except Exception:
         return None
 from werkzeug.utils import secure_filename
-from models import (db, Product, ScanRecord, ShopConnection, Listing, EmailMonitor,
+from models import (db, utcnow, Product, ScanRecord, ShopConnection, Listing, EmailMonitor,
                     SaleEvent, ReferenceCard, ReferenceSync, TypeReference, AppSetting,
                     CollectionPrice)
 from dotenv import load_dotenv
@@ -2504,7 +2504,7 @@ def _apply_ocr_candidate(record, cand):
                 "url":          ref.url,
                 "full_url":     ref.url,
                 "source":       "tcgcsv",
-                "saved_at":     datetime.utcnow().isoformat(),
+                "saved_at":     utcnow().isoformat(),
                 "product_id":   str(ref.product_id),
                 "product_name": ref.name or "",
                 "set_name":     ref.set_name or "",
@@ -2895,7 +2895,7 @@ class Role(db.Model):
     name = db.Column(db.String(64), unique=True, nullable=False)
     is_admin = db.Column(db.Boolean, default=False, nullable=False)
     permissions = db.Column(db.JSON, default=dict)   # {resource_key: none|view|edit}
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
 
 
 class User(db.Model):
@@ -2906,7 +2906,7 @@ class User(db.Model):
     role_id = db.Column(db.Integer, db.ForeignKey("auth_roles.id"))
     role = db.relationship("Role")
     active = db.Column(db.Boolean, default=True, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
 
     def set_password(self, pw):
         self.password_hash = generate_password_hash(pw)
@@ -2927,7 +2927,7 @@ class SecurityEvent(db.Model):
     """
     __tablename__ = "auth_security_events"
     id = db.Column(db.Integer, primary_key=True)
-    at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False, index=True)
+    at = db.Column(db.DateTime, default=utcnow, nullable=False, index=True)
     action = db.Column(db.String(40), nullable=False)
     actor_id = db.Column(db.Integer)          # null for a failed sign-in or anonymous
     actor_name = db.Column(db.String(64))
@@ -4990,7 +4990,7 @@ def builder_export():
     if not groups:
         return jsonify({"status": "error", "message": "Nothing to export."}), 400
     csv_text, _ids = _builder_csv(groups)
-    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    stamp = utcnow().strftime("%Y%m%d_%H%M%S")
     safe_game = _re.sub(r"[^A-Za-z0-9_-]+", "_", game)
     fname = f"{safe_game}_{mode}_{stamp}.csv"
     return Response(csv_text, mimetype="text/csv",
@@ -5282,7 +5282,7 @@ def analytics_export():
     w.writerow([])
     w.writerow(["TOTAL"] + [result["totals"][m["key"]] for m in result["metrics"]])
 
-    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    stamp = utcnow().strftime("%Y%m%d_%H%M%S")
     fname = f"analytics_{p['source']}_{(p['group_by'] or 'all')}_{stamp}.csv"
     return Response(buf.getvalue(), mimetype="text/csv",
                     headers={"Content-Disposition": f'attachment; filename="{fname}"'})
@@ -6191,7 +6191,7 @@ def quick_scan_identify():
 
     ensure_dirs()
     tmp = os.path.join(app.config["TEMP_CARD_FOLDER"],
-                       "quickscan_" + datetime.utcnow().strftime("%Y%m%d%H%M%S%f") + ".png")
+                       "quickscan_" + utcnow().strftime("%Y%m%d%H%M%S%f") + ".png")
     try:
         file.save(tmp)
         bgr = _imread(tmp)
@@ -8514,7 +8514,7 @@ def _build_entry_from_hit(hit: dict, card_name: str, set_number: str) -> dict:
     return {
         "url":          product_url,
         "full_url":     product_url,
-        "saved_at":     datetime.utcnow().isoformat(),
+        "saved_at":     utcnow().isoformat(),
         "source":       "justtcg",
         "product_id":   str(card_id),
         "tcgplayer_id": str(tcgplayer_id),
@@ -8741,7 +8741,7 @@ def tcg_save_url(record_id):
     entry = {
         "url":      url,
         "full_url": url,
-        "saved_at": datetime.utcnow().isoformat(),
+        "saved_at": utcnow().isoformat(),
         "source":   "manual",
     }
 
@@ -9025,7 +9025,7 @@ def ocr_apply(record_id):
                 "url":          ref.url,
                 "full_url":     ref.url,
                 "source":       "tcgcsv",
-                "saved_at":     datetime.utcnow().isoformat(),
+                "saved_at":     utcnow().isoformat(),
                 "product_id":   str(ref.product_id),
                 "product_name": ref.name or "",
                 "set_name":     ref.set_name or "",
@@ -9252,7 +9252,7 @@ def reference_categories():
         return jsonify({"status": "error", "message": "Reference sync source unavailable."}), 503
 
     # Serve from cache if fetched within the last 30 minutes.
-    now = datetime.utcnow()
+    now = utcnow()
     cached = _REF_CATEGORIES_CACHE
     if cached["data"] and cached["at"] and (now - cached["at"]).total_seconds() < 1800:
         cats = cached["data"]
@@ -11724,7 +11724,7 @@ def _set_held(ids, value):
         if not value:
             # Marking sold — stamp a sale date (unless an integration sale already
             # recorded one) so the sale lands in the right reporting period.
-            data.setdefault("sold_at", datetime.utcnow().isoformat())
+            data.setdefault("sold_at", utcnow().isoformat())
         else:
             data.pop("sold_at", None)   # back to held: drop the stale sale date
         r.extracted_data = data   # reassign -> row dirty -> before_update resyncs column
@@ -12230,7 +12230,7 @@ def _build_migration_bundle(include_reference=False, include_images_manifest=Tru
     """Assemble the migration bundle as a .tar.gz on disk and return its path."""
     import tarfile
     ensure_dirs()
-    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    stamp = utcnow().strftime("%Y%m%d_%H%M%S")
     work = tempfile.mkdtemp(prefix="migration_", dir=app.config["TEMP_PDF_FOLDER"])
     bundle_dir = os.path.join(work, f"ccim_migration_{stamp}")
     os.makedirs(bundle_dir, exist_ok=True)
@@ -12262,7 +12262,7 @@ def _build_migration_bundle(include_reference=False, include_images_manifest=Tru
     roots = app.config.get("STORAGE_ROOTS", {})
     manifest = {
         "bundle_version": MIGRATION_BUNDLE_VERSION,
-        "created_utc": datetime.utcnow().isoformat(),
+        "created_utc": utcnow().isoformat(),
         "source": "Card Collector Inventory Manager (SQLite build)",
         "source_cap": INVENTORY_MAX_RECORDS,
         "capacity": _capacity_status(),
@@ -13566,7 +13566,7 @@ def _grade_condition_single(record, mode="ebay"):
 
     grading = {
         "mode":      mode if mode in XIMILAR_CONDITION_MODES else "ebay",
-        "graded_at": datetime.utcnow().isoformat() + "Z",
+        "graded_at": utcnow().isoformat() + "Z",
         "front":     by_id.get("front"),
         "back":      by_id.get("back"),
     }
@@ -14108,7 +14108,7 @@ def ebay_template_asset():
                 pass
         if real is None:
             return jsonify({"status": "error", "message": "That file isn't a readable image."}), 415
-        name = datetime.utcnow().strftime("%Y%m%d%H%M%S%f") + ext
+        name = utcnow().strftime("%Y%m%d%H%M%S%f") + ext
         f.save(os.path.join(sub, name))
         saved.append({"src": url_for("uploaded_file", filename=f"ebay_assets/{name}")})
     return jsonify({"data": saved})
@@ -14153,7 +14153,7 @@ def ebay_listing_csv():
             p.get("price") if p.get("price") is not None else "",
             "GTC",
         ]])
-    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    stamp = utcnow().strftime("%Y%m%d_%H%M%S")
     return Response(buf.getvalue(), mimetype="text/csv",
                     headers={"Content-Disposition": f'attachment; filename="ebay_listings_{stamp}.csv"'})
 
@@ -14268,7 +14268,7 @@ def shops_save(marketplace):
         conn.status = "disconnected"
         conn.status_detail = "Destination changed — test the connection again before syncing."
         conn.connected_at = None
-    conn.updated_at = datetime.utcnow()
+    conn.updated_at = utcnow()
     db.session.commit()
     msg = f"{MARKETPLACES[marketplace]['label']} settings saved."
     if host_changed:
@@ -14291,8 +14291,8 @@ def shops_test(marketplace):
     conn.status_detail = result.get("message", "")
     if result.get("ok"):
         conn.enabled = True
-        conn.connected_at = conn.connected_at or datetime.utcnow()
-    conn.updated_at = datetime.utcnow()
+        conn.connected_at = conn.connected_at or utcnow()
+    conn.updated_at = utcnow()
     db.session.commit()
 
     return jsonify({
@@ -14379,7 +14379,7 @@ def shops_ebay_callback():
     if result.get("ok"):
         conn.status = "connected"
         conn.enabled = True
-        conn.connected_at = datetime.utcnow()
+        conn.connected_at = utcnow()
         conn.status_detail = "Account connected."
         db.session.commit()
         return redirect(url_for("shops_page") + "?ebay_ok=1")
@@ -14484,7 +14484,7 @@ def shops_push():
         listing.title = payload["title"]
         listing.price = payload["price"]
         listing.quantity = payload["quantity"]
-        listing.last_synced = datetime.utcnow()
+        listing.last_synced = utcnow()
         if result.get("ok"):
             listing.external_id = result.get("external_id") or listing.external_id
             listing.external_url = result.get("external_url") or listing.external_url
@@ -14541,7 +14541,7 @@ def shops_unlist():
     if result.get("ok"):
         listing.status = result.get("status", "ended")
         listing.last_error = None
-        listing.last_synced = datetime.utcnow()
+        listing.last_synced = utcnow()
     else:
         listing.last_error = result.get("message", "")
     db.session.commit()
@@ -14587,7 +14587,7 @@ def shops_pull(marketplace):
         listing.price = item.get("price", listing.price)
         listing.quantity = item.get("quantity", listing.quantity)
         listing.status = item.get("status") or "active"
-        listing.last_synced = datetime.utcnow()
+        listing.last_synced = utcnow()
         if item.get("extra"):
             merged = dict(listing.extra or {}); merged.update(item["extra"])
             listing.extra = merged
@@ -14792,10 +14792,10 @@ def shops_tcgplayer_export_csv():
         listing.quantity = row["qty"]
         listing.status = "draft"          # generated into an import file, awaiting upload
         listing.last_error = None
-        listing.last_synced = datetime.utcnow()
+        listing.last_synced = utcnow()
     db.session.commit()
 
-    fname = f"tcgplayer_import_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.csv"
+    fname = f"tcgplayer_import_{utcnow().strftime('%Y%m%d_%H%M')}.csv"
     resp = app.response_class(csv_text, mimetype="text/csv")
     resp.headers["Content-Disposition"] = f'attachment; filename="{fname}"'
     resp.headers["X-CCIM-Included"] = str(len(rows))
@@ -15034,7 +15034,7 @@ def shops_tcgplayer_import_ids():
                 listing.quantity = m["row"]["qty"] or _record_quantity(r)
                 listing.status = "active"      # these are live TCGplayer listings
                 listing.last_error = None
-                listing.last_synced = datetime.utcnow()
+                listing.last_synced = utcnow()
 
     if mode == "apply":
         db.session.commit()
@@ -15082,14 +15082,14 @@ def _mark_record_sold(record, sold_qty, source, order_id, sold_price=None):
     data["quantity"] = remaining
     log = list(data.get("sales_log", []))
     log.append({"source": source, "order_id": order_id, "qty": int(sold_qty or 1),
-                "price": sold_price, "at": datetime.utcnow().isoformat()})
+                "price": sold_price, "at": utcnow().isoformat()})
     data["sales_log"] = log
     if remaining == 0:
         # held=False is what moves the record to the Sold page: _held_from /
         # is_held read the "held" key (see _set_held), not a "sold" flag.
         data["held"] = False
         data.pop("sold", None)   # retire the old wrong-key flag if present
-        data["sold_at"] = datetime.utcnow().isoformat()
+        data["sold_at"] = utcnow().isoformat()
     record.extracted_data = data
 
     results = []
@@ -15098,7 +15098,7 @@ def _mark_record_sold(record, sold_qty, source, order_id, sold_price=None):
         if listing.marketplace == source:
             listing.quantity = remaining
             listing.status = "ended" if remaining == 0 else listing.status
-            listing.last_synced = datetime.utcnow()
+            listing.last_synced = utcnow()
             continue
 
         conn = _get_connection(listing.marketplace)
@@ -15117,7 +15117,7 @@ def _mark_record_sold(record, sold_qty, source, order_id, sold_price=None):
             payload["extra"] = listing.extra or {}
             r = provider.push(payload)
         listing.last_error = None if r.get("ok") else r.get("message")
-        listing.last_synced = datetime.utcnow()
+        listing.last_synced = utcnow()
         results.append({"marketplace": listing.marketplace, "ok": bool(r.get("ok")),
                         "message": r.get("message", "")})
 
@@ -15364,7 +15364,7 @@ def shops_email_check():
         summary["details"].append(out)
 
     m.last_uid = res.get("max_uid", m.last_uid)
-    m.last_checked = datetime.utcnow()
+    m.last_checked = utcnow()
     m.status = "connected"
     m.status_detail = (f"Checked {summary['emails']} email(s): "
                        f"{summary['processed']} sold, {summary['unmatched']} unmatched.")
@@ -15415,7 +15415,7 @@ def _email_poll_once():
     interval = max(int(m.poll_interval or 60), 15)
 
     res = email_monitor.fetch_sale_emails(_email_cfg(m), since_uid=m.last_uid or 0)
-    m.last_checked = datetime.utcnow()
+    m.last_checked = utcnow()
     if not res.get("ok"):
         m.status = "error"
         m.status_detail = (res.get("message") or "Fetch failed.")[:500]
@@ -16002,7 +16002,7 @@ def _ensure_self_signed_cert(cert_dir, hostnames, ips):
             san.append(x509.IPAddress(ipaddress.ip_address(ip)))
         except ValueError:
             pass
-    now = _dt.datetime.utcnow()
+    now = _dt.utcnow()
     cert = (x509.CertificateBuilder()
             .subject_name(name).issuer_name(name)
             .public_key(key.public_key())

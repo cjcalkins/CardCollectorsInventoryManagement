@@ -1,8 +1,18 @@
 from flask_sqlalchemy import SQLAlchemy
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 
 db = SQLAlchemy()
+
+
+def utcnow():
+    """Naive UTC now — the storage convention for every datetime column.
+
+    Replaces datetime.utcnow (deprecated since Python 3.12) without changing
+    what gets stored: values stay naive and UTC. Code that buckets these
+    into local-calendar windows must convert the window, not the data
+    (see app.py's _report_build)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 class Product(db.Model):
     __tablename__ = 'products'
@@ -27,7 +37,7 @@ class ScanRecord(db.Model):
     # representative. Set via /duplicates/resolve. Never affects this
     # record's own image_path, so its individual inventory_detail page
     # always keeps showing the photo it was actually scanned with.
-    scan_date = db.Column(db.DateTime, default=datetime.utcnow)
+    scan_date = db.Column(db.DateTime, default=utcnow)
     template_used = db.Column(db.String(100))  # e.g. "product_label_v1"
     extracted_data = db.Column(db.JSON)        # stores all OCR segments
     matched_product_id = db.Column(db.Integer, db.ForeignKey('products.id'), nullable=True)
@@ -93,7 +103,7 @@ class ShopConnection(db.Model):
     status       = db.Column(db.String(20), default='disconnected')  # connected|disconnected|error
     status_detail = db.Column(db.Text, nullable=True)                 # last test/connect message
     connected_at = db.Column(db.DateTime, nullable=True)
-    updated_at   = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at   = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
 
     def __repr__(self):
         return f"<ShopConnection {self.marketplace} {self.status}>"
@@ -161,7 +171,7 @@ class EmailMonitor(db.Model):
     last_checked   = db.Column(db.DateTime, nullable=True)
     status         = db.Column(db.String(20), default='disconnected')
     status_detail  = db.Column(db.Text, nullable=True)
-    updated_at     = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at     = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
 
     def __repr__(self):
         return f"<EmailMonitor {self.username or '-'} {self.status}>"
@@ -184,7 +194,7 @@ class SaleEvent(db.Model):
     status       = db.Column(db.String(20), default='unmatched')  # unmatched|matched|processed|error|unparsed
     detail       = db.Column(db.Text, nullable=True)
     email_subject = db.Column(db.String(400), nullable=True)
-    created_at   = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at   = db.Column(db.DateTime, default=utcnow)
 
     record = db.relationship('ScanRecord')
 
@@ -219,7 +229,7 @@ class ReferenceCard(db.Model):
     url          = db.Column(db.String(500))
     market_price = db.Column(db.Float, nullable=True)
     extended     = db.Column(db.JSON, default=dict)                  # full extendedData as {name: value}
-    updated_at   = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at   = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
 
     def __repr__(self):
         return f"<ReferenceCard {self.game} {self.name} {self.number}>"
@@ -239,7 +249,7 @@ class ReferenceSync(db.Model):
     product_count  = db.Column(db.Integer, default=0)
     group_count    = db.Column(db.Integer, default=0)
     remote_updated = db.Column(db.String(60), nullable=True)   # value of last-updated.txt at sync time
-    last_synced    = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_synced    = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
     status         = db.Column(db.String(20), default='idle')  # idle|syncing|ok|error
     status_detail  = db.Column(db.Text, nullable=True)
 
@@ -267,7 +277,7 @@ class TypeReference(db.Model):
     image_path  = db.Column(db.String(255), nullable=False)              # upload-relative PNG of the icon
     source      = db.Column(db.String(30), default='upload')            # upload | capture
     note        = db.Column(db.String(200), nullable=True)
-    created_at  = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at  = db.Column(db.DateTime, default=utcnow)
 
     def __repr__(self):
         return f"<TypeReference {self.game} {self.type_name} [{self.region}] #{self.id}>"
@@ -286,7 +296,7 @@ class AppSetting(db.Model):
     id         = db.Column(db.Integer, primary_key=True)
     key        = db.Column(db.String(120), unique=True, nullable=False)
     value      = db.Column(db.Text, nullable=True)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
 
     def __repr__(self):
         return f"<AppSetting {self.key}>"
@@ -306,7 +316,7 @@ class CollectionPrice(db.Model):
     name_key   = db.Column(db.String(200), unique=True, nullable=False, index=True)
     name       = db.Column(db.String(200), nullable=False)
     bought_for = db.Column(db.Float, nullable=True)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
 
     def __repr__(self):
         return f"<CollectionPrice {self.name} {self.bought_for}>"
