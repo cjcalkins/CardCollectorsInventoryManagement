@@ -15083,7 +15083,10 @@ def _mark_record_sold(record, sold_qty, source, order_id, sold_price=None):
                 "price": sold_price, "at": datetime.utcnow().isoformat()})
     data["sales_log"] = log
     if remaining == 0:
-        data["sold"] = True
+        # held=False is what moves the record to the Sold page: _held_from /
+        # is_held read the "held" key (see _set_held), not a "sold" flag.
+        data["held"] = False
+        data.pop("sold", None)   # retire the old wrong-key flag if present
         data["sold_at"] = datetime.utcnow().isoformat()
     record.extracted_data = data
 
