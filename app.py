@@ -6162,16 +6162,19 @@ def _held_inventory_match(game, name, number):
     gk = (game or "").strip().lower()
     if gk:
         q = q.filter(ScanRecord.game_key == gk)
+    # Two-column projection: the loop's _get_name/_get_serial are exactly what
+    # the mapper stores in name_key/serial_key, and the is_held SQL condition
+    # already mirrors the _held_from re-check — so the fuzzy substring match
+    # runs without hydrating any held row's extracted_data. It fires once per
+    # card in a scanning session.
     count = 0
-    for r in q.all():
-        data = r.extracted_data or {}
-        if not _held_from(data):
-            continue
-        rn = _re.sub(r"[^a-z0-9]+", "", (_get_name(data) or "").lower())
+    for name_key, serial_key in q.with_entities(ScanRecord.name_key,
+                                                ScanRecord.serial_key).all():
+        rn = _re.sub(r"[^a-z0-9]+", "", (name_key or "").lower())
         if not rn or not (tn == rn or tn in rn or rn in tn):
             continue
         if tnum_variants:
-            rnum = (_get_serial(data) or "").strip()
+            rnum = (serial_key or "").strip()
             rvar = _collector_number_variants(rnum) if rnum else set()
             if rvar and not (tnum_variants & rvar):
                 continue   # both have numbers but they disagree
