@@ -434,7 +434,13 @@ STORAGE_CONFIG_PATH = os.path.join(BASE_DIR, "storage_config.json")
 
 # Subfolders each movable root "owns" — used both to derive app.config paths and
 # to know exactly what to migrate when a root is relocated.
-STORAGE_UPLOAD_SUBDIRS = ["inventory_cards", "type_refs", "debug", "orb_cache"]
+# Every subdirectory the uploads root owns must be listed here: this list IS
+# the relocation/sizing/wipe contract (_move_folder_slot, _slot_owned_paths,
+# _wipe_storage_contents). "albums" (container covers), "game_icons", and
+# "migration_exports" (credential-bearing bundles) were missing, so moving the
+# uploads root silently left them behind at the old location.
+STORAGE_UPLOAD_SUBDIRS = ["inventory_cards", "type_refs", "debug", "orb_cache",
+                          "albums", "game_icons", "migration_exports"]
 STORAGE_TEMP_SUBDIRS   = ["import_pages", "temp_split", "temp_cards", "temp_pdf_pages"]
 
 # Defaults reproduce the original on-disk layout exactly: images and temp both
@@ -12667,9 +12673,11 @@ def _wipe_storage_contents():
     targets = []
     up = roots.get("uploads", "")
     if up:
+        # STORAGE_UPLOAD_SUBDIRS now carries albums/game_icons/migration_exports
+        # too. The old extras list here named "album_covers" — a directory
+        # nothing ever wrote (covers live in "albums"), so container covers
+        # silently survived every factory reset.
         targets += [os.path.join(up, s) for s in STORAGE_UPLOAD_SUBDIRS]
-        targets += [os.path.join(up, "migration_exports"), os.path.join(up, "game_icons"),
-                    os.path.join(up, "album_covers")]
     tmp = roots.get("temp", "")
     if tmp:
         targets += [os.path.join(tmp, s) for s in STORAGE_TEMP_SUBDIRS]
