@@ -1852,6 +1852,69 @@ _OCR_NAME_NOISE = frozenset({
 })
 
 
+# ---- FTS5 search helpers ---------------------------------------------------
+# The FTS tables (scan_search / ref_search, trigram tokenizer) are created by
+# migrate_add_search_fts(). These helpers return the SAME logical filter either
+# way — a LIKE '%q%' match, ASCII-case-insensitive — but route it through the
+# FTS index when the table exists and the query has >= 3 characters (a trigram
+# needs three); otherwise the original scan runs unchanged.
+_FTS_READY = {}   # {table_name: bool}, probed once per process
+
+# Lightweight handles for the FTS virtual tables (not in db.metadata, so
+# create_all/drop_all never touch them). Using Core constructs here means
+# .like() gets a fresh anonymous bindparam per call — two conditions in one
+# statement can never collide the way fixed-name text() params silently do.
+from sqlalchemy import table as _sa_lite_table, column as _sa_lite_column
+_scan_search_t = _sa_lite_table("scan_search", _sa_lite_column("rowid"),
+                                _sa_lite_column("extracted_data"))
+_ref_search_t = _sa_lite_table("ref_search", _sa_lite_column("rowid"),
+                               _sa_lite_column("name"))
+
+
+def _fts_ready(table):
+    """Is the FTS table actually usable on this connection?
+
+    A real probe query on a dedicated connection, not a sqlite_master lookup:
+    a DB file can carry the FTS tables while the runtime's SQLite lacks the
+    fts5 module or trigram tokenizer (e.g. the same collection opened on an
+    older Pi build), and on non-SQLite backends the tables never exist at
+    all. Any failure caches False — searches then use the portable LIKE scan
+    for the rest of the process, which returns identical rows, just slower.
+    migrate_add_search_fts() clears the cache after (re)creating the tables.
+    """
+    if table not in _FTS_READY:
+        try:
+            if db.engine.dialect.name != "sqlite":
+                _FTS_READY[table] = False
+            else:
+                with db.engine.connect() as conn:
+                    conn.exec_driver_sql(f"SELECT rowid FROM {table} LIMIT 0")
+                _FTS_READY[table] = True
+        except Exception:
+            _FTS_READY[table] = False
+    return _FTS_READY[table]
+
+
+def _scan_search_condition(search):
+    """'This text appears anywhere in the record JSON', as a filter clause."""
+    pattern = f"%{search}%"
+    if len(search) >= 3 and _fts_ready("scan_search"):
+        return ScanRecord.id.in_(
+            db.select(_scan_search_t.c.rowid)
+              .where(_scan_search_t.c.extracted_data.like(pattern)))
+    return ScanRecord.extracted_data.cast(db.Text).ilike(pattern)
+
+
+def _ref_name_condition(fragment):
+    """'This text appears in the reference card name', as a filter clause."""
+    pattern = f"%{fragment}%"
+    if len(fragment) >= 3 and _fts_ready("ref_search"):
+        return ReferenceCard.id.in_(
+            db.select(_ref_search_t.c.rowid)
+              .where(_ref_search_t.c.name.like(pattern)))
+    return ReferenceCard.name.ilike(pattern)
+
+
 def _strip_ocr_name_noise(name):
     """Drop stage/rarity/UI tokens (incl. lightly OCR-mangled ones) from an OCR'd
     name so 'BASIC Panpour' / 'sic Panpour' narrows and scores as 'Panpour'."""
@@ -1895,7 +1958,7 @@ def _reference_candidates_for_ocr(category_id, ocr_result, limit=8):
         narrowed = base.filter(ReferenceCard.number.in_(list(variants))).limit(300).all()
     if not narrowed and name:
         first = (name.split() or [name])[0]
-        narrowed = base.filter(ReferenceCard.name.ilike(f"%{first}%")).limit(500).all()
+        narrowed = base.filter(_ref_name_condition(first)).limit(500).all()
     if not narrowed:
         narrowed = base.limit(500).all()
 
@@ -1950,13 +2013,13 @@ def _database_match_candidates(category_id, name, number, limit=25):
         pool = base.filter(ReferenceCard.number.in_(list(qvariants) or [qnum])).limit(400).all()
     if qname and not pool:
         first = (qname.split() or [qname])[0]
-        pool = base.filter(ReferenceCard.name.ilike(f"%{first}%")).limit(600).all()
+        pool = base.filter(_ref_name_condition(first)).limit(600).all()
     elif qname and qnum:
         # Add name-token matches too, so a padding/number mismatch still surfaces
         # the right card in the picker rather than hiding it.
         first = (qname.split() or [qname])[0]
         seen = {c.product_id for c in pool}
-        pool += [c for c in base.filter(ReferenceCard.name.ilike(f"%{first}%")).limit(400).all()
+        pool += [c for c in base.filter(_ref_name_condition(first)).limit(400).all()
                  if c.product_id not in seen]
     if not pool:
         pool = base.limit(800).all()
@@ -4971,7 +5034,7 @@ def _analytics_filtered_records(source, f_game, f_template, search):
         conds.append(ScanRecord.template_used == f_template)
     q = ScanRecord.query.filter(and_(*conds))
     if search:
-        q = q.filter(ScanRecord.extracted_data.cast(db.Text).ilike(f"%{search}%"))
+        q = q.filter(_scan_search_condition(search))
     return q.all()
 
 
@@ -6184,7 +6247,7 @@ def inventory():
     if f_template:
         query = query.filter(ScanRecord.template_used == f_template)
     if search:
-        query = query.filter(ScanRecord.extracted_data.cast(db.Text).ilike(f"%{search}%"))
+        query = query.filter(_scan_search_condition(search))
     if f_game:
         query = query.filter(ScanRecord.game_key == f_game.strip().lower())
     if f_album:
@@ -6341,7 +6404,7 @@ def inventory_export_csv():
     if f_template:
         query = query.filter(ScanRecord.template_used == f_template)
     if search:
-        query = query.filter(ScanRecord.extracted_data.cast(db.Text).ilike(f"%{search}%"))
+        query = query.filter(_scan_search_condition(search))
 
     records = query.all()
     records = [r for r in records if _is_catalog_only(r.extracted_data or {}) == view_catalog]
@@ -6486,7 +6549,7 @@ def inventory_all_ids():
     if f_template:
         query = query.filter(ScanRecord.template_used == f_template)
     if search:
-        query = query.filter(ScanRecord.extracted_data.cast(db.Text).ilike(f"%{search}%"))
+        query = query.filter(_scan_search_condition(search))
 
     rows = query.all()
 
@@ -12231,6 +12294,10 @@ def reset_confirm():
         db.session.remove()
         db.drop_all()
         db.create_all()
+        # drop_all took the FTS sync triggers with the base tables; recreate
+        # them (and rebuild the now-stale search index) without waiting for
+        # the next restart's migrations.
+        migrate_add_search_fts()
         _inv_count_cache["n"] = 0
 
         # Delete stored images, caches, temp files, and exports.
@@ -15414,6 +15481,66 @@ def migrate_drop_unused_indexes():
             conn.exec_driver_sql(f"DROP INDEX IF EXISTS {name}")
 
 
+def migrate_add_search_fts():
+    """
+    Full-text search backing (FTS5, trigram tokenizer) so the substring
+    searches stay index-served as the collection grows:
+
+      • scan_search — external-content FTS over scan_records.extracted_data.
+        The inventory / analytics / CSV-export / Select-All search all match a
+        LIKE pattern against the serialized JSON; a trigram FTS5 table serves
+        that exact LIKE from an index (same pattern semantics, ASCII-case-
+        insensitive — identical to the lower()/LIKE scan it replaces).
+      • ref_search — the same over reference_cards.name for the OCR matchers.
+
+    Sync is by AFTER INSERT/UPDATE/DELETE triggers on the base tables, so
+    every write path is covered, ORM or raw SQL. Self-healing: when the row
+    counts diverge from the base table (e.g. a factory reset dropped and
+    recreated the base tables, taking the triggers with them), the index is
+    rebuilt from the content table. The reset route also re-runs this
+    migration directly so search works again before the next restart.
+
+    On a SQLite without FTS5 or the trigram tokenizer (< 3.34) everything
+    here is skipped; _search_condition helpers then fall back to the plain
+    LIKE scan, so search keeps working, just unindexed.
+    """
+    specs = [
+        ("scan_search", "scan_records", "extracted_data"),
+        ("ref_search", "reference_cards", "name"),
+    ]
+    try:
+        with db.engine.begin() as conn:
+            for fts, base, col in specs:
+                conn.exec_driver_sql(
+                    f"CREATE VIRTUAL TABLE IF NOT EXISTS {fts} USING fts5("
+                    f"{col}, content='{base}', content_rowid='id', tokenize='trigram')")
+                conn.exec_driver_sql(
+                    f"CREATE TRIGGER IF NOT EXISTS {fts}_ai AFTER INSERT ON {base} BEGIN "
+                    f"INSERT INTO {fts}(rowid, {col}) VALUES (new.id, new.{col}); END")
+                conn.exec_driver_sql(
+                    f"CREATE TRIGGER IF NOT EXISTS {fts}_ad AFTER DELETE ON {base} BEGIN "
+                    f"INSERT INTO {fts}({fts}, rowid, {col}) VALUES ('delete', old.id, old.{col}); END")
+                conn.exec_driver_sql(
+                    f"CREATE TRIGGER IF NOT EXISTS {fts}_au AFTER UPDATE OF {col} ON {base} BEGIN "
+                    f"INSERT INTO {fts}({fts}, rowid, {col}) VALUES ('delete', old.id, old.{col}); "
+                    f"INSERT INTO {fts}(rowid, {col}) VALUES (new.id, new.{col}); END")
+                n_base = conn.exec_driver_sql(f"SELECT count(*) FROM {base}").fetchone()[0]
+                # count(*) on an external-content FTS table is answered from the
+                # CONTENT table, so it can never detect a stale/empty index. The
+                # _docsize shadow table counts what is actually indexed.
+                n_fts = conn.exec_driver_sql(
+                    f"SELECT count(*) FROM {fts}_docsize").fetchone()[0]
+                if n_base != n_fts:
+                    conn.exec_driver_sql(f"INSERT INTO {fts}({fts}) VALUES ('rebuild')")
+        _FTS_READY.clear()   # re-probe: tables may have just appeared
+    except Exception as exc:
+        try:
+            app.logger.warning("FTS5 search index unavailable (%s); "
+                               "search falls back to table scans.", exc)
+        except Exception:
+            pass
+
+
 def init_db():
     """
     Create/upgrade the database schema and load persisted settings. Every step
@@ -15434,6 +15561,7 @@ def init_db():
         migrate_add_scan_scaling_columns()
         migrate_add_performance_indexes()
         migrate_drop_unused_indexes()
+        migrate_add_search_fts()
         optimize_database()
         load_settings()   # load API keys/settings; one-time seed from .env
 
