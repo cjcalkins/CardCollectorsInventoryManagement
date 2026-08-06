@@ -15327,6 +15327,29 @@ def migrate_add_scan_scaling_columns():
         _backfill_scan_columns()
 
 
+def init_db():
+    """
+    Create/upgrade the database schema and load persisted settings. Every step
+    is idempotent, so running it on an up-to-date database is a cheap no-op.
+
+    Called only from the __main__ block. Importing this module must stay free
+    of database side effects: test harnesses and `flask shell` rely on import
+    being inert, and the import-time SECRET_KEY / SESSION_COOKIE_SECURE code
+    is deliberately written around the database not being ready at import. A
+    WSGI server importing this module never runs this — `python app.py` is the
+    only supported launch path (see README, "Running the app").
+    """
+    with app.app_context():
+        db.create_all()
+        migrate_add_image_path_back_column()
+        migrate_add_display_image_path_column()
+        migrate_add_type_reference_region_column()
+        migrate_add_scan_scaling_columns()
+        migrate_add_performance_indexes()
+        optimize_database()
+        load_settings()   # load API keys/settings; one-time seed from .env
+
+
 def _lan_ip():
     """Best-effort primary LAN IPv4 of this machine (no packet is actually sent)."""
     import socket
@@ -15547,16 +15570,9 @@ if __name__ == "__main__":
     # (re)starting on the current configured database.
     process_pending_deletions()
 
-    with app.app_context():
-        db.create_all()
-        migrate_add_image_path_back_column()
-        migrate_add_display_image_path_column()
-        migrate_add_type_reference_region_column()
-        migrate_add_scan_scaling_columns()
-        migrate_add_performance_indexes()
-        optimize_database()
-        load_settings()   # load API keys/settings; one-time seed from .env
+    init_db()
 
+    with app.app_context():
         # Stable session secret so logins survive restarts and are shared across the
         # reloader's parent/child processes. Env SECRET_KEY wins; otherwise a value
         # is generated once and stored in app_settings.

@@ -177,6 +177,15 @@ command is in the lock file's header) so the next person inherits a tested set.
 python app.py
 ```
 
+**`python app.py` is the only supported way to run the app.** Do not point a WSGI
+server (gunicorn, uWSGI, mod_wsgi) at it: a WSGI server imports the module without
+running its startup block, which is where the database schema is created, migrations
+run, and stored settings load. A fresh WSGI deployment comes up with no tables at all —
+it still shows the first-run setup page, which then fails on submit — and an existing
+one silently skips every new migration on upgrade. HTTPS setup, mDNS advertisement,
+and the optional email poller also only start from `python app.py`. If you need a
+reverse proxy (nginx, Tailscale, Cloudflare), put it in front of `python app.py`.
+
 By default the app serves over **HTTPS** on port **443** and advertises itself on the
 local network. On first launch it generates a self-signed certificate (stored in
 `certs/`) and prints the address to visit, for example:
@@ -228,7 +237,7 @@ All configuration is via environment variables (a `.env` file is supported). Com
 | `PORT`                    | `443` / `80`       | Listening port (HTTPS / HTTP default). |
 | `PORT_FALLBACK`           | `8443` / `5005`    | Port used if the primary port can't bind. |
 | `SECRET_KEY`              | *(auto-persisted)* | Flask session secret. Auto-generated and stored if unset. |
-| `SESSION_COOKIE_SECURE`   | *(unset)*          | Mark the session cookie `Secure`. **Set this to `1` when running behind a TLS-terminating proxy** (gunicorn/uWSGI + nginx): the app sees plain HTTP there and cannot tell. Running `python app.py` over HTTPS turns it on by itself. Leave unset for plain HTTP — a `Secure` cookie on an `http://` origin is never sent back, which looks like "login does nothing". |
+| `SESSION_COOKIE_SECURE`   | *(unset)*          | Mark the session cookie `Secure`. **Set this to `1` when running behind a TLS-terminating reverse proxy** (e.g. nginx, Tailscale, or Cloudflare in front of `python app.py`): the app sees plain HTTP there and cannot tell. Running `python app.py` over HTTPS turns it on by itself. Leave unset for plain HTTP — a `Secure` cookie on an `http://` origin is never sent back, which looks like "login does nothing". |
 | `IMAP_ALLOW_INSECURE_TLS` | *(unset)*          | Accept an IMAP server certificate that isn't trusted or doesn't match the hostname. **Only set this for your own mail server with a self-signed certificate** — it disables the check that stops anything on the network path from impersonating your mail provider and collecting the mailbox password. It does **not** allow an unencrypted connection: a server that won't start TLS is still refused. |
 | `DISABLE_AUTH`            | *(unset)*          | Kill-switch to disable authentication entirely. |
 | `FLASK_DEBUG`             | `0`                | Enable the Werkzeug debugger/reloader (local dev only — unsafe on a LAN). |
