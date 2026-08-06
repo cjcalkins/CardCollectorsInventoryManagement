@@ -37,7 +37,7 @@ import hashlib
 import urllib.request
 import urllib.parse
 import urllib.error
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 # Imported as a bare name ON PURPOSE. Both Cardmarket request builders assign a local
 # called `xml`, so `import xml.sax.saxutils` and a `xml.sax.saxutils.escape(...)` call
 # inside them would resolve to that local -- Python marks `xml` local for the whole
@@ -46,6 +46,13 @@ from xml.sax.saxutils import escape as _xml_escape
 
 DEFAULT_TIMEOUT = 30
 SHOPIFY_API_VERSION = "2026-01"
+
+
+def _utcnow():
+    """Naive UTC now (matches models.utcnow, duplicated because this module
+    deliberately imports nothing framework-side). Replaces the deprecated
+    datetime.utcnow; token-expiry timestamps stay naive UTC."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -529,7 +536,7 @@ class EbayProvider(ShopProvider):
         return {"ok": False, "message": _first_api_error(parsed, raw, "eBay token exchange failed")}
 
     def _store_tokens(self, tok):
-        now = datetime.utcnow()
+        now = _utcnow()
         self.cfg["access_token"] = tok.get("access_token", "")
         self.cfg["access_expires_at"] = (now + timedelta(seconds=int(tok.get("expires_in", 7200)) - 120)).isoformat()
         if tok.get("refresh_token"):
@@ -542,7 +549,7 @@ class EbayProvider(ShopProvider):
         exp = self.cfg.get("access_expires_at")
         if token and exp:
             try:
-                if datetime.fromisoformat(exp) > datetime.utcnow():
+                if datetime.fromisoformat(exp) > _utcnow():
                     return True
             except ValueError:
                 pass
@@ -736,7 +743,7 @@ class TCGplayerProvider(ShopProvider):
         exp = self.cfg.get("bearer_expires_at")
         if token and exp:
             try:
-                if datetime.fromisoformat(exp) > datetime.utcnow():
+                if datetime.fromisoformat(exp) > _utcnow():
                     return token
             except ValueError:
                 pass
@@ -751,7 +758,7 @@ class TCGplayerProvider(ShopProvider):
         if c == 200 and isinstance(parsed, dict) and parsed.get("access_token"):
             self.cfg["bearer_token"] = parsed["access_token"]
             secs = int(parsed.get("expires_in", 1209600)) if str(parsed.get("expires_in", "")).isdigit() else 1209600
-            self.cfg["bearer_expires_at"] = (datetime.utcnow() + timedelta(seconds=max(secs - 3600, 60))).isoformat()
+            self.cfg["bearer_expires_at"] = (_utcnow() + timedelta(seconds=max(secs - 3600, 60))).isoformat()
             self._save_cfg()
             return self.cfg["bearer_token"]
         return None

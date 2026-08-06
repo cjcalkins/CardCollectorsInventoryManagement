@@ -39,7 +39,7 @@ from datetime import datetime, timedelta
 
 from flask import Blueprint, current_app, jsonify, render_template, request, send_file
 
-from models import db, ShopConnection, ScanRecord, SaleEvent
+from models import db, utcnow, ShopConnection, ScanRecord, SaleEvent
 from shipping_models import Order, OrderItem, Shipment
 from shipping_providers import (
     SHIPPING_PROVIDERS, SHIPPING_SECRET_FIELDS, ENVELOPE_SIZES,
@@ -213,7 +213,7 @@ def _sync_order_status(order):
         order.status = "delivered"
     elif (ship.events or []) and order.status in ("labeled", "ready", "needs_address"):
         order.status = "shipped"
-        order.shipped_at = order.shipped_at or datetime.utcnow()
+        order.shipped_at = order.shipped_at or utcnow()
     elif order.status in ("ready", "needs_address"):
         order.status = "labeled"
 
@@ -331,7 +331,7 @@ def shipping_save(provider_key):
         cfg[k] = submitted
 
     conn.config = cfg
-    conn.updated_at = datetime.utcnow()
+    conn.updated_at = utcnow()
     db.session.commit()
     return jsonify({"status": "success",
                     "message": f"{SHIPPING_PROVIDERS[provider_key]['label']} settings saved."})
@@ -348,8 +348,8 @@ def shipping_test(provider_key):
     conn.status_detail = result.get("message", "")
     if result.get("ok"):
         conn.enabled = True
-        conn.connected_at = conn.connected_at or datetime.utcnow()
-    conn.updated_at = datetime.utcnow()
+        conn.connected_at = conn.connected_at or utcnow()
+    conn.updated_at = utcnow()
     db.session.commit()
     return jsonify({"status": "success" if result.get("ok") else "error",
                     "message": result.get("message", ""),
@@ -923,7 +923,7 @@ def shipping_print():
         merged.close()
 
     resp = send_file(io.BytesIO(buf), mimetype="application/pdf", as_attachment=False,
-                     download_name=f"labels-{datetime.utcnow():%Y%m%d-%H%M}.pdf")
+                     download_name=f"labels-{utcnow():%Y%m%d-%H%M}.pdf")
     if missing:
         resp.headers["X-Labels-Missing"] = ",".join(missing[:20])
     return resp
@@ -938,7 +938,7 @@ def _refresh_shipment(s):
     if provider is None or not conn or not conn.enabled:
         return {"ok": False, "message": f"{s.provider} isn't connected."}
     result = provider.track(s)
-    s.last_tracked_at = datetime.utcnow()
+    s.last_tracked_at = utcnow()
     if not result.get("ok"):
         return result
     s.tracking_status = result.get("status") or s.tracking_status
@@ -1002,7 +1002,7 @@ def shipping_track_refresh():
                         "message": "No shipping provider is connected.",
                         "checked": 0, "moved": 0, "failed": 0})
 
-    cutoff = datetime.utcnow() - timedelta(minutes=min_age)
+    cutoff = utcnow() - timedelta(minutes=min_age)
     q = (Shipment.query.join(Order, Shipment.order_id == Order.id)
          .filter(Shipment.provider.in_(enabled))
          .filter(Shipment.status.in_(("purchased", "created")))
@@ -1059,7 +1059,7 @@ def start_tracking_poller(app, interval_minutes=180):
                     enabled = _connected_provider_keys()
                     if not enabled:
                         continue
-                    cutoff = datetime.utcnow() - timedelta(minutes=60)
+                    cutoff = utcnow() - timedelta(minutes=60)
                     rows = (Shipment.query.join(Order, Shipment.order_id == Order.id)
                             .filter(Shipment.provider.in_(enabled))
                             .filter(Shipment.status.in_(("purchased", "created")))

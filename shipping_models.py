@@ -27,7 +27,7 @@ a rate quoted today is not the rate you paid last week.
 
 from datetime import datetime
 
-from models import db
+from models import db, utcnow
 
 
 # Order.status lifecycle:
@@ -69,8 +69,8 @@ class Order(db.Model):
     shipping_paid = db.Column(db.Float, default=0.0)   # what the buyer paid for shipping
     notes         = db.Column(db.Text, nullable=True)
 
-    created_at    = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-    updated_at    = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at    = db.Column(db.DateTime, default=utcnow, index=True)
+    updated_at    = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
     shipped_at    = db.Column(db.DateTime, nullable=True)
 
     items = db.relationship("OrderItem", backref="order", cascade="all, delete-orphan",
@@ -174,7 +174,7 @@ class Shipment(db.Model):
     last_tracked_at  = db.Column(db.DateTime, nullable=True)
     events           = db.Column(db.JSON, default=list)
 
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
 
     @property
     def is_delivered(self):
