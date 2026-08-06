@@ -4377,49 +4377,46 @@ def _rep_sort_key(record, sort_col, group_info):
 
 # ====================== GAME SELECTION HELPER ======================
 def _inventory_game_select():
-    """Render the game selection landing page for /inventory."""
-    rows = (
-        ScanRecord.query
-        .with_entities(ScanRecord.extracted_data)
-        .all()
-    )
+    """Render the game selection landing page for /inventory.
 
-    game_map = {}
-    catalog_count = 0
-    for (extracted_data,) in rows:
-        if isinstance(extracted_data, dict):
-            data = extracted_data
-        else:
-            try:
-                data = json.loads(extracted_data or "{}")
-            except (ValueError, TypeError):
-                data = {}
+    Tile counts come from one SQL aggregation over the raw (trimmed) game
+    value — no rows are hydrated for counting. NULL and empty games collapse
+    into the "(Unknown Game)" tile inside the GROUP BY, same as the Python
+    fold this replaces. Field discovery then samples up to 200 rows per tile
+    through the indexed game_key; for mixed-case variants of one game the
+    sample now spans the normalized game rather than each casing separately,
+    consistent with how every filter treats casing since the normalization
+    work.
+    """
+    from sqlalchemy import func as _f
+    not_catalog = _f.coalesce(ScanRecord.is_catalog, False) == False  # noqa: E712
+    game_expr = _f.coalesce(
+        _f.nullif(_f.trim(_f.json_extract(ScanRecord.extracted_data, "$.game")), ""),
+        "(Unknown Game)")
+    album_expr = _f.nullif(_f.trim(_f.json_extract(ScanRecord.extracted_data, "$.album")), "")
 
-        if _is_catalog_only(data):
-            catalog_count += 1
-            continue
-
-        game_name = str(data.get("game", "")).strip()
-        if not game_name:
-            game_name = "(Unknown Game)"
-
-        if game_name not in game_map:
-            game_map[game_name] = {"name": game_name, "count": 0, "albums": set(), "all_data": []}
-        game_map[game_name]["count"] += 1
-        album = str(data.get("album", "")).strip()
-        if album:
-            game_map[game_name]["albums"].add(album)
-        game_map[game_name]["all_data"].append(data)
+    agg = (db.session.query(game_expr,
+                            _f.count(ScanRecord.id),
+                            _f.count(_f.distinct(album_expr)))
+           .filter(not_catalog).group_by(game_expr).all())
+    catalog_count = (db.session.query(_f.count(ScanRecord.id))
+                     .filter(_f.coalesce(ScanRecord.is_catalog, False) == True)  # noqa: E712
+                     .scalar()) or 0
 
     games = []
-    for info in game_map.values():
-        # Discover fields for this game using a sample
-        sample_records_fake = [type("R", (), {"extracted_data": d})() for d in info["all_data"][:200]]
+    for raw_name, count, album_count in agg:
+        game_name = str(raw_name)
+        gkey = game_name.strip().lower() or None
+        key_cond = (ScanRecord.game_key.is_(None)
+                    if game_name == "(Unknown Game)" else ScanRecord.game_key == gkey)
+        sample = (ScanRecord.query.with_entities(ScanRecord.extracted_data)
+                  .filter(not_catalog, key_cond).limit(200).all())
+        sample_records_fake = [type("R", (), {"extracted_data": d})() for (d,) in sample]
         fields = discover_entry_fields(sample_records_fake)
         games.append({
-            "name":        info["name"],
-            "count":       info["count"],
-            "album_count": len(info["albums"]),
+            "name":        game_name,
+            "count":       count,
+            "album_count": album_count,
             "fields":      fields,
         })
 
@@ -6253,33 +6250,22 @@ def inventory():
     if f_album:
         query = query.filter(ScanRecord.album_key == f_album.strip().lower())
 
-    all_records_raw = query.all()
-
-    # Catalog-only records (from CSV import) are lookup/reference rows, not
-    # owned inventory. Normally they're excluded from the Inventory list;
-    # in catalog view, the filter is flipped so ONLY they show.
-    if view_catalog:
-        all_records_raw = [
-            r for r in all_records_raw
-            if _is_catalog_only(r.extracted_data or {})
-        ]
-    else:
-        all_records_raw = [
-            r for r in all_records_raw
-            if not _is_catalog_only(r.extracted_data or {})
-        ]
-
-    # game/album already filtered in SQL above.
-    all_records = all_records_raw
-
-    # Archived rows (cold storage) are hidden from the normal Inventory list.
+    # Catalog / archived / held scoping in SQL on the derived columns — the
+    # same coalesce() conditions the fast path uses, and equal by construction
+    # to the _is_catalog_only/_bool_from/_held_from checks that used to run
+    # here in Python: the mapper events derive those columns from exactly
+    # those helpers. Only the rows the page can actually show are loaded.
+    from sqlalchemy import func as _f
+    query = query.filter(_f.coalesce(ScanRecord.is_catalog, False) == bool(view_catalog))
     if not view_catalog:
-        all_records = [r for r in all_records if not _bool_from(r.extracted_data or {}, "archived")]
+        # Archived rows (cold storage) are hidden from the normal Inventory list.
+        query = query.filter(_f.coalesce(ScanRecord.is_archived, False) == False)  # noqa: E712
         # Held vs Sold split: Inventory shows held entries; the Sold page shows
         # the rest. (Catalog view leaves held_state None and skips this.)
         if held_state is not None:
-            all_records = [r for r in all_records
-                           if _held_from(r.extracted_data or {}) == held_state]
+            query = query.filter(_f.coalesce(ScanRecord.is_held, True) == bool(held_state))
+
+    all_records = query.all()
 
     # Build groups across the full filtered set so duplicates on other pages
     # are still counted in the quantity badge.
@@ -6398,28 +6384,22 @@ def inventory_export_csv():
     columns_param = request.args.get("columns", "").strip()
     view_catalog = request.args.get("catalog", "").strip() in ("1", "true", "yes")
 
-    # Build query — same logic as /inventory, but no pagination
-    # Python-side filtering for game/album for SQLite compatibility (.astext is PostgreSQL-only)
-    query = ScanRecord.query.order_by(ScanRecord.scan_date.desc())
+    # Build query — same logic as /inventory, but no pagination. All filters
+    # run in SQL on the derived key columns (same strip/lower normalization as
+    # the page), so only the exported rows are ever loaded.
+    from sqlalchemy import func as _f
+    query = (ScanRecord.query.order_by(ScanRecord.scan_date.desc())
+             .filter(_f.coalesce(ScanRecord.is_catalog, False) == bool(view_catalog)))
     if f_template:
         query = query.filter(ScanRecord.template_used == f_template)
     if search:
         query = query.filter(_scan_search_condition(search))
+    if f_game:
+        query = query.filter(ScanRecord.game_key == f_game.strip().lower())
+    if f_album:
+        query = query.filter(ScanRecord.album_key == f_album.strip().lower())
 
     records = query.all()
-    records = [r for r in records if _is_catalog_only(r.extracted_data or {}) == view_catalog]
-    # Same strip/lower normalization as the page's own filters, so the export
-    # contains exactly the rows the filtered view displays.
-    if f_game:
-        records = [
-            r for r in records
-            if str((r.extracted_data or {}).get("game", "")).strip().lower() == f_game.strip().lower()
-        ]
-    if f_album:
-        records = [
-            r for r in records
-            if str((r.extracted_data or {}).get("album", "")).strip().lower() == f_album.strip().lower()
-        ]
 
     # Determine which columns to export
     # Static column key → (header label, value extractor)
@@ -6544,35 +6524,22 @@ def inventory_all_ids():
     f_template   = request.args.get("template", "").strip()
     view_catalog = request.args.get("catalog", "").strip() in ("1", "true", "yes")
 
-    query = ScanRecord.query.with_entities(ScanRecord.id, ScanRecord.extracted_data)
-
+    # Every filter runs in SQL on the derived columns (same strip/lower
+    # normalization as the page), so this selects bare ids — no JSON is
+    # transferred or parsed at all.
+    from sqlalchemy import func as _f
+    query = (ScanRecord.query.with_entities(ScanRecord.id)
+             .filter(_f.coalesce(ScanRecord.is_catalog, False) == bool(view_catalog)))
     if f_template:
         query = query.filter(ScanRecord.template_used == f_template)
     if search:
         query = query.filter(_scan_search_condition(search))
+    if f_game:
+        query = query.filter(ScanRecord.game_key == f_game.strip().lower())
+    if f_album:
+        query = query.filter(ScanRecord.album_key == f_album.strip().lower())
 
-    rows = query.all()
-
-    # Python-side filtering for game / album (SQLite-safe)
-    ids = []
-    for row_id, extracted_data in rows:
-        if isinstance(extracted_data, dict):
-            data = extracted_data
-        else:
-            try:
-                data = json.loads(extracted_data or "{}")
-            except (ValueError, TypeError):
-                data = {}
-        if _is_catalog_only(data) != view_catalog:
-            continue
-        # Same strip/lower normalization as the page's own filters, so "Select
-        # All in Filter" selects exactly the set the page is displaying.
-        if f_game and str(data.get("game", "")).strip().lower() != f_game.strip().lower():
-            continue
-        if f_album and str(data.get("album", "")).strip().lower() != f_album.strip().lower():
-            continue
-        ids.append(row_id)
-
+    ids = [row_id for (row_id,) in query.all()]
     return jsonify({"ids": ids, "count": len(ids)})
 
 
@@ -6587,12 +6554,11 @@ def game_fields():
     if not game:
         return jsonify({"fields": [], "albums": []})
 
-    # Filter in Python — .astext requires PostgreSQL JSONB and is not available here
-    all_records = ScanRecord.query.all()
-    records = [
-        r for r in all_records
-        if str((r.extracted_data or {}).get("game", "")).strip().lower() == game.strip().lower()
-    ]
+    # The indexed game_key column carries the same strip/lower normalization
+    # this comparison applied in Python — only the game's own rows load.
+    records = (ScanRecord.query
+               .filter(ScanRecord.game_key == game.strip().lower())
+               .all())
 
     fields = discover_entry_fields(records)
     albums = sorted({
@@ -9723,7 +9689,15 @@ def duplicates():
     Groups where all members already share the same image_path are also
     excluded — they are already resolved and won't reappear after a reload.
     """
-    records = ScanRecord.query.order_by(ScanRecord.scan_date.desc()).all()
+    # SQL pre-narrowing on provably-implied conditions: name_key is derived as
+    # `_get_name(data) or None` by the mapper events, and is_catalog mirrors
+    # _is_catalog_only — so this can never exclude a row the loop below would
+    # have kept. The loop's own checks still run on the narrowed set.
+    from sqlalchemy import func as _f
+    records = (ScanRecord.query
+               .filter(_f.coalesce(ScanRecord.is_catalog, False) == False,  # noqa: E712
+                       ScanRecord.name_key.isnot(None))
+               .order_by(ScanRecord.scan_date.desc()).all())
 
     groups_map = {}
     for record in records:
