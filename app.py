@@ -1626,38 +1626,45 @@ def _build_ocr_candidates(exclude_record_id=None, catalog_only=False):
     catalog_only=True restricts matching to imported reference rows (the CSV
     "Imported Catalog"), which is usually the cleanest identification target.
     """
-    # SQL narrowing on provably-implied conditions (the derived columns come
-    # from the same helpers the loop calls): rows with neither name nor
-    # serial can't match, the catalog scope mirrors _is_catalog_only, and the
-    # excluded record drops before hydration. Loop checks still run.
+    # Projection, not hydration: name/serial come straight from the derived
+    # columns (the mapper sets name_key/serial_key from exactly _get_name/
+    # _get_serial), the display fields via json_extract. The old shape loaded
+    # every candidate row's full extracted_data per identify click — with
+    # catalog_only=True that is the whole imported catalog. The catalog scope
+    # relies on the derived is_catalog column (same derivation as the old
+    # loop's _is_catalog_only re-check).
     from sqlalchemy import func as _f, or_
-    q = ScanRecord.query.filter(or_(ScanRecord.name_key.isnot(None),
-                                    ScanRecord.serial_key.isnot(None)))
+    if db.engine.dialect.name == "sqlite":
+        set_v = _f.json_extract(ScanRecord.extracted_data, "$.set")
+        set_name_v = _f.json_extract(ScanRecord.extracted_data, "$.set_name")
+        game_v = _f.json_extract(ScanRecord.extracted_data, "$.game")
+    else:
+        set_v = ScanRecord.extracted_data["set"].as_string()
+        set_name_v = ScanRecord.extracted_data["set_name"].as_string()
+        game_v = ScanRecord.extracted_data["game"].as_string()
+
+    q = (db.session.query(ScanRecord.id, ScanRecord.name_key, ScanRecord.serial_key,
+                          ScanRecord.image_path, set_v, set_name_v, game_v)
+         .filter(or_(ScanRecord.name_key.isnot(None),
+                     ScanRecord.serial_key.isnot(None))))
     if catalog_only:
         q = q.filter(_f.coalesce(ScanRecord.is_catalog, False) == True)  # noqa: E712
     if exclude_record_id is not None:
         q = q.filter(ScanRecord.id != exclude_record_id)
 
     candidates = []
-    for r in q.all():
-        if exclude_record_id is not None and r.id == exclude_record_id:
-            continue
-        data = r.extracted_data or {}
-        if catalog_only and not _is_catalog_only(data):
-            continue
-
-        name = _get_name(data)
-        serial = _get_serial(data)
+    for rid, name_key, serial_key, image_path, sv, snv, gv in q.all():
+        name = name_key or ""
+        serial = serial_key or ""
         if not name and not serial:
             continue  # nothing to match on
-
         candidates.append({
-            "record_id": r.id,
+            "record_id": rid,
             "name":      name,
             "serial":    serial,
-            "set":       str(data.get("set") or data.get("set_name") or "").strip(),
-            "game":      str(data.get("game") or "").strip(),
-            "thumbnail": build_uploaded_file_url(r.image_path) if r.image_path else None,
+            "set":       str(sv or snv or "").strip(),
+            "game":      str(gv or "").strip(),
+            "thumbnail": build_uploaded_file_url(image_path) if image_path else None,
         })
     return candidates
 
@@ -5093,10 +5100,10 @@ def _analytics_group_value(rec, field):
     return v or "—"
 
 
-def _analytics_filtered_records(source, f_game, f_template, search):
-    """Records matching the source (held/sold/all) + optional game/template/search.
-    Catalog and archived rows are always excluded."""
-    from sqlalchemy import func as _f, and_
+def _analytics_conditions(source, f_game, f_template):
+    """WHERE conditions for the analytics record scope (shared by the full
+    hydration below and the projected/grouped queries)."""
+    from sqlalchemy import func as _f
     conds = [
         _f.coalesce(ScanRecord.is_catalog, False) == False,   # noqa: E712
         _f.coalesce(ScanRecord.is_archived, False) == False,  # noqa: E712
@@ -5110,10 +5117,79 @@ def _analytics_filtered_records(source, f_game, f_template, search):
         conds.append(ScanRecord.game_key == f_game.strip().lower())
     if f_template:
         conds.append(ScanRecord.template_used == f_template)
-    q = ScanRecord.query.filter(and_(*conds))
+    return conds
+
+
+def _json_field(key):
+    """extracted_data[key] as a SQL expression. Dialect-gated: the portable
+    accessor JSON_QUOTEs NULL into 'null' on SQLite (see _report_build)."""
+    from sqlalchemy import func as _f
+    if db.engine.dialect.name == "sqlite":
+        return _f.json_extract(ScanRecord.extracted_data, "$." + key)
+    return ScanRecord.extracted_data[key].as_string()
+
+
+def _analytics_filtered_records(source, f_game, f_template, search):
+    """Records matching the source (held/sold/all) + optional game/template/search.
+    Catalog and archived rows are always excluded."""
+    from sqlalchemy import and_
+    q = ScanRecord.query.filter(and_(*_analytics_conditions(source, f_game, f_template)))
     if search:
         q = q.filter(_scan_search_condition(search))
     return q.all()
+
+
+# Group keys that can ride a json_extract path safely. Anything else (exotic
+# punctuation that could change the path's meaning) falls back to the full
+# hydration, which accepts any string — same result, just slower.
+_ANALYTICS_SAFE_FIELD = _re.compile(r"^[A-Za-z0-9_ \-]+$")
+
+
+def _analytics_value_rows(source, f_game, f_template, search, group_by):
+    """(group_value, intake_price, current_value, sold_price) per matching
+    record, projected in SQL — the dashboard aggregation no longer hydrates
+    every active record's extracted_data per widget change. Group-value
+    semantics mirror _analytics_group_value exactly: __status__ from the
+    derived is_held, template from the column, everything else from the JSON
+    key with ''/None collapsing to the em-dash bucket."""
+    from sqlalchemy import func as _f
+    if group_by and group_by not in ("__status__", "template") \
+            and not _ANALYTICS_SAFE_FIELD.match(group_by):
+        out = []
+        for rec in _analytics_filtered_records(source, f_game, f_template, search):
+            data = rec.extracted_data or {}
+            out.append((_analytics_group_value(rec, group_by),
+                        data.get("intake_price"), data.get("current_value"),
+                        data.get("sold_price")))
+        return out
+
+    if group_by == "__status__":
+        gexpr = _f.coalesce(ScanRecord.is_held, True)
+    elif group_by == "template":
+        gexpr = ScanRecord.template_used
+    elif group_by:
+        gexpr = _json_field(group_by)
+    else:
+        gexpr = ScanRecord.id   # placeholder; the group is the constant "All"
+
+    q = (db.session.query(gexpr, _json_field("intake_price"),
+                          _json_field("current_value"), _json_field("sold_price"))
+         .filter(*_analytics_conditions(source, f_game, f_template)))
+    if search:
+        q = q.filter(_scan_search_condition(search))
+
+    out = []
+    for gv, ip, cv, sp in q.all():
+        if not group_by:
+            g = "All"
+        elif group_by == "__status__":
+            g = "Held" if bool(gv) else "Sold"
+        elif group_by == "template":
+            g = gv or "—"
+        else:
+            g = (str(gv).strip() if gv is not None else "") or "—"
+        out.append((g, ip, cv, sp))
+    return out
 
 
 def _analytics_available_dimensions(sample):
@@ -5146,20 +5222,18 @@ def _analytics_run(source, f_game, f_template, search, group_by, metrics):
     valid = [m for m in (metrics or []) if m in _ANALYTICS_METRIC_LABELS]
     if "count" not in valid:
         valid = ["count"] + valid
-    records = _analytics_filtered_records(source, f_game, f_template, search)
+    value_rows = _analytics_value_rows(source, f_game, f_template, search, group_by)
 
     buckets, order = {}, []
-    for rec in records:
-        g = _analytics_group_value(rec, group_by)
+    for g, ip_raw, cv_raw, sp_raw in value_rows:
         b = buckets.get(g)
         if b is None:
             b = buckets[g] = {"count": 0, "intake": [], "current": [], "sold": [], "profit": []}
             order.append(g)
         b["count"] += 1
-        data = rec.extracted_data or {}
-        ip = _analytics_money(data.get("intake_price"))
-        cv = _analytics_money(data.get("current_value"))
-        sp = _analytics_money(data.get("sold_price"))
+        ip = _analytics_money(ip_raw)
+        cv = _analytics_money(cv_raw)
+        sp = _analytics_money(sp_raw)
         if ip is not None: b["intake"].append(ip)
         if cv is not None: b["current"].append(cv)
         if sp is not None: b["sold"].append(sp)
@@ -5186,7 +5260,7 @@ def _analytics_run(source, f_game, f_template, search, group_by, metrics):
         "metrics": [{"key": m, "label": _ANALYTICS_METRIC_LABELS[m]} for m in valid],
         "rows": rows,
         "totals": totals,
-        "record_count": len(records),
+        "record_count": len(value_rows),
         "group_count": len(rows),
         "group_by": group_by,
     }
@@ -5225,6 +5299,20 @@ def _collection_counts(records):
         if c:
             counts[c] = counts.get(c, 0) + 1
     return counts
+
+
+def _collection_groups_sql():
+    """[(collection_key, display_name, count)] over every active record
+    (held+sold), grouped in SQL — replaces hydrating the whole table to read
+    one JSON key. Display name is the MIN of the trimmed raw values sharing a
+    key (deterministic; the old first-seen pick was query-order arbitrary)."""
+    from sqlalchemy import func as _f
+    raw = _f.trim(_f.cast(_json_field("collection"), db.String))
+    key = _f.lower(raw)
+    rows = (db.session.query(key, _f.min(raw), _f.count())
+            .filter(*_analytics_conditions("all", "", ""))
+            .group_by(key).all())
+    return [(k, disp, n) for k, disp, n in rows if k]
 
 
 def _record_effective_cost(rec, lot_prices, lot_counts):
@@ -5309,7 +5397,8 @@ def analytics_overview():
     # Lot prices spread across a collection's cards; denominator is the full
     # collection (held+sold) so an owned subset gets its pro-rata share.
     lot_prices = _collection_lot_prices()
-    lot_counts = _collection_counts(_analytics_filtered_records("all", "", "", "")) if lot_prices else {}
+    lot_counts = ({k: n for k, _, n in _collection_groups_sql()}
+                  if lot_prices else {})
 
     by = {}
     for r in records:
@@ -6073,16 +6162,19 @@ def _held_inventory_match(game, name, number):
     gk = (game or "").strip().lower()
     if gk:
         q = q.filter(ScanRecord.game_key == gk)
+    # Two-column projection: the loop's _get_name/_get_serial are exactly what
+    # the mapper stores in name_key/serial_key, and the is_held SQL condition
+    # already mirrors the _held_from re-check — so the fuzzy substring match
+    # runs without hydrating any held row's extracted_data. It fires once per
+    # card in a scanning session.
     count = 0
-    for r in q.all():
-        data = r.extracted_data or {}
-        if not _held_from(data):
-            continue
-        rn = _re.sub(r"[^a-z0-9]+", "", (_get_name(data) or "").lower())
+    for name_key, serial_key in q.with_entities(ScanRecord.name_key,
+                                                ScanRecord.serial_key).all():
+        rn = _re.sub(r"[^a-z0-9]+", "", (name_key or "").lower())
         if not rn or not (tn == rn or tn in rn or rn in tn):
             continue
         if tnum_variants:
-            rnum = (_get_serial(data) or "").strip()
+            rnum = (serial_key or "").strip()
             rvar = _collector_number_variants(rnum) if rnum else set()
             if rvar and not (tnum_variants & rvar):
                 continue   # both have numbers but they disagree
@@ -6298,15 +6390,12 @@ def quick_scan_identify():
 def collections_prices():
     """List collections (from scanned cards + any saved prices) with their card
     count and 'Bought For' lot price, for the Inventory pricing modal."""
-    records = _analytics_filtered_records("all", "", "", "")
-    counts = _collection_counts(records)
     saved = {cp.name_key: cp for cp in CollectionPrice.query.all()}
 
-    names = {}   # name_key -> display name (prefer the casing seen on cards)
-    for r in records:
-        c = str((r.extracted_data or {}).get("collection") or "").strip()
-        if c:
-            names.setdefault(c.lower(), c)
+    counts, names = {}, {}   # name_key -> count / display name (casing from cards)
+    for k, disp, n in _collection_groups_sql():
+        counts[k] = n
+        names[k] = disp
     for k, cp in saved.items():
         names.setdefault(k, cp.name)
 
@@ -6853,21 +6942,7 @@ def storage_next_index():
     client fetches this so successive box imports don't collide on page 1.
     """
     name = (request.args.get("name") or "").strip().lower()
-    nxt = 1
-    if name:
-        rows = (ScanRecord.query
-                .filter(ScanRecord.album_key == name)
-                .with_entities(ScanRecord.extracted_data)
-                .all())
-        max_page = 0
-        for (data,) in rows:
-            try:
-                p = int((data or {}).get("page") or 0)
-            except (TypeError, ValueError):
-                p = 0
-            if p > max_page:
-                max_page = p
-        nxt = max_page + 1
+    nxt = _container_max_int(name, "page") + 1 if name else 1
     return jsonify({"next": nxt})
 
 
@@ -7241,6 +7316,21 @@ def _normalize_game_name(g):
     return (g[:1].upper() + g[1:]) if g else g
 
 
+def _container_max_int(album_key, json_key):
+    """max(CAST(extracted_data->json_key AS INTEGER)) over one container, in
+    SQL. Replaces the shape that hydrated every row of the container to read
+    one JSON int — called once per created card, that made a k-card box
+    import O(k^2). CAST of non-numeric text yields 0/NULL, matching the old
+    int()-or-0 tolerance for the integer values these keys actually hold."""
+    from sqlalchemy import func as _f, Integer
+    v = (db.session.query(_f.max(_f.cast(_json_field(json_key), Integer)))
+         .filter(ScanRecord.album_key == album_key).scalar())
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _next_box_number(name):
     """Next sequential card number for a Box container (max existing + 1).
 
@@ -7251,19 +7341,7 @@ def _next_box_number(name):
     key = str(name or "").strip().lower()
     if not key:
         return 1
-    rows = (ScanRecord.query
-            .filter(ScanRecord.album_key == key)
-            .with_entities(ScanRecord.extracted_data)
-            .all())
-    max_n = 0
-    for (data,) in rows:
-        try:
-            n = int((data or {}).get("box_number") or 0)
-        except (TypeError, ValueError):
-            n = 0
-        if n > max_n:
-            max_n = n
-    return max_n + 1
+    return _container_max_int(key, "box_number") + 1
 
 
 def _create_single_card(front_path, back_path, game, album, template,
@@ -10666,16 +10744,7 @@ def _next_sheet_index(name):
     key = (name or "").strip().lower()
     if not key:
         return 1
-    rows = (ScanRecord.query.filter(ScanRecord.album_key == key)
-            .with_entities(ScanRecord.extracted_data).all())
-    mx = 0
-    for (data,) in rows:
-        try:
-            p = int((data or {}).get("page") or 0)
-        except (TypeError, ValueError):
-            p = 0
-        mx = max(mx, p)
-    return mx + 1
+    return _container_max_int(key, "page") + 1
 
 
 # ── PDF-import job registry ──
