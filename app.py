@@ -14274,14 +14274,30 @@ def _connection_public_view(conn, marketplace):
     }
 
 
-def _sellable_records_query():
-    """Owned inventory only — exclude catalog-only reference rows and blank slots."""
-    # Catalog rows drop out in SQL (is_catalog mirrors _is_catalog_only by
-    # derivation); the "empty slot" flag has no derived column, so that check
-    # stays in Python on the narrowed set.
+def _sellable_conditions():
+    """SQL share of the sellable-inventory filter: not catalog (derived
+    column), not an empty slot (JSON flag; dialect-gated json_extract because
+    the portable accessor JSON_QUOTEs NULL into 'null' on SQLite). The flag is
+    written as the string "true" or a JSON true, so both spellings are
+    excluded."""
     from sqlalchemy import func as _f
+    if db.engine.dialect.name == "sqlite":
+        empty_flag = _f.json_extract(ScanRecord.extracted_data, "$.empty")
+    else:
+        empty_flag = ScanRecord.extracted_data["empty"].as_string()
+    return (
+        _f.coalesce(ScanRecord.is_catalog, False) == False,  # noqa: E712
+        db.or_(empty_flag.is_(None),
+               _f.lower(_f.cast(empty_flag, db.String)).notin_(("true", "1"))),
+    )
+
+
+def _sellable_records_query():
+    """Owned inventory only — exclude catalog-only reference rows and blank
+    slots. Filtering happens in SQL (_sellable_conditions); the Python
+    re-check stays as a cheap belt-and-braces pass over the narrowed set."""
     records = (ScanRecord.query
-               .filter(_f.coalesce(ScanRecord.is_catalog, False) == False)  # noqa: E712
+               .filter(*_sellable_conditions())
                .order_by(ScanRecord.scan_date.desc(), ScanRecord.id.desc()).all())
     out = []
     for r in records:
@@ -14477,19 +14493,36 @@ def shops_ebay_callback():
 
 @app.route("/shops/listings")
 def shops_listings():
-    """Paginated inventory with per-marketplace listing status (JSON for the table)."""
-    page = max(int(request.args.get("page", 1) or 1), 1)
-    per_page = min(max(int(request.args.get("per_page", 25) or 25), 1), 100)
+    """Paginated inventory with per-marketplace listing status (JSON for the table).
+
+    Filter/count/paginate in SQL and hydrate only the page: the old shape
+    loaded every sellable record AND every listing row, built a display dict
+    per record, then sliced the list in Python — page/per_page saved nothing."""
+    page = max(request.args.get("page", 1, type=int) or 1, 1)
+    per_page = min(max(request.args.get("per_page", 25, type=int) or 25, 1), 100)
     only_marketplace = request.args.get("marketplace", "")
     unlisted_only = request.args.get("unlisted", "") == "1"
 
-    records = _sellable_records_query()
+    q = ScanRecord.query.filter(*_sellable_conditions())
 
-    # Pre-index listings by (record_id, marketplace)
-    all_listings = Listing.query.all()
+    if unlisted_only and only_marketplace in MARKETPLACES:
+        # "Unlisted" = no listing row for that shop, or one still not_listed.
+        listed = (db.session.query(Listing.id)
+                  .filter(Listing.record_id == ScanRecord.id,
+                          Listing.marketplace == only_marketplace,
+                          Listing.status != "not_listed"))
+        q = q.filter(~listed.exists())
+
+    total = q.order_by(None).count()
+    records = (q.order_by(ScanRecord.scan_date.desc(), ScanRecord.id.desc())
+                .limit(per_page).offset((page - 1) * per_page).all())
+
+    # One IN query for the page's listings instead of Listing.query.all().
     idx = {}
-    for lst in all_listings:
-        idx[(lst.record_id, lst.marketplace)] = lst
+    if records:
+        page_ids = [r.id for r in records]
+        for lst in Listing.query.filter(Listing.record_id.in_(page_ids)).all():
+            idx[(lst.record_id, lst.marketplace)] = lst
 
     def record_row(r):
         data = r.extracted_data or {}
@@ -14501,7 +14534,7 @@ def shops_listings():
                 "listing_id": lst.id if lst else None,
                 "url": lst.external_url if lst else "",
                 "price": lst.price if lst else None,
-            } if True else None
+            }
         return {
             "record_id": r.id,
             "name": _record_display_name(r),
@@ -14514,18 +14547,9 @@ def shops_listings():
             "listings": row_listings,
         }
 
-    rows = [record_row(r) for r in records]
-
-    if unlisted_only and only_marketplace in MARKETPLACES:
-        rows = [row for row in rows if row["listings"][only_marketplace]["status"] == "not_listed"]
-
-    total = len(rows)
-    start = (page - 1) * per_page
-    page_rows = rows[start:start + per_page]
-
     return jsonify({
         "status": "success",
-        "rows": page_rows,
+        "rows": [record_row(r) for r in records],
         "page": page,
         "per_page": per_page,
         "total": total,
