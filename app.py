@@ -5100,10 +5100,10 @@ def _analytics_group_value(rec, field):
     return v or "—"
 
 
-def _analytics_filtered_records(source, f_game, f_template, search):
-    """Records matching the source (held/sold/all) + optional game/template/search.
-    Catalog and archived rows are always excluded."""
-    from sqlalchemy import func as _f, and_
+def _analytics_conditions(source, f_game, f_template):
+    """WHERE conditions for the analytics record scope (shared by the full
+    hydration below and the projected/grouped queries)."""
+    from sqlalchemy import func as _f
     conds = [
         _f.coalesce(ScanRecord.is_catalog, False) == False,   # noqa: E712
         _f.coalesce(ScanRecord.is_archived, False) == False,  # noqa: E712
@@ -5117,10 +5117,79 @@ def _analytics_filtered_records(source, f_game, f_template, search):
         conds.append(ScanRecord.game_key == f_game.strip().lower())
     if f_template:
         conds.append(ScanRecord.template_used == f_template)
-    q = ScanRecord.query.filter(and_(*conds))
+    return conds
+
+
+def _json_field(key):
+    """extracted_data[key] as a SQL expression. Dialect-gated: the portable
+    accessor JSON_QUOTEs NULL into 'null' on SQLite (see _report_build)."""
+    from sqlalchemy import func as _f
+    if db.engine.dialect.name == "sqlite":
+        return _f.json_extract(ScanRecord.extracted_data, "$." + key)
+    return ScanRecord.extracted_data[key].as_string()
+
+
+def _analytics_filtered_records(source, f_game, f_template, search):
+    """Records matching the source (held/sold/all) + optional game/template/search.
+    Catalog and archived rows are always excluded."""
+    from sqlalchemy import and_
+    q = ScanRecord.query.filter(and_(*_analytics_conditions(source, f_game, f_template)))
     if search:
         q = q.filter(_scan_search_condition(search))
     return q.all()
+
+
+# Group keys that can ride a json_extract path safely. Anything else (exotic
+# punctuation that could change the path's meaning) falls back to the full
+# hydration, which accepts any string — same result, just slower.
+_ANALYTICS_SAFE_FIELD = _re.compile(r"^[A-Za-z0-9_ \-]+$")
+
+
+def _analytics_value_rows(source, f_game, f_template, search, group_by):
+    """(group_value, intake_price, current_value, sold_price) per matching
+    record, projected in SQL — the dashboard aggregation no longer hydrates
+    every active record's extracted_data per widget change. Group-value
+    semantics mirror _analytics_group_value exactly: __status__ from the
+    derived is_held, template from the column, everything else from the JSON
+    key with ''/None collapsing to the em-dash bucket."""
+    from sqlalchemy import func as _f
+    if group_by and group_by not in ("__status__", "template") \
+            and not _ANALYTICS_SAFE_FIELD.match(group_by):
+        out = []
+        for rec in _analytics_filtered_records(source, f_game, f_template, search):
+            data = rec.extracted_data or {}
+            out.append((_analytics_group_value(rec, group_by),
+                        data.get("intake_price"), data.get("current_value"),
+                        data.get("sold_price")))
+        return out
+
+    if group_by == "__status__":
+        gexpr = _f.coalesce(ScanRecord.is_held, True)
+    elif group_by == "template":
+        gexpr = ScanRecord.template_used
+    elif group_by:
+        gexpr = _json_field(group_by)
+    else:
+        gexpr = ScanRecord.id   # placeholder; the group is the constant "All"
+
+    q = (db.session.query(gexpr, _json_field("intake_price"),
+                          _json_field("current_value"), _json_field("sold_price"))
+         .filter(*_analytics_conditions(source, f_game, f_template)))
+    if search:
+        q = q.filter(_scan_search_condition(search))
+
+    out = []
+    for gv, ip, cv, sp in q.all():
+        if not group_by:
+            g = "All"
+        elif group_by == "__status__":
+            g = "Held" if bool(gv) else "Sold"
+        elif group_by == "template":
+            g = gv or "—"
+        else:
+            g = (str(gv).strip() if gv is not None else "") or "—"
+        out.append((g, ip, cv, sp))
+    return out
 
 
 def _analytics_available_dimensions(sample):
@@ -5153,20 +5222,18 @@ def _analytics_run(source, f_game, f_template, search, group_by, metrics):
     valid = [m for m in (metrics or []) if m in _ANALYTICS_METRIC_LABELS]
     if "count" not in valid:
         valid = ["count"] + valid
-    records = _analytics_filtered_records(source, f_game, f_template, search)
+    value_rows = _analytics_value_rows(source, f_game, f_template, search, group_by)
 
     buckets, order = {}, []
-    for rec in records:
-        g = _analytics_group_value(rec, group_by)
+    for g, ip_raw, cv_raw, sp_raw in value_rows:
         b = buckets.get(g)
         if b is None:
             b = buckets[g] = {"count": 0, "intake": [], "current": [], "sold": [], "profit": []}
             order.append(g)
         b["count"] += 1
-        data = rec.extracted_data or {}
-        ip = _analytics_money(data.get("intake_price"))
-        cv = _analytics_money(data.get("current_value"))
-        sp = _analytics_money(data.get("sold_price"))
+        ip = _analytics_money(ip_raw)
+        cv = _analytics_money(cv_raw)
+        sp = _analytics_money(sp_raw)
         if ip is not None: b["intake"].append(ip)
         if cv is not None: b["current"].append(cv)
         if sp is not None: b["sold"].append(sp)
@@ -5193,7 +5260,7 @@ def _analytics_run(source, f_game, f_template, search, group_by, metrics):
         "metrics": [{"key": m, "label": _ANALYTICS_METRIC_LABELS[m]} for m in valid],
         "rows": rows,
         "totals": totals,
-        "record_count": len(records),
+        "record_count": len(value_rows),
         "group_count": len(rows),
         "group_by": group_by,
     }
@@ -5232,6 +5299,20 @@ def _collection_counts(records):
         if c:
             counts[c] = counts.get(c, 0) + 1
     return counts
+
+
+def _collection_groups_sql():
+    """[(collection_key, display_name, count)] over every active record
+    (held+sold), grouped in SQL — replaces hydrating the whole table to read
+    one JSON key. Display name is the MIN of the trimmed raw values sharing a
+    key (deterministic; the old first-seen pick was query-order arbitrary)."""
+    from sqlalchemy import func as _f
+    raw = _f.trim(_f.cast(_json_field("collection"), db.String))
+    key = _f.lower(raw)
+    rows = (db.session.query(key, _f.min(raw), _f.count())
+            .filter(*_analytics_conditions("all", "", ""))
+            .group_by(key).all())
+    return [(k, disp, n) for k, disp, n in rows if k]
 
 
 def _record_effective_cost(rec, lot_prices, lot_counts):
@@ -5316,7 +5397,8 @@ def analytics_overview():
     # Lot prices spread across a collection's cards; denominator is the full
     # collection (held+sold) so an owned subset gets its pro-rata share.
     lot_prices = _collection_lot_prices()
-    lot_counts = _collection_counts(_analytics_filtered_records("all", "", "", "")) if lot_prices else {}
+    lot_counts = ({k: n for k, _, n in _collection_groups_sql()}
+                  if lot_prices else {})
 
     by = {}
     for r in records:
@@ -6305,15 +6387,12 @@ def quick_scan_identify():
 def collections_prices():
     """List collections (from scanned cards + any saved prices) with their card
     count and 'Bought For' lot price, for the Inventory pricing modal."""
-    records = _analytics_filtered_records("all", "", "", "")
-    counts = _collection_counts(records)
     saved = {cp.name_key: cp for cp in CollectionPrice.query.all()}
 
-    names = {}   # name_key -> display name (prefer the casing seen on cards)
-    for r in records:
-        c = str((r.extracted_data or {}).get("collection") or "").strip()
-        if c:
-            names.setdefault(c.lower(), c)
+    counts, names = {}, {}   # name_key -> count / display name (casing from cards)
+    for k, disp, n in _collection_groups_sql():
+        counts[k] = n
+        names[k] = disp
     for k, cp in saved.items():
         names.setdefault(k, cp.name)
 
