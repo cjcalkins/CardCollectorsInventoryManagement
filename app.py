@@ -15249,9 +15249,14 @@ def _mark_record_sold(record, sold_qty, source, order_id, sold_price=None):
     return {"record_id": record.id, "remaining": remaining, "delisted": results}
 
 
-def _match_email_item_to_record(item, source="tcgplayer"):
-    """Resolve a parsed sale line to a single ScanRecord, else (None, reason)."""
-    records = _sellable_records_query()
+def _match_email_item_to_record(item, source="tcgplayer", records=None):
+    """Resolve a parsed sale line to a single ScanRecord, else (None, reason).
+
+    `records`: the sellable set to match against. _process_sale_email loads it
+    once and passes it per line — the old shape re-hydrated the whole table
+    for every item on the order, on the poller's timer."""
+    if records is None:
+        records = _sellable_records_query()
 
     tid = str(item.get("tcgplayer_id") or "").strip()
     if tid:
@@ -15281,9 +15286,15 @@ def _match_email_item_to_record(item, source="tcgplayer"):
     if refined:
         cands = refined
 
-    # Prefer records actually listed on the source marketplace.
-    listed = [r for r in cands
-              if (_listing_for(r.id, source) and _listing_for(r.id, source).status in ("active", "draft"))]
+    # Prefer records actually listed on the source marketplace. One IN query
+    # over the (small) candidate set — this used to call _listing_for twice
+    # per candidate, each a SELECT.
+    listed_ids = {row.record_id for row in
+                  db.session.query(Listing.record_id)
+                    .filter(Listing.record_id.in_([r.id for r in cands]),
+                            Listing.marketplace == source,
+                            Listing.status.in_(("active", "draft"))).all()}
+    listed = [r for r in cands if r.id in listed_ids]
     if listed:
         cands = listed
 
@@ -15311,6 +15322,7 @@ def _process_sale_email(parsed, source="tcgplayer"):
         return out
 
     created_events = []
+    sellable = _sellable_records_query()   # one load for the whole email
     for item in items:
         title = (item.get("name") or "").strip() or "(unknown)"
         if item.get("set"):
@@ -15321,7 +15333,7 @@ def _process_sale_email(parsed, source="tcgplayer"):
             out["items"].append({"title": title, "status": "duplicate"})
             continue
 
-        rec, conf = _match_email_item_to_record(item, source)
+        rec, conf = _match_email_item_to_record(item, source, records=sellable)
         ev = SaleEvent(source=source, order_id=order_id, item_title=title,
                        qty=int(item.get("qty", 1)), price=item.get("price"),
                        record_id=rec.id if rec else None, email_subject=subject,
