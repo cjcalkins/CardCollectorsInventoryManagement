@@ -1626,38 +1626,45 @@ def _build_ocr_candidates(exclude_record_id=None, catalog_only=False):
     catalog_only=True restricts matching to imported reference rows (the CSV
     "Imported Catalog"), which is usually the cleanest identification target.
     """
-    # SQL narrowing on provably-implied conditions (the derived columns come
-    # from the same helpers the loop calls): rows with neither name nor
-    # serial can't match, the catalog scope mirrors _is_catalog_only, and the
-    # excluded record drops before hydration. Loop checks still run.
+    # Projection, not hydration: name/serial come straight from the derived
+    # columns (the mapper sets name_key/serial_key from exactly _get_name/
+    # _get_serial), the display fields via json_extract. The old shape loaded
+    # every candidate row's full extracted_data per identify click — with
+    # catalog_only=True that is the whole imported catalog. The catalog scope
+    # relies on the derived is_catalog column (same derivation as the old
+    # loop's _is_catalog_only re-check).
     from sqlalchemy import func as _f, or_
-    q = ScanRecord.query.filter(or_(ScanRecord.name_key.isnot(None),
-                                    ScanRecord.serial_key.isnot(None)))
+    if db.engine.dialect.name == "sqlite":
+        set_v = _f.json_extract(ScanRecord.extracted_data, "$.set")
+        set_name_v = _f.json_extract(ScanRecord.extracted_data, "$.set_name")
+        game_v = _f.json_extract(ScanRecord.extracted_data, "$.game")
+    else:
+        set_v = ScanRecord.extracted_data["set"].as_string()
+        set_name_v = ScanRecord.extracted_data["set_name"].as_string()
+        game_v = ScanRecord.extracted_data["game"].as_string()
+
+    q = (db.session.query(ScanRecord.id, ScanRecord.name_key, ScanRecord.serial_key,
+                          ScanRecord.image_path, set_v, set_name_v, game_v)
+         .filter(or_(ScanRecord.name_key.isnot(None),
+                     ScanRecord.serial_key.isnot(None))))
     if catalog_only:
         q = q.filter(_f.coalesce(ScanRecord.is_catalog, False) == True)  # noqa: E712
     if exclude_record_id is not None:
         q = q.filter(ScanRecord.id != exclude_record_id)
 
     candidates = []
-    for r in q.all():
-        if exclude_record_id is not None and r.id == exclude_record_id:
-            continue
-        data = r.extracted_data or {}
-        if catalog_only and not _is_catalog_only(data):
-            continue
-
-        name = _get_name(data)
-        serial = _get_serial(data)
+    for rid, name_key, serial_key, image_path, sv, snv, gv in q.all():
+        name = name_key or ""
+        serial = serial_key or ""
         if not name and not serial:
             continue  # nothing to match on
-
         candidates.append({
-            "record_id": r.id,
+            "record_id": rid,
             "name":      name,
             "serial":    serial,
-            "set":       str(data.get("set") or data.get("set_name") or "").strip(),
-            "game":      str(data.get("game") or "").strip(),
-            "thumbnail": build_uploaded_file_url(r.image_path) if r.image_path else None,
+            "set":       str(sv or snv or "").strip(),
+            "game":      str(gv or "").strip(),
+            "thumbnail": build_uploaded_file_url(image_path) if image_path else None,
         })
     return candidates
 
