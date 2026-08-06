@@ -13422,6 +13422,16 @@ import shop_providers
 import email_monitor
 from shop_providers import MARKETPLACES, SECRET_FIELDS, get_provider
 
+# ====================== SHIPPING (labels + tracking) ======================
+# Imported at module level so shipping_models' tables are registered on
+# db.metadata before init_db()'s create_all() runs. The /shipping/* routes
+# inherit the Shops permission via the "shipping": "shops" entry in
+# _resource_for_path's map.
+import shipping_models  # noqa: F401  (registers Order/OrderItem/Shipment)
+from shipping_routes import shipping_bp, ensure_order_from_sale, start_tracking_poller
+
+app.register_blueprint(shipping_bp)
+
 SHOP_SKU_PREFIX = "CCIM-"
 
 
@@ -14970,6 +14980,7 @@ def _process_sale_email(parsed, source="tcgplayer"):
         out["items"].append({"title": title, "status": "unparsed"})
         return out
 
+    created_events = []
     for item in items:
         title = (item.get("name") or "").strip() or "(unknown)"
         if item.get("set"):
@@ -14988,6 +14999,7 @@ def _process_sale_email(parsed, source="tcgplayer"):
                        detail=None if rec else f"reason: {conf}")
         db.session.add(ev)
         db.session.flush()
+        created_events.append(ev)
 
         if rec:
             fan = _mark_record_sold(rec, item.get("qty", 1), source, order_id, item.get("price"))
@@ -14999,6 +15011,15 @@ def _process_sale_email(parsed, source="tcgplayer"):
         else:
             out["unmatched"] += 1
             out["items"].append({"title": title, "status": "unmatched", "reason": conf})
+
+    # Fan the sale out into a shippable order. Idempotent per (source, order_id);
+    # lands in "needs address" unless the email carried a usable address block.
+    # Wrapped in try on purpose: a shipping problem must never break the sale
+    # pipeline that decrements inventory and delists on other marketplaces.
+    try:
+        ensure_order_from_sale(parsed, source=source, sale_events=created_events)
+    except Exception as exc:
+        app.logger.warning("Could not create an order from %s: %s", parsed.get("order_id"), exc)
 
     db.session.commit()
     return out
@@ -15675,6 +15696,9 @@ if __name__ == "__main__":
     # Optional background sale-email polling (off by default; "Check now" always works).
     if os.environ.get("EMAIL_MONITOR_BACKGROUND") == "1":
         start_email_poller()
+    # Optional background tracking refresh; self-guarded, a no-op unless
+    # SHIPPING_POLL_BACKGROUND=1. "Refresh tracking" remains the primary path.
+    start_tracking_poller(app)
 
     _roots = app.config.get("STORAGE_ROOTS", {})
     print("Card Collector Inventory Manager")
