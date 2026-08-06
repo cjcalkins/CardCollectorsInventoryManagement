@@ -4671,8 +4671,47 @@ def _render_inventory_fast(f_game, f_album, f_template, view_catalog,
     )
 
 
+# Merged field-type config, cached on a fingerprint of its inputs. Rebuilt
+# only when a ROI template file or the ReferenceSync table changes — the old
+# shape re-listed the folder, re-parsed every template file, and loaded the
+# ReferenceSync table once per template (T+1 loads) on EVERY inventory view.
+# Unlocked like the module's other caches: worst case under threads is a
+# redundant rebuild, never a wrong result.
+_TPL_FIELDS_CFG_CACHE = {"key": None, "cfg": None}
+
+
+def _template_fields_config_key():
+    """Cheap fingerprint of everything the merged config derives from: the
+    on-disk ROI templates (name + mtime) and a narrow ReferenceSync projection
+    (product_count/remote_updated catch new cards and re-syncs, which change
+    the derived per-game fields)."""
+    files = []
+    folder = app.config["ROI_TEMPLATE_FOLDER"]
+    try:
+        for f in sorted(os.listdir(folder)):
+            if f.endswith(".json"):
+                try:
+                    files.append((f, os.stat(os.path.join(folder, f)).st_mtime_ns))
+                except OSError:
+                    files.append((f, None))
+    except OSError:
+        pass
+    try:
+        syncs = tuple(db.session.query(
+            ReferenceSync.id, ReferenceSync.category_id, ReferenceSync.game,
+            ReferenceSync.product_count, ReferenceSync.remote_updated,
+        ).order_by(ReferenceSync.id).all())
+    except Exception:
+        syncs = None   # table unavailable -> key still works, just coarser
+    return (tuple(files), syncs)
+
+
 def _template_fields_config():
     """Aggregate field-type config across all templates (shared by both paths)."""
+    key = _template_fields_config_key()
+    if key == _TPL_FIELDS_CFG_CACHE["key"] and _TPL_FIELDS_CFG_CACHE["cfg"] is not None:
+        return _TPL_FIELDS_CFG_CACHE["cfg"]
+
     cfg = {}
     for tpl_name in get_template_names():
         try:
@@ -4686,6 +4725,8 @@ def _template_fields_config():
                     }
         except Exception:
             pass
+    _TPL_FIELDS_CFG_CACHE["key"] = key
+    _TPL_FIELDS_CFG_CACHE["cfg"] = cfg
     return cfg
 
 
