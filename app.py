@@ -975,7 +975,14 @@ def build_storage_index():
     Album has pages + 9 slots, a Box is a flat 1..N run with no page numbers.
     When records disagree, the majority kind wins (they share a kind at import).
     """
-    records = ScanRecord.query.order_by(ScanRecord.scan_date.desc()).all()
+    # Only rows that can land in a container load: non-catalog (is_catalog
+    # mirrors _is_catalog_only) with a non-empty album (album_key is NULL
+    # exactly when the album strips to empty). The loop's checks still run.
+    from sqlalchemy import func as _f
+    records = (ScanRecord.query
+               .filter(_f.coalesce(ScanRecord.is_catalog, False) == False,  # noqa: E712
+                       ScanRecord.album_key.isnot(None))
+               .order_by(ScanRecord.scan_date.desc()).all())
     storage_map = {}
 
     for record in records:
@@ -4278,6 +4285,7 @@ def _derive_scan_columns(record):
     record.game_key      = (str(data.get("game", "")).strip().lower() or None)
     record.album_key     = (str(data.get("album", "")).strip().lower() or None)
     record.name_key      = (_get_name(data) or None)
+    record.serial_key    = (_get_serial(data) or None)
     record.card_type_key = (_derive_card_type(data) or None)
     record.dup_hash      = _compute_dup_hash(data)
     record.is_finalized  = _bool_from(data, "finalized")
@@ -5905,6 +5913,8 @@ def _held_inventory_match(game, name, number):
     q = ScanRecord.query.filter(and_(
         _f.coalesce(ScanRecord.is_catalog, False) == False,   # noqa: E712
         _f.coalesce(ScanRecord.is_archived, False) == False,  # noqa: E712
+        # is_held mirrors _held_from by derivation; sold rows never load.
+        _f.coalesce(ScanRecord.is_held, True) == True,        # noqa: E712
     ))
     gk = (game or "").strip().lower()
     if gk:
@@ -7754,25 +7764,14 @@ def add_custom_field():
     want_catalog = bool(data.get("catalog_only", False))
 
     if game:
-        all_rows = (
-            ScanRecord.query
-            .with_entities(ScanRecord.id, ScanRecord.extracted_data)
-            .all()
-        )
-        matching_ids = []
-        for row_id, extracted_data in all_rows:
-            if isinstance(extracted_data, dict):
-                row_data = extracted_data
-            else:
-                try:
-                    row_data = json.loads(extracted_data or "{}")
-                except (ValueError, TypeError):
-                    row_data = {}
-            if str(row_data.get("game", "")).strip().lower() != game.strip().lower():
-                continue
-            if scope_passed and _is_catalog_only(row_data) != want_catalog:
-                continue
-            matching_ids.append(row_id)
+        # Same normalized comparisons the Python loop here made, as indexed
+        # SQL: game via game_key, the optional catalog scope via is_catalog.
+        from sqlalchemy import func as _f
+        q = (ScanRecord.query.with_entities(ScanRecord.id)
+             .filter(ScanRecord.game_key == game.strip().lower()))
+        if scope_passed:
+            q = q.filter(_f.coalesce(ScanRecord.is_catalog, False) == bool(want_catalog))
+        matching_ids = [row_id for (row_id,) in q.all()]
 
         if not matching_ids:
             return jsonify({"status": "error", "message": f"No records found for game '{game}'"}), 404
@@ -9689,15 +9688,30 @@ def duplicates():
     Groups where all members already share the same image_path are also
     excluded — they are already resolved and won't reappear after a reload.
     """
-    # SQL pre-narrowing on provably-implied conditions: name_key is derived as
-    # `_get_name(data) or None` by the mapper events, and is_catalog mirrors
-    # _is_catalog_only — so this can never exclude a row the loop below would
-    # have kept. The loop's own checks still run on the narrowed set.
-    from sqlalchemy import func as _f
-    records = (ScanRecord.query
-               .filter(_f.coalesce(ScanRecord.is_catalog, False) == False,  # noqa: E712
-                       ScanRecord.name_key.isnot(None))
-               .order_by(ScanRecord.scan_date.desc()).all())
+    # Candidate groups come from one GROUP BY over the derived keys —
+    # name_key/serial_key are `_get_name/_get_serial(data) or None` by the
+    # mapper events and is_catalog mirrors _is_catalog_only, so this can never
+    # exclude a row the loop below would have kept. Only members of groups
+    # that share (name, serial) at least twice are hydrated; edition
+    # subdivision and every original check still run in the loop.
+    from sqlalchemy import func as _f, tuple_ as _sa_tuple
+    not_cat = _f.coalesce(ScanRecord.is_catalog, False) == False  # noqa: E712
+    keyed = (ScanRecord.name_key.isnot(None), ScanRecord.serial_key.isnot(None))
+    dup_keys = [tuple(k) for k in
+                (db.session.query(ScanRecord.name_key, ScanRecord.serial_key)
+                 .filter(not_cat, *keyed)
+                 .group_by(ScanRecord.name_key, ScanRecord.serial_key)
+                 .having(_f.count(ScanRecord.id) > 1).all())]
+    records = []
+    for i in range(0, len(dup_keys), 400):   # stay under the bound-param limit
+        records.extend(
+            ScanRecord.query
+            .filter(not_cat, *keyed,
+                    _sa_tuple(ScanRecord.name_key, ScanRecord.serial_key)
+                    .in_(dup_keys[i:i + 400]))
+            .all())
+    # Same ordering the old full-table query had: newest first.
+    records.sort(key=lambda r: (r.scan_date or datetime.min, r.id), reverse=True)
 
     groups_map = {}
     for record in records:
@@ -14031,7 +14045,13 @@ def _connection_public_view(conn, marketplace):
 
 def _sellable_records_query():
     """Owned inventory only — exclude catalog-only reference rows and blank slots."""
-    records = ScanRecord.query.order_by(ScanRecord.scan_date.desc(), ScanRecord.id.desc()).all()
+    # Catalog rows drop out in SQL (is_catalog mirrors _is_catalog_only by
+    # derivation); the "empty slot" flag has no derived column, so that check
+    # stays in Python on the narrowed set.
+    from sqlalchemy import func as _f
+    records = (ScanRecord.query
+               .filter(_f.coalesce(ScanRecord.is_catalog, False) == False)  # noqa: E712
+               .order_by(ScanRecord.scan_date.desc(), ScanRecord.id.desc()).all())
     out = []
     for r in records:
         data = r.extracted_data or {}
@@ -15455,6 +15475,35 @@ def migrate_drop_unused_indexes():
             conn.exec_driver_sql(f"DROP INDEX IF EXISTS {name}")
 
 
+def migrate_add_serial_key_column():
+    """
+    Add scan_records.serial_key (normalized duplicate-group serial, NULL when
+    absent) plus idx_scan_dupe(name_key, serial_key) to installs that predate
+    them, then backfill once. Fresh databases get both from create_all().
+    Lets /duplicates find its candidate groups with one GROUP BY instead of
+    hydrating and grouping every record in Python.
+    """
+    from sqlalchemy import inspect
+
+    inspector = inspect(db.engine)
+    if "scan_records" not in inspector.get_table_names():
+        return  # fresh DB — create_all() already made the column
+
+    existing = {c["name"] for c in inspector.get_columns("scan_records")}
+    added = False
+    if "serial_key" not in existing:
+        with db.engine.begin() as conn:
+            conn.exec_driver_sql(
+                "ALTER TABLE scan_records ADD COLUMN serial_key VARCHAR(120)")
+        added = True
+    with db.engine.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_scan_dupe "
+            "ON scan_records(name_key, serial_key)")
+    if added:
+        _backfill_scan_columns()
+
+
 def migrate_add_search_fts():
     """
     Full-text search backing (FTS5, trigram tokenizer) so the substring
@@ -15533,6 +15582,7 @@ def init_db():
         migrate_add_display_image_path_column()
         migrate_add_type_reference_region_column()
         migrate_add_scan_scaling_columns()
+        migrate_add_serial_key_column()
         migrate_add_performance_indexes()
         migrate_drop_unused_indexes()
         migrate_add_search_fts()

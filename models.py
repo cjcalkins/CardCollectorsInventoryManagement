@@ -51,6 +51,10 @@ class ScanRecord(db.Model):
     game_key      = db.Column(db.String(120))
     album_key     = db.Column(db.String(200))
     name_key      = db.Column(db.String(300), index=True)
+    # Duplicate-page group key half: normalized serial (first non-empty of the
+    # serial-ish fields, lower/stripped, NULL when absent). Grouped with
+    # name_key via idx_scan_dupe so /duplicates finds candidate groups in SQL.
+    serial_key    = db.Column(db.String(120))
     card_type_key = db.Column(db.String(80),  index=True)
     dup_hash      = db.Column(db.String(64),  index=True)
     is_finalized  = db.Column(db.Boolean, default=False)
@@ -65,6 +69,8 @@ class ScanRecord(db.Model):
         # Serves the hot Inventory query: filter by game + owned/active, order by recency.
         db.Index('idx_scan_hot', 'game_key', 'is_catalog', 'is_archived', 'scan_date'),
         db.Index('idx_scan_album_hot', 'album_key', 'is_catalog', 'is_archived'),
+        # Serves the /duplicates GROUP BY (name_key, serial_key).
+        db.Index('idx_scan_dupe', 'name_key', 'serial_key'),
     )
 
 
