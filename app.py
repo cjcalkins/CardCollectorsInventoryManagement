@@ -2757,6 +2757,121 @@ class User(db.Model):
             return False
 
 
+class SecurityEvent(db.Model):
+    """Append-only record of security-relevant actions.
+
+    Names are captured AS THEY WERE, not looked up later through a foreign key: the
+    point of this table is to survive the account being renamed or deleted, which is
+    exactly what someone covering their tracks would do.
+    """
+    __tablename__ = "auth_security_events"
+    id = db.Column(db.Integer, primary_key=True)
+    at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False, index=True)
+    action = db.Column(db.String(40), nullable=False)
+    actor_id = db.Column(db.Integer)          # null for a failed sign-in or anonymous
+    actor_name = db.Column(db.String(64))
+    target_id = db.Column(db.Integer)
+    target_name = db.Column(db.String(64))
+    source_ip = db.Column(db.String(45))      # fits IPv6
+    detail = db.Column(db.String(80))         # vocabulary only -- never caller text
+
+
+# The complete vocabulary. `action` and `detail` are checked against these sets, so
+# nothing a caller controls can reach either column. The only free-ish values in the
+# table are the captured names, and usernames are NOT charset-validated anywhere in
+# this app -- which is why the viewer escapes every field it renders.
+_EVENT_ACTIONS = frozenset({
+    "sign_in", "sign_in_failed", "sign_in_throttled", "sign_out", "first_admin_created",
+    "user_created", "user_updated", "user_deleted", "password_changed",
+    "role_saved", "role_deleted", "storage_root_changed", "migration_bundle_exported",
+})
+_EVENT_DETAILS = frozenset({
+    "", "by_admin", "self_service", "role_changed", "activated", "deactivated",
+    "password_reset", "role_and_password", "bad_password", "unknown_user", "inactive_user",
+})
+EVENT_LOG_KEEP = 5000          # rows retained; the oldest are pruned on write
+_EVENT_TABLE_READY = {"ok": False}
+
+
+def _event_table_ready():
+    """Create the table on first use.
+
+    db.create_all() and every migration in this app run only from the __main__
+    block, so a WSGI deployment would otherwise come up without this table and every
+    write below would raise. checkfirst=True makes it a no-op once it exists.
+    """
+    if _EVENT_TABLE_READY["ok"]:
+        return True
+    try:
+        SecurityEvent.__table__.create(db.engine, checkfirst=True)
+        _EVENT_TABLE_READY["ok"] = True
+    except Exception:
+        return False
+    return True
+
+
+def _clip(v, n=64):
+    return (str(v)[:n] if v is not None else None)
+
+
+def log_security_event(action, actor=None, target=None, detail="",
+                       actor_name=None, target_name=None):
+    """Best-effort append to the security log. NEVER raises.
+
+    An audit write that can 500 a sign-in is worse than no audit write: it converts a
+    logging fault into an outage and hands an attacker a way to deny the action it was
+    meant to record. Everything here is swallowed, and the caller is not told.
+    """
+    try:
+        if action not in _EVENT_ACTIONS or detail not in _EVENT_DETAILS:
+            return                      # programming error, not a caller's input
+        if not _event_table_ready():
+            return
+        ip = None
+        try:
+            ip = _clip(request.remote_addr, 45)
+        except Exception:
+            pass
+        row = SecurityEvent(
+            action=action, detail=detail, source_ip=ip,
+            actor_id=(getattr(actor, "id", None) if actor is not None else None),
+            actor_name=_clip(actor_name if actor_name is not None
+                             else getattr(actor, "username", None)),
+            target_id=(getattr(target, "id", None) if target is not None else None),
+            target_name=_clip(target_name if target_name is not None
+                              else getattr(target, "username", None)),
+        )
+        db.session.add(row)
+        db.session.commit()
+        _prune_security_events()
+    except Exception:
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+
+
+def _prune_security_events():
+    """Keep the newest EVENT_LOG_KEEP rows. Unbounded growth is its own availability
+    problem on a device with a small disk, which is what this app often runs on."""
+    try:
+        n = db.session.query(SecurityEvent.id).count()
+        if n <= EVENT_LOG_KEEP:
+            return
+        cutoff = (db.session.query(SecurityEvent.id)
+                  .order_by(SecurityEvent.id.desc())
+                  .offset(EVENT_LOG_KEEP).limit(1).scalar())
+        if cutoff:
+            db.session.query(SecurityEvent).filter(SecurityEvent.id <= cutoff).delete(
+                synchronize_session=False)
+            db.session.commit()
+    except Exception:
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+
+
 def _auth_disabled():
     """Kill-switch: DISABLE_AUTH=1 turns authentication off entirely."""
     return os.environ.get("DISABLE_AUTH", "").strip().lower() in ("1", "true", "yes", "on")
@@ -2859,7 +2974,7 @@ def _resource_for_path(path):
     head = seg[0]
     if head == "settings":
         sub = seg[1] if len(seg) > 1 else ""
-        if sub in ("users", "roles"):
+        if sub in ("users", "roles", "security"):
             return "__admin__"
         # "reset" is the factory wipe (drops the DB + storage) — admins only, never
         # the plain "settings" default it would otherwise inherit.
@@ -3319,6 +3434,7 @@ def auth_setup_submit():
     db.session.commit()
     session["uid"] = u.id
     session["sauth"] = _session_auth_hash(u)
+    log_security_event("first_admin_created", actor=u, target=u)
     return jsonify({"status": "success", "redirect": url_for("index")})
 
 
@@ -3371,15 +3487,22 @@ def auth_login_submit():
     password = str(body.get("password", ""))
     key = _login_throttle_key(username)
     if _login_is_locked(key):
+        log_security_event("sign_in_throttled", actor_name=username)
         return jsonify({"status": "error",
                         "message": "Too many failed attempts. Wait a few minutes and try again."}), 429
     u = User.query.filter(db.func.lower(User.username) == username.lower()).first()
     if u is None or not u.active or not u.check_password(password):
         _login_record_fail(key)
+        # The reason is recorded for the log only. The RESPONSE stays the single
+        # generic message -- distinguishing them to the caller is user enumeration.
+        why = ("unknown_user" if u is None
+               else "inactive_user" if not u.active else "bad_password")
+        log_security_event("sign_in_failed", actor=u, actor_name=username, detail=why)
         return jsonify({"status": "error", "message": "Invalid username or password."}), 401
     _login_clear(key)
     session["uid"] = u.id
     session["sauth"] = _session_auth_hash(u)
+    log_security_event("sign_in", actor=u)
     return jsonify({"status": "success",
                     "redirect": _same_origin_next(body.get("next"), url_for("index"))})
 
@@ -3479,12 +3602,14 @@ def account_password_change():
     # changing a password you believe someone else knows. Re-stamp this one so the
     # person doing it is not signed out by their own action.
     session["sauth"] = _session_auth_hash(u)
+    log_security_event("password_changed", actor=u, target=u, detail="self_service")
     return jsonify({"status": "success",
                     "message": "Password changed. Any other sessions signed in as you have been signed out."})
 
 
 @app.route("/auth/logout")
 def auth_logout():
+    log_security_event("sign_out", actor=_current_user())
     session.pop("uid", None)
     session.pop("sauth", None)
     return redirect(url_for("auth_login_page"))
@@ -3507,7 +3632,7 @@ _AUTH_USERS_HTML = ("""<!doctype html><html lang=en><head><meta charset=utf-8>
     <button id=addBtn>Add user</button>
   </div>
   <div id=msg class=msg></div>
-  <div class=links><a href="/settings/roles">Manage roles</a><a href="/account/password">My password</a><a href="/settings">All settings</a><a href="/auth/logout">Sign out</a></div>
+  <div class=links><a href="/settings/roles">Manage roles</a><a href="/settings/security">Security log</a><a href="/account/password">My password</a><a href="/settings">All settings</a><a href="/auth/logout">Sign out</a></div>
 </div>
 <script>
   var msg=document.getElementById('msg');
@@ -3584,6 +3709,7 @@ def users_create():
     u.set_password(password)
     db.session.add(u)
     db.session.commit()
+    log_security_event("user_created", actor=_current_user(), target=u)
     return jsonify({"status": "success"})
 
 
@@ -3602,6 +3728,8 @@ def users_update():
         if (not (will_admin and will_active)) and _admin_count() <= 1:
             return jsonify({"status": "error",
                             "message": "This is the only administrator — keep at least one."}), 400
+    changed_role = bool(body.get("role_id")) and int(body["role_id"]) != u.role_id
+    changed_active = "active" in body and bool(body["active"]) != bool(u.active)
     if body.get("role_id"):
         u.role_id = int(body["role_id"])
     if "active" in body:
@@ -3618,6 +3746,14 @@ def users_update():
         # Re-stamp the one making the request so an admin changing their own
         # password is not logged out by their own action.
         session["sauth"] = _session_auth_hash(u)
+    actor = _current_user()
+    if pw:
+        log_security_event("password_changed", actor=actor, target=u,
+                           detail=("role_and_password" if changed_role else "by_admin"))
+    if changed_role or changed_active:
+        log_security_event("user_updated", actor=actor, target=u,
+                           detail=("role_changed" if changed_role
+                                   else "activated" if bool(body.get("active")) else "deactivated"))
     return jsonify({"status": "success"})
 
 
@@ -3629,8 +3765,11 @@ def users_delete():
         return jsonify({"status": "error", "message": "No such user."}), 404
     if u.role and u.role.is_admin and u.active and _admin_count() <= 1:
         return jsonify({"status": "error", "message": "Can't delete the only administrator."}), 400
+    gone_id, gone_name = u.id, u.username
     db.session.delete(u)
     db.session.commit()
+    log_security_event("user_deleted", actor=_current_user(),
+                       target_name=gone_name)
     return jsonify({"status": "success"})
 
 
@@ -3715,6 +3854,77 @@ _AUTH_ROLES_HTML = ("""<!doctype html><html lang=en><head><meta charset=utf-8>
 </script></body></html>""")
 
 
+# ---- Security event log (admin only; gated by _resource_for_path -> '__admin__') ----
+_AUTH_EVENTS_HTML = ("""<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width, initial-scale=1"><title>Security log</title>
+<style>""" + _AUTH_CSS + """
+ table{width:100%;border-collapse:collapse;font-size:13px}
+ th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #e5e7eb;vertical-align:top}
+ th{color:#6b7280;font-weight:600;white-space:nowrap}
+ td.mono{font-family:ui-monospace,Menlo,Consolas,monospace;white-space:nowrap;color:#6b7280}
+ .act{font-weight:600}
+</style></head><body>
+<div class="card wide">
+  <h1>Security log</h1>
+  <p class=sub>Sign-ins, account and role changes, password resets, storage moves and
+     migration-bundle exports. Newest first; the oldest entries are pruned once the log
+     passes __KEEP__ rows.</p>
+  <div id=rows></div>
+  <div id=msg class=msg></div>
+  <div class=links><a href="/settings/users">Manage users</a><a href="/settings/roles">Manage roles</a><a href="/settings">All settings</a></div>
+</div>
+<script>
+  var msg=document.getElementById('msg');
+  function show(t,ok){msg.textContent=t;msg.className='msg show '+(ok?'ok':'err');}
+  function cell(row,text,cls){var td=document.createElement('td');if(cls)td.className=cls;
+    td.textContent=(text===null||text===undefined||text==='')?'\u2014':String(text);row.appendChild(td);}
+  async function load(){
+    try{
+      var r=await fetch('/settings/security/list');var d=await r.json();
+      if(d.status!=='ok'){show(d.message||'Could not load the log.',false);return;}
+      var wrap=document.getElementById('rows');wrap.textContent='';
+      if(!d.events.length){show('No events recorded yet.',true);return;}
+      var t=document.createElement('table');
+      var hr=document.createElement('tr');
+      ['When (UTC)','Action','Detail','Actor','Target','From'].forEach(function(h){
+        var th=document.createElement('th');th.textContent=h;hr.appendChild(th);});
+      t.appendChild(hr);
+      d.events.forEach(function(e){
+        var tr=document.createElement('tr');
+        cell(tr,e.at,'mono');cell(tr,e.action,'act');cell(tr,e.detail);
+        cell(tr,e.actor_name);cell(tr,e.target_name);cell(tr,e.source_ip,'mono');
+        t.appendChild(tr);});
+      wrap.appendChild(t);
+    }catch(e){show('Error: '+e.message,false);}
+  }
+  load();
+</script></body></html>""").replace("__KEEP__", str(EVENT_LOG_KEEP))
+
+
+@app.route("/settings/security")
+def security_log_page():
+    return Response(_AUTH_EVENTS_HTML, mimetype="text/html")
+
+
+@app.route("/settings/security/list")
+def security_log_list():
+    """Rows as JSON. Every value is rendered by the page with textContent, never as
+    markup: usernames are not charset-validated anywhere in this app, so a user can be
+    created called <img src=x onerror=...> and this viewer is where it would land."""
+    if not _event_table_ready():
+        return jsonify({"status": "ok", "events": []})
+    try:
+        rows = (SecurityEvent.query.order_by(SecurityEvent.id.desc()).limit(500).all())
+    except Exception:
+        return jsonify({"status": "ok", "events": []})
+    return jsonify({"status": "ok", "events": [{
+        "at": (e.at.strftime("%Y-%m-%d %H:%M:%S") if e.at else ""),
+        "action": e.action, "detail": e.detail or "",
+        "actor_name": e.actor_name, "target_name": e.target_name,
+        "source_ip": e.source_ip,
+    } for e in rows]})
+
+
 @app.route("/settings/roles")
 def roles_page():
     return Response(_AUTH_ROLES_HTML, mimetype="text/html")
@@ -3761,6 +3971,8 @@ def roles_save():
         r = Role(name=name, is_admin=is_admin, permissions=perms)
         db.session.add(r)
     db.session.commit()
+    log_security_event("role_saved", actor=_current_user(),
+                       target_name=r.name)
     return jsonify({"status": "success", "id": r.id})
 
 
@@ -3774,8 +3986,10 @@ def roles_delete():
         return jsonify({"status": "error", "message": "Reassign users off this role before deleting it."}), 400
     if r.is_admin and _admin_count() <= 1:
         return jsonify({"status": "error", "message": "Can't delete the only administrator role."}), 400
+    gone_role = r.name
     db.session.delete(r)
     db.session.commit()
+    log_security_event("role_deleted", actor=_current_user(), target_name=gone_role)
     return jsonify({"status": "success"})
 
 
@@ -11901,6 +12115,8 @@ def upgrade_export():
     except Exception as exc:
         return jsonify({"status": "error", "message": f"Export failed: {exc}"}), 500
     size = os.path.getsize(tar_path)
+    log_security_event("migration_bundle_exported", actor=_current_user(),
+                       target_name=os.path.basename(tar_path))
     return jsonify({
         "status": "success",
         "message": "Migration bundle created.",
@@ -12298,6 +12514,11 @@ def storage_update():
     code = 200 if result.get("status") == "success" else 400
     if result.get("status") == "success":
         result["slots"] = _storage_status()
+        # The slot name is a STORAGE_SLOTS member, not caller text. The new path is
+        # deliberately not recorded: it is operator-supplied and would put an
+        # arbitrary string into the log the admin viewer renders.
+        log_security_event("storage_root_changed", actor=_current_user(),
+                           target_name=slot)
     return jsonify(result), code
 
 
