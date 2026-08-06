@@ -4552,17 +4552,22 @@ def _inventory_base_conditions(f_game, f_album, f_template, view_catalog, held_s
 
 
 def _render_inventory_fast(f_game, f_album, f_template, view_catalog,
-                           page, per_page, sort_col, sort_dir, held_state=None):
+                           page, per_page, sort_col, sort_dir, held_state=None,
+                           search=""):
     """
     Fast Inventory path: de-duplicate and paginate entirely in SQL using the
     dup_hash column and window functions, loading only the page's ~50 rows
-    instead of the whole filtered set. Used for the default (recency) view;
-    the caller falls back to the Python path for free-text search and arbitrary
-    field sorts. Raises on any DB error so the caller can fall back safely.
+    instead of the whole filtered set. Used for the default (recency) view,
+    with or without a free-text search (the same _scan_search_condition the
+    Python path uses, so both return identical sets); the caller falls back
+    to the Python path only for arbitrary field sorts. Raises on any DB error
+    so the caller can fall back safely.
     """
     from sqlalchemy import select, func, cast, String, and_
 
     conds = _inventory_base_conditions(f_game, f_album, f_template, view_catalog, held_state)
+    if search:
+        conds = list(conds) + [_scan_search_condition(search)]
 
     # Group key: dup_hash for finalized rows; a per-row token for the rest so
     # unfinalized records never merge together.
@@ -4644,7 +4649,7 @@ def _render_inventory_fast(f_game, f_album, f_template, view_catalog,
         "inventory.html",
         records=pagination.items,
         pagination=pagination,
-        search="",
+        search=search,
         f_game=f_game,
         f_album=f_album,
         f_template=f_template,
@@ -6380,16 +6385,19 @@ def inventory():
     page = max(page, 1)
     per_page = max(1, min(per_page, 200))
 
-    # ---- Fast path: default (recency) view with no free-text search ----------
-    # De-dup + paginate in SQL so only the page's rows load. Any arbitrary field
-    # sort or search falls through to the Python path below (which handles the
-    # full range of sort keys). The fast path is guarded: if the denormalized
-    # columns aren't present yet (e.g. mid-upgrade), we fall back transparently.
+    # ---- Fast path: default (recency) view, with or without free-text search --
+    # De-dup + paginate in SQL so only the page's rows load. Searches route
+    # here too (the filter clause is shared with the Python path); only an
+    # arbitrary field sort falls through to the Python path below, which
+    # handles the full range of sort keys. The fast path is guarded: if the
+    # denormalized columns aren't present yet (e.g. mid-upgrade), we fall
+    # back transparently.
     effective_sort_early = sort_col[len("entry_"):] if sort_col.startswith("entry_") else sort_col
-    if not search and not effective_sort_early:
+    if not effective_sort_early:
         try:
             return _render_inventory_fast(
-                f_game, f_album, f_template, view_catalog, page, per_page, sort_col, sort_dir, held_state)
+                f_game, f_album, f_template, view_catalog, page, per_page, sort_col, sort_dir,
+                held_state, search=search)
         except Exception:
             db.session.rollback()  # fall back to the proven Python grouping path
 
