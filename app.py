@@ -4874,6 +4874,16 @@ def builder_page():
     return render_template("builder.html", game=game, options=_builder_options(pool), games=None)
 
 
+# Hard input ceilings for the builder. builder._constrained_slots materializes
+# the whole requested slot list BEFORE build_pack truncates it to the pack
+# size, so an unbounded count is an allocation, not a preference: a single
+# request with a billion-count rarity line was an OOM, and an unbounded
+# set-of-packs count pegged a worker thread re-scanning the pool per pack.
+# 10k slots / 500 packs comfortably exceed any physical pack or set.
+BUILDER_MAX_SLOTS = 10_000
+BUILDER_MAX_PACKS = 500
+
+
 @app.route("/inventory/builder/build", methods=["POST"])
 def builder_build():
     body = request.get_json(silent=True) or {}
@@ -4898,6 +4908,23 @@ def builder_build():
                 out[key] = out.get(key, 0) + n
         return out
 
+    def _ceiling_error(size, count_dicts=(), value_lists=(), count=1):
+        """400 message when a spec exceeds the hard ceilings, else None.
+        Checked before anything is allocated or matched."""
+        if size < 0 or size > BUILDER_MAX_SLOTS:
+            return f"Pack/set size must be between 0 and {BUILDER_MAX_SLOTS}."
+        for d in count_dicts:
+            total = sum(d.values())
+            if total > BUILDER_MAX_SLOTS:
+                return (f"Requested {total} constrained slots; "
+                        f"the limit is {BUILDER_MAX_SLOTS}.")
+        for lst in value_lists:
+            if len(lst or []) > BUILDER_MAX_SLOTS:
+                return f"Too many filter values (limit {BUILDER_MAX_SLOTS})."
+        if count > BUILDER_MAX_PACKS:
+            return f"Pack count must be at most {BUILDER_MAX_PACKS}."
+        return None
+
     try:
         if mode == "pack":
             spec = {
@@ -4906,6 +4933,10 @@ def builder_build():
                 "holos": _counts(body.get("holos")),
                 "sets": body.get("sets") or [],
             }
+            err = _ceiling_error(spec["size"], (spec["rarities"], spec["holos"]),
+                                 (spec["sets"],))
+            if err:
+                return jsonify({"status": "error", "message": err}), 400
             res = _builder.build_pack(pool, spec)
             cards = [_builder_result_card(c, by_id) for c in res["selected"]]
             out = {
@@ -4923,6 +4954,10 @@ def builder_build():
                 "rarities": body.get("rarities") or [],
                 "sets": body.get("sets") or [],
             }
+            err = _ceiling_error(spec["size"],
+                                 value_lists=(spec["types"], spec["rarities"], spec["sets"]))
+            if err:
+                return jsonify({"status": "error", "message": err}), 400
             res = _builder.build_set(pool, spec)
             cards = [_builder_result_card(c, by_id) for c in res["selected"]]
             out = {
@@ -4940,6 +4975,10 @@ def builder_build():
                 "sets": pack.get("sets") or [],
             }
             count = max(1, int(body.get("count") or 1))
+            err = _ceiling_error(spec["size"], (spec["rarities"], spec["holos"]),
+                                 (spec["sets"],), count=count)
+            if err:
+                return jsonify({"status": "error", "message": err}), 400
             res = _builder.build_set_of_packs(pool, spec, count)
             packs_out = [
                 {
@@ -4958,6 +4997,13 @@ def builder_build():
             }
         else:
             return jsonify({"status": "error", "message": "Unknown build mode."}), 400
+    except RecursionError:
+        # Kuhn's matching in builder._match_slots recurses along augmenting
+        # chains; a pathological collection can exceed the interpreter limit.
+        # A clear rejection beats an unhandled 500.
+        return jsonify({"status": "error",
+                        "message": "This build is too complex to match — narrow the "
+                                   "criteria or reduce the size."}), 400
     except (TypeError, ValueError) as exc:
         return jsonify({"status": "error", "message": f"Invalid criteria: {exc}"}), 400
 
