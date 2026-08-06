@@ -15083,7 +15083,10 @@ def _mark_record_sold(record, sold_qty, source, order_id, sold_price=None):
                 "price": sold_price, "at": datetime.utcnow().isoformat()})
     data["sales_log"] = log
     if remaining == 0:
-        data["sold"] = True
+        # held=False is what moves the record to the Sold page: _held_from /
+        # is_held read the "held" key (see _set_held), not a "sold" flag.
+        data["held"] = False
+        data.pop("sold", None)   # retire the old wrong-key flag if present
         data["sold_at"] = datetime.utcnow().isoformat()
     record.extracted_data = data
 
@@ -15213,16 +15216,22 @@ def _process_sale_email(parsed, source="tcgplayer"):
             out["unmatched"] += 1
             out["items"].append({"title": title, "status": "unmatched", "reason": conf})
 
+    # The delist fan-out has already hit the other marketplaces, so make the
+    # quantity decrements and SaleEvents durable before anything else can fail.
+    db.session.commit()
+
     # Fan the sale out into a shippable order. Idempotent per (source, order_id);
     # lands in "needs address" unless the email carried a usable address block.
     # Wrapped in try on purpose: a shipping problem must never break the sale
     # pipeline that decrements inventory and delists on other marketplaces.
+    # ensure_order_from_sale commits on success; on failure, roll back so its
+    # half-flushed Order (or a poisoned session) can't leak into a later commit.
     try:
         ensure_order_from_sale(parsed, source=source, sale_events=created_events)
     except Exception as exc:
+        db.session.rollback()
         app.logger.warning("Could not create an order from %s: %s", parsed.get("order_id"), exc)
 
-    db.session.commit()
     return out
 
 
