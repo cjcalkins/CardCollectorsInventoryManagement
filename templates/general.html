@@ -161,6 +161,40 @@
 
                     <div id="providerStatus" class="mt-3" style="font-size:.9rem;"></div>
                 </div>
+
+                <!-- Report timezone -->
+                <div class="panel">
+                    <div>
+                        <h5 class="fw-bold mb-1"><i class="fas fa-clock me-2"></i>Report timezone</h5>
+                        <p class="text-muted mb-3" style="max-width:620px;">
+                            The timezone financial reports use to decide which day, week, month or
+                            quarter a scan or sale belongs to. Timestamps are stored in UTC; this only
+                            changes how they are bucketed and labeled. Leave blank to use this
+                            machine's local timezone. Changes apply to the next report immediately.
+                        </p>
+                    </div>
+
+                    <div class="row g-3 align-items-end">
+                        <div class="col-md-5">
+                            <label class="form-label small fw-semibold mb-1" for="tzInput">Timezone (IANA name)</label>
+                            <input id="tzInput" class="form-control" list="tzList"
+                                   value="{{ general.report_timezone }}"
+                                   placeholder="System local ({{ general.report_timezone_effective }})">
+                            <datalist id="tzList">
+                                {% for z in timezones %}<option value="{{ z }}">{% endfor %}
+                            </datalist>
+                        </div>
+                        <div class="col-md-7">
+                            <button class="btn btn-primary" onclick="saveTimezone(false)">Save</button>
+                            <button class="btn btn-outline-secondary ms-1" onclick="saveTimezone(true)">Use system timezone</button>
+                        </div>
+                    </div>
+                    <div class="mt-2 text-muted" style="font-size:.85rem;">
+                        Currently in effect: <span id="tzEffective">{{ general.report_timezone_effective }}</span>
+                    </div>
+
+                    <div id="tzStatus" class="mt-3" style="font-size:.9rem;"></div>
+                </div>
             </div>
         </main>
     </div>
@@ -193,6 +227,35 @@
             })
             .catch(err => {
                 el.disabled = false; el.checked = !enabled;
+                status.className = 'mt-3 text-danger';
+                status.textContent = 'Request failed: ' + err;
+            });
+        }
+
+        function saveTimezone(useSystem) {
+            const input = document.getElementById('tzInput');
+            const status = document.getElementById('tzStatus');
+            const tz = useSystem ? '' : input.value.trim();
+            status.className = 'mt-3 text-muted';
+            status.textContent = 'Saving…';
+            fetch('/settings/general/timezone', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ timezone: tz })
+            })
+            .then(r => r.json())
+            .then(d => {
+                // textContent on purpose: the error message echoes what was
+                // typed, so it must never go through innerHTML.
+                status.className = 'mt-3 ' + (d.status === 'success' ? 'text-success' : 'text-danger');
+                status.textContent = d.message || (d.status === 'success' ? 'Saved.' : 'Could not save.');
+                const g = d.general || {};
+                if (d.status === 'success') {
+                    input.value = g.report_timezone || '';
+                    document.getElementById('tzEffective').textContent = g.report_timezone_effective || '';
+                }
+            })
+            .catch(err => {
                 status.className = 'mt-3 text-danger';
                 status.textContent = 'Request failed: ' + err;
             });

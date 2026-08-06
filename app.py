@@ -22,6 +22,7 @@ import tempfile
 import threading as _threading
 import numpy as np
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from PIL import Image
 # Same ceiling for Pillow (its default is ~89 MP, far below legitimate scans).
 Image.MAX_IMAGE_PIXELS = _MAX_IMAGE_PIXELS
@@ -5422,19 +5423,48 @@ def _parse_dt(v):
     return None
 
 
-def _local_to_utc_naive(dt):
-    """Convert a naive LOCAL datetime to naive UTC, honouring the machine's
-    zone and DST at that moment. Report windows are local-calendar (that is
+REPORT_TIMEZONE_KEY = "REPORT_TIMEZONE"   # app_settings key; IANA name or unset
+
+
+def _report_tz():
+    """The zone report windows are computed in (Settings → General).
+
+    Read fresh on every call, so saving a new zone applies to the very next
+    report with no restart. Unset or unknown -> None, which means the
+    machine's local zone — exactly the pre-setting behavior."""
+    name = (get_setting(REPORT_TIMEZONE_KEY, "") or "").strip()
+    if not name:
+        return None
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return None
+
+
+def _report_now():
+    """Naive wall-clock "now" in the report zone — the ref that decides which
+    period 'today' belongs to."""
+    tz = _report_tz()
+    now = datetime.now(tz) if tz is not None else datetime.now()
+    return now.replace(tzinfo=None)
+
+
+def _local_to_utc_naive(dt, tz=None):
+    """Convert a naive report-zone datetime to naive UTC, honouring that
+    zone's DST at that moment. Report windows are wall-clock calendar (that is
     what their labels promise); every stored timestamp (scan_date, sales_log
     "at", sold_at) is naive UTC — so the WINDOW converts, never the data."""
-    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    tz = tz if tz is not None else _report_tz()
+    if tz is None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt.replace(tzinfo=tz).astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def _report_period_range(period_type, ref=None):
     """Return (start, end, label, normalized_type) for the period containing ref.
-    The bounds are naive LOCAL datetimes; convert with _local_to_utc_naive
-    before comparing them against stored timestamps."""
-    ref = ref or datetime.now()
+    The bounds are naive report-zone datetimes; convert with
+    _local_to_utc_naive before comparing them against stored timestamps."""
+    ref = ref or _report_now()
     day = datetime(ref.year, ref.month, ref.day)
     pt = (period_type or "monthly").lower()
     if pt == "weekly":
@@ -5670,7 +5700,7 @@ def _report_build(start, end, label, period_type):
 
     return {
         "label": label, "period_type": period_type, "start": start, "end": end,
-        "generated": datetime.now(),
+        "generated": _report_now(),
         "acquisitions": {"rows": acq_rows, "totals": acq_tot},
         "sales": {"rows": sales_rows, "totals": sales_tot, "items": sale_items, "undated": undated},
         "strategies": strat_rows,
@@ -5685,7 +5715,7 @@ def _money_str(v):
 
 def _report_from_args():
     period = (request.args.get("period") or "monthly").lower()
-    ref = _parse_dt((request.args.get("date") or "").strip()) or datetime.now()
+    ref = _parse_dt((request.args.get("date") or "").strip()) or _report_now()
     start, end, label, pt = _report_period_range(period, ref)
     return _report_build(start, end, label, pt)
 
@@ -11112,6 +11142,10 @@ def _general_status():
         "required_swap_gb": int(REQUIRED_SWAP_BYTES / 1000 ** 3),
         "swap_ok": swap >= REQUIRED_SWAP_BYTES,
         "env_forced": os.environ.get("PDF_UNLIMITED_NATIVE") is not None,
+        # Report timezone: the stored setting ("" = machine local) and the
+        # zone actually in effect right now, for display.
+        "report_timezone": get_setting(REPORT_TIMEZONE_KEY, "") or "",
+        "report_timezone_effective": str(_report_tz() or datetime.now().astimezone().tzinfo),
         "ximilar_fallback_enabled": _ximilar_fallback_on(),
         "ximilar_key_set": bool(get_api_key("XIMILAR_API_TOKEN")),
         "ximilar_env_forced": os.environ.get("XIMILAR_IDENTIFY_FALLBACK") is not None,
@@ -11142,7 +11176,15 @@ def _general_status():
 
 @app.route("/settings/general")
 def general_page():
-    return render_template("general.html", general=_general_status())
+    # The zone list feeds a <datalist> only at page render; it is deliberately
+    # NOT part of _general_status(), which every save endpoint echoes back.
+    import zoneinfo as _zi
+    try:
+        tz_choices = sorted(_zi.available_timezones())
+    except Exception:
+        tz_choices = []
+    return render_template("general.html", general=_general_status(),
+                           timezones=tz_choices)
 
 
 @app.route("/settings/general/native_import", methods=["POST"])
@@ -11217,6 +11259,37 @@ def general_auto_identify_threshold():
         "message": f"Auto-accept confidence set to {pct}%.{hint}",
         "general": _general_status(),
     })
+
+
+@app.route("/settings/general/timezone", methods=["GET", "POST"])
+def general_report_timezone():
+    """Read (GET) or set (POST) the timezone reports bucket in.
+
+    POST body takes `timezone`: an IANA name ("America/Chicago"), validated
+    against the system zone database before it is stored; empty (or "local"/
+    "system") clears the setting back to the machine's local zone. Takes
+    effect immediately — _report_tz() is read fresh per report, no restart."""
+    if request.method == "GET":
+        return jsonify({"status": "success", "general": _general_status()})
+
+    body = request.get_json(silent=True) or request.form
+    name = str(body.get("timezone", "")).strip()
+    if not name or name.lower() in ("local", "system"):
+        delete_setting(REPORT_TIMEZONE_KEY)
+        return jsonify({"status": "success",
+                        "message": "Reports now use this machine's local timezone.",
+                        "general": _general_status()})
+    try:
+        ZoneInfo(name)
+    except Exception:
+        return jsonify({"status": "error",
+                        "message": f"Unknown timezone '{name}' — use an IANA name "
+                                   "like America/Chicago or Europe/London.",
+                        "general": _general_status()}), 400
+    set_setting(REPORT_TIMEZONE_KEY, name)
+    return jsonify({"status": "success",
+                    "message": f"Reports now bucket in {name}. Applied immediately.",
+                    "general": _general_status()})
 
 
 @app.route("/settings/general/identify_provider", methods=["POST"])
