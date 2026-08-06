@@ -4671,8 +4671,47 @@ def _render_inventory_fast(f_game, f_album, f_template, view_catalog,
     )
 
 
+# Merged field-type config, cached on a fingerprint of its inputs. Rebuilt
+# only when a ROI template file or the ReferenceSync table changes — the old
+# shape re-listed the folder, re-parsed every template file, and loaded the
+# ReferenceSync table once per template (T+1 loads) on EVERY inventory view.
+# Unlocked like the module's other caches: worst case under threads is a
+# redundant rebuild, never a wrong result.
+_TPL_FIELDS_CFG_CACHE = {"key": None, "cfg": None}
+
+
+def _template_fields_config_key():
+    """Cheap fingerprint of everything the merged config derives from: the
+    on-disk ROI templates (name + mtime) and a narrow ReferenceSync projection
+    (product_count/remote_updated catch new cards and re-syncs, which change
+    the derived per-game fields)."""
+    files = []
+    folder = app.config["ROI_TEMPLATE_FOLDER"]
+    try:
+        for f in sorted(os.listdir(folder)):
+            if f.endswith(".json"):
+                try:
+                    files.append((f, os.stat(os.path.join(folder, f)).st_mtime_ns))
+                except OSError:
+                    files.append((f, None))
+    except OSError:
+        pass
+    try:
+        syncs = tuple(db.session.query(
+            ReferenceSync.id, ReferenceSync.category_id, ReferenceSync.game,
+            ReferenceSync.product_count, ReferenceSync.remote_updated,
+        ).order_by(ReferenceSync.id).all())
+    except Exception:
+        syncs = None   # table unavailable -> key still works, just coarser
+    return (tuple(files), syncs)
+
+
 def _template_fields_config():
     """Aggregate field-type config across all templates (shared by both paths)."""
+    key = _template_fields_config_key()
+    if key == _TPL_FIELDS_CFG_CACHE["key"] and _TPL_FIELDS_CFG_CACHE["cfg"] is not None:
+        return _TPL_FIELDS_CFG_CACHE["cfg"]
+
     cfg = {}
     for tpl_name in get_template_names():
         try:
@@ -4686,6 +4725,8 @@ def _template_fields_config():
                     }
         except Exception:
             pass
+    _TPL_FIELDS_CFG_CACHE["key"] = key
+    _TPL_FIELDS_CFG_CACHE["cfg"] = cfg
     return cfg
 
 
@@ -5120,13 +5161,17 @@ def _analytics_conditions(source, f_game, f_template):
     return conds
 
 
-def _json_field(key):
-    """extracted_data[key] as a SQL expression. Dialect-gated: the portable
-    accessor JSON_QUOTEs NULL into 'null' on SQLite (see _report_build)."""
+def _json_field(*keys):
+    """extracted_data[key][...] as a SQL expression (nested keys allowed).
+    Dialect-gated: the portable accessor JSON_QUOTEs NULL into 'null' on
+    SQLite (see _report_build)."""
     from sqlalchemy import func as _f
     if db.engine.dialect.name == "sqlite":
-        return _f.json_extract(ScanRecord.extracted_data, "$." + key)
-    return ScanRecord.extracted_data[key].as_string()
+        return _f.json_extract(ScanRecord.extracted_data, "$." + ".".join(keys))
+    expr = ScanRecord.extracted_data
+    for k in keys[:-1]:
+        expr = expr[k]
+    return expr[keys[-1]].as_string()
 
 
 def _analytics_filtered_records(source, f_game, f_template, search):
@@ -6814,17 +6859,24 @@ def game_fields():
         return jsonify({"fields": [], "albums": []})
 
     # The indexed game_key column carries the same strip/lower normalization
-    # this comparison applied in Python — only the game's own rows load.
-    records = (ScanRecord.query
-               .filter(ScanRecord.game_key == game.strip().lower())
-               .all())
+    # this comparison applied in Python. Field discovery runs on a bounded
+    # newest-500 sample — the same tradeoff _render_inventory_fast already
+    # made for the inventory page — instead of hydrating the game's whole
+    # set; albums come from one DISTINCT on the JSON key (case preserved,
+    # whitespace-only values dropped rather than surfacing as "").
+    from sqlalchemy import func as _f
+    gk = game.strip().lower()
+    sample = (ScanRecord.query
+              .filter(ScanRecord.game_key == gk)
+              .order_by(ScanRecord.scan_date.desc(), ScanRecord.id.desc())
+              .limit(500).all())
+    fields = discover_entry_fields(sample)
 
-    fields = discover_entry_fields(records)
-    albums = sorted({
-        str((r.extracted_data or {}).get("album", "")).strip()
-        for r in records
-        if (r.extracted_data or {}).get("album")
-    })
+    album_raw = _f.trim(_f.cast(_json_field("album"), db.String))
+    albums = sorted({a for (a,) in
+                     db.session.query(album_raw.distinct())
+                       .filter(ScanRecord.game_key == gk).all()
+                     if a})
     return jsonify({"fields": fields, "albums": albums})
 
 
@@ -8566,42 +8618,20 @@ def justtcg_missing_ids():
     Used by the bulk-fetch UI to know which records still need pricing.
     Only includes records that have a card name, so the fetch is likely to succeed.
     """
-    rows = (
-        ScanRecord.query
-        .with_entities(ScanRecord.id, ScanRecord.extracted_data)
-        .order_by(ScanRecord.id.asc())
-        .all()
-    )
-
-    missing = []
-    for row_id, extracted_data in rows:
-        if isinstance(extracted_data, dict):
-            data = extracted_data
-        else:
-            try:
-                data = json.loads(extracted_data or "{}")
-            except (ValueError, TypeError):
-                data = {}
-
-        # Catalog-only records (CSV import) aren't owned inventory — skip them
-        if _is_catalog_only(data):
-            continue
-
-        # Must have a usable card name or the fetch will fail immediately
-        card_name = (
-            data.get("product_name") or data.get("name") or
-            data.get("card_name")    or data.get("title") or ""
-        ).strip()
-        if not card_name:
-            continue
-
-        # Check whether a market price is already present
-        tcg = data.get("tcgplayer") or {}
-        prices = tcg.get("prices") or {}
-        market = prices.get("market")
-        if market is None or market == "":
-            missing.append(row_id)
-
+    # Every check the old full-table loop made is derivable in SQL: catalog
+    # via the derived is_catalog column, "has a usable card name" via name_key
+    # (the mapper stores _get_name over exactly the key order this route
+    # tested), and the market probe as a json_extract path — NULL for a
+    # missing path, '' for an empty string, both "missing". Ids only.
+    from sqlalchemy import func as _f
+    market = _json_field("tcgplayer", "prices", "market")
+    rows = (db.session.query(ScanRecord.id)
+            .filter(_f.coalesce(ScanRecord.is_catalog, False) == False,  # noqa: E712
+                    ScanRecord.name_key.isnot(None),
+                    db.or_(market.is_(None), market == ""))
+            .order_by(ScanRecord.id.asc())
+            .all())
+    missing = [r.id for r in rows]
     return jsonify({"ids": missing, "count": len(missing)})
 
 
@@ -9821,12 +9851,19 @@ def reference_upload_csv():
 # attribute, ...). Populate it by uploading an icon image or capturing one from a
 # scanned card; type detection then matches a card's icon against this library.
 def _known_games_for_types():
-    """Distinct games seen in inventory + defined templates, for the picker."""
-    games = set()
-    for rec in ScanRecord.query.all():
-        g = str((rec.extracted_data or {}).get("game") or "").strip()
-        if g and not _is_catalog_only(rec.extracted_data or {}):
-            games.add(g)
+    """Distinct games seen in inventory + defined templates, for the picker.
+
+    One DISTINCT over the JSON game key (case preserved — a set of raw
+    trimmed strings, exactly what the old full-table loop collected) with
+    catalog rows excluded via the derived column, instead of hydrating every
+    record to read one field."""
+    from sqlalchemy import func as _f
+    game_raw = _f.trim(_f.cast(_json_field("game"), db.String))
+    games = {g for (g,) in
+             db.session.query(game_raw.distinct())
+               .filter(_f.coalesce(ScanRecord.is_catalog, False) == False)  # noqa: E712
+               .all()
+             if g}
     for t in get_template_names():
         games.add(t.replace("_", " "))
     return sorted(games, key=str.lower)
