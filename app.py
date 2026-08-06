@@ -15588,6 +15588,36 @@ def shops_email_test():
 
 
 @app.route("/shops/email/check", methods=["POST"])
+def _email_cursor_bootstrap(m):
+    """Initialize the UID cursor to the mailbox's current top when the monitor
+    has never run (last_uid 0/None). Returns a status message when a bootstrap
+    happened (the caller must NOT fetch this pass), else None.
+
+    This is the guard against history replay: the oldest-first fetch window
+    walks forward from the cursor, so a zero cursor on a mailbox with months
+    of old sale notifications would process every one of them as a NEW sale —
+    decrementing inventory and delisting on other marketplaces. Only mail
+    arriving after the monitor is connected gets processed. Guarding at the
+    fetch sites (poller + manual check) covers every entry point, however the
+    monitor row came to be enabled."""
+    if int(m.last_uid or 0) > 0:
+        return None
+    top = email_monitor.mailbox_top_uid(_email_cfg(m))
+    if top is None:
+        m.status = "error"
+        m.status_detail = "Could not read the mailbox to initialize the cursor."
+        m.last_checked = utcnow()
+        db.session.commit()
+        return "Could not reach the mailbox; will retry."
+    m.last_uid = top
+    m.last_checked = utcnow()
+    m.status = "connected"
+    m.status_detail = (f"Cursor initialized at the current mailbox top (uid {top}); "
+                       "watching for new sales from here on.")
+    db.session.commit()
+    return m.status_detail
+
+
 def shops_email_check():
     denied = _require_admin()
     if denied:
@@ -15595,6 +15625,13 @@ def shops_email_check():
     m = _get_email_monitor(create=True)
     if not (m.host and m.username and m.password):
         return jsonify({"status": "error", "message": "Configure and save the mailbox first."}), 400
+
+    boot = _email_cursor_bootstrap(m)
+    if boot is not None:
+        ok = (m.status == "connected")
+        return jsonify({"status": "success" if ok else "error", "message": boot,
+                        "summary": {"emails": 0, "processed": 0, "unmatched": 0,
+                                    "duplicate": 0, "unparsed": 0, "details": []}}), (200 if ok else 502)
 
     res = email_monitor.fetch_sale_emails(_email_cfg(m), since_uid=m.last_uid or 0)
     if not res.get("ok"):
@@ -15664,6 +15701,10 @@ def _email_poll_once():
         return 60
     interval = max(int(m.poll_interval or 60), 15)
 
+    boot = _email_cursor_bootstrap(m)
+    if boot is not None:
+        return interval
+
     res = email_monitor.fetch_sale_emails(_email_cfg(m), since_uid=m.last_uid or 0)
     m.last_checked = utcnow()
     if not res.get("ok"):
@@ -15704,6 +15745,10 @@ def _email_poll_once():
             cursor = max(cursor, uid)
 
     m.last_uid = cursor
+    # Re-stamp: the pre-loop assignment is discarded by the rollback a failing
+    # email triggers, which left "last checked" stale on exactly the passes
+    # that need to look alive.
+    m.last_checked = utcnow()
     if failure:
         m.status = "error"
         m.status_detail = failure[:500]
