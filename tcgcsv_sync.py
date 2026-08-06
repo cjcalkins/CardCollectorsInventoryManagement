@@ -106,13 +106,17 @@ def is_card(extended):
 
 def price_index(price_rows):
     """Build {productId: representative marketPrice}. Prefers the 'Normal'
-    sub-type, else the first row that carries a marketPrice."""
+    sub-type when it carries a price, else the first row that has one."""
     by_product = {}
     for row in price_rows or []:
         by_product.setdefault(row.get("productId"), []).append(row)
     out = {}
     for pid, rows in by_product.items():
-        normal = next((r for r in rows if r.get("subTypeName") == "Normal"), None)
+        # Only a Normal row that actually carries a price may win: holo-only
+        # printings ship a priceless Normal row next to a priced Holofoil one.
+        normal = next((r for r in rows
+                       if r.get("subTypeName") == "Normal"
+                       and r.get("marketPrice") is not None), None)
         chosen = normal or next((r for r in rows if r.get("marketPrice") is not None), rows[0])
         out[pid] = chosen.get("marketPrice")
     return out
