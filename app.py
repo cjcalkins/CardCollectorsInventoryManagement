@@ -21,7 +21,7 @@ import shutil
 import tempfile
 import threading as _threading
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from PIL import Image
 # Same ceiling for Pillow (its default is ~89 MP, far below legitimate scans).
 Image.MAX_IMAGE_PIXELS = _MAX_IMAGE_PIXELS
@@ -5422,8 +5422,18 @@ def _parse_dt(v):
     return None
 
 
+def _local_to_utc_naive(dt):
+    """Convert a naive LOCAL datetime to naive UTC, honouring the machine's
+    zone and DST at that moment. Report windows are local-calendar (that is
+    what their labels promise); every stored timestamp (scan_date, sales_log
+    "at", sold_at) is naive UTC — so the WINDOW converts, never the data."""
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 def _report_period_range(period_type, ref=None):
-    """Return (start, end, label, normalized_type) for the period containing ref."""
+    """Return (start, end, label, normalized_type) for the period containing ref.
+    The bounds are naive LOCAL datetimes; convert with _local_to_utc_naive
+    before comparing them against stored timestamps."""
     ref = ref or datetime.now()
     day = datetime(ref.year, ref.month, ref.day)
     pt = (period_type or "monthly").lower()
@@ -5503,6 +5513,12 @@ def _report_build(start, end, label, period_type):
     from sqlalchemy import func as _f
     money = _analytics_money
 
+    # start/end arrive as LOCAL calendar bounds (the label describes them);
+    # stored timestamps are naive UTC. Compare in UTC or a late-evening scan
+    # lands in the neighbouring day/week/month. The dict below still reports
+    # the local bounds.
+    q_start, q_end = _local_to_utc_naive(start), _local_to_utc_naive(end)
+
     # Two scoped loads replace the single full-table hydration. The
     # acquisitions, strategies, and unrealized passes all filter
     # start <= scan_date < end, so they read period_records (served by the
@@ -5521,8 +5537,8 @@ def _report_build(start, end, label, period_type):
     period_records = (ScanRecord.query
                       .filter(*base_conds,
                               ScanRecord.scan_date.isnot(None),
-                              ScanRecord.scan_date >= start,
-                              ScanRecord.scan_date < end)
+                              ScanRecord.scan_date >= q_start,
+                              ScanRecord.scan_date < q_end)
                       .order_by(ScanRecord.id)   # rowid order, like the old full scan
                       .all())
     # Existence probe for sales_log, per dialect. The portable accessor
@@ -5547,7 +5563,7 @@ def _report_build(start, end, label, period_type):
     acq, acq_tot = {}, {"count": 0, "intake": 0.0, "market": 0.0, "sold_count": 0, "sold_value": 0.0}
     for rec in period_records:
         d = rec.scan_date
-        if not (d and start <= d < end):
+        if not (d and q_start <= d < q_end):
             continue
         data = rec.extracted_data or {}
         coll = (data.get("collection") or "").strip() or "Uncategorized"
@@ -5579,7 +5595,7 @@ def _report_build(start, end, label, period_type):
     sales, sales_tot = {}, {"count": 0, "revenue": 0.0, "cost": 0.0, "profit": 0.0}
     sale_items, undated = [], 0
     for rec in sales_candidates:
-        s = _record_sale_in_period(rec, start, end)
+        s = _record_sale_in_period(rec, q_start, q_end)
         if s is None:
             data = rec.extracted_data or {}
             if (not _held_from(data)) and not (data.get("sales_log")) \
@@ -5608,7 +5624,7 @@ def _report_build(start, end, label, period_type):
     strat = {}
     for rec in period_records:
         d = rec.scan_date
-        if not (d and start <= d < end):
+        if not (d and q_start <= d < q_end):
             continue
         data = rec.extracted_data or {}
         tag = (data.get("strategy") or "").strip()
@@ -5638,7 +5654,7 @@ def _report_build(start, end, label, period_type):
     unrealized = 0.0
     for rec in period_records:
         d = rec.scan_date
-        if d and start <= d < end and _held_from(rec.extracted_data or {}):
+        if d and q_start <= d < q_end and _held_from(rec.extracted_data or {}):
             data = rec.extracted_data or {}
             unrealized += (money(data.get("current_value")) or 0.0) - (money(data.get("intake_price")) or 0.0)
 
