@@ -6313,15 +6313,17 @@ def inventory_export_csv():
 
     records = query.all()
     records = [r for r in records if _is_catalog_only(r.extracted_data or {}) == view_catalog]
+    # Same strip/lower normalization as the page's own filters, so the export
+    # contains exactly the rows the filtered view displays.
     if f_game:
         records = [
             r for r in records
-            if str((r.extracted_data or {}).get("game", "")).strip() == f_game
+            if str((r.extracted_data or {}).get("game", "")).strip().lower() == f_game.strip().lower()
         ]
     if f_album:
         records = [
             r for r in records
-            if str((r.extracted_data or {}).get("album", "")).strip() == f_album
+            if str((r.extracted_data or {}).get("album", "")).strip().lower() == f_album.strip().lower()
         ]
 
     # Determine which columns to export
@@ -6473,9 +6475,11 @@ def inventory_all_ids():
                 data = {}
         if _is_catalog_only(data) != view_catalog:
             continue
-        if f_game and str(data.get("game", "")).strip() != f_game:
+        # Same strip/lower normalization as the page's own filters, so "Select
+        # All in Filter" selects exactly the set the page is displaying.
+        if f_game and str(data.get("game", "")).strip().lower() != f_game.strip().lower():
             continue
-        if f_album and str(data.get("album", "")).strip() != f_album:
+        if f_album and str(data.get("album", "")).strip().lower() != f_album.strip().lower():
             continue
         ids.append(row_id)
 
@@ -6497,7 +6501,7 @@ def game_fields():
     all_records = ScanRecord.query.all()
     records = [
         r for r in all_records
-        if str((r.extracted_data or {}).get("game", "")).strip() == game
+        if str((r.extracted_data or {}).get("game", "")).strip().lower() == game.strip().lower()
     ]
 
     fields = discover_entry_fields(records)
@@ -7712,7 +7716,7 @@ def add_custom_field():
                     row_data = json.loads(extracted_data or "{}")
                 except (ValueError, TypeError):
                     row_data = {}
-            if str(row_data.get("game", "")).strip() != game:
+            if str(row_data.get("game", "")).strip().lower() != game.strip().lower():
                 continue
             if scope_passed and _is_catalog_only(row_data) != want_catalog:
                 continue
