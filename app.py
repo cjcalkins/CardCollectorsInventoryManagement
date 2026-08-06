@@ -6329,7 +6329,10 @@ def inventory():
     if sort_dir not in ("asc", "desc"):
         sort_dir = "asc"
 
-    per_page = min(per_page, 200)
+    # Clamp from below too: both pagination helpers ceiling-divide by per_page,
+    # so ?per_page=0 (or negative) would be a ZeroDivisionError 500.
+    page = max(page, 1)
+    per_page = max(1, min(per_page, 200))
 
     # ---- Fast path: default (recency) view with no free-text search ----------
     # De-dup + paginate in SQL so only the page's rows load. Any arbitrary field
