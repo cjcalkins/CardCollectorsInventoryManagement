@@ -494,7 +494,8 @@ def shipping_order_delete(order_id):
     if any(s.status == "purchased" and s.provider == "easypost" for s in o.shipments):
         return jsonify({"status": "error",
                         "message": "This order has purchased postage. Refund or void it in EasyPost "
-                                   "first — deleting it here won't get your money back."}), 400
+                                   "first — deleting it here won't get your money back. Then mark "
+                                   "the shipment voided here to unlock deletion."}), 400
     # Clean up label files; leaving orphans behind would quietly grow storage.
     label_root = os.path.join(current_app.config["UPLOAD_FOLDER"], LABEL_SUBDIR, str(o.id))
     if os.path.isdir(label_root):
@@ -784,6 +785,38 @@ def shipping_create_label(order_id):
     return jsonify({"status": "success", "message": result.get("message", "Label created."),
                     "order": _order_json(o, full=True), "shipment_id": s.id,
                     "duplicate": bool(result.get("duplicate"))})
+
+
+@shipping_bp.route("/shipping/shipments/<int:shipment_id>/void", methods=["POST"])
+def shipping_shipment_void(shipment_id):
+    """Locally mark a shipment voided after it was refunded/voided with the
+    provider. Nothing here talks to the provider — this is the bookkeeping
+    exit off "purchased" that order deletion checks; without it, nothing ever
+    transitioned a shipment off that status and any order with bought postage
+    was permanently undeletable (and Shipment's documented "voided" state was
+    unreachable)."""
+    s = Shipment.query.get(shipment_id)
+    if not s:
+        return jsonify({"status": "error", "message": "Shipment not found"}), 404
+    if s.status not in ("purchased", "created", "error"):
+        return jsonify({"status": "error",
+                        "message": f"A shipment in status '{s.status}' can't be voided."}), 400
+    # A delivered/shipped package still has status "purchased" (tracking_status
+    # is a separate field) — voiding it would reset a live order backwards.
+    if s.is_delivered or (s.order and s.order.status in ("shipped", "delivered")):
+        return jsonify({"status": "error",
+                        "message": "This shipment already moved — carriers won't refund it and "
+                                   "voiding here would corrupt the order's history."}), 400
+    s.status = "voided"
+    if s.order:
+        # latest_shipment only counts purchased/created, so the order falls
+        # back to ready/needs_address and can be re-labeled or deleted.
+        _sync_order_status(s.order)
+    db.session.commit()
+    return jsonify({"status": "success",
+                    "message": "Shipment marked voided. If postage was bought, make sure the "
+                               "refund was requested in the provider's dashboard.",
+                    "order": _order_json(s.order, full=True) if s.order else None})
 
 
 @shipping_bp.route("/shipping/label/<int:shipment_id>/reprint", methods=["POST"])
