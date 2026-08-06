@@ -6942,21 +6942,7 @@ def storage_next_index():
     client fetches this so successive box imports don't collide on page 1.
     """
     name = (request.args.get("name") or "").strip().lower()
-    nxt = 1
-    if name:
-        rows = (ScanRecord.query
-                .filter(ScanRecord.album_key == name)
-                .with_entities(ScanRecord.extracted_data)
-                .all())
-        max_page = 0
-        for (data,) in rows:
-            try:
-                p = int((data or {}).get("page") or 0)
-            except (TypeError, ValueError):
-                p = 0
-            if p > max_page:
-                max_page = p
-        nxt = max_page + 1
+    nxt = _container_max_int(name, "page") + 1 if name else 1
     return jsonify({"next": nxt})
 
 
@@ -7330,6 +7316,21 @@ def _normalize_game_name(g):
     return (g[:1].upper() + g[1:]) if g else g
 
 
+def _container_max_int(album_key, json_key):
+    """max(CAST(extracted_data->json_key AS INTEGER)) over one container, in
+    SQL. Replaces the shape that hydrated every row of the container to read
+    one JSON int — called once per created card, that made a k-card box
+    import O(k^2). CAST of non-numeric text yields 0/NULL, matching the old
+    int()-or-0 tolerance for the integer values these keys actually hold."""
+    from sqlalchemy import func as _f, Integer
+    v = (db.session.query(_f.max(_f.cast(_json_field(json_key), Integer)))
+         .filter(ScanRecord.album_key == album_key).scalar())
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _next_box_number(name):
     """Next sequential card number for a Box container (max existing + 1).
 
@@ -7340,19 +7341,7 @@ def _next_box_number(name):
     key = str(name or "").strip().lower()
     if not key:
         return 1
-    rows = (ScanRecord.query
-            .filter(ScanRecord.album_key == key)
-            .with_entities(ScanRecord.extracted_data)
-            .all())
-    max_n = 0
-    for (data,) in rows:
-        try:
-            n = int((data or {}).get("box_number") or 0)
-        except (TypeError, ValueError):
-            n = 0
-        if n > max_n:
-            max_n = n
-    return max_n + 1
+    return _container_max_int(key, "box_number") + 1
 
 
 def _create_single_card(front_path, back_path, game, album, template,
@@ -10755,16 +10744,7 @@ def _next_sheet_index(name):
     key = (name or "").strip().lower()
     if not key:
         return 1
-    rows = (ScanRecord.query.filter(ScanRecord.album_key == key)
-            .with_entities(ScanRecord.extracted_data).all())
-    mx = 0
-    for (data,) in rows:
-        try:
-            p = int((data or {}).get("page") or 0)
-        except (TypeError, ValueError):
-            p = 0
-        mx = max(mx, p)
-    return mx + 1
+    return _container_max_int(key, "page") + 1
 
 
 # ── PDF-import job registry ──
