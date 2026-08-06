@@ -8377,19 +8377,30 @@ def records_summary():
             f"s{data.get('slot','')}" if data.get("slot") else "",
         ] if p]
 
-        clean_data = {
-            k: v for k, v in data.items()
-            if not k.startswith("__ocr_") and k != "__roi_fields_used"
-        }
-
         records.append({
             "id":    row_id,
             "label": str(label).strip(),
             "sub":   " · ".join(parts),
-            "data":  clean_data,
+            # No "data" here on purpose: shipping every record's full
+            # extracted_data made this response grow to tens of MB. The
+            # dropdown fetches one record's fields on selection instead
+            # (/records_summary/<id>/data).
         })
 
     return jsonify({"records": records})
+
+
+@app.route("/records_summary/<int:record_id>/data")
+def record_summary_data(record_id):
+    """One record's cleaned fields for the copy-from dropdown, fetched when a
+    source is picked (records_summary itself is id/label/sub only)."""
+    rec = ScanRecord.query.get(record_id)
+    if rec is None:
+        return jsonify({"status": "error", "message": "Record not found"}), 404
+    data = rec.extracted_data or {}
+    clean = {k: v for k, v in data.items()
+             if not k.startswith("__ocr_") and k != "__roi_fields_used"}
+    return jsonify({"status": "success", "id": rec.id, "data": clean})
 
 
 # ====================== JUSTTCG ROUTES ======================
