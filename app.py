@@ -5217,20 +5217,35 @@ def _analytics_value_rows(source, f_game, f_template, search, group_by):
     else:
         gexpr = ScanRecord.id   # placeholder; the group is the constant "All"
 
-    q = (db.session.query(gexpr, _json_field("intake_price"),
+    # json_extract flattens JSON booleans to 0/1, but the Python path bucketed
+    # them as "False"/"True" (legacy boolean holographic values exist in the
+    # wild — there is a migration route for them). Select json_type alongside
+    # on SQLite so true/false keep their old labels.
+    from sqlalchemy import literal
+    generic_key = bool(group_by) and group_by not in ("__status__", "template")
+    if generic_key and db.engine.dialect.name == "sqlite":
+        gtype = _f.json_type(ScanRecord.extracted_data, "$." + group_by)
+    else:
+        gtype = literal(None)
+
+    q = (db.session.query(gexpr, gtype, _json_field("intake_price"),
                           _json_field("current_value"), _json_field("sold_price"))
          .filter(*_analytics_conditions(source, f_game, f_template)))
     if search:
         q = q.filter(_scan_search_condition(search))
 
     out = []
-    for gv, ip, cv, sp in q.all():
+    for gv, gt, ip, cv, sp in q.all():
         if not group_by:
             g = "All"
         elif group_by == "__status__":
             g = "Held" if bool(gv) else "Sold"
         elif group_by == "template":
             g = gv or "—"
+        elif gt == "true":
+            g = "True"
+        elif gt == "false":
+            g = "False"
         else:
             g = (str(gv).strip() if gv is not None else "") or "—"
         out.append((g, ip, cv, sp))
@@ -5349,15 +5364,33 @@ def _collection_counts(records):
 def _collection_groups_sql():
     """[(collection_key, display_name, count)] over every active record
     (held+sold), grouped in SQL — replaces hydrating the whole table to read
-    one JSON key. Display name is the MIN of the trimmed raw values sharing a
+    one JSON key.
+
+    Grouped by the RAW value in SQL and merged by Python .strip().lower():
+    SQLite's lower()/trim() are ASCII-only ('ÉLITE' -> 'Élite', newlines kept),
+    so a SQL-lowered key diverges from CollectionPrice.name_key and the other
+    Python-lowered keys, splitting non-ASCII collections and zeroing their lot
+    cost attribution. Display name is the MIN of the raw spellings sharing a
     key (deterministic; the old first-seen pick was query-order arbitrary)."""
     from sqlalchemy import func as _f
-    raw = _f.trim(_f.cast(_json_field("collection"), db.String))
-    key = _f.lower(raw)
-    rows = (db.session.query(key, _f.min(raw), _f.count())
+    raw = _json_field("collection")
+    rows = (db.session.query(raw, _f.count())
             .filter(*_analytics_conditions("all", "", ""))
-            .group_by(key).all())
-    return [(k, disp, n) for k, disp, n in rows if k]
+            .group_by(raw).all())
+    merged = {}
+    for disp, n in rows:
+        disp = str(disp).strip() if disp is not None else ""
+        if not disp:
+            continue
+        k = disp.lower()
+        cur = merged.get(k)
+        if cur is None:
+            merged[k] = [disp, n]
+        else:
+            cur[1] += n
+            if disp < cur[0]:
+                cur[0] = disp
+    return [(k, disp, n) for k, (disp, n) in merged.items()]
 
 
 def _record_effective_cost(rec, lot_prices, lot_counts):
@@ -14413,7 +14446,7 @@ def _sellable_conditions():
     return (
         _f.coalesce(ScanRecord.is_catalog, False) == False,  # noqa: E712
         db.or_(empty_flag.is_(None),
-               _f.lower(_f.cast(empty_flag, db.String)).notin_(("true", "1"))),
+               _f.lower(_f.trim(_f.cast(empty_flag, db.String))).notin_(("true", "1"))),
     )
 
 
