@@ -642,6 +642,9 @@
                                     href="/shipping/label/${ship.id}/download"><i class="fas fa-download"></i></a>` : ''}
                                 <button class="btn btn-outline-secondary" id="btnReprint" title="Fetch the label again">
                                     <i class="fas fa-rotate"></i></button>
+                                <button class="btn btn-outline-danger" id="btnVoidShipment"
+                                    title="Mark this shipment voided (refund it with the provider first)">
+                                    <i class="fas fa-ban"></i></button>
                             </div>
                         </div>
                         ${ship.has_label ? `<iframe class="label-frame mt-2" src="/shipping/label/${ship.id}/view"></iframe>` : ''}
@@ -726,6 +729,16 @@
             if (res.shipment) document.getElementById('tlBox').innerHTML = timeline(res.shipment.events);
             this.disabled = false;
             loadOrders();
+        };
+
+        const btnVoid = document.getElementById('btnVoidShipment');
+        if (btnVoid) btnVoid.onclick = async function () {
+            if (!confirm('Mark this shipment voided? Refund the postage with the provider first — this only updates the books here.')) return;
+            this.disabled = true;
+            const res = await post(`/shipping/shipments/${ship.id}/void`, new FormData());
+            toast(res.message, res.status === 'success' ? 'success' : 'danger');
+            this.disabled = false;
+            if (res.status === 'success') { openOrder(o.id); loadOrders(); }
         };
 
         const btnReprint = document.getElementById('btnReprint');

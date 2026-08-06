@@ -4961,19 +4961,19 @@ def _builder_csv(groups):
     return buf.getvalue(), ids
 
 
-def _delete_record_files(rec):
-    """Best-effort removal of a record's image files + descriptor caches."""
-    for rel in (rec.image_path, rec.image_path_back, rec.display_image_path):
-        if not rel or rel == "__blank__" or str(rel).startswith(("http://", "https://")):
-            continue
-        p = os.path.join(app.config["UPLOAD_FOLDER"], normalize_to_upload_relative(rel))
-        try:
-            if os.path.exists(p):
-                os.remove(p)
-        except OSError:
-            pass
+def _delete_record_files(rec_id, image_path, image_path_back):
+    """Best-effort removal of the files a deleted record OWNS: its own images
+    (through remove_file_if_exists, which enforces inventory_cards/ containment)
+    and its ORB/global descriptor caches, whose names derive from the id.
+
+    display_image_path is deliberately NOT deleted: /duplicates/resolve points
+    it at the duplicate group's canonical image_path, so it aliases a file a
+    still-live record owns. Takes plain values, not the record, because the
+    callers delete files only after the DB delete has committed."""
+    remove_file_if_exists(image_path)
+    remove_file_if_exists(image_path_back)
     for suffix in (".npy", ".gvec.npy"):
-        c = os.path.join(app.config["ORB_CACHE_FOLDER"], f"{rec.id}{suffix}")
+        c = os.path.join(app.config["ORB_CACHE_FOLDER"], f"{rec_id}{suffix}")
         try:
             if os.path.exists(c):
                 os.remove(c)
@@ -7789,8 +7789,7 @@ def delete_scan(record_id):
     _detach_record_references([record.id])
     db.session.delete(record)
     db.session.commit()
-    remove_file_if_exists(image_path)
-    remove_file_if_exists(image_path_back)
+    _delete_record_files(record_id, image_path, image_path_back)
     return jsonify({"status": "success", "message": "Inventory item deleted"})
 
 
@@ -7806,14 +7805,14 @@ def delete_scans():
     if not records:
         return jsonify({"status": "error", "message": "No matching records found"}), 404
 
-    image_paths = [r.image_path for r in records] + [r.image_path_back for r in records]
+    snapshots = [(r.id, r.image_path, r.image_path_back) for r in records]
     _detach_record_references([r.id for r in records])
     for record in records:
         db.session.delete(record)
     db.session.commit()
 
-    for image_path in image_paths:
-        remove_file_if_exists(image_path)
+    for snap in snapshots:
+        _delete_record_files(*snap)
 
     return jsonify({"status": "success", "message": f"Deleted {len(records)} record(s)"})
 

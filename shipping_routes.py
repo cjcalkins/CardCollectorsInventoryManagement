@@ -43,7 +43,7 @@ from models import db, ShopConnection, ScanRecord, SaleEvent
 from shipping_models import Order, OrderItem, Shipment
 from shipping_providers import (
     SHIPPING_PROVIDERS, SHIPPING_SECRET_FIELDS, ENVELOPE_SIZES,
-    get_shipping_provider, _validate_destination,
+    get_shipping_provider, _validate_destination, normalize_state, normalize_country,
 )
 
 shipping_bp = Blueprint("shipping", __name__)
@@ -254,9 +254,9 @@ def ensure_order_from_sale(parsed, source="tcgplayer", sale_events=None):
         order.address1 = addr.get("address1") or None
         order.address2 = addr.get("address2") or None
         order.city = addr.get("city") or None
-        order.state = (addr.get("state") or "")[:2].upper() or None
+        order.state = normalize_state(addr.get("state")) or None
         order.zipcode = addr.get("zip") or None
-        order.country = (addr.get("country") or "US")[:2].upper()
+        order.country = normalize_country(addr.get("country"))
 
     db.session.add(order)
     db.session.flush()
@@ -417,9 +417,9 @@ def _apply_order_form(o, f):
     o.address1 = (f.get("address1", o.address1 or "") or "").strip() or None
     o.address2 = (f.get("address2", o.address2 or "") or "").strip() or None
     o.city = (f.get("city", o.city or "") or "").strip() or None
-    o.state = (f.get("state", o.state or "") or "").strip().upper()[:2] or None
+    o.state = normalize_state(f.get("state", o.state or "")) or None
     o.zipcode = (f.get("zipcode", o.zipcode or "") or "").strip() or None
-    o.country = ((f.get("country", o.country or "US") or "US").strip().upper() or "US")[:2]
+    o.country = normalize_country(f.get("country", o.country or "US"))
     o.email = (f.get("email", o.email or "") or "").strip() or None
     o.phone = (f.get("phone", o.phone or "") or "").strip() or None
     if f.get("notes") is not None:
@@ -494,7 +494,8 @@ def shipping_order_delete(order_id):
     if any(s.status == "purchased" and s.provider == "easypost" for s in o.shipments):
         return jsonify({"status": "error",
                         "message": "This order has purchased postage. Refund or void it in EasyPost "
-                                   "first — deleting it here won't get your money back."}), 400
+                                   "first — deleting it here won't get your money back. Then mark "
+                                   "the shipment voided here to unlock deletion."}), 400
     # Clean up label files; leaving orphans behind would quietly grow storage.
     label_root = os.path.join(current_app.config["UPLOAD_FOLDER"], LABEL_SUBDIR, str(o.id))
     if os.path.isdir(label_root):
@@ -628,12 +629,11 @@ def shipping_import_csv():
                 setattr(order, attr, v[:cap])
         st = _row_get(head, index, "state")
         if st:
-            order.state = st.upper()[:2]
+            order.state = normalize_state(st)
         country = _row_get(head, index, "country")
         if country:
             # Exports write "US" or "United States" interchangeably.
-            c = country.strip().upper()
-            order.country = "US" if c.startswith("UNITED STATES") or c == "USA" else c[:2]
+            order.country = normalize_country(country)
         sp = _row_get(head, index, "shipping_paid")
         if sp:
             try:
@@ -785,6 +785,38 @@ def shipping_create_label(order_id):
     return jsonify({"status": "success", "message": result.get("message", "Label created."),
                     "order": _order_json(o, full=True), "shipment_id": s.id,
                     "duplicate": bool(result.get("duplicate"))})
+
+
+@shipping_bp.route("/shipping/shipments/<int:shipment_id>/void", methods=["POST"])
+def shipping_shipment_void(shipment_id):
+    """Locally mark a shipment voided after it was refunded/voided with the
+    provider. Nothing here talks to the provider — this is the bookkeeping
+    exit off "purchased" that order deletion checks; without it, nothing ever
+    transitioned a shipment off that status and any order with bought postage
+    was permanently undeletable (and Shipment's documented "voided" state was
+    unreachable)."""
+    s = Shipment.query.get(shipment_id)
+    if not s:
+        return jsonify({"status": "error", "message": "Shipment not found"}), 404
+    if s.status not in ("purchased", "created", "error"):
+        return jsonify({"status": "error",
+                        "message": f"A shipment in status '{s.status}' can't be voided."}), 400
+    # A delivered/shipped package still has status "purchased" (tracking_status
+    # is a separate field) — voiding it would reset a live order backwards.
+    if s.is_delivered or (s.order and s.order.status in ("shipped", "delivered")):
+        return jsonify({"status": "error",
+                        "message": "This shipment already moved — carriers won't refund it and "
+                                   "voiding here would corrupt the order's history."}), 400
+    s.status = "voided"
+    if s.order:
+        # latest_shipment only counts purchased/created, so the order falls
+        # back to ready/needs_address and can be re-labeled or deleted.
+        _sync_order_status(s.order)
+    db.session.commit()
+    return jsonify({"status": "success",
+                    "message": "Shipment marked voided. If postage was bought, make sure the "
+                               "refund was requested in the provider's dashboard.",
+                    "order": _order_json(s.order, full=True) if s.order else None})
 
 
 @shipping_bp.route("/shipping/label/<int:shipment_id>/reprint", methods=["POST"])
