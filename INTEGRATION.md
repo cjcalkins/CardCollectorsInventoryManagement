@@ -218,7 +218,8 @@ value. Both are off unless you tick the box or set a per-provider default.
 EasyPost rates go stale, and a stale id fails at the worst moment.
 
 **Deleting an order with purchased EasyPost postage is blocked.** Deleting the row doesn't
-refund the label; void it in EasyPost first.
+refund the label; void it in EasyPost first, then mark the shipment voided in the order
+modal (POST /shipping/shipments/<id>/void) to unlock deletion.
 
 **Tracking polling is bounded** — only orders in flight, only shipments not checked in the
 last 30 minutes, capped at 50 per press. USPS posts a few scans a day; polling harder just

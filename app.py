@@ -3177,8 +3177,8 @@ def _resource_for_path(path):
         "search_by_image": "image_search", "search_by_image_page": "image_search",
         "reference": "reference",
         "shops": "shops", "shop": "shops",
-        # Shipping blueprint is dormant (unregistered) today; map it now so the gate
-        # covers /shipping/* the moment INTEGRATION.md wires it up. Reuses shops.
+        # Shipping blueprint is registered at startup (see register_blueprint
+        # further down); /shipping/* rides the shops permission.
         "shipping": "shops",
         "justtcg_fetch": "pricing", "justtcg_search_manual": "pricing",
         "tcg_save_url": "pricing", "tcg_clear_url": "pricing",
@@ -5621,12 +5621,20 @@ def _report_now():
     return now.replace(tzinfo=None)
 
 
-def _local_to_utc_naive(dt, tz=None):
+_TZ_UNSET = object()   # "no zone passed" sentinel: None must mean machine-local
+
+
+def _local_to_utc_naive(dt, tz=_TZ_UNSET):
     """Convert a naive report-zone datetime to naive UTC, honouring that
     zone's DST at that moment. Report windows are wall-clock calendar (that is
     what their labels promise); every stored timestamp (scan_date, sales_log
-    "at", sold_at) is naive UTC — so the WINDOW converts, never the data."""
-    tz = tz if tz is not None else _report_tz()
+    "at", sold_at) is naive UTC — so the WINDOW converts, never the data.
+
+    Pass an explicit tz (which may be None = machine local, from one
+    _report_tz() read) to convert several bounds in the SAME zone; omitting it
+    reads the setting fresh."""
+    if tz is _TZ_UNSET:
+        tz = _report_tz()
     if tz is None:
         return dt.astimezone(timezone.utc).replace(tzinfo=None)
     return dt.replace(tzinfo=tz).astimezone(timezone.utc).replace(tzinfo=None)
@@ -5719,7 +5727,10 @@ def _report_build(start, end, label, period_type):
     # stored timestamps are naive UTC. Compare in UTC or a late-evening scan
     # lands in the neighbouring day/week/month. The dict below still reports
     # the local bounds.
-    q_start, q_end = _local_to_utc_naive(start), _local_to_utc_naive(end)
+    # One zone read for both bounds: each conversion re-reading the setting
+    # would let a mid-request save produce a window with mixed zones.
+    _tz = _report_tz()
+    q_start, q_end = _local_to_utc_naive(start, _tz), _local_to_utc_naive(end, _tz)
 
     # Two scoped loads replace the single full-table hydration. The
     # acquisitions, strategies, and unrealized passes all filter
@@ -7405,9 +7416,19 @@ def _container_max_int(album_key, json_key):
     """max(CAST(extracted_data->json_key AS INTEGER)) over one container, in
     SQL. Replaces the shape that hydrated every row of the container to read
     one JSON int — called once per created card, that made a k-card box
-    import O(k^2). CAST of non-numeric text yields 0/NULL, matching the old
-    int()-or-0 tolerance for the integer values these keys actually hold."""
+    import O(k^2). On SQLite, CAST of non-numeric text yields 0/NULL, matching
+    the old int()-or-0 tolerance; other backends raise on a bad cast, so they
+    keep the tolerant Python loop over a narrow projection instead."""
     from sqlalchemy import func as _f, Integer
+    if db.engine.dialect.name != "sqlite":
+        mx = 0
+        for (v,) in (db.session.query(_json_field(json_key))
+                     .filter(ScanRecord.album_key == album_key).all()):
+            try:
+                mx = max(mx, int(v or 0))
+            except (TypeError, ValueError):
+                pass
+        return mx
     v = (db.session.query(_f.max(_f.cast(_json_field(json_key), Integer)))
          .filter(ScanRecord.album_key == album_key).scalar())
     try:
@@ -8514,8 +8535,9 @@ def update_field_hidden():
 @app.route("/records_summary")
 def records_summary():
     """
-    Lightweight summary of all records for the copy-from dropdown
-    on the inventory detail page. Strips internal OCR keys.
+    Lightweight summary of all records (id/label/sub only) for the copy-from
+    dropdown on the inventory detail page. Per-record fields are served by
+    /records_summary/<id>/data, which strips the internal OCR keys.
     """
     rows = (
         ScanRecord.query
