@@ -70,7 +70,7 @@
             <div class="nav-tabs-minimal">
                 {% if can_view('import') %}<a href="{{ url_for('import_page') }}" class="nav-tab">Import</a>{% endif %}
                 {% if can_view('inventory') %}<a href="{{ url_for('inventory') }}" class="nav-tab">Inventory</a>{% endif %}
-                {% if can_view('storage') %}<a href="{{ url_for('storage_list') }}" class="nav-tab">Storage</a>{% endif %}
+                {% if can_view('albums') %}<a href="{{ url_for('storage_list') }}" class="nav-tab">Storage</a>{% endif %}
                 {% if can_view('analytics') %}<a href="{{ url_for('analytics_page') }}" class="nav-tab">Analytics</a>{% endif %}
                 {% if can_view('settings') %}<a href="{{ url_for('settings_page') }}" class="nav-tab active" title="Settings"><i class="fas fa-gear"></i></a>{% endif %}
                 {% if auth_user %}<a href="{{ url_for('auth_logout') }}" class="nav-tab" title="Sign out ({{ auth_username }})"><i class="fas fa-right-from-bracket"></i></a>{% endif %}

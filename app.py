@@ -2888,7 +2888,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 PROTECTED_RESOURCES = [
     ("templates",    "Game Templates (home)"),
     ("inventory",    "Inventory"),
-    ("albums",       "Albums"),
+    ("albums",       "Albums / storage containers"),
     ("import",       "Import / scanning"),
     ("duplicates",   "Duplicates"),
     ("analytics",    "Analytics"),
@@ -2900,7 +2900,7 @@ PROTECTED_RESOURCES = [
     ("pricing",      "Pricing lookups"),
     ("identify",     "Card identification"),
     ("api_keys",     "API Keys"),
-    ("storage",      "Storage locations"),
+    ("storage",      "Storage locations (Settings → where files live)"),
     ("network",      "Network name"),
     ("settings",     "General settings"),
     ("upgrade",      "Upgrade / export"),
@@ -3199,7 +3199,15 @@ def _resource_for_path(path):
         # rides the resource an importing user has by definition.
         "types": "import",
         "cloud_identify": "identify", "identify": "identify", "identify_diagnose": "identify",
-        "storage": "storage", "upgrade": "upgrade",
+        # Top-level /storage/* is the card-container browser (the same pages the
+        # /albums aliases serve), so it rides "albums" — the key whose label
+        # says containers. The unrelated FILESYSTEM relocation page lives under
+        # /settings/storage and keeps the "storage" key: sharing one key meant
+        # granting a clerk binder access also exposed the storage settings
+        # status (absolute DB/upload paths, sizes, free space), while the
+        # "Albums" grant reached nothing the UI links to.
+        "storage": "albums",
+        "upgrade": "upgrade",
         # update_field_type/hidden rewrite every game template that has the field,
         # so they are template edits (Chris-approved), not record edits.
         "template": "templates", "template_save": "templates",
@@ -16313,6 +16321,34 @@ def migrate_add_search_fts():
             pass
 
 
+def migrate_split_storage_albums_permission():
+    """Carry each role's old "storage" level onto "albums" once.
+
+    Container browsing (/storage/*, /albums/*) used to ride the "storage" key,
+    which also gates the filesystem-relocation settings page. Now that they are
+    split, a role granted "storage" would silently lose the container pages —
+    so copy the level across for any role that has not set "albums" itself.
+    The "storage" level is left alone (that grant now means only the settings
+    page); an operator who does not want that can clear it in the role editor.
+    Idempotent: after the copy, "albums" is set, so a re-run is a no-op.
+    """
+    from sqlalchemy import inspect
+    inspector = inspect(db.engine)
+    if "auth_roles" not in inspector.get_table_names():
+        return
+    changed = 0
+    for r in Role.query.all():
+        perms = dict(r.permissions or {})
+        storage_level = perms.get("storage", "none")
+        if storage_level in ("view", "edit") and perms.get("albums", "none") == "none":
+            perms["albums"] = storage_level
+            r.permissions = perms   # reassign: JSON column change tracking
+            changed += 1
+    if changed:
+        db.session.commit()
+        app.logger.info("Copied 'storage' permission onto 'albums' for %d role(s).", changed)
+
+
 def init_db():
     """
     Create/upgrade the database schema and load persisted settings. Every step
@@ -16335,6 +16371,7 @@ def init_db():
         migrate_add_performance_indexes()
         migrate_drop_unused_indexes()
         migrate_add_search_fts()
+        migrate_split_storage_albums_permission()
         optimize_database()
         load_settings()   # load API keys/settings; one-time seed from .env
 
