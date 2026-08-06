@@ -45,18 +45,21 @@ class ScanRecord(db.Model):
     #                FINALIZED records; NULL for unfinalized (each is its own group)
     #   is_*       : booleans promoted out of the JSON for fast WHERE clauses
     # ------------------------------------------------------------------ #
-    game_key      = db.Column(db.String(120), index=True)
-    album_key     = db.Column(db.String(200), index=True)
+    # game_key/album_key get their index via the composite prefixes below;
+    # the is_* booleans are only ever queried through coalesce(), which SQLite
+    # cannot seek an index for, so indexing them is pure write cost.
+    game_key      = db.Column(db.String(120))
+    album_key     = db.Column(db.String(200))
     name_key      = db.Column(db.String(300), index=True)
     card_type_key = db.Column(db.String(80),  index=True)
     dup_hash      = db.Column(db.String(64),  index=True)
-    is_finalized  = db.Column(db.Boolean, default=False, index=True)
-    is_catalog    = db.Column(db.Boolean, default=False, index=True)
-    is_archived   = db.Column(db.Boolean, default=False, index=True)
+    is_finalized  = db.Column(db.Boolean, default=False)
+    is_catalog    = db.Column(db.Boolean, default=False)
+    is_archived   = db.Column(db.Boolean, default=False)
     # "Held" = still in your possession (default). Cleared to False when an entry
     # is sold, which moves it off the Inventory list and onto the Sold page.
     # Mirrors extracted_data["held"]; NULL is treated as held (True) everywhere.
-    is_held       = db.Column(db.Boolean, default=True, index=True)
+    is_held       = db.Column(db.Boolean, default=True)
 
     __table_args__ = (
         # Serves the hot Inventory query: filter by game + owned/active, order by recency.
