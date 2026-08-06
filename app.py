@@ -6139,11 +6139,14 @@ def inventory():
         except Exception:
             db.session.rollback()  # fall back to the proven Python grouping path
 
-    # Base query. game/album live inside the extracted_data JSON; we filter them
-    # in SQL with json_extract so the matching expression indexes are used and we
-    # only load the relevant rows (huge win once one game has tens of thousands
-    # of records). template_used and the JSON text search are handled in SQL as
-    # before.
+    # Base query. game/album are filtered on the denormalized key columns with
+    # the same strip/lower normalization the fast path uses (app.py:_inventory_
+    # base_conditions), so both paths return the same set for the same URL —
+    # the raw json_extract comparison this replaced was case-sensitive, which
+    # made a search or column sort silently drop mixed-case records. The ORM
+    # SELECT lists every mapped column anyway, so this path never worked
+    # without the denormalized columns either. template_used and the JSON text
+    # search are handled in SQL as before.
     query = ScanRecord.query.order_by(ScanRecord.scan_date.desc())
 
     if f_template:
@@ -6151,9 +6154,9 @@ def inventory():
     if search:
         query = query.filter(ScanRecord.extracted_data.cast(db.Text).ilike(f"%{search}%"))
     if f_game:
-        query = query.filter(db.func.json_extract(ScanRecord.extracted_data, "$.game") == f_game)
+        query = query.filter(ScanRecord.game_key == f_game.strip().lower())
     if f_album:
-        query = query.filter(db.func.json_extract(ScanRecord.extracted_data, "$.album") == f_album)
+        query = query.filter(ScanRecord.album_key == f_album.strip().lower())
 
     all_records_raw = query.all()
 
@@ -15214,9 +15217,8 @@ def migrate_add_performance_indexes():
     Create indexes that keep reads fast as the collection grows into the tens of
     thousands. This is the scalable alternative to splitting the DB per game:
       • scan_date / template_used / matched_product_id — ordering & direct filters
-      • expression indexes on json_extract(extracted_data,'$.game'|'$.album') so
-        the Inventory game/album filters (now pushed into SQL) are index-served
-      • a composite reference_cards(game, number) for card identification lookups
+      • a composite reference_cards(category_id, number) for the OCR number
+        match, which always binds category_id (nothing ever filters by game)
     All are IF NOT EXISTS, so this is a cheap no-op on every start after the first.
     A final PRAGMA optimize lets SQLite refresh stats only when worthwhile.
     """
@@ -15226,9 +15228,7 @@ def migrate_add_performance_indexes():
         "CREATE INDEX IF NOT EXISTS idx_scan_scan_date ON scan_records(scan_date)",
         "CREATE INDEX IF NOT EXISTS idx_scan_template ON scan_records(template_used)",
         "CREATE INDEX IF NOT EXISTS idx_scan_matched_product ON scan_records(matched_product_id)",
-        "CREATE INDEX IF NOT EXISTS idx_scan_game ON scan_records(json_extract(extracted_data, '$.game'))",
-        "CREATE INDEX IF NOT EXISTS idx_scan_album ON scan_records(json_extract(extracted_data, '$.album'))",
-        "CREATE INDEX IF NOT EXISTS idx_refcard_game_number ON reference_cards(game, number)",
+        "CREATE INDEX IF NOT EXISTS idx_refcard_category_number ON reference_cards(category_id, number)",
         "CREATE INDEX IF NOT EXISTS idx_listing_marketplace_status ON listings(marketplace, status)",
     ]
     try:
@@ -15306,16 +15306,13 @@ def migrate_add_scan_scaling_columns():
                 "UPDATE scan_records SET is_held = 1 "
                 "WHERE is_held IS NULL AND COALESCE(is_catalog, 0) = 0")
     # Indexes (names match SQLAlchemy's so a fresh DB's create_all doesn't dupe).
+    # game_key/album_key are served by the composite prefixes; the is_* booleans
+    # are only queried through coalesce() (unindexable), so neither gets its own
+    # index — migrate_drop_unused_indexes() removes them from older installs.
     index_sql = [
-        "CREATE INDEX IF NOT EXISTS ix_scan_records_game_key ON scan_records(game_key)",
-        "CREATE INDEX IF NOT EXISTS ix_scan_records_album_key ON scan_records(album_key)",
         "CREATE INDEX IF NOT EXISTS ix_scan_records_name_key ON scan_records(name_key)",
         "CREATE INDEX IF NOT EXISTS ix_scan_records_card_type_key ON scan_records(card_type_key)",
         "CREATE INDEX IF NOT EXISTS ix_scan_records_dup_hash ON scan_records(dup_hash)",
-        "CREATE INDEX IF NOT EXISTS ix_scan_records_is_finalized ON scan_records(is_finalized)",
-        "CREATE INDEX IF NOT EXISTS ix_scan_records_is_catalog ON scan_records(is_catalog)",
-        "CREATE INDEX IF NOT EXISTS ix_scan_records_is_archived ON scan_records(is_archived)",
-        "CREATE INDEX IF NOT EXISTS ix_scan_records_is_held ON scan_records(is_held)",
         "CREATE INDEX IF NOT EXISTS idx_scan_hot ON scan_records(game_key, is_catalog, is_archived, scan_date)",
         "CREATE INDEX IF NOT EXISTS idx_scan_album_hot ON scan_records(album_key, is_catalog, is_archived)",
     ]
@@ -15325,6 +15322,39 @@ def migrate_add_scan_scaling_columns():
 
     if added:
         _backfill_scan_columns()
+
+
+def migrate_drop_unused_indexes():
+    """
+    Drop indexes that older installs carry but that no query can use — verified
+    with EXPLAIN QUERY PLAN against every query site (see the 2026-08-06 DB
+    audit). Three groups:
+      • idx_scan_game / idx_scan_album — json_extract expression indexes whose
+        only consumer (the /inventory Python fallback) now filters the
+        normalized game_key/album_key columns instead;
+      • ix_scan_records_{game_key,album_key} — shadowed by the idx_scan_hot /
+        idx_scan_album_hot composite prefixes;
+      • ix_scan_records_is_* — every query wraps these booleans in coalesce(),
+        which SQLite cannot seek an index for;
+      • idx_refcard_game_number — nothing filters reference_cards by game;
+        every lookup binds category_id (idx_refcard_category_number replaces it).
+    DROP INDEX IF EXISTS, so this is a no-op on fresh databases and on every
+    start after the first.
+    """
+    drops = [
+        "idx_scan_game",
+        "idx_scan_album",
+        "ix_scan_records_game_key",
+        "ix_scan_records_album_key",
+        "ix_scan_records_is_finalized",
+        "ix_scan_records_is_catalog",
+        "ix_scan_records_is_archived",
+        "ix_scan_records_is_held",
+        "idx_refcard_game_number",
+    ]
+    with db.engine.begin() as conn:
+        for name in drops:
+            conn.exec_driver_sql(f"DROP INDEX IF EXISTS {name}")
 
 
 def init_db():
@@ -15346,6 +15376,7 @@ def init_db():
         migrate_add_type_reference_region_column()
         migrate_add_scan_scaling_columns()
         migrate_add_performance_indexes()
+        migrate_drop_unused_indexes()
         optimize_database()
         load_settings()   # load API keys/settings; one-time seed from .env
 
