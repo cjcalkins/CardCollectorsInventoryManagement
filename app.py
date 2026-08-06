@@ -1047,6 +1047,61 @@ def build_storage_index():
 build_album_index = build_storage_index
 
 
+def build_storage_summary():
+    """
+    The container list without per-record hydration: one SQL aggregation over
+    the raw (trimmed) album value, matching build_storage_index's grouping —
+    case-sensitive container names, box-vs-album by majority storage_type
+    vote, non-empty games, newest-first ordering with dateless containers
+    last. Serves /storage and /storage/list, which never touch the per-record
+    lists build_storage_index carries.
+    """
+    from sqlalchemy import func as _f
+    not_cat = _f.coalesce(ScanRecord.is_catalog, False) == False  # noqa: E712
+    album_expr = _f.trim(_f.json_extract(ScanRecord.extracted_data, "$.album"))
+    game_expr = _f.nullif(_f.trim(_f.json_extract(ScanRecord.extracted_data, "$.game")), "")
+    box_vote = _f.sum(db.case(
+        (_f.lower(_f.trim(_f.coalesce(
+            _f.json_extract(ScanRecord.extracted_data, "$.storage_type"), ""))) == "box", 1),
+        else_=0))
+    rows = (db.session.query(album_expr,
+                             _f.count(ScanRecord.id),
+                             _f.max(ScanRecord.scan_date),
+                             box_vote)
+            .filter(not_cat, ScanRecord.album_key.isnot(None))
+            .group_by(album_expr).all())
+    # Distinct (album, game) pairs separately: group_concat(DISTINCT ...)
+    # cannot take a custom separator on SQLite, and game names may contain
+    # commas, so folding pairs in Python is the safe shape.
+    games_by_album = {}
+    for alb, game in (db.session.query(album_expr, game_expr)
+                      .filter(not_cat, ScanRecord.album_key.isnot(None),
+                              game_expr.isnot(None))
+                      .distinct().all()):
+        games_by_album.setdefault(str(alb), set()).add(str(game))
+    containers = []
+    for name, count, latest, box_votes in rows:
+        name = str(name)
+        latest_dt = latest if not isinstance(latest, str) else None
+        if latest_dt is None and isinstance(latest, str):
+            try:
+                latest_dt = datetime.fromisoformat(latest)
+            except ValueError:
+                latest_dt = None
+        stype = "box" if (box_votes or 0) > count - (box_votes or 0) else "album"
+        containers.append({
+            "name": name,
+            "count": count,
+            "latest_scan": latest_dt,
+            "games": sorted(games_by_album.get(name, set())),
+            "storage_type": stype,
+            "is_box": stype == "box",
+        })
+    return sorted(containers,
+                  key=lambda item: item["latest_scan"] or datetime.min,
+                  reverse=True)
+
+
 # ====================== GAME TEMPLATES ======================
 # A "template" file (templates/roi/<name>.json) now represents a Game
 # definition: just a name plus a flat list of fields that belong to every
@@ -1570,8 +1625,20 @@ def _build_ocr_candidates(exclude_record_id=None, catalog_only=False):
     catalog_only=True restricts matching to imported reference rows (the CSV
     "Imported Catalog"), which is usually the cleanest identification target.
     """
+    # SQL narrowing on provably-implied conditions (the derived columns come
+    # from the same helpers the loop calls): rows with neither name nor
+    # serial can't match, the catalog scope mirrors _is_catalog_only, and the
+    # excluded record drops before hydration. Loop checks still run.
+    from sqlalchemy import func as _f, or_
+    q = ScanRecord.query.filter(or_(ScanRecord.name_key.isnot(None),
+                                    ScanRecord.serial_key.isnot(None)))
+    if catalog_only:
+        q = q.filter(_f.coalesce(ScanRecord.is_catalog, False) == True)  # noqa: E712
+    if exclude_record_id is not None:
+        q = q.filter(ScanRecord.id != exclude_record_id)
+
     candidates = []
-    for r in ScanRecord.query.all():
+    for r in q.all():
         if exclude_record_id is not None and r.id == exclude_record_id:
             continue
         data = r.extracted_data or {}
@@ -6670,7 +6737,7 @@ def inventory_detail(record_id):
 
 @app.route("/storage")
 def storage_home():
-    containers = build_storage_index()
+    containers = build_storage_summary()
     if containers:
         return redirect(url_for("storage_detail", name=containers[0]["name"]))
     return render_template("storage.html", containers=[])
@@ -6678,7 +6745,7 @@ def storage_home():
 
 @app.route("/storage/list")
 def storage_list():
-    containers = build_storage_index()
+    containers = build_storage_summary()
     for c in containers:
         c["image_url"] = find_saved_image("albums", c["name"])
     return render_template("storage.html", containers=containers)
@@ -6780,7 +6847,12 @@ def _storage_item_name(record, fallback=""):
 
 @app.route("/storage/<path:name>")
 def storage_detail(name):
-    containers = build_storage_index()
+    # Resolve the container from the light summary (same first-match-by-
+    # lowercase rule as before), then hydrate ONLY that container's rows:
+    # the indexed album_key narrows to the album, and the raw-name re-filter
+    # keeps membership exactly what the old full-table grouping produced
+    # (container names are case-sensitive; the key is not).
+    containers = build_storage_summary()
     selected = next(
         (c for c in containers if c["name"].lower() == name.strip().lower()),
         None,
@@ -6788,6 +6860,17 @@ def storage_detail(name):
 
     if not selected:
         return redirect(url_for("storage_list"))
+
+    from sqlalchemy import func as _f
+    selected = dict(selected)
+    selected["records"] = [
+        r for r in (ScanRecord.query
+                    .filter(_f.coalesce(ScanRecord.is_catalog, False) == False,  # noqa: E712
+                            ScanRecord.album_key == selected["name"].strip().lower())
+                    .order_by(ScanRecord.scan_date.desc()).all())
+        if get_record_value(r, "album") == selected["name"]
+        and not _is_catalog_only(r.extracted_data or {})
+    ]
 
     def record_sort_key(record):
         page = get_record_value(record, "page")
