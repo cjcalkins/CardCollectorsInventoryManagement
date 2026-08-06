@@ -6329,7 +6329,10 @@ def inventory():
     if sort_dir not in ("asc", "desc"):
         sort_dir = "asc"
 
-    per_page = min(per_page, 200)
+    # Clamp from below too: both pagination helpers ceiling-divide by per_page,
+    # so ?per_page=0 (or negative) would be a ZeroDivisionError 500.
+    page = max(page, 1)
+    per_page = max(1, min(per_page, 200))
 
     # ---- Fast path: default (recency) view with no free-text search ----------
     # De-dup + paginate in SQL so only the page's rows load. Any arbitrary field
@@ -15389,6 +15392,78 @@ def shops_email_disconnect():
 # "Check now" button is the primary, always-available path.
 _email_poller_started = False
 
+# Consecutive processing failures per email UID, kept in memory: after
+# EMAIL_POISON_SKIP_AFTER failed passes the email is skipped with an error
+# SaleEvent as the audit trail instead of blocking the mailbox forever. A
+# restart resets the counts, which only means a poison email gets another
+# EMAIL_POISON_SKIP_AFTER attempts before being skipped again.
+_EMAIL_POISON_FAILS = {}
+EMAIL_POISON_SKIP_AFTER = 3
+
+
+def _email_poll_once():
+    """One background poll pass; returns the interval until the next pass.
+
+    Error isolation is per email: a failing email is logged, rolled back, and
+    stops the batch so the UID cursor never passes unprocessed mail (emails
+    before it stay processed and the cursor advances to them). It is retried
+    on later passes and skipped after EMAIL_POISON_SKIP_AFTER consecutive
+    failures. Every outcome lands on the monitor row, so the UI shows the
+    failure instead of a silently stale "last checked"."""
+    m = _get_email_monitor()
+    if not (m and m.enabled and (m.poll_interval or 0) > 0 and m.host and m.password):
+        return 60
+    interval = max(int(m.poll_interval or 60), 15)
+
+    res = email_monitor.fetch_sale_emails(_email_cfg(m), since_uid=m.last_uid or 0)
+    m.last_checked = datetime.utcnow()
+    if not res.get("ok"):
+        m.status = "error"
+        m.status_detail = (res.get("message") or "Fetch failed.")[:500]
+        db.session.commit()
+        return interval
+
+    cursor = int(m.last_uid or 0)
+    failure = None
+    for pe in res["emails"]:   # ascending UID order (oldest window)
+        uid = int(pe.get("uid") or 0)
+        try:
+            _process_sale_email(pe, source=m.source or "tcgplayer")
+        except Exception as exc:
+            db.session.rollback()
+            app.logger.exception("Sale email uid %s failed to process", uid)
+            fails = _EMAIL_POISON_FAILS.get(uid, 0) + 1
+            _EMAIL_POISON_FAILS[uid] = fails
+            if fails < EMAIL_POISON_SKIP_AFTER:
+                failure = (f"Email uid {uid} failed to process "
+                           f"(attempt {fails}/{EMAIL_POISON_SKIP_AFTER}): {exc}")
+                break   # cursor stays behind it; retried next pass
+            # Poison: leave the audit trail where sales are reviewed, then
+            # move the cursor past it so the rest of the mailbox flows again.
+            db.session.add(SaleEvent(
+                source=m.source or "tcgplayer",
+                order_id=pe.get("order_id") or "",
+                item_title=f"(skipped) uid {uid} failed {fails} passes",
+                status="error",
+                email_subject=(pe.get("subject") or "")[:300],
+                detail=str(exc)[:500]))
+            failure = f"Email uid {uid} skipped after {fails} failed passes: {exc}"
+            _EMAIL_POISON_FAILS.pop(uid, None)
+            cursor = max(cursor, uid)
+        else:
+            _EMAIL_POISON_FAILS.pop(uid, None)
+            cursor = max(cursor, uid)
+
+    m.last_uid = cursor
+    if failure:
+        m.status = "error"
+        m.status_detail = failure[:500]
+    else:
+        m.status = "connected"
+        m.status_detail = None
+    db.session.commit()
+    return interval
+
 
 def start_email_poller():
     global _email_poller_started
@@ -15401,24 +15476,21 @@ def start_email_poller():
     def _loop():
         while True:
             interval = 60
-            try:
-                with app.app_context():
-                    m = _get_email_monitor()
-                    if m and m.enabled and (m.poll_interval or 0) > 0 and m.host and m.password:
-                        res = email_monitor.fetch_sale_emails(_email_cfg(m), since_uid=m.last_uid or 0)
-                        if res.get("ok"):
-                            for pe in res["emails"]:
-                                _process_sale_email(pe, source=m.source or "tcgplayer")
-                            m.last_uid = res.get("max_uid", m.last_uid)
-                            m.last_checked = datetime.utcnow()
-                            m.status = "connected"
-                            db.session.commit()
-                        interval = max(int(m.poll_interval or 60), 15)
-            except Exception:
-                interval = 60
+            with app.app_context():
+                try:
+                    interval = _email_poll_once()
+                except Exception:
+                    # Never let the thread die, but never die silently either.
+                    app.logger.exception("Email poller pass failed")
+                    try:
+                        db.session.rollback()
+                    except Exception:
+                        pass
+                finally:
+                    db.session.remove()
             _time.sleep(interval)
 
-    threading.Thread(target=_loop, daemon=True).start()
+    threading.Thread(target=_loop, daemon=True, name="email-poller").start()
 
 
 # ====================== START ======================
