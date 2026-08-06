@@ -680,6 +680,12 @@ class EasyPostProvider(ShippingProvider):
             "height": num("height", "parcel_height", 0.75),
         }
 
+    @staticmethod
+    def _order_reference(order):
+        """The reference stamped on every EasyPost shipment at quote time —
+        also what create_label checks before buying a client-posted id."""
+        return order.external_order_id or f"CCIM-{order.id}"
+
     def _shipment_body(self, order, opts=None):
         return {
             "shipment": {
@@ -689,7 +695,7 @@ class EasyPostProvider(ShippingProvider):
                 # Ask for PDF up front — the default is PNG, and PDF is what
                 # lets batch printing merge these with TCGTracking envelopes.
                 "options": {"label_format": "PDF"},
-                "reference": order.external_order_id or f"CCIM-{order.id}",
+                "reference": self._order_reference(order),
             }
         }
 
@@ -780,6 +786,20 @@ class EasyPostProvider(ShippingProvider):
             if not chosen:
                 return {"ok": False, "message": "No rate available to buy."}
             rate_id = chosen["id"]
+        else:
+            # The id pair came from the client. Two order tabs (or a crafted
+            # POST) can cross them, buying real postage for order A's address
+            # and recording it as order B's shipment. The quote stamped this
+            # order's reference on the shipment; refuse to buy unless it
+            # matches.
+            code, parsed, raw = _http("GET", f"{EASYPOST_BASE}/shipments/{shipment_id}",
+                                      headers=self._headers())
+            if code != 200 or not isinstance(parsed, dict):
+                return {"ok": False, "message": self._error(parsed, raw, code)}
+            if (parsed.get("reference") or "") != self._order_reference(order):
+                return {"ok": False,
+                        "message": "That quote belongs to a different order — re-quote "
+                                   "this order and try again."}
 
         insured = opts.get("insured")
         if insured is None:
