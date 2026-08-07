@@ -178,39 +178,6 @@
                 </div>
 
                 <div class="row g-4">
-                    {% if can_view('quick_scan') %}
-                    <div class="col-12 col-md-6 col-xl-4">
-                        <a href="/quickscan" class="setting-card">
-                            <div class="sc-icon"><i class="fas fa-camera-retro"></i></div>
-                            <div>
-                                <h5>Quick Scan</h5>
-                                <p>Identify cards live from the camera to a CSV without saving them to inventory.</p>
-                            </div>
-                        </a>
-                    </div>
-                    {% endif %}
-                    {% if can_view('shops') %}
-                    <div class="col-12 col-md-6 col-xl-4">
-                        <a href="/shops/ebay/template" class="setting-card">
-                            <div class="sc-icon"><i class="fab fa-ebay"></i></div>
-                            <div>
-                                <h5>eBay Listing Template</h5>
-                                <p>Design the HTML description used for eBay listings, filled from each item's details.</p>
-                            </div>
-                        </a>
-                    </div>
-                    {% endif %}
-                    {% if can_view('reports') %}
-                    <div class="col-12 col-md-6 col-xl-4">
-                        <a href="/reports" class="setting-card">
-                            <div class="sc-icon"><i class="fas fa-file-invoice-dollar"></i></div>
-                            <div>
-                                <h5>Financial Reports</h5>
-                                <p>Weekly, monthly, quarterly, and annual PDF reports of acquisitions, sales by shop, and outcome.</p>
-                            </div>
-                        </a>
-                    </div>
-                    {% endif %}
                     {% if auth_is_admin %}
                     <div class="col-12 col-md-6 col-xl-4">
                         <a href="/settings/users" class="setting-card">
@@ -272,26 +239,6 @@
                         </a>
                     </div>
                     <div class="col-12 col-md-6 col-xl-4">
-                        <a href="{{ url_for('shops_page') }}" class="setting-card">
-                            <div class="sc-icon"><i class="fas fa-store"></i></div>
-                            <div>
-                                <h5>Shops</h5>
-                                <p>Connect marketplaces (TCGplayer, eBay, Shopify), manage listings, and watch sale emails.</p>
-                            </div>
-                        </a>
-                    </div>
-                    {% if can_view('shops') %}
-                    <div class="col-12 col-md-6 col-xl-4">
-                        <a href="/shipping" class="setting-card">
-                            <div class="sc-icon"><i class="fas fa-box-open"></i></div>
-                            <div>
-                                <h5>Shipping</h5>
-                                <p>Buy postage, print labels per order, and follow USPS tracking to delivery.</p>
-                            </div>
-                        </a>
-                    </div>
-                    {% endif %}
-                    <div class="col-12 col-md-6 col-xl-4">
                         <a href="{{ url_for('api_keys_page') }}" class="setting-card">
                             <div class="sc-icon"><i class="fas fa-key"></i></div>
                             <div>
@@ -310,15 +257,6 @@
                         </a>
                     </div>
                     <div class="col-12 col-md-6 col-xl-4">
-                        <a href="{{ url_for('search_by_image_page') }}" class="setting-card">
-                            <div class="sc-icon"><i class="fas fa-camera"></i></div>
-                            <div>
-                                <h5>Search by Image</h5>
-                                <p>Find a card already in your inventory by matching a photo against stored scans.</p>
-                            </div>
-                        </a>
-                    </div>
-                    <div class="col-12 col-md-6 col-xl-4">
                         <a href="{{ url_for('duplicates') }}" class="setting-card">
                             <div class="sc-icon"><i class="fas fa-clone"></i></div>
                             <div>
@@ -331,7 +269,7 @@
                         <a href="{{ url_for('storage_page') }}" class="setting-card">
                             <div class="sc-icon"><i class="fas fa-hard-drive"></i></div>
                             <div>
-                                <h5>Storage</h5>
+                                <h5>File Storage</h5>
                                 <p>Choose where images, temp files, and the database live — and move them between drives.</p>
                             </div>
                         </a>

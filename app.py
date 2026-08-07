@@ -6184,8 +6184,10 @@ def _report_to_pdf(rep):
     return buf.getvalue()
 
 
-_REPORTS_LANDING_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width, initial-scale=1"><title>Reports</title>
+_REPORTS_LANDING_HTML = """{% extends "base.html" %}
+{% set nav_active = 'analytics' %}
+{% block title %}Financial Reports - Card Collector Inventory Manager{% endblock %}
+{% block head %}
 <style>
  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#1f2937;background:#f5f7fb;margin:0;padding:28px;}
  .card{max-width:640px;margin:6vh auto 0;background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:26px 28px;box-shadow:0 10px 30px rgba(0,0,0,.06);}
@@ -6198,7 +6200,13 @@ _REPORTS_LANDING_HTML = """<!doctype html><html lang=en><head><meta charset=utf-
  button.sec{background:#eef2ff;color:#4338ca;}
  .links{margin-top:20px;font-size:14px;color:#6b7280;} .links a{margin-right:14px;}
  .hint{color:#6b7280;font-size:13px;margin-top:14px;line-height:1.5;}
-</style></head><body>
+</style>
+{% endblock %}
+{% block content %}
+<div class="page-tabs" style="margin:2px 0 0 28px">
+  {% if can_view('analytics') %}<a class="page-tab" href="{{ url_for('analytics_page') }}">Analytics</a>{% endif %}
+  <a class="page-tab active" href="/reports">Financial Reports</a>
+</div>
 <div class=card>
  <h1>Financial reports</h1>
  <p class=sub>Generate a report of acquisitions, sales by shop, strategies, and the financial outcome for a period.</p>
@@ -6230,12 +6238,13 @@ _REPORTS_LANDING_HTML = """<!doctype html><html lang=en><head><meta charset=utf-
  function qs(){return 'period='+encodeURIComponent(document.getElementById('period').value)+'&date='+encodeURIComponent(document.getElementById('date').value);}
  document.getElementById('view').addEventListener('click',function(){location.href='/reports/view?'+qs();});
  document.getElementById('pdf').addEventListener('click',function(){location.href='/reports/pdf?'+qs();});
-</script></body></html>"""
+</script>
+{% endblock %}"""
 
 
 @app.route("/reports")
 def reports_page():
-    return Response(_REPORTS_LANDING_HTML, mimetype="text/html")
+    return render_template_string(_REPORTS_LANDING_HTML)
 
 
 @app.route("/reports/view")
@@ -6294,8 +6303,10 @@ def _held_inventory_match(game, name, number):
     return count
 
 
-_QUICK_SCAN_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width, initial-scale=1"><title>Quick Scan</title>
+_QUICK_SCAN_HTML = """{% extends "base.html" %}
+{% set nav_active = 'quick_scan' %}
+{% block title %}Quick Scan - Card Collector Inventory Manager{% endblock %}
+{% block head %}
 <style>
  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#1f2937;background:#f5f7fb;margin:0;padding:18px;}
  .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px;}
@@ -6315,10 +6326,12 @@ _QUICK_SCAN_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
  .x{color:#9ca3af;cursor:pointer;} .links{margin-top:14px;font-size:14px;color:#6b7280;} .links a{margin-right:14px;}
  .overlay{position:fixed;left:50%;top:34%;transform:translate(-50%,-50%);z-index:99999;padding:18px 34px;border-radius:16px;font-size:22px;font-weight:800;color:#fff;box-shadow:0 12px 40px rgba(0,0,0,.35);opacity:0;transition:opacity .25s ease;pointer-events:none;text-align:center;}
  .overlay.show{opacity:1;} .overlay.have{background:#059669;} .overlay.new{background:#2563eb;} .overlay.proc{background:#4f46e5;}
-</style></head><body>
+</style>
+{% endblock %}
+{% block content %}
  <div id=ovl class=overlay></div>
  <div class=bar>
-   <h1>Quick Scan</h1>
+   <h1>Quick Scan</h1><a href="/search_by_image" style="background:#eef2ff;color:#4338ca;padding:9px 15px;border-radius:9px;font-size:14px;font-weight:700;text-decoration:none">Search by Photo</a>
    <select id=game></select>
    <button id=startBtn class=sec>Start camera</button>
    <button id=scanBtn>Scan card</button>
@@ -6418,12 +6431,13 @@ _QUICK_SCAN_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
    else if(autoTimer){clearInterval(autoTimer);autoTimer=null;}
  });
  loadGames();
-</script></body></html>"""
+</script>
+{% endblock %}"""
 
 
 @app.route("/quickscan")
 def quick_scan_page():
-    return Response(_QUICK_SCAN_HTML, mimetype="text/html")
+    return render_template_string(_QUICK_SCAN_HTML)
 
 
 @app.route("/quickscan/identify", methods=["POST"])
@@ -14300,8 +14314,10 @@ def _ebay_sample_record():
     )).order_by(ScanRecord.scan_date.desc()).first())
 
 
-_EBAY_TEMPLATE_PAGE_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width, initial-scale=1"><title>eBay listing template</title>
+_EBAY_TEMPLATE_PAGE_HTML = """{% extends "base.html" %}
+{% set nav_active = 'shops' %}
+{% block title %}eBay Listing Template - Card Collector Inventory Manager{% endblock %}
+{% block head %}
 <link href="https://cdn.jsdelivr.net/npm/grapesjs/dist/css/grapes.min.css" rel="stylesheet">
 <link href="https://cdn.jsdelivr.net/npm/grapesjs-preset-webpage/dist/grapesjs-preset-webpage.min.css" rel="stylesheet">
 <style>
@@ -14320,7 +14336,10 @@ _EBAY_TEMPLATE_PAGE_HTML = """<!doctype html><html lang=en><head><meta charset=u
  .modal.show{display:flex;} .modal .box{background:#fff;border-radius:12px;width:min(720px,92vw);max-height:88vh;overflow:hidden;display:flex;flex-direction:column;}
  .modal .box header{padding:12px 16px;font-weight:700;border-bottom:1px solid #eee;display:flex;justify-content:space-between;align-items:center;}
  .modal iframe{border:0;width:100%;height:70vh;}
-</style></head><body>
+</style>
+{% endblock %}
+{% block content %}
+{% raw %}
  <div class=bar>
    <h1>eBay listing template</h1>
    <button id=save>Save</button>
@@ -14402,12 +14421,14 @@ _EBAY_TEMPLATE_PAGE_HTML = """<!doctype html><html lang=en><head><meta charset=u
  document.getElementById('htmlBtn').addEventListener('click',function(){var raw=document.getElementById('raw'),wrap=document.getElementById('rawWrap'),gjs=document.getElementById('gjs');if(!rawMode){raw.value=buildTemplate();wrap.style.display='block';gjs.style.display='none';rawMode=true;this.textContent='Visual editor';}else{loadIntoEditor(raw.value);wrap.style.display='none';gjs.style.display='';rawMode=false;this.textContent='Edit HTML';}});
  document.getElementById('previewBtn').addEventListener('click',async function(){var d=await api('/shops/ebay/template/preview',{template:buildTemplate()});document.getElementById('pvFrame').srcdoc=d.html||'';document.getElementById('pvModal').classList.add('show');});
  document.getElementById('pvClose').addEventListener('click',function(){document.getElementById('pvModal').classList.remove('show');});
-</script></body></html>"""
+</script>
+{% endraw %}
+{% endblock %}"""
 
 
 @app.route("/shops/ebay/template")
 def ebay_template_page():
-    return Response(_EBAY_TEMPLATE_PAGE_HTML, mimetype="text/html")
+    return render_template_string(_EBAY_TEMPLATE_PAGE_HTML)
 
 
 @app.route("/shops/ebay/template/data")
