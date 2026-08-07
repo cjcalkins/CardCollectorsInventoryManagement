@@ -103,7 +103,7 @@ on your network.
 ## Tech stack
 
 - **Backend:** Python + [Flask](https://flask.palletsprojects.com/), [SQLAlchemy](https://www.sqlalchemy.org/) (SQLite by default)
-- **Imaging / OCR:** [OpenCV](https://opencv.org/), [Pillow](https://python-pillow.org/), [NumPy](https://numpy.org/), [PyMuPDF](https://pymupdf.readthedocs.io/) (PDF), [pytesseract](https://github.com/madmaze/pytesseract) + the Tesseract engine
+- **Imaging / OCR:** [OpenCV](https://opencv.org/), [Pillow](https://python-pillow.org/), [NumPy](https://numpy.org/), [PyMuPDF](https://pymupdf.readthedocs.io/) (PDF), [RapidOCR](https://github.com/RapidAI/RapidOCR) (PP-OCRv5 mobile models on [ONNX Runtime](https://onnxruntime.ai/)), and optionally [hnswlib](https://github.com/nmslib/hnswlib) (fast candidate shortlisting for Search by Image)
 - **Reports:** [ReportLab](https://www.reportlab.com/) (PDF generation)
 - **Security / networking:** [cryptography](https://cryptography.io/) (self-signed TLS), [zeroconf](https://python-zeroconf.readthedocs.io/) (mDNS, optional)
 - **Frontend:** server-rendered HTML + vanilla JS, [Bootstrap](https://getbootstrap.com/), [Font Awesome](https://fontawesome.com/), and [GrapesJS](https://grapesjs.com/) (the eBay template editor, via CDN)
@@ -113,30 +113,29 @@ on your network.
 ## Requirements
 
 - **Python 3.10+**
-- **Tesseract OCR** system binary (for card OCR):
-  - Debian/Ubuntu: `sudo apt install tesseract-ocr`
-  - macOS: `brew install tesseract`
-  - Windows: install from the [UB-Mannheim build](https://github.com/UB-Mannheim/tesseract/wiki)
-- Python packages (see `requirements.txt`), typically:
+- **No system OCR binary.** Card OCR runs on RapidOCR (PP-OCRv5 mobile models via ONNX
+  Runtime), installed with the Python packages below. The model files download
+  automatically the first time OCR runs, so the machine needs network access that one time.
+- Python packages (see `requirements.txt` for the authoritative list):
 
 ```text
-Flask
-SQLAlchemy
-Flask-SQLAlchemy
-python-dotenv
-opencv-python-headless
-Pillow
-numpy
-PyMuPDF
-pytesseract
-reportlab
-cryptography
-zeroconf        # optional, enables the .local name
-requests
+Flask, Flask-SQLAlchemy, SQLAlchemy, Werkzeug, python-dotenv
+opencv-python-headless, Pillow, numpy
+rapidocr, onnxruntime, networkx     # OCR engine and its dependencies
+reportlab                           # PDF financial reports
+cryptography                        # self-signed HTTPS certificate generation
+requests                            # provider / marketplace API calls
+PyMuPDF                             # optional: PDF import (imported as "fitz")
+zeroconf                            # optional: advertises the .local mDNS name
 ```
 
-> `PyMuPDF`, `pytesseract`/Tesseract, and `zeroconf` are optional at boot — the app
-> starts without them and simply disables the related feature with a clear message.
+> `PyMuPDF` and `zeroconf` are optional at boot — the app starts without them and
+> simply disables the related feature with a clear message. `hnswlib` is a third
+> optional package, deliberately **not** in `requirements.txt` (it ships as source
+> only and needs a C++ toolchain to build): `pip install hnswlib` enables the fast
+> approximate-nearest-neighbour shortlist behind **Search by Image** on collections
+> above ~3,000 records; without it the search falls back to a full brute-force scan
+> with identical ranking, just slower.
 
 ---
 
@@ -144,8 +143,8 @@ requests
 
 ```bash
 # 1. Clone
-git clone https://github.com/<your-username>/card-collector-inventory-manager.git
-cd card-collector-inventory-manager
+git clone https://github.com/cjcalkins/CardCollectorsInventoryManagement.git
+cd CardCollectorsInventoryManagement
 
 # 2. Create a virtual environment
 python3 -m venv .venv
@@ -213,8 +212,14 @@ Notes on access:
 
 ## First-run setup
 
-On a fresh install the app redirects to a one-time setup page to create the first
-**administrator** account. Creating it also seeds three starter roles:
+On a brand-new install the app walks through a short one-time setup:
+
+1. **System mode** (`/setup`) — choose **Sorting Machine** (SQLite, enforces the
+   1,000,000-record cap; the only choice on a Raspberry Pi) or **Dedicated Server**
+   (lifts the cap and, when `DATABASE_URL` is set, runs on PostgreSQL). The choice is
+   stored in `system_config.json` next to `app.py`.
+2. **Administrator account** (`/auth/setup`) — create the first admin. Creating it also
+   seeds three starter roles:
 
 | Role          | Access                                   |
 |---------------|-------------------------------------------|
@@ -225,11 +230,20 @@ On a fresh install the app redirects to a one-time setup page to create the firs
 After that, sign in at `/auth/login`. Manage users and roles from **Settings → Users** and
 **Settings → Roles**.
 
+> **Note:** the repository currently ships a committed `system_config.json` with the
+> mode already set to Dedicated Server (and unlimited native-resolution import turned
+> on), so a fresh clone skips step 1 and goes straight to admin creation. Delete
+> `system_config.json` before first launch if you want to pick the mode yourself.
+
 ---
 
 ## Configuration
 
-All configuration is via environment variables (a `.env` file is supported). Common options:
+All configuration is via environment variables (a `.env` file is supported). Several
+values can also be set in the UI and persist in the app's settings store or in
+`system_config.json` — where both exist, the precedence is noted in the description.
+
+### Server & security
 
 | Variable                  | Default            | Description |
 |---------------------------|--------------------|-------------|
@@ -241,17 +255,57 @@ All configuration is via environment variables (a `.env` file is supported). Com
 | `IMAP_ALLOW_INSECURE_TLS` | *(unset)*          | Accept an IMAP server certificate that isn't trusted or doesn't match the hostname. **Only set this for your own mail server with a self-signed certificate** — it disables the check that stops anything on the network path from impersonating your mail provider and collecting the mailbox password. It does **not** allow an unencrypted connection: a server that won't start TLS is still refused. |
 | `DISABLE_AUTH`            | *(unset)*          | Kill-switch to disable authentication entirely. |
 | `FLASK_DEBUG`             | `0`                | Enable the Werkzeug debugger/reloader (local dev only — unsafe on a LAN). |
-| `DATABASE_URL`            | SQLite file        | SQLAlchemy database URL. |
-| `MAX_UPLOAD_MB`           | `1024`             | Max upload size (MB). |
-| `MAX_IMAGE_MEGAPIXELS`    | `2000`             | Decoded-image pixel ceiling (decompression-bomb guard). |
-| `MAX_IMAGE_DECODE_RATIO`  | `300`              | Max decoded-size / file-size ratio before an image is rejected as a bomb. |
-| `MAX_PDF_PAGES`           | `5000`             | Max pages accepted from a single PDF. |
-| `PDF_CAPPED_DPI`          | `600`              | Cap for PDF page rasterization DPI. |
-| `REFERENCE_PROVIDER`      | provider default   | Reference-catalog data provider. |
-| `IDENTIFY_PROVIDER`       | provider default   | Card identification provider. |
-| `INVENTORY_MAX_RECORDS`   | high default       | Safety cap on total inventory records. |
+| `DATABASE_URL`            | *(unset)*          | PostgreSQL connection URL, honored **only in Dedicated Server mode**. Otherwise the app uses its SQLite file (location configurable in **Settings → Storage**). |
+
+### Uploads & PDF import
+
+| Variable                  | Default   | Description |
+|---------------------------|-----------|-------------|
+| `MAX_UPLOAD_MB`           | `1024`    | Max upload size (MB). |
+| `MAX_IMAGE_MEGAPIXELS`    | `2000`    | Decoded-image pixel ceiling (decompression-bomb guard). |
+| `MAX_IMAGE_DECODE_RATIO`  | `300`     | Max decoded-size / file-size ratio before an image is rejected as a bomb. |
+| `MAX_PDF_PAGES`           | `5000`    | Max pages accepted from a single PDF. |
+| `PDF_CAPPED_DPI`          | `600`     | PDF rasterization DPI cap while unlimited native import is **off**. |
+| `PDF_RASTER_ZOOM`         | `4.0`     | Rasterization floor for vector/low-DPI PDF pages (zoom × 72 ≈ 288 DPI). |
+| `PDF_SANITY_DPI`          | `4800`    | Absolute rasterization guard, applied even with unlimited native import **on**. |
+| `PDF_UNLIMITED_NATIVE`    | *(unset)* | Force unlimited native-resolution PDF import on (`1`) or off (`0`). Overrides the stored toggle; enabling it in Settings requires ≥8 GB of swap, and this env override skips that check for headless deploys. |
+
+### Identification & catalogs
+
+| Variable                    | Default          | Description |
+|-----------------------------|------------------|-------------|
+| `REFERENCE_PROVIDER`        | `tcgcsv`         | Reference-catalog data provider. |
+| `IDENTIFY_PROVIDER`         | stored setting   | External card-ID service used when local OCR/catalog matching fails: `ximilar`, `cardsight`, or `none`. The env var overrides the choice stored in `system_config.json`. |
+| `XIMILAR_IDENTIFY_FALLBACK` | *(unset)*        | Legacy on/off switch for the Ximilar fallback; env overrides the stored toggle. Prefer `IDENTIFY_PROVIDER`. |
+| `AUTO_IDENTIFY_MIN_SCORE`   | `0.60`           | Auto-accept confidence threshold for import auto-identification (`0.45`–`1.0`; accepts a fraction or a percentage). A value saved via the Settings slider takes precedence; the env var covers headless installs that never touched the slider. |
+| `XIMILAR_API_TOKEN`         | *(unset)*        | Ximilar API token (image-based card recognition). |
+| `CARDSIGHT_API_KEY`         | *(unset)*        | CardSight AI API key (image-based card ID, free tier available). |
+| `JUSTTCG_API_KEY`           | *(unset)*        | JustTCG API key (price lookups and manual search). |
+| `POKEMONTCG_API_KEY`        | *(unset)*        | pokemontcg.io API key for the Pokémon catalog sync (optional — raises rate limits). |
+
+API keys can also be entered under **Settings → API Keys**; a key saved there takes
+precedence over its environment variable.
+
+### Background pollers & platform
+
+| Variable                   | Default   | Description |
+|----------------------------|-----------|-------------|
+| `EMAIL_MONITOR_BACKGROUND` | *(unset)* | `1` starts the background IMAP sale-email poller at launch. Off by default — "Check now" in the UI always works regardless. |
+| `SHIPPING_POLL_BACKGROUND` | *(unset)* | `1` starts the background shipment-tracking poller. Off by default — "Refresh tracking" in the UI always works regardless. |
+| `INVENTORY_MAX_RECORDS`    | `1000000` | Record cap enforced in Sorting Machine mode (Dedicated Server lifts it). |
+| `FORCE_PI` / `FORCE_NOT_PI`| *(unset)* | `1` overrides Raspberry Pi hardware detection (Pi installs are limited to Sorting Machine mode). |
 
 The advertised network name (`<name>.local`) is set in **Settings → Network Name**.
+
+### App-managed config files
+
+Two JSON files next to `app.py` hold state the app writes itself — manage them through
+the UI rather than by hand:
+
+- `system_config.json` — system mode, the unlimited native-import toggle, and the
+  identification provider.
+- `storage_config.json` — where uploads, temp files, and the SQLite database live
+  (**Settings → Storage**). Machine-local paths; gitignored.
 
 ---
 
@@ -306,22 +360,35 @@ For internet exposure (beyond a trusted LAN), place the app behind a reverse pro
 that terminates a publicly-trusted certificate (e.g. Tailscale, Cloudflare Tunnel, or Nginx +
 Let's Encrypt).
 
+See [`SECURITY.md`](SECURITY.md) for the reporting policy and the rules on handling
+secrets in this repository.
+
 ---
 
 ## Project structure
 
 ```
 .
-├── app.py               # Main Flask application: routes, imaging/OCR, auth, reports, shops…
-├── models.py            # SQLAlchemy models (ScanRecord, Product, SaleEvent, Reference*, …)
-├── builder.py           # "Builder" tool for assembling sellable lots/products
-├── shop_providers.py    # Marketplace/shop integrations (e.g. eBay)
-├── email_monitor.py     # Optional sale/email monitoring
-├── card_ocr.py          # OCR + catalog-matching helpers
-├── templates/           # Jinja templates (inventory, import, albums, analytics, settings…)
-├── static/              # CSS, images, and other static assets
-├── certs/               # Auto-generated self-signed TLS cert/key (gitignored)
-└── requirements.txt
+├── app.py                 # Main Flask application: routes, imaging/OCR, auth, reports, shops…
+├── models.py              # SQLAlchemy models (ScanRecord, Product, SaleEvent, Reference*, …)
+├── builder.py             # "Builder" tool for assembling sellable lots/products
+├── card_ocr.py            # RapidOCR engine + card name/number reading and catalog matching
+├── shop_providers.py      # Marketplace/shop integrations (e.g. eBay)
+├── shipping_models.py     # Shipping subsystem: orders, labels, USPS tracking…
+├── shipping_providers.py  #   …provider integrations (EasyPost postage)…
+├── shipping_routes.py     #   …and the /shipping blueprint (see INTEGRATION.md)
+├── email_monitor.py       # Optional IMAP sale-email monitoring
+├── tcgcsv_sync.py         # tcgcsv reference-catalog sync
+├── pokemontcg_sync.py     # pokemontcg.io reference-catalog sync
+├── templates/             # Jinja templates (inventory, import, albums, analytics, settings…)
+├── static/                # CSS, images, and other static assets
+├── tools/                 # Repo QA / checker scripts (not needed to run the app)
+├── certs/                 # Auto-generated self-signed TLS cert/key (gitignored)
+├── system_config.json     # App-managed: system mode + identification provider
+├── requirements.txt       # Dependency floors
+├── requirements.lock      # Pinned, verified install set (preferred for installs)
+├── INTEGRATION.md         # Shipping-integration design notes
+└── SECURITY.md            # Security policy and secret-handling rules
 ```
 
 > The main application logic lives in `app.py`; several inline admin/utility pages (auth,
@@ -338,7 +405,9 @@ Let's Encrypt).
 - OCR accuracy depends on lighting, framing, and catalog coverage — always review matches.
 - Catalog matching requires the relevant **game catalog to be downloaded** first.
 - Some features are optional and degrade gracefully if their library isn't installed
-  (PDF import → PyMuPDF, OCR → Tesseract, `.local` name → zeroconf).
+  (PDF import → PyMuPDF, Search-by-Image shortlisting → hnswlib, `.local` name → zeroconf).
+- OCR model files (PP-OCRv5 mobile) download automatically on first OCR use, so the
+  first scan needs network access; after that OCR runs fully offline.
 
 ---
 
@@ -351,20 +420,11 @@ Contributions are welcome. A typical workflow:
 3. Verify the app still boots and the affected pages work.
 4. Open a pull request describing the change and motivation.
 
-Please avoid committing local data, uploads, the SQLite database, or generated
-certificates. A suggested `.gitignore`:
-
-```gitignore
-.venv/
-__pycache__/
-*.pyc
-.env
-certs/
-*.sqlite3
-*.db
-uploads/
-instance/
-```
+Please avoid committing local data, uploads, the SQLite database, generated
+certificates, or key material. The repository's tracked [`.gitignore`](.gitignore)
+already covers all of these (databases, uploads, certs, keys by extension, `.env`,
+migration bundles, `storage_config.json`) — if a new kind of local artifact appears,
+extend it there rather than in a local exclude.
 
 ---
 
