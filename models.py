@@ -5,6 +5,35 @@ import json
 db = SQLAlchemy()
 
 
+# ── Why money is db.Float here, deliberately ────────────────────────────────
+# Reviewed 2026-08-07. The obvious "fix" — swapping these columns to
+# db.Numeric(10, 2) — was investigated and rejected on evidence:
+#
+#   * It would not fix the reported symptom. The analytics and report money
+#     (intake_price / current_value / sold_price) lives in ScanRecord.
+#     extracted_data JSON and is parsed by _analytics_money() into floats. It
+#     never passes through these columns, so retyping them changes nothing
+#     about those sums.
+#   * SQLite stores NUMERIC as REAL anyway (verified: typeof() == 'real'), so
+#     the on-disk value stays a binary float. Numeric only adds a Python-side
+#     Decimal conversion.
+#   * Flask serializes Decimal as a JSON *string* ("12.34", not 12.34), which
+#     would change the type of every money field in ~355 jsonify responses —
+#     breaking the templates' JS arithmetic and the marketplace payloads that
+#     do float()/round()/f-string formatting on them.
+#   * Decimal * float raises TypeError, and ~87 sites in app.py do money
+#     arithmetic; any missed one is a 500 in a marketplace push or a report.
+#
+# What actually protects correctness is that every money OUTPUT path rounds or
+# formats to cents at the boundary (analytics round(...,2), the overview's
+# per-row + total rounding, _money_str's ",.2f"). A 200-trial property test at
+# realistic scale confirms boundary rounding agrees with exact decimal
+# arithmetic. Those invariants are pinned by .scratch/test_money_invariants.py
+# — if you add a money output, round it at the boundary and the suite will
+# tell you when you forget.
+# ────────────────────────────────────────────────────────────────────────────
+
+
 def utcnow():
     """Naive UTC now — the storage convention for every datetime column.
 
