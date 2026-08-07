@@ -193,9 +193,15 @@ command is in the lock file's header) so the next person inherits a tested set.
 
 ## Running the app
 
+**The app requires administrator/root privileges and refuses to start without them.**
+
 ```bash
-python app.py
+sudo -E python3 app.py          # Linux / macOS
+python app.py                   # Windows, from a terminal opened "as administrator"
 ```
+
+`sudo -E` preserves your environment, so `PORT`, `USE_HTTPS` and any other variables you
+set still apply; plain `sudo` clears them.
 
 Launch begins with an environment **preflight** that verifies Python 3.10+, every
 required package, and the OpenCV system libraries — a broken install prints the exact
@@ -228,10 +234,32 @@ local network. On first launch it generates a self-signed certificate (stored in
 
 Notes on access:
 
-- **Port 443 is privileged.** Run with elevated privileges to bind it, or the app
-  automatically falls back to `https://cardcollector.local:8443`. On Linux you can grant
-  the capability once instead of using `sudo`:
-  `sudo setcap 'cap_net_bind_service=+ep' $(readlink -f $(which python3))`.
+- **Administrator privileges are required.** The app checks at startup and exits if it is
+  not elevated, rather than starting in a reduced state. Port 443 is the concrete reason —
+  every port below 1024 is reserved for root — and starting unprivileged would silently
+  move the app to `:8443`.
+  ```bash
+  sudo -E python3 app.py       # Linux / macOS — -E keeps PORT, USE_HTTPS and friends
+  ```
+  On Windows, start the terminal with **Run as administrator**, then `python app.py`.
+  There is deliberately **no environment variable to bypass the check**: an override would
+  end up in a shell profile and turn the requirement back into a suggestion.
+- **Root is given up as soon as the port is bound.** The launch has a short privileged
+  phase — bind the port, drop to an ordinary account, permanently and verified — and
+  everything after it runs unprivileged, including the database, migrations, uploads and
+  the certificate. So the app is *started* with sudo but does not *run* as root, and
+  nothing it writes ends up owned by root. Startup prints the account it dropped to:
+  ```
+  [privileges] Bound port 443 as root, then dropped to 'chris' (uid 1000, gid 1000) — permanently, verified.
+  ```
+  The account is `SUDO_USER` (whoever typed sudo) unless `CCIM_RUN_AS` names another. If
+  neither resolves, the app says so and continues as root rather than guessing.
+- **Files must belong to that account.** After dropping, the app checks it can write the
+  storage roots and stops with the exact `chown` if it cannot — which is what an earlier
+  root-owned run leaves behind. Windows has no equivalent of dropping and keeps the
+  elevated token; `FLASK_DEBUG=1` also skips the drop, because the reloader re-executes
+  the file and the unprivileged child would hit the startup check on every edit.
+- **`python preflight.py`** reports an unelevated shell before you get as far as launching.
 - **Self-signed certificate warning:** each device shows a one-time "not secure" prompt —
   accept it once to enable full functionality (including the live camera). To remove the
   warning, drop a locally-trusted cert (e.g. via [mkcert](https://github.com/FiloSottile/mkcert))
@@ -278,6 +306,7 @@ values can also be set in the UI and persist in the app's settings store or in
 | `USE_HTTPS`               | `1`                | Serve over HTTPS with a self-signed cert. `0` for plain HTTP. |
 | `PORT`                    | `443` / `80`       | Listening port (HTTPS / HTTP default). |
 | `PORT_FALLBACK`           | `8443` / `5005`    | Port used if the primary port can't bind. |
+| `CCIM_RUN_AS`             | `SUDO_USER`        | Account to drop to once the port is bound. Must own the checkout and the storage roots. |
 | `SECRET_KEY`              | *(auto-persisted)* | Flask session secret. Auto-generated and stored if unset. |
 | `SESSION_COOKIE_SECURE`   | *(unset)*          | Mark the session cookie `Secure`. **Set this to `1` when running behind a TLS-terminating reverse proxy** (e.g. nginx, Tailscale, or Cloudflare in front of `python app.py`): the app sees plain HTTP there and cannot tell. Running `python app.py` over HTTPS turns it on by itself. Leave unset for plain HTTP — a `Secure` cookie on an `http://` origin is never sent back, which looks like "login does nothing". |
 | `IMAP_ALLOW_INSECURE_TLS` | *(unset)*          | Accept an IMAP server certificate that isn't trusted or doesn't match the hostname. **Only set this for your own mail server with a self-signed certificate** — it disables the check that stops anything on the network path from impersonating your mail provider and collecting the mailbox password. It does **not** allow an unencrypted connection: a server that won't start TLS is still refused. |

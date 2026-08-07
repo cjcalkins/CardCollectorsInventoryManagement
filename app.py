@@ -16401,18 +16401,153 @@ def restart_mdns(new_name):
     return name
 
 
-def _port_bindable(port):
-    """True if we can bind the given TCP port on all interfaces right now."""
+def _bind_listening_socket(port, backlog=128):
+    """Bind and listen on the given TCP port; return (socket, None) or (None, OSError).
+
+    The socket is kept open on success. That is the entire point: binding a
+    privileged port is the one thing that needs root, so it happens first and the
+    live descriptor is handed to the server after root is gone.
+
+    The OSError is returned rather than collapsed to a bool because EACCES and
+    EADDRINUSE call for opposite advice — "something outside the app is denying the
+    port" versus "a second copy is already running"."""
     import socket
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         s.bind(("0.0.0.0", port))
-        return True
-    except OSError:
-        return False
-    finally:
+        s.listen(backlog)
+        s.set_inheritable(True)
+        return s, None
+    except OSError as exc:
         s.close()
+        return None, exc
+
+
+def _run_as_target():
+    """(name, uid, gid) of the account to run as after the port is bound, or None
+    if there is nobody to drop to.
+
+    CCIM_RUN_AS wins when set. Otherwise SUDO_USER — the account that typed
+    `sudo`, which is also the account that owns the checkout and everything the
+    app writes, so it is the one choice that does not create file-ownership
+    problems. uid 0 is never a target: dropping to root is not dropping."""
+    import pwd
+    name = (os.environ.get("CCIM_RUN_AS") or os.environ.get("SUDO_USER") or "").strip()
+    if not name:
+        return None
+    try:
+        ent = pwd.getpwnam(name)
+    except KeyError:
+        return None
+    if ent.pw_uid == 0:
+        return None
+    return (ent.pw_name, ent.pw_uid, ent.pw_gid)
+
+
+def _drop_privileges(target):
+    """Permanently drop to (name, uid, gid).
+
+    Order is load-bearing and is the classic way this gets written wrong:
+    supplementary groups and the gid must be set BEFORE the uid, because after
+    setuid the process no longer has the privilege to change either — a setuid-
+    first version silently keeps root's group memberships.
+
+    Verifies afterwards that root cannot be regained. A drop that can be undone
+    is not a drop, and an unverified one would leave the app claiming a guarantee
+    it does not have."""
+    name, uid, gid = target
+    os.initgroups(name, gid)     # replaces root's supplementary groups
+    os.setgid(gid)
+    os.setuid(uid)
+    if os.getuid() != uid or os.geteuid() != uid or os.getgid() != gid:
+        raise RuntimeError(f"privilege drop to {name} did not take effect")
+    try:
+        os.setuid(0)
+    except OSError:
+        return                    # expected: the drop is irreversible
+    raise RuntimeError("root could be regained after dropping privileges — "
+                       "refusing to serve")
+
+
+def _first_existing_dir(path):
+    """The nearest existing directory at or above path (storage roots are created
+    later, so the check has to look at what exists now)."""
+    p = os.path.abspath(path if os.path.isdir(path) else os.path.dirname(path) or ".")
+    while not os.path.isdir(p):
+        parent = os.path.dirname(p)
+        if parent == p:
+            return p
+        p = parent
+    return p
+
+
+def _unwritable_dirs(paths):
+    """Which of these locations the current account cannot write into. Run after a
+    privilege drop: files left behind by an earlier root launch are exactly what
+    stops the dropped account, and finding out here beats finding out from a
+    'readonly database' error three screens later."""
+    bad = []
+    for raw in paths:
+        if not raw:
+            continue
+        d = _first_existing_dir(raw)
+        if not os.access(d, os.W_OK | os.X_OK) and d not in bad:
+            bad.append(d)
+    return bad
+
+
+def _is_elevated():
+    """True if this process holds administrator/root privileges.
+
+    POSIX: the EFFECTIVE uid is what the kernel checks when binding a privileged
+    port, so that — not the real uid — is the one to test; under sudo they differ.
+    Windows: shell32.IsUserAnAdmin() reports whether the process is running with
+    an elevated token, which is what "Run as administrator" produces.
+
+    Anything unexpected answers False. A privilege check that fails open is worse
+    than one that fails closed: the whole point is that a launch which cannot do
+    the privileged work stops instead of half-working."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+    try:
+        return os.geteuid() == 0
+    except AttributeError:
+        return False
+
+
+def _require_elevated():
+    """Stop the launch unless this process is elevated. Called first in the
+    __main__ block, before the database, the storage roots or the certificate are
+    touched, so a refused launch changes nothing on disk.
+
+    Deliberately has no environment-variable bypass: an override that exists is an
+    override that ends up in someone's shell profile, and then the requirement is
+    back to being a suggestion. Importing this module is unaffected — the gate is
+    in __main__ only, so test harnesses and `flask shell` still import freely."""
+    if _is_elevated():
+        return
+    print("Card Collector Inventory Manager — administrator privileges are required.")
+    print("")
+    if os.name == "nt":
+        print("  Close this window, right-click your terminal (or the shortcut),")
+        print("  choose 'Run as administrator', and start the app again:")
+        print("      python app.py")
+    else:
+        print("  Start it with sudo, keeping your environment so PORT / USE_HTTPS")
+        print("  and any other variables you set still apply:")
+        print("      sudo -E python3 app.py")
+        print("")
+        print("  Plain 'sudo python3 app.py' also works, but sudo clears the")
+        print("  environment by default, so shell variables would be dropped.")
+    print("")
+    print("Refusing to start unprivileged: a partly-privileged run is harder to")
+    print("diagnose than one that stops here.")
+    raise SystemExit(1)
 
 
 # SPKI SHA-256 of keypairs that are known to be public and must never be served.
@@ -16461,13 +16596,28 @@ def _ensure_self_signed_cert(cert_dir, hostnames, ips):
     key_path = os.path.join(cert_dir, "cardcollector.key")
     if os.path.exists(cert_path) and os.path.exists(key_path):
         try:
+            with open(cert_path, "rb"):
+                pass
             with open(key_path, "rb") as f:
-                fingerprint = _spki_sha256(f.read())
-        except OSError:
-            fingerprint = None
-        # Only a POSITIVE match discards the pair. An unreadable or unparseable key gives
-        # None, which is not in the set, so it is reused exactly as before — a transient
-        # read error must not churn a legitimate certificate on every boot.
+                key_pem = f.read()
+        except OSError as exc:
+            # A pair this process cannot read is a pair it cannot serve: the same
+            # process hands these paths to werkzeug moments later, so the failure is
+            # deterministic, not transient. Returning it anyway deferred the error
+            # into app.run(), which is outside the caller's try — so the launcher
+            # died with a raw PermissionError instead of falling back to HTTP. The
+            # usual cause is a single earlier start with sudo: that run leaves
+            # certs/ owned by root with the key at 0600, and every ordinary run
+            # afterwards crashes, which reads as "this app needs sudo".
+            raise RuntimeError(
+                f"the certificate exists but cannot be read ({exc}). It belongs to a "
+                f"different account than this launch — most often because an earlier "
+                f"run used one and this one uses another. Hand it to the account the "
+                f"app runs as:  chown -R <that account> {cert_dir}")
+        fingerprint = _spki_sha256(key_pem)
+        # Only a POSITIVE match discards the pair. An unparseable key gives None,
+        # which is not in the set, so it is reused exactly as before — a garbled read
+        # must not churn a legitimate certificate on every boot.
         if fingerprint not in _COMPROMISED_SPKI_SHA256:
             return cert_path, key_path
         print("[https] SECURITY: this certificate's private key was published in the "
@@ -16525,6 +16675,92 @@ def _ensure_self_signed_cert(cert_dir, hostnames, ips):
 
 
 if __name__ == "__main__":
+    # Privilege gate FIRST, ahead of every side effect below. A refused launch must
+    # not have moved the database, run a migration, written a certificate or created
+    # a storage root — otherwise the "wrong" launch leaves files owned by the wrong
+    # account, which is its own support problem.
+    _require_elevated()
+
+    # ---- privileged phase -------------------------------------------------------
+    # Everything that needs root happens here and nowhere else: bind the port, then
+    # give root away. Every side effect below this block — the database move,
+    # migrations, storage roots, the certificate — then runs as the ordinary account,
+    # so nothing on disk ends up owned by root. That ordering is the whole design;
+    # doing the drop later would leave root-owned files behind on first run.
+    # HTTPS is required for the live camera (getUserMedia) on machines other than the
+    # server, so it's ON by default; disable with USE_HTTPS=0. Default port is 443 for
+    # HTTPS, 80 for HTTP; override with PORT.
+    USE_HTTPS = os.environ.get("USE_HTTPS", "1").strip().lower() in ("1", "true", "yes", "on")
+    scheme = "https" if USE_HTTPS else "http"
+    default_port = 443 if USE_HTTPS else 80
+    DEBUG = os.environ.get("FLASK_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on")
+
+    PORT = int(os.environ.get("PORT", str(default_port)))
+    _sock, _bind_err = _bind_listening_socket(PORT)
+    if _bind_err is not None:
+        import errno as _errno
+        fallback = int(os.environ.get("PORT_FALLBACK", "8443" if USE_HTTPS else "5005"))
+        if _bind_err.errno == _errno.EADDRINUSE:
+            print(f"[port] Port {PORT} is already in use — another program (or a second "
+                  f"copy of this app) is holding it.")
+        elif _bind_err.errno == _errno.EACCES:
+            # Elevated and still refused: the privilege came from something narrower
+            # than root (a container without NET_BIND_SERVICE, an SELinux/AppArmor
+            # policy). "Use sudo" would be the wrong advice — this launch already is.
+            print(f"[port] Couldn't bind port {PORT}: {_bind_err.strerror}. This launch "
+                  f"is elevated, so something outside the app is denying the port — "
+                  f"check container capabilities or an SELinux/AppArmor policy.")
+        else:
+            print(f"[port] Couldn't bind port {PORT}: {_bind_err.strerror}.")
+        if PORT != fallback:
+            print(f"[port] Falling back to {fallback}. {scheme.upper()} still works, the "
+                  f"address just carries :{fallback}.")
+            PORT = fallback
+            _sock, _bind_err = _bind_listening_socket(PORT)
+    if _sock is None:
+        print(f"[port] Could not bind {PORT} either ({_bind_err}). Nothing to serve on — "
+              f"stopping.")
+        raise SystemExit(1)
+
+    _dropped = None
+    if DEBUG:
+        # The reloader re-executes this file as a child process. After a drop that
+        # child is unprivileged, so it would hit the privilege gate and exit — and a
+        # reloader that dies on every edit is worse than no drop in development.
+        print("[privileges] FLASK_DEBUG=1: staying elevated so the reloader keeps "
+              "working. Do not use debug mode for a normal run.")
+        _sock.close()
+        _sock = None
+    elif os.name == "nt":
+        print("[privileges] Windows has no equivalent of dropping to another account; "
+              "the app continues with the elevated token.")
+    else:
+        _target = _run_as_target()
+        if _target is None:
+            print("[privileges] No unprivileged account to drop to — continuing as root.")
+            print("[privileges] Set CCIM_RUN_AS to the account that owns this checkout "
+                  "(sudo -E already provides SUDO_USER) to have the app give up root "
+                  "after binding the port.")
+        else:
+            _drop_privileges(_target)
+            _dropped = _target
+            print(f"[privileges] Bound port {PORT} as root, then dropped to "
+                  f"'{_target[0]}' (uid {_target[1]}, gid {_target[2]}) — permanently, "
+                  f"verified. The server runs unprivileged from here.")
+            # Anything an earlier root launch left behind is unwritable now. Say so
+            # here, with the command that fixes it, rather than let it surface as a
+            # 'readonly database' or a certificate error further down.
+            _bad = _unwritable_dirs(list(app.config.get("STORAGE_ROOTS", {}).values())
+                                    + [app.root_path])
+            if _bad:
+                print(f"[privileges] '{_target[0]}' cannot write these, so the app "
+                      f"cannot run as that account:")
+                for _d in _bad:
+                    print(f"[privileges]     {_d}")
+                print(f"[privileges] Most likely an earlier root launch created them. "
+                      f"Fix with:  sudo chown -R {_target[0]} <path>")
+                raise SystemExit(1)
+
     # Complete a staged DB relocation FIRST — before init_db opens anything —
     # so writes made after the move (which land in the old file) are carried
     # over; then run any legacy deferred deletions.
@@ -16598,27 +16834,8 @@ if __name__ == "__main__":
     print(" • /template_save   — Save a Game definition (name + fields)")
     print(" • /justtcg_fetch/<id>              — Fetch live price from JustTCG API (POST, manual trigger)")
     print(" • /tcg_save_url/<id>, /tcg_clear_url/<id> — Legacy URL save / pricing data clear")
-    # Port: default to 80 so the URL needs no ":port" suffix. Binding to 80 needs
-    # admin/root (ports below 1024 are privileged); if that's not available or 80
-    # is already in use, fall back so the app still starts. Override with the PORT
-    # env var (e.g. PORT=5005) to pin a specific port.
-    # HTTPS is required for the live camera (getUserMedia) to work on machines other
-    # than the server, so it's ON by default; a self-signed certificate is generated
-    # automatically. Disable with USE_HTTPS=0 to serve plain HTTP. Default port is
-    # 443 for HTTPS, 80 for HTTP.
-    USE_HTTPS = os.environ.get("USE_HTTPS", "1").strip().lower() in ("1", "true", "yes", "on")
-    scheme = "https" if USE_HTTPS else "http"
-    default_port = 443 if USE_HTTPS else 80
-
-    PORT = int(os.environ.get("PORT", str(default_port)))
-    if not _port_bindable(PORT):
-        fallback = int(os.environ.get("PORT_FALLBACK", "8443" if USE_HTTPS else "5005"))
-        if PORT != fallback:
-            print(f"[port] Couldn't bind port {PORT} — it needs admin/root privileges, "
-                  f"or it's already in use.")
-            print(f"[port] Falling back to {fallback}. To use {PORT}: launch with elevated "
-                  f"privileges (e.g. 'sudo'), or set PORT to a free port.")
-            PORT = fallback
+    # The port was bound (and privileges dropped) in the privileged phase at the top
+    # of this block; PORT, USE_HTTPS, scheme and default_port are already settled.
 
     with app.app_context():
         _mdns_name = get_mdns_name()
@@ -16638,8 +16855,16 @@ if __name__ == "__main__":
             if isinstance(exc, ImportError):
                 print("[https] HTTPS needs the 'cryptography' package. Install it with:")
                 print("[https]     pip install cryptography      (or: pip install -r requirements.txt)")
-            print(f"[https] Could not set up HTTPS ({exc}); serving over HTTP instead.")
-            print("[https] Note: the live camera won't work on other devices over HTTP.")
+            # On its own line: the certificate-permission message carries a command to
+            # run, and burying that in a parenthetical is how it gets skipped.
+            print(f"[https] Could not set up HTTPS: {exc}")
+            if isinstance(exc, PermissionError):
+                # makedirs failing, rather than the pair being unreadable — same
+                # ownership cause, so point at the same place.
+                print(f"[https] This is a file-permission problem, not a missing feature: "
+                      f"check who owns {cert_dir} and its parent.")
+            print("[https] Serving over HTTP instead — the live camera won't work on "
+                  "devices other than this machine.")
             USE_HTTPS = False
             scheme = "http"
             default_port = 80
@@ -16662,10 +16887,10 @@ if __name__ == "__main__":
         print(" • Running over HTTP — the live camera won't work on other devices. "
               "HTTPS is the default; unset USE_HTTPS=0 to restore it.")
 
-    # The Werkzeug debug reloader is OFF by default: its interactive debugger allows
-    # remote code execution, which is dangerous on a LAN-exposed server. Turn it on
-    # only for local development with FLASK_DEBUG=1.
-    DEBUG = os.environ.get("FLASK_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on")
+    # DEBUG was read in the privileged phase: it decides whether privileges are
+    # dropped at all, which has to be settled before the port is bound. The Werkzeug
+    # debug reloader stays OFF by default — its interactive debugger allows remote
+    # code execution, which is dangerous on a LAN-exposed server.
 
     # Advertise mDNS from the process that actually serves requests: the reloader
     # child when debug is on (WERKZEUG_RUN_MAIN==true), or the sole process when off.
@@ -16674,7 +16899,22 @@ if __name__ == "__main__":
         _mdns = start_mdns(_mdns_name, PORT, scheme=scheme)
 
     try:
-        app.run(host="0.0.0.0", port=PORT, debug=DEBUG, threaded=True, ssl_context=ssl_context)
+        if _sock is not None:
+            # Serve on the socket bound during the privileged phase. app.run() can't
+            # be used here: it goes through run_simple(), which only accepts an
+            # existing descriptor via the reloader's own environment variable, and
+            # rebinding is exactly what we cannot do now that root is gone.
+            # make_server() takes the descriptor directly and applies ssl_context to
+            # it, so HTTPS is unaffected by where the socket came from.
+            from werkzeug.serving import make_server
+            _srv = make_server("0.0.0.0", PORT, app, threaded=True,
+                               ssl_context=ssl_context, fd=_sock.fileno())
+            if hasattr(_srv, "log_startup"):
+                _srv.log_startup()
+            _srv.serve_forever()
+        else:
+            app.run(host="0.0.0.0", port=PORT, debug=DEBUG, threaded=True,
+                    ssl_context=ssl_context)
     finally:
         if _mdns is not None:
             try:
