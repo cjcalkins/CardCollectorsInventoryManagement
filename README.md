@@ -193,9 +193,15 @@ command is in the lock file's header) so the next person inherits a tested set.
 
 ## Running the app
 
+**The app requires administrator/root privileges and refuses to start without them.**
+
 ```bash
-python app.py
+sudo -E python3 app.py          # Linux / macOS
+python app.py                   # Windows, from a terminal opened "as administrator"
 ```
+
+`sudo -E` preserves your environment, so `PORT`, `USE_HTTPS` and any other variables you
+set still apply; plain `sudo` clears them.
 
 Launch begins with an environment **preflight** that verifies Python 3.10+, every
 required package, and the OpenCV system libraries — a broken install prints the exact
@@ -228,29 +234,21 @@ local network. On first launch it generates a self-signed certificate (stored in
 
 Notes on access:
 
-- **The app never needs `sudo` to run, and never needs it for HTTPS.** What needs
-  privilege is the *number* 443: on Linux and macOS every port below 1024 is reserved for
-  root. If 443 won't bind, the app says so and serves HTTPS on
-  `https://cardcollector.local:8443` instead — same certificate, same camera access, the
-  address just carries the port. Running as an ordinary user is the recommended way to
-  run it.
-- **To drop the `:8443` suffix**, pick one of these. Each needs root **once, at setup** —
-  never at launch:
-  - *Lower the reserved range* (simplest, and it grants nothing to any program):
-    ```bash
-    sudo sysctl -w net.ipv4.ip_unprivileged_port_start=443
-    echo net.ipv4.ip_unprivileged_port_start=443 | sudo tee /etc/sysctl.d/50-cardcollector.conf
-    ```
-  - *Grant the interpreter the bind capability*:
-    `sudo setcap 'cap_net_bind_service=+ep' $(readlink -f $(which python3))`. Note what this
-    actually does: `readlink -f` resolves a virtualenv's `python3` to the **system**
-    interpreter, so the capability is granted to every Python program on the machine, not
-    just this app — and it is silently lost whenever python3 is upgraded or reinstalled.
-  - *Redirect the port* with nftables/iptables, or put a reverse proxy in front.
-- **Never start it with `sudo` "just to test".** That run writes `certs/` owned by root
-  with the key mode `0600`, and every later ordinary run then finds a certificate it
-  cannot read. The app reports this and falls back to HTTP rather than failing; the fix is
-  `sudo chown -R $(id -un):$(id -gn) certs`.
+- **Administrator privileges are required.** The app checks at startup and exits if it is
+  not elevated, rather than starting in a reduced state. Port 443 is the concrete reason —
+  every port below 1024 is reserved for root — and starting unprivileged would silently
+  move the app to `:8443`.
+  ```bash
+  sudo -E python3 app.py       # Linux / macOS — -E keeps PORT, USE_HTTPS and friends
+  ```
+  On Windows, start the terminal with **Run as administrator**, then `python app.py`.
+  There is deliberately **no environment variable to bypass the check**: an override would
+  end up in a shell profile and turn the requirement back into a suggestion.
+- **Use the same account every time.** `certs/`, `uploads/` and the database are written by
+  whoever runs the app; alternating between `sudo` and an ordinary user leaves files the
+  other account cannot read. If that happens the app reports which path and falls back to
+  HTTP instead of crashing — `chown -R` the directory to the account you launch with.
+- **`python preflight.py`** reports an unelevated shell before you get as far as launching.
 - **Self-signed certificate warning:** each device shows a one-time "not secure" prompt —
   accept it once to enable full functionality (including the live camera). To remove the
   warning, drop a locally-trusted cert (e.g. via [mkcert](https://github.com/FiloSottile/mkcert))

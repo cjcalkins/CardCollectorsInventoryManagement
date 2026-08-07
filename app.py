@@ -16425,6 +16425,59 @@ def _port_bindable(port):
     return _bind_error(port) is None
 
 
+def _is_elevated():
+    """True if this process holds administrator/root privileges.
+
+    POSIX: the EFFECTIVE uid is what the kernel checks when binding a privileged
+    port, so that — not the real uid — is the one to test; under sudo they differ.
+    Windows: shell32.IsUserAnAdmin() reports whether the process is running with
+    an elevated token, which is what "Run as administrator" produces.
+
+    Anything unexpected answers False. A privilege check that fails open is worse
+    than one that fails closed: the whole point is that a launch which cannot do
+    the privileged work stops instead of half-working."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+    try:
+        return os.geteuid() == 0
+    except AttributeError:
+        return False
+
+
+def _require_elevated():
+    """Stop the launch unless this process is elevated. Called first in the
+    __main__ block, before the database, the storage roots or the certificate are
+    touched, so a refused launch changes nothing on disk.
+
+    Deliberately has no environment-variable bypass: an override that exists is an
+    override that ends up in someone's shell profile, and then the requirement is
+    back to being a suggestion. Importing this module is unaffected — the gate is
+    in __main__ only, so test harnesses and `flask shell` still import freely."""
+    if _is_elevated():
+        return
+    print("Card Collector Inventory Manager — administrator privileges are required.")
+    print("")
+    if os.name == "nt":
+        print("  Close this window, right-click your terminal (or the shortcut),")
+        print("  choose 'Run as administrator', and start the app again:")
+        print("      python app.py")
+    else:
+        print("  Start it with sudo, keeping your environment so PORT / USE_HTTPS")
+        print("  and any other variables you set still apply:")
+        print("      sudo -E python3 app.py")
+        print("")
+        print("  Plain 'sudo python3 app.py' also works, but sudo clears the")
+        print("  environment by default, so shell variables would be dropped.")
+    print("")
+    print("Refusing to start unprivileged: a partly-privileged run is harder to")
+    print("diagnose than one that stops here.")
+    raise SystemExit(1)
+
+
 # SPKI SHA-256 of keypairs that are known to be public and must never be served.
 # The 2048-bit RSA key below was committed here in 65e455c4 (2026-07-14) and removed in
 # 0787925 (2026-07-29) by a delete-commit, NOT a history rewrite — so it stays recoverable
@@ -16485,9 +16538,10 @@ def _ensure_self_signed_cert(cert_dir, hostnames, ips):
             # certs/ owned by root with the key at 0600, and every ordinary run
             # afterwards crashes, which reads as "this app needs sudo".
             raise RuntimeError(
-                f"the certificate exists but cannot be read ({exc}). If the app was "
-                f"ever started with sudo, that run left {cert_dir} owned by root — "
-                f"take it back with:  sudo chown -R $(id -un):$(id -gn) {cert_dir}")
+                f"the certificate exists but cannot be read ({exc}). It belongs to a "
+                f"different account than this launch — most often because an earlier "
+                f"run used one and this one uses another. Hand it to the account the "
+                f"app runs as:  chown -R <that account> {cert_dir}")
         fingerprint = _spki_sha256(key_pem)
         # Only a POSITIVE match discards the pair. An unparseable key gives None,
         # which is not in the set, so it is reused exactly as before — a garbled read
@@ -16549,6 +16603,12 @@ def _ensure_self_signed_cert(cert_dir, hostnames, ips):
 
 
 if __name__ == "__main__":
+    # Privilege gate FIRST, ahead of every side effect below. A refused launch must
+    # not have moved the database, run a migration, written a certificate or created
+    # a storage root — otherwise the "wrong" launch leaves files owned by the wrong
+    # account, which is its own support problem.
+    _require_elevated()
+
     # Complete a staged DB relocation FIRST — before init_db opens anything —
     # so writes made after the move (which land in the old file) are carried
     # over; then run any legacy deferred deletions.
@@ -16638,7 +16698,6 @@ if __name__ == "__main__":
     _bind_err = _bind_error(PORT)
     if _bind_err is not None:
         import errno as _errno
-        import sys as _sys
 
         fallback = int(os.environ.get("PORT_FALLBACK", "8443" if USE_HTTPS else "5005"))
         if PORT != fallback:
@@ -16648,18 +16707,19 @@ if __name__ == "__main__":
             if _bind_err.errno == _errno.EADDRINUSE:
                 print(f"[port] Port {PORT} is already in use — another program (or a "
                       f"second copy of this app) is holding it.")
+            elif _bind_err.errno == _errno.EACCES:
+                # Reaching this while elevated means the privilege came from
+                # somewhere narrower than root (a container without
+                # NET_BIND_SERVICE, an SELinux/AppArmor policy). Saying "use sudo"
+                # here would be wrong — the launch already is.
+                print(f"[port] Couldn't bind port {PORT}: {_bind_err.strerror}. This "
+                      f"launch is elevated, so something outside the app is denying "
+                      f"the port — check container capabilities or an SELinux/AppArmor "
+                      f"policy.")
             else:
-                print(f"[port] Couldn't bind port {PORT}: {_bind_err.strerror}. Ports "
-                      f"below 1024 are privileged and this process is not root.")
-            print(f"[port] Falling back to {fallback}. Nothing else changes — {scheme.upper()} "
-                  f"still works, the address just carries :{fallback}.")
-            if _bind_err.errno == _errno.EACCES and _sys.platform.startswith("linux"):
-                # Neither of these is needed to run the app; they only remove the
-                # ":port" suffix. Both need root ONCE, at setup, never at launch.
-                print(f"[port] To serve on {PORT} as an ordinary user (Linux, one-time root):")
-                print(f"[port]     sudo sysctl -w net.ipv4.ip_unprivileged_port_start={PORT}")
-                print(f"[port]     echo net.ipv4.ip_unprivileged_port_start={PORT} | "
-                      f"sudo tee /etc/sysctl.d/50-cardcollector.conf   # to persist it")
+                print(f"[port] Couldn't bind port {PORT}: {_bind_err.strerror}.")
+            print(f"[port] Falling back to {fallback}. {scheme.upper()} still works, the "
+                  f"address just carries :{fallback}.")
             PORT = fallback
 
     with app.app_context():

@@ -161,12 +161,38 @@ def run_preflight():
         sys.exit(1)
 
 
+def _elevated():
+    """Best-effort 'is this an administrator/root shell'. Advisory only here — the
+    binding decision lives in app.py's launcher, and this module is imported by
+    app.py at import time, so nothing in it may exit on a privilege check."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return None      # unknown, not "no"
+    try:
+        return os.geteuid() == 0
+    except AttributeError:
+        return None
+
+
 def main():
     if os.environ.get("CCIM_SKIP_PREFLIGHT") == "1":
         print("[preflight] Skipped: CCIM_SKIP_PREFLIGHT=1 is set — nothing was checked.")
         return 0
     run_preflight()
-    print("[preflight] All required dependencies are importable. Ready to run: python app.py")
+    print("[preflight] All required dependencies are importable.")
+    # Say it here rather than let the launcher be the first to mention it: finding
+    # out about the privilege requirement from a preflight that just said "ready"
+    # is a worse experience than being told in the same breath.
+    if _elevated() is False:
+        launch = "python app.py" if os.name == "nt" else "sudo -E python3 app.py"
+        print("[preflight] This shell is NOT elevated. The app requires administrator "
+              "privileges and will refuse to start.")
+        print("[preflight] Ready to run, once elevated:  %s" % launch)
+    else:
+        print("[preflight] Ready to run: python app.py")
     return 0
 
 
