@@ -79,3 +79,10 @@ ccim_migration_*.tar.gz
 # install's directory paths and is never meant to be shared. Root-anchored so it
 # cannot swallow a same-named file elsewhere in the tree.
 /storage_config.json
+
+# Per-install system state written next to app.py by the app itself (system mode,
+# unlimited native-import toggle, identification provider). A committed copy
+# pre-answers the first-run Sorting Machine vs Dedicated Server chooser for every
+# fresh clone, which is how one install's mode ended up shipped to everyone.
+# Root-anchored for the same reason as storage_config.json above.
+/system_config.json

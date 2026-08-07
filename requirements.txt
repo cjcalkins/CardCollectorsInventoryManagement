@@ -27,4 +27,10 @@ requests>=2.31                   # provider / marketplace API calls
 
 # ── Optional (features degrade gracefully if missing) ──
 PyMuPDF>=1.24                    # optional: PDF import/rasterization  (import "fitz")
-zeroconf>=0.130                 # optional: advertises the stable <name>.local address
+zeroconf>=0.130                  # optional: advertises the stable <name>.local address
+# hnswlib>=0.8                   # optional: ANN shortlist for Search by Image on large
+#                                # collections. Left commented out because PyPI has no
+#                                # prebuilt wheels — installing it compiles C++ and would
+#                                # fail a first install on machines without a toolchain.
+#                                # Without it the search brute-forces with identical
+#                                # ranking, just slower. Enable with: pip install hnswlib
