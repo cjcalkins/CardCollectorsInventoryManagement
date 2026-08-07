@@ -974,12 +974,6 @@ def find_saved_image(subfolder, name):
     return None
 
 
-def _record_storage_type(record):
-    """A record's storage container kind: 'box' or 'album' (default)."""
-    val = str((record.extracted_data or {}).get("storage_type", "") or "").strip().lower()
-    return "box" if val == "box" else "album"
-
-
 def build_storage_summary():
     """
     The container list without per-record hydration: one SQL aggregation over
@@ -3313,13 +3307,6 @@ def _csrf_token():
     return tok
 
 
-def csrf_exempt(view):
-    """Decorator to opt a view out of CSRF checks (e.g. a machine-to-machine
-    endpoint). Not currently used, but available for future non-browser callers."""
-    view._csrf_exempt = True
-    return view
-
-
 _CSRF_SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
 
 
@@ -3329,9 +3316,6 @@ def _csrf_protect():
         return
     path = request.path or "/"
     if path.startswith("/static/"):
-        return
-    fn = app.view_functions.get(request.endpoint)
-    if fn is not None and getattr(fn, "_csrf_exempt", False):
         return
     expected = session.get("_csrf")
     sent = (request.headers.get("X-CSRFToken")
@@ -15758,7 +15742,6 @@ def shops_email_test():
                     "message": result.get("message", ""), "connected": bool(result.get("ok"))})
 
 
-@app.route("/shops/email/check", methods=["POST"])
 def _email_cursor_bootstrap(m):
     """Initialize the UID cursor to the mailbox's current top when the monitor
     has never run (last_uid 0/None). Returns a status message when a bootstrap
@@ -15789,6 +15772,7 @@ def _email_cursor_bootstrap(m):
     return m.status_detail
 
 
+@app.route("/shops/email/check", methods=["POST"])
 def shops_email_check():
     denied = _require_admin()
     if denied:
