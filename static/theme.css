@@ -1,11 +1,13 @@
 /* ============================================================================
    Card Collector Inventory Manager — shared theme
    ----------------------------------------------------------------------------
-   One place for the whole app's colour profile. Loaded last on every page, so
-   it retints the existing pages without touching their layout. Tuned for long
-   sessions of reading entries and analytics: softer canvas, off-white surfaces
-   (less glare), calmer dark bands, and one restful teal accent instead of the
-   default electric blue. Change a value here and every page follows.
+   One place for the whole app's visual system. Loaded last on every page, so
+   it restyles the existing pages without touching their structure. Tuned for
+   long sessions of reading entries and analytics: softer canvas, off-white
+   surfaces (less glare), calmer dark bands, one restful teal accent instead of
+   the default electric blue — and a quiet depth model: cards sit on 1px
+   borders, shadows are reserved for hover lift and overlays. Type tops out at
+   semibold. Change a value here and every page follows.
    ============================================================================ */
 
 :root {
@@ -56,7 +58,17 @@
     --shadow-sm: 0 2px 10px rgba(35, 45, 52, .05);
     --shadow:    0 4px 16px rgba(35, 45, 52, .06);
     --shadow-lg: 0 10px 26px rgba(35, 45, 52, .09);
-    --radius:    14px;
+    --radius:    14px;   /* cards / large surfaces */
+    --radius-sm: 8px;    /* controls: buttons, inputs, chips */
+
+    /* Spacing scale — padding and margins snap to these steps */
+    --space-1: 4px;
+    --space-2: 8px;
+    --space-3: 12px;
+    --space-4: 16px;
+    --space-5: 24px;
+    --space-6: 32px;
+    --space-7: 48px;
 }
 
 /* ── Base ─────────────────────────────────────────────────────────────── */
@@ -64,7 +76,10 @@ body {
     background-color: var(--bg) !important;
     color: var(--text);
     -webkit-font-smoothing: antialiased;
+    font-size: 0.9375rem;   /* 15px — data-dense screens read better a step down */
 }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; }   /* semibold ceiling */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 a { color: var(--accent-text); }
 a:hover { color: var(--accent-strong); }
 code, .path-line, .masked {
@@ -82,6 +97,14 @@ code, .path-line, .masked {
     --bs-table-color: var(--on-ink);
     color: var(--on-ink);
 }
+
+/* ── Tables: calm data — even-width numerals, soft grid, quiet headers ── */
+.table {
+    --bs-table-border-color: var(--border);
+    font-variant-numeric: tabular-nums;
+}
+.table thead th { font-weight: 600; color: var(--text-soft); }
+table.analytics-table, #inventoryTable { font-variant-numeric: tabular-nums; }
 
 /* ── Buttons — route Bootstrap's own component variables ──────────────── */
 .btn-dark {
@@ -113,8 +136,10 @@ code, .path-line, .masked {
     --bs-btn-active-bg: var(--danger-text);--bs-btn-active-border-color: var(--danger-text);
     --bs-btn-disabled-bg: var(--danger);   --bs-btn-disabled-border-color: var(--danger);
 }
+.btn { --bs-btn-border-radius: var(--radius-sm); }
 
 /* ── Forms — calm teal focus instead of electric blue ─────────────────── */
+.form-control, .form-select { border-radius: var(--radius-sm); }
 .form-control:focus, .form-select:focus {
     border-color: var(--accent);
     box-shadow: 0 0 0 .2rem rgba(47, 125, 116, .18);
@@ -160,16 +185,27 @@ code, .path-line, .masked {
 .settings-sidebar a.ss-link:hover { background: var(--surface-2); color: var(--text); }
 .settings-sidebar a.ss-link.active { background: var(--ink); color: var(--on-ink); }
 
-/* ── Named surfaces (recolour only: bg / border / shadow) ─────────────── */
+/* ── Named surfaces: cards sit on 1px borders, flat at rest ───────────── */
 .setting-card, .stat-card, .quick-link, .cap-card, .step-card,
 .storage-card, .key-card, .panel, .card-mini, .type-group, .summary-card {
     background: var(--surface);
-    border-color: var(--border);
-    box-shadow: var(--shadow-sm);
+    border: 1px solid var(--border);
+    box-shadow: none;
 }
-.setting-card:hover, .quick-link:hover { box-shadow: var(--shadow-lg); border-color: var(--border-strong); }
-.table-card  { box-shadow: var(--shadow) !important; }
-.summary-card{ box-shadow: var(--shadow) !important; }
+.setting-card:hover, .quick-link:hover { box-shadow: var(--shadow); border-color: var(--border-strong); }
+.table-card  { box-shadow: none !important; border: 1px solid var(--border) !important; }
+.summary-card{ box-shadow: none !important; border: 1px solid var(--border) !important; }
+
+/* Page cards that carry their own literal shadows: flatten to the border
+   model; hover keeps a soft lift where the page had one. Overlay dialogs
+   (import OCR/progress) keep their deep shadows — depth means "floating". */
+.panel-card, .storage-card-wrap, .page-card, .search-card, .content-card,
+.tune-card, .connector-card, .detail-card {
+    border: 1px solid var(--border);
+    box-shadow: none;
+}
+.storage-card-wrap:hover { box-shadow: var(--shadow); border-color: var(--border-strong); }
+.dup-group:hover { box-shadow: var(--shadow-sm); }
 .pack-block  { border-color: var(--border-strong); }
 .danger-card { background: var(--surface); border-color: #e8b9bf; }
 .thumbnail, .mobile-card { background: var(--surface); border-color: var(--border); }
@@ -181,7 +217,7 @@ code, .path-line, .masked {
 }
 
 /* ── Album / box slots ────────────────────────────────────────────────── */
-.album-slot, .box-slot { border-color: var(--border); background: var(--surface); }
+.album-slot, .box-slot { border-color: var(--border); background: var(--surface); box-shadow: none; }
 .slot-label { background: var(--surface); border-top-color: var(--border); color: var(--text); }
 .slot-image-wrap, .empty-slot { background: var(--surface-2); }
 
@@ -236,9 +272,9 @@ table.analytics-table tr.total-row td { background: var(--surface-2); border-top
    ============================================================================ */
 
 /* ── Setup / choose-implementation ────────────────────────────────────── */
-.opt-card { background: var(--surface); border-color: var(--border); }
-.opt-card:hover:not(.disabled) { border-color: var(--border-strong); box-shadow: var(--shadow-lg); }
-.opt-card.selected { border-color: var(--accent); box-shadow: var(--shadow-lg); }
+.opt-card { background: var(--surface); border-color: var(--border); box-shadow: none; }
+.opt-card:hover:not(.disabled) { border-color: var(--border-strong); box-shadow: var(--shadow); }
+.opt-card.selected { border-color: var(--accent); box-shadow: var(--shadow); }
 .opt-card ul { color: var(--text-soft); }
 .opt-card .check { color: var(--accent); }
 .badge-cap   { background: var(--accent-soft);  color: var(--accent-text);  }
@@ -246,15 +282,15 @@ table.analytics-table tr.total-row td { background: var(--surface-2); border-top
 .disabled-note { color: var(--danger); }
 
 /* ── Inventory landing: game cards ────────────────────────────────────── */
-.game-card { box-shadow: var(--shadow); }
-.game-card:hover { box-shadow: var(--shadow-lg); }
+.game-card { border: 1px solid var(--border); box-shadow: none; }
+.game-card:hover { box-shadow: var(--shadow); border-color: var(--border-strong); }
 .game-meta, .empty-state { color: var(--muted); }
 .field-pill      { background: var(--surface-2); color: var(--text-soft); }
 .field-pill-more { background: var(--surface-3); color: var(--muted); }
 
 /* ── Albums ───────────────────────────────────────────────────────────── */
-.album-card-wrap { box-shadow: var(--shadow); }
-.album-card-wrap:hover { box-shadow: var(--shadow-lg); }
+.album-card-wrap { border: 1px solid var(--border); box-shadow: none; }
+.album-card-wrap:hover { box-shadow: var(--shadow); border-color: var(--border-strong); }
 .album-img-area { background: var(--surface-2); }
 .album-placeholder { background: var(--ink); }        /* softened dark card back */
 .album-name-label { background: var(--surface); border-top-color: var(--border); color: var(--text); }
