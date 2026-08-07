@@ -214,12 +214,13 @@ Notes on access:
 
 On a brand-new install the app walks through a short one-time setup:
 
-1. **System mode** (`/setup`) — choose **Sorting Machine** (SQLite, enforces the
+1. **Administrator account** (`/auth/setup`) — create the first admin. Creating it also
+   seeds three starter roles (table below).
+2. **System mode** (`/setup`) — choose **Sorting Machine** (SQLite, enforces the
    1,000,000-record cap; the only choice on a Raspberry Pi) or **Dedicated Server**
    (lifts the cap and, when `DATABASE_URL` is set, runs on PostgreSQL). The choice is
-   stored in `system_config.json` next to `app.py`.
-2. **Administrator account** (`/auth/setup`) — create the first admin. Creating it also
-   seeds three starter roles:
+   written to `system_config.json` next to `app.py` (gitignored — each install answers
+   for itself).
 
 | Role          | Access                                   |
 |---------------|-------------------------------------------|
@@ -229,11 +230,6 @@ On a brand-new install the app walks through a short one-time setup:
 
 After that, sign in at `/auth/login`. Manage users and roles from **Settings → Users** and
 **Settings → Roles**.
-
-> **Note:** the repository currently ships a committed `system_config.json` with the
-> mode already set to Dedicated Server (and unlimited native-resolution import turned
-> on), so a fresh clone skips step 1 and goes straight to admin creation. Delete
-> `system_config.json` before first launch if you want to pick the mode yourself.
 
 ---
 
@@ -299,13 +295,14 @@ The advertised network name (`<name>.local`) is set in **Settings → Network Na
 
 ### App-managed config files
 
-Two JSON files next to `app.py` hold state the app writes itself — manage them through
-the UI rather than by hand:
+Two JSON files next to `app.py` hold state the app writes itself. Both are created on
+first run and gitignored (they are per-install state) — manage them through the UI
+rather than by hand:
 
 - `system_config.json` — system mode, the unlimited native-import toggle, and the
   identification provider.
 - `storage_config.json` — where uploads, temp files, and the SQLite database live
-  (**Settings → Storage**). Machine-local paths; gitignored.
+  (**Settings → Storage**). Machine-local paths.
 
 ---
 
@@ -384,7 +381,6 @@ secrets in this repository.
 ├── static/                # CSS, images, and other static assets
 ├── tools/                 # Repo QA / checker scripts (not needed to run the app)
 ├── certs/                 # Auto-generated self-signed TLS cert/key (gitignored)
-├── system_config.json     # App-managed: system mode + identification provider
 ├── requirements.txt       # Dependency floors
 ├── requirements.lock      # Pinned, verified install set (preferred for installs)
 ├── INTEGRATION.md         # Shipping-integration design notes
