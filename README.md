@@ -228,10 +228,29 @@ local network. On first launch it generates a self-signed certificate (stored in
 
 Notes on access:
 
-- **Port 443 is privileged.** Run with elevated privileges to bind it, or the app
-  automatically falls back to `https://cardcollector.local:8443`. On Linux you can grant
-  the capability once instead of using `sudo`:
-  `sudo setcap 'cap_net_bind_service=+ep' $(readlink -f $(which python3))`.
+- **The app never needs `sudo` to run, and never needs it for HTTPS.** What needs
+  privilege is the *number* 443: on Linux and macOS every port below 1024 is reserved for
+  root. If 443 won't bind, the app says so and serves HTTPS on
+  `https://cardcollector.local:8443` instead — same certificate, same camera access, the
+  address just carries the port. Running as an ordinary user is the recommended way to
+  run it.
+- **To drop the `:8443` suffix**, pick one of these. Each needs root **once, at setup** —
+  never at launch:
+  - *Lower the reserved range* (simplest, and it grants nothing to any program):
+    ```bash
+    sudo sysctl -w net.ipv4.ip_unprivileged_port_start=443
+    echo net.ipv4.ip_unprivileged_port_start=443 | sudo tee /etc/sysctl.d/50-cardcollector.conf
+    ```
+  - *Grant the interpreter the bind capability*:
+    `sudo setcap 'cap_net_bind_service=+ep' $(readlink -f $(which python3))`. Note what this
+    actually does: `readlink -f` resolves a virtualenv's `python3` to the **system**
+    interpreter, so the capability is granted to every Python program on the machine, not
+    just this app — and it is silently lost whenever python3 is upgraded or reinstalled.
+  - *Redirect the port* with nftables/iptables, or put a reverse proxy in front.
+- **Never start it with `sudo` "just to test".** That run writes `certs/` owned by root
+  with the key mode `0600`, and every later ordinary run then finds a certificate it
+  cannot read. The app reports this and falls back to HTTP rather than failing; the fix is
+  `sudo chown -R $(id -un):$(id -gn) certs`.
 - **Self-signed certificate warning:** each device shows a one-time "not secure" prompt —
   accept it once to enable full functionality (including the live camera). To remove the
   warning, drop a locally-trusted cert (e.g. via [mkcert](https://github.com/FiloSottile/mkcert))
