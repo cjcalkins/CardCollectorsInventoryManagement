@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% set nav_active = 'settings' %}
+{% set nav_active = 'shops' %}
 
 {% block title %}Shops - Card Collector Inventory Manager{% endblock %}
 
@@ -96,9 +96,6 @@
 
 {% block content %}
 
-    <div class="settings-layout">
-        {% set ss_active = 'shops' %}{% include '_settings_sidebar.html' %}
-        <main class="settings-content">
 
     <div class="container py-4">
         <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
@@ -106,6 +103,7 @@
                 <h2 class="mb-1"><i class="fas fa-store me-2"></i>Shops</h2>
                 <div class="text-muted">Connect marketplaces and synchronize your inventory's online listings.</div>
             </div>
+            <a href="/shops/ebay/template" class="btn btn-outline-secondary"><i class="fab fa-ebay me-1"></i>Listing template</a>
         </div>
 
         <div id="ebayBanner"></div>
@@ -1089,6 +1087,4 @@
 
         loadListings();
     </script>
-    </main>
-    </div>
 {% endblock %}

@@ -49,6 +49,11 @@
             <div class="text-muted">Query your held and sold inventory, group by any field, and build dashboards and spreadsheets.</div>
         </div>
 
+        <div class="page-tabs mb-4">
+            <a class="page-tab active" href="{{ url_for('analytics_page') }}">Analytics</a>
+            {% if can_view('reports') %}<a class="page-tab" href="/reports">Financial Reports</a>{% endif %}
+        </div>
+
         <!-- ── Landing overview: per-game cost vs value vs expected proceeds ── -->
         <div class="panel">
             <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-2">

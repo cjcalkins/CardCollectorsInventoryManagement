@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% set nav_active = 'settings' %}
+{% set nav_active = 'quick_scan' %}
 
 {% block title %}Search by Photo - Card Collector Inventory Manager{% endblock %}
 
@@ -186,9 +186,6 @@
 
 {% block content %}
 
-    <div class="settings-layout">
-        {% set ss_active = 'search' %}{% include '_settings_sidebar.html' %}
-        <main class="settings-content">
 
     <div class="container py-5" style="max-width: 680px;">
 
@@ -623,6 +620,4 @@
         selectedCardId = null;
     }
     </script>
-    </main>
-    </div>
 {% endblock %}

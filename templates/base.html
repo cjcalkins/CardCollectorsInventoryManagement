@@ -14,7 +14,8 @@
       scripts       — page scripts, rendered after the bundle
 
     To highlight a sidebar item, set nav_active at the top of the child template
-    to one of: import, inventory, storage, analytics, shipping, settings.
+    to one of: import, inventory, storage, analytics, shops, shipping,
+    quick_scan, settings.
 #}<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -55,9 +56,11 @@
                 {% if can_view('inventory') %}<a href="{{ url_for('inventory') }}" class="app-nav-link{% if nav_active == 'inventory' %} active{% endif %}"><i class="fas fa-table-list"></i>Inventory</a>{% endif %}
                 {% if can_view('albums') %}<a href="{{ url_for('storage_list') }}" class="app-nav-link{% if nav_active == 'storage' %} active{% endif %}"><i class="fas fa-box-open"></i>Storage</a>{% endif %}
                 {% if can_view('analytics') %}<a href="{{ url_for('analytics_page') }}" class="app-nav-link{% if nav_active == 'analytics' %} active{% endif %}"><i class="fas fa-chart-line"></i>Analytics</a>{% endif %}
+                {% if can_view('shops') %}<a href="{{ url_for('shops_page') }}" class="app-nav-link{% if nav_active == 'shops' %} active{% endif %}"><i class="fas fa-store"></i>Shops</a>{% endif %}
                 {% if can_view('shops') %}<a href="{{ url_for('shipping.shipping_page') }}" class="app-nav-link{% if nav_active == 'shipping' %} active{% endif %}"><i class="fas fa-truck"></i>Shipping</a>{% endif %}
             </nav>
             <div class="app-sidebar-foot">
+                {% if can_view('quick_scan') %}<a href="{{ url_for('quick_scan_page') }}" class="app-nav-link{% if nav_active == 'quick_scan' %} active{% endif %}"><i class="fas fa-camera-retro"></i>Quick Scan</a>{% endif %}
                 {% if can_view('settings') %}<a href="{{ url_for('settings_page') }}" class="app-nav-link{% if nav_active == 'settings' %} active{% endif %}"><i class="fas fa-gear"></i>Settings</a>{% endif %}
                 {% if auth_user %}<a href="{{ url_for('auth_logout') }}" class="app-nav-link" title="Sign out ({{ auth_username }})"><i class="fas fa-right-from-bracket"></i>Sign out</a>{% endif %}
             </div>
