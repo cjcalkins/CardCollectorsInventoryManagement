@@ -116,6 +116,27 @@ on your network.
 - **No system OCR binary.** Card OCR runs on RapidOCR (PP-OCRv5 mobile models via ONNX
   Runtime), installed with the Python packages below. The model files download
   automatically the first time OCR runs, so the machine needs network access that one time.
+- **Headless Linux (DietPi, Raspberry Pi OS Lite, server Debian/Ubuntu):** OpenCV needs
+  two system libraries that minimal images leave out — install them or `import cv2`
+  fails at startup with `libGL.so.1: cannot open shared object file`:
+
+  ```bash
+  sudo apt install -y libgl1 libglib2.0-0
+  ```
+
+  Why this happens: `rapidocr` hard-depends on the full `opencv-python` package, so pip
+  installs it alongside the `opencv-python-headless` in `requirements.txt`; both ship
+  the same `cv2` module and the full desktop build (linked against libGL) wins. If you
+  can't install system packages, the pip-only alternative after installing
+  requirements is:
+
+  ```bash
+  pip uninstall -y opencv-python
+  pip install --force-reinstall --no-deps opencv-python-headless
+  ```
+
+  (`pip check` will then report rapidocr's `opencv-python` as missing — harmless:
+  rapidocr only needs the `cv2` module, which headless provides.)
 - Python packages (see `requirements.txt` for the authoritative list):
 
 ```text

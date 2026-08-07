@@ -9,7 +9,10 @@ Werkzeug>=3.0
 python-dotenv>=1.0
 
 # ── Imaging ──
-opencv-python-headless>=4.8      # use opencv-python instead if you need GUI/debug windows
+opencv-python-headless>=4.8      # NOTE: rapidocr below hard-depends on full opencv-python,
+                                 # which pip installs as well and which needs libGL at import
+                                 # time. On headless Linux: apt install libgl1 libglib2.0-0,
+                                 # or see README "Requirements" for the pip-only swap.
 Pillow>=10.0
 numpy>=1.26
 # These two carried NO constraint at all, so `pip install` would take a future major
