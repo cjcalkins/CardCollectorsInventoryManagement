@@ -523,6 +523,87 @@ def parse_shipping_address(text):
     return out
 
 
+# Charge/summary lines that match the "N x <text>" item shape but are not
+# purchased cards. Two tiers, because one rule cannot separate both hazards:
+#
+#   PHRASES are multi-word labels no card title starts with, so anything
+#   following them is a qualifier -- "Shipping & Handling on all orders over
+#   $50" is promo copy, not a product.
+#
+#   WORDS are single generic nouns that DO begin real card names ("Shipping
+#   Container Deck", "Tax Collector", "Total Eclipse"), so they only count as
+#   noise when nothing but an amount follows the label.
+_CHARGE_PHRASES = (
+    "shipping & handling", "shipping and handling", "sales tax", "order total",
+    "grand total", "item total", "sub total", "service fee", "seller fee",
+    "processing fee", "handling fee", "shipping cost", "estimated tax",
+)
+_CHARGE_WORDS = (
+    "shipping", "handling", "postage", "delivery", "tax", "vat", "fee", "fees",
+    "surcharge", "subtotal", "total", "discount", "coupon", "promo",
+    "promotion", "credit", "refund", "insurance", "tracking", "amount",
+    "balance", "payment",
+)
+
+
+# Words that mark a '#<digits>' as something other than an order number.
+_NOT_AN_ORDER_CONTEXT = re.compile(
+    r"track|shipment|shipped|carrier|usps|ups|fedex|dhl|parcel|label|"
+    r"invoice\s*date|zip|postal|phone|tel\b",
+    re.I)
+
+
+def _bare_hash_order_id(blob):
+    """Match a bare '#123456' only on a line that is not about tracking.
+
+    Returns a match object (group 1 = the id) or None. Scanning line by line
+    is what makes the context check meaningful: a whole-blob regex would
+    happily pair the '#' from a shipping line with an 'order' word paragraphs
+    away."""
+    for line in blob.splitlines():
+        if _NOT_AN_ORDER_CONTEXT.search(line):
+            continue
+        m = re.search(r"#\s*([0-9]{6,})", line)
+        if m:
+            return m
+    return None
+
+
+def _is_non_item_line(name_raw):
+    """True when a matched 'N x <text>' line is a charge or summary row rather
+    than a card.
+
+    The item regex matches any 'N x anything', so '1 x Shipping & Handling',
+    '2 x $0.99 fee' and promotional copy all became phantom sale items. That
+    mattered beyond a messy log: items being non-empty is what makes
+    _process_sale_email treat an email as a real sale, so a non-sale email
+    mentioning quantities entered the path that decrements inventory and
+    delists on other marketplaces.
+
+    See _CHARGE_PHRASES / _CHARGE_WORDS for why this takes two tiers: matching
+    a bare single-word prefix drops real cards ('Shipping Container Deck'),
+    while requiring an amount-only remainder keeps promo copy ('Shipping &
+    Handling on all orders over $50'). Each tier handles the case the other
+    gets wrong."""
+    s = " ".join(str(name_raw or "").split()).strip(" -—:|\t").lower()
+    if not s:
+        return True
+    # A name with no letters at all is a price or a bare number, not a card.
+    if not re.search(r"[a-z]", s):
+        return True
+    # Tier 1: an unambiguous charge phrase, whatever trails it.
+    for phrase in _CHARGE_PHRASES:
+        if s.startswith(phrase):
+            return True
+    # Tier 2: a generic label followed by nothing but an amount/punctuation.
+    for word in _CHARGE_WORDS:
+        if not s.startswith(word):
+            continue
+        if not re.search(r"[a-z]", s[len(word):]):
+            return True
+    return False
+
+
 def parse_tcgplayer_sale(subject, text):
     """
     Best-effort extraction of {order_id, items[]} from a TCGplayer sale email.
@@ -536,9 +617,16 @@ def parse_tcgplayer_sale(subject, text):
     for pat in (
         r"order\s*(?:number|no\.?|#)\s*[:#]?\s*([A-Za-z0-9][A-Za-z0-9\-]{4,})",
         r"order\s+([A-Z0-9]{6,}\-[A-Z0-9]+)",
-        r"#\s*([0-9]{6,})",
+        # Bare "#123456" only when the same line is about an order. Unanchored,
+        # this grabbed ANY six-plus-digit number after a '#' — a tracking
+        # number on a shipping-confirmation line became the order id, which is
+        # the SaleEvent dedupe key, so two real orders could collide on it.
+        None,
     ):
-        m = re.search(pat, blob, re.I)
+        if pat is None:
+            m = _bare_hash_order_id(blob)
+        else:
+            m = re.search(pat, blob, re.I)
         if m:
             order_id = m.group(1).strip()
             break
@@ -559,6 +647,8 @@ def parse_tcgplayer_sale(subject, text):
                 continue
             qty = int(m.group(1))
             name_raw = m.group(2).strip(" -—:\t")
+            if _is_non_item_line(name_raw):
+                break   # a charge line or noise, not a purchased card
             items.append(_split_item(name_raw, qty))
             break
 
