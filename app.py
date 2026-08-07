@@ -4,7 +4,7 @@
 from preflight import run_preflight
 run_preflight()
 
-from flask import Flask, request, jsonify, render_template, send_from_directory, url_for, redirect, Response, session, g
+from flask import Flask, request, jsonify, render_template, render_template_string, send_from_directory, url_for, redirect, Response, session, g
 import os
 import posixpath
 import re as _re
@@ -3720,9 +3720,11 @@ def auth_logout():
 
 
 # ---- User management (admin only; gated by _resource_for_path -> '__admin__') ----
-_AUTH_USERS_HTML = ("""<!doctype html><html lang=en><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width, initial-scale=1"><title>Users</title>
-<style>""" + _AUTH_CSS + """</style></head><body>
+_AUTH_USERS_HTML = ("""{% extends "base.html" %}
+{% set nav_active = 'settings' %}
+{% block title %}Users - Card Collector Inventory Manager{% endblock %}
+{% block head %}<style>""" + _AUTH_CSS + """</style>{% endblock %}
+{% block content %}
 <div class="card wide">
   <h1>Users</h1>
   <p class=sub>Create accounts and assign each a role. Roles decide what each account can view or edit.</p>
@@ -3775,12 +3777,13 @@ _AUTH_USERS_HTML = ("""<!doctype html><html lang=en><head><meta charset=utf-8>
     document.getElementById('nu').value='';document.getElementById('np').value='';
   });
   load();
-</script></body></html>""").replace("__MINPW__", str(MIN_PASSWORD_LEN))
+</script>
+{% endblock %}""").replace("__MINPW__", str(MIN_PASSWORD_LEN))
 
 
 @app.route("/settings/users")
 def users_page():
-    return Response(_AUTH_USERS_HTML, mimetype="text/html")
+    return render_template_string(_AUTH_USERS_HTML)
 
 
 @app.route("/settings/users/list")
@@ -3918,9 +3921,11 @@ def users_delete():
 
 
 # ---- Role management (admin only) ----
-_AUTH_ROLES_HTML = ("""<!doctype html><html lang=en><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width, initial-scale=1"><title>Roles</title>
-<style>""" + _AUTH_CSS + """</style></head><body>
+_AUTH_ROLES_HTML = ("""{% extends "base.html" %}
+{% set nav_active = 'settings' %}
+{% block title %}Roles - Card Collector Inventory Manager{% endblock %}
+{% block head %}<style>""" + _AUTH_CSS + """</style>{% endblock %}
+{% block content %}
 <div class="card wide">
   <h1>Roles</h1>
   <p class=sub>A role sets, for each tab and tool, whether members can <b>view</b>, <b>edit</b>, or have no access.
@@ -3995,19 +4000,22 @@ _AUTH_ROLES_HTML = ("""<!doctype html><html lang=en><head><meta charset=utf-8>
     document.getElementById('rn').value='';document.getElementById('radmin').checked=false;
   });
   load();
-</script></body></html>""")
+</script>
+{% endblock %}""")
 
 
 # ---- Security event log (admin only; gated by _resource_for_path -> '__admin__') ----
-_AUTH_EVENTS_HTML = ("""<!doctype html><html lang=en><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width, initial-scale=1"><title>Security log</title>
-<style>""" + _AUTH_CSS + """
+_AUTH_EVENTS_HTML = ("""{% extends "base.html" %}
+{% set nav_active = 'settings' %}
+{% block title %}Security log - Card Collector Inventory Manager{% endblock %}
+{% block head %}<style>""" + _AUTH_CSS + """
  table{width:100%;border-collapse:collapse;font-size:13px}
  th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #e5e7eb;vertical-align:top}
  th{color:#6b7280;font-weight:600;white-space:nowrap}
  td.mono{font-family:ui-monospace,Menlo,Consolas,monospace;white-space:nowrap;color:#6b7280}
  .act{font-weight:600}
-</style></head><body>
+</style>{% endblock %}
+{% block content %}
 <div class="card wide">
   <h1>Security log</h1>
   <p class=sub>Sign-ins, account and role changes, password resets, storage moves and
@@ -4042,12 +4050,13 @@ _AUTH_EVENTS_HTML = ("""<!doctype html><html lang=en><head><meta charset=utf-8>
     }catch(e){show('Error: '+e.message,false);}
   }
   load();
-</script></body></html>""").replace("__KEEP__", str(EVENT_LOG_KEEP))
+</script>
+{% endblock %}""").replace("__KEEP__", str(EVENT_LOG_KEEP))
 
 
 @app.route("/settings/security")
 def security_log_page():
-    return Response(_AUTH_EVENTS_HTML, mimetype="text/html")
+    return render_template_string(_AUTH_EVENTS_HTML)
 
 
 @app.route("/settings/security/list")
@@ -4071,7 +4080,7 @@ def security_log_list():
 
 @app.route("/settings/roles")
 def roles_page():
-    return Response(_AUTH_ROLES_HTML, mimetype="text/html")
+    return render_template_string(_AUTH_ROLES_HTML)
 
 
 @app.route("/settings/roles/list")
@@ -11580,12 +11589,10 @@ def general_identify_provider():
 # inline (no template file) so it works regardless of the theme templates, and is
 # reachable at /settings/identify. The main General settings page can also embed
 # the same control via /settings/general/identify_provider.
-_IDENTIFY_SETTINGS_HTML = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Card Identification Service</title>
+_IDENTIFY_SETTINGS_HTML = """{% extends "base.html" %}
+{% set nav_active = 'settings' %}
+{% block title %}Card Identification Service - Card Collector Inventory Manager{% endblock %}
+{% block head %}
 <style>
   body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:#f5f7fb; color:#1f2937; margin:0; padding:24px; }
   .card { max-width:720px; margin:0 auto; background:#fff; border:1px solid #e5e7eb; border-radius:16px; padding:24px 28px; box-shadow:0 10px 30px rgba(0,0,0,.05); }
@@ -11613,8 +11620,8 @@ _IDENTIFY_SETTINGS_HTML = """<!doctype html>
   .links { margin-top:20px; font-size:14px; color:#6b7280; }
   .links a { margin-right:14px; }
 </style>
-</head>
-<body>
+{% endblock %}
+{% block content %}
   <div class="card">
     <h1>Card Identification Service</h1>
     <p class="sub">Choose which external service identifies a card from its front image when the
@@ -11713,8 +11720,7 @@ _IDENTIFY_SETTINGS_HTML = """<!doctype html>
     }
   });
 </script>
-</body>
-</html>"""
+{% endblock %}"""
 
 
 @app.route("/settings/identify")
@@ -11722,22 +11728,23 @@ def identify_settings_page():
     """Standalone page to pick the external identification provider. Self-contained
     so it doesn't depend on the theme templates; reachable at /settings/identify."""
     g = _general_status()
-    html = (_IDENTIFY_SETTINGS_HTML
+    # Render first, substitute after: the __X__ values are runtime data and must
+    # not pass through the template engine (a value containing Jinja delimiters
+    # would otherwise be evaluated as template code).
+    html = render_template_string(_IDENTIFY_SETTINGS_HTML)
+    return (html
             .replace("__MIN_PCT__", str(g["auto_identify_min_pct"]))
             .replace("__PROVIDER__", g["identify_provider"])
             .replace("__XIMILAR_SET__", "yes" if g["ximilar_key_set"] else "no")
             .replace("__CARDSIGHT_SET__", "yes" if g["cardsight_key_set"] else "no"))
-    return Response(html, mimetype="text/html")
 
 
 # Self-contained page to set the advertised .local network name. Inline (no theme
 # template dependency), reachable at /settings/network.
-_NETWORK_SETTINGS_HTML = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Network Name</title>
+_NETWORK_SETTINGS_HTML = """{% extends "base.html" %}
+{% set nav_active = 'settings' %}
+{% block title %}Network Name - Card Collector Inventory Manager{% endblock %}
+{% block head %}
 <style>
   body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:#f5f7fb; color:#1f2937; margin:0; padding:24px; }
   .card { max-width:720px; margin:0 auto; background:#fff; border:1px solid #e5e7eb; border-radius:16px; padding:24px 28px; box-shadow:0 10px 30px rgba(0,0,0,.05); }
@@ -11761,8 +11768,8 @@ _NETWORK_SETTINGS_HTML = """<!doctype html>
   .msg.err { background:#fef2f2; color:#991b1b; border:1px solid #fecaca; }
   .links { margin-top:20px; font-size:14px; color:#6b7280; } .links a { margin-right:14px; }
 </style>
-</head>
-<body>
+{% endblock %}
+{% block content %}
   <div class="card">
     <h1>Network Name (.local)</h1>
     <p class="sub">Set the name this server advertises on your local network. Devices on the same
@@ -11818,8 +11825,7 @@ _NETWORK_SETTINGS_HTML = """<!doctype html>
     finally { btn.disabled = false; }
   });
 </script>
-</body>
-</html>"""
+{% endblock %}"""
 
 
 @app.route("/settings/network")
@@ -11831,12 +11837,14 @@ def network_settings_page():
     default_port = 443 if scheme == "https" else 80
     suffix = "" if port == default_port else f":{port}"
     zc_active = _MDNS.get("zc") is not None
-    html = (_NETWORK_SETTINGS_HTML
+    # Render first, substitute after — same reason as the identify page: runtime
+    # values must not pass through the template engine.
+    html = render_template_string(_NETWORK_SETTINGS_HTML)
+    return (html
             .replace("__NAME__", name)
             .replace("__SCHEME__", scheme)
             .replace("__PORTSUFFIX__", suffix)
             .replace("__ZC_WARN__", "none" if zc_active else "block"))
-    return Response(html, mimetype="text/html")
 
 
 @app.route("/settings/network/name", methods=["POST"])
