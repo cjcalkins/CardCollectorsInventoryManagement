@@ -8345,6 +8345,39 @@ def _clean_template_fields(fields):
     return cleaned_fields
 
 
+# Serializes template-file read-modify-write cycles. /update_field_type and
+# /update_field_hidden each read a template, patch one field, and write the
+# whole file back; two concurrent toggles on the same game interleaved and the
+# later write clobbered the earlier one (or, mid-write, truncated the file).
+# The write itself is also atomic (see _atomic_write_json) so a crash or a
+# full disk can never leave a half-written template that stops parsing.
+_TEMPLATE_FILE_LOCK = _threading.RLock()
+
+
+def _atomic_write_json(path, payload):
+    """Write JSON so readers only ever see the complete old or new file.
+
+    Same temp-file-plus-os.replace pattern save_storage_config and
+    save_system_config already use; the template writers were the one JSON
+    persistence path that still wrote in place. os.replace is atomic within a
+    filesystem, and the temp file is created alongside the target so it never
+    crosses one. The temp file is removed if anything fails before the
+    rename."""
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())   # the rename is atomic; the CONTENTS need this
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _write_template_file(clean_name, cleaned_fields, csv_column_mapping=None):
     """
     Write a template's JSON file. Field definitions are always replaced with
@@ -8377,8 +8410,8 @@ def _write_template_file(clean_name, cleaned_fields, csv_column_mapping=None):
     if merged_mapping:
         payload["csv_column_mapping"] = merged_mapping
 
-    with open(template_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+    with _TEMPLATE_FILE_LOCK:
+        _atomic_write_json(template_path, payload)
 
 
 @app.route("/template_save", methods=["POST"])
@@ -8518,23 +8551,26 @@ def update_field_type():
     for tpl_name in get_template_names():
         tpl_path = os.path.join(app.config["ROI_TEMPLATE_FOLDER"], f"{tpl_name}.json")
         try:
-            with open(tpl_path, "r", encoding="utf-8") as f:
-                tpl = json.load(f)
+            # Read and write under one lock: this is a read-modify-write of the
+            # whole file, so two concurrent toggles on the same template used to
+            # interleave and the later write dropped the earlier field change.
+            with _TEMPLATE_FILE_LOCK:
+                with open(tpl_path, "r", encoding="utf-8") as f:
+                    tpl = json.load(f)
 
-            fields = tpl.get("fields", {})
-            if field_key not in fields:
-                continue  # this template doesn't have the field — skip
+                fields = tpl.get("fields", {})
+                if field_key not in fields:
+                    continue  # this template doesn't have the field — skip
 
-            # Patch in-place, preserving all existing ROI coordinates / config
-            fields[field_key]["field_type"] = field_type
-            if field_type == "dropdown":
-                fields[field_key]["dropdown_options"] = dropdown_options
-            else:
-                # Remove stale dropdown_options for non-dropdown types
-                fields[field_key].pop("dropdown_options", None)
+                # Patch in-place, preserving all existing ROI coordinates / config
+                fields[field_key]["field_type"] = field_type
+                if field_type == "dropdown":
+                    fields[field_key]["dropdown_options"] = dropdown_options
+                else:
+                    # Remove stale dropdown_options for non-dropdown types
+                    fields[field_key].pop("dropdown_options", None)
 
-            with open(tpl_path, "w", encoding="utf-8") as f:
-                json.dump(tpl, f, indent=2)
+                _atomic_write_json(tpl_path, tpl)
 
             updated_templates.append(tpl_name)
 
@@ -8598,21 +8634,22 @@ def update_field_hidden():
     for tpl_name in get_template_names():
         tpl_path = os.path.join(app.config["ROI_TEMPLATE_FOLDER"], f"{tpl_name}.json")
         try:
-            with open(tpl_path, "r", encoding="utf-8") as f:
-                tpl = json.load(f)
+            # Read and write under one lock — see /update_field_type.
+            with _TEMPLATE_FILE_LOCK:
+                with open(tpl_path, "r", encoding="utf-8") as f:
+                    tpl = json.load(f)
 
-            fields = tpl.get("fields", {})
-            if field_key not in fields:
-                continue  # this template doesn't have the field — skip
+                fields = tpl.get("fields", {})
+                if field_key not in fields:
+                    continue  # this template doesn't have the field — skip
 
-            if hidden:
-                fields[field_key]["hidden"] = True
-            else:
-                # Clearing the flag entirely keeps template files tidy.
-                fields[field_key].pop("hidden", None)
+                if hidden:
+                    fields[field_key]["hidden"] = True
+                else:
+                    # Clearing the flag entirely keeps template files tidy.
+                    fields[field_key].pop("hidden", None)
 
-            with open(tpl_path, "w", encoding="utf-8") as f:
-                json.dump(tpl, f, indent=2)
+                _atomic_write_json(tpl_path, tpl)
 
             updated_templates.append(tpl_name)
 
