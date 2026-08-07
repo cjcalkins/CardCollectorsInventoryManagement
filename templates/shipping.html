@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block nav_extra %}{% if can_view('shops') %}<a href="{{ url_for('shipping.shipping_page') }}" class="nav-tab active">Shipping</a>{% endif %}{% endblock %}
+{% set nav_active = 'shipping' %}
 
 {% block title %}Shipping - Card Collector Inventory Manager{% endblock %}
 

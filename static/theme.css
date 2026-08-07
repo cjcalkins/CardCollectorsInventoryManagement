@@ -69,6 +69,8 @@
     --space-5: 24px;
     --space-6: 32px;
     --space-7: 48px;
+
+    --sidebar-w: 232px;
 }
 
 /* ── Base ─────────────────────────────────────────────────────────────── */
@@ -174,10 +176,55 @@ table.analytics-table, #inventoryTable { font-variant-numeric: tabular-nums; }
 .progress-bar.bg-warning { background-color: var(--warn)    !important; }
 .progress-bar.bg-danger  { background-color: var(--danger)  !important; }
 
-/* ── App framework: top nav tabs ──────────────────────────────────────── */
+/* ── App framework: nav tabs (still used by setup.html's own minimal nav) ─ */
 .nav-tab { color: rgba(255, 255, 255, .82); }
 .nav-tab:hover { color: #fff; }
 .nav-tab.active { background: var(--surface); color: var(--text); }
+
+/* ── App shell: fixed sidebar at lg+, offcanvas drawer below ──────────── */
+.app-topbar { position: sticky; top: 0; z-index: 1020; }
+.app-sidebar { width: var(--sidebar-w); background-color: var(--ink); color: var(--on-ink); }
+.app-sidebar-body { display: flex; flex-direction: column; gap: var(--space-2); }
+.app-brand {
+    display: flex; align-items: center; gap: var(--space-3);
+    color: var(--on-ink); text-decoration: none;
+    font-weight: 600; font-size: .9rem; line-height: 1.2;
+    padding: var(--space-2) var(--space-2) var(--space-4);
+}
+.app-brand img { border-radius: 6px; object-fit: cover; }
+.app-brand:hover { color: #fff; }
+.app-nav, .app-sidebar-foot { display: flex; flex-direction: column; gap: 2px; }
+.app-nav-link {
+    display: flex; align-items: center; gap: var(--space-3);
+    padding: 10px var(--space-3); border-radius: var(--radius-sm);
+    color: rgba(255, 255, 255, .82); text-decoration: none;
+    font-weight: 600; font-size: .95rem;
+}
+.app-nav-link i { width: 18px; text-align: center; opacity: .85; }
+.app-nav-link:hover { background: rgba(255, 255, 255, .08); color: #fff; }
+.app-nav-link.active { background: var(--surface); color: var(--text); }
+.app-nav-link.active i { opacity: 1; }
+.app-sidebar-foot {
+    margin-top: auto;
+    border-top: 1px solid rgba(255, 255, 255, .12);
+    padding-top: var(--space-3);
+}
+@media (min-width: 992px) {
+    /* Bootstrap's responsive offcanvas resets width/height/background with
+       !important at this breakpoint; the shell needs them back to pin the
+       sidebar as a fixed full-height rail. */
+    .app-sidebar {
+        position: fixed; top: 0; bottom: 0; left: 0; z-index: 1030;
+        width: var(--sidebar-w) !important;
+        height: 100vh !important;
+        background-color: var(--ink) !important;
+        overflow-y: auto;
+    }
+    .app-sidebar-body { height: 100%; }
+    /* Scoped to base.html's body class: the pages not yet on base.html
+       (inventory, inventory_detail, setup) have no sidebar to offset for. */
+    body.app-shell { padding-left: var(--sidebar-w); }
+}
 
 /* ── App framework: settings sidebar ──────────────────────────────────── */
 .settings-sidebar { background: var(--surface); border-color: var(--border); }
