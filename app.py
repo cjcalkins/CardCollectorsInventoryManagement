@@ -12634,12 +12634,60 @@ def _write_images_manifest(fh):
     return n
 
 
+def _bundle_staging_root():
+    """Directory the bundle is assembled in: instance/, never a served root.
+
+    The loose files staged here are the same plaintext credentials the finished
+    bundle carries (shop tokens, the mailbox password), and the previous
+    location — a mkdtemp inside TEMP_PDF_FOLDER — is handed to every signed-in
+    user by /temp_pdf/<path> regardless of role. instance/ is Flask's spot for
+    per-deployment state, is gitignored, and no route serves it (the four
+    send_from_directory roots are UPLOAD_FOLDER and the three temp folders).
+    0700 because anyone who can read this can read the credentials."""
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "instance",
+                        "migration_staging")
+    os.makedirs(root, exist_ok=True)
+    try:
+        os.chmod(root, 0o700)
+    except OSError:
+        pass
+    return root
+
+
+def _sweep_stale_bundle_staging():
+    """Best-effort removal of staging trees a previous failed export left --
+    both in instance/ and in the old TEMP_PDF_FOLDER location, so an upgrade
+    clears credentials already sitting in the served folder."""
+    for parent in (_bundle_staging_root(), app.config.get("TEMP_PDF_FOLDER", "")):
+        if not parent or not os.path.isdir(parent):
+            continue
+        for name in os.listdir(parent):
+            if not name.startswith("migration_"):
+                continue
+            p = os.path.join(parent, name)
+            if os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=True)
+
+
 def _build_migration_bundle(include_reference=False, include_images_manifest=True):
     """Assemble the migration bundle as a .tar.gz on disk and return its path."""
     import tarfile
     ensure_dirs()
     stamp = utcnow().strftime("%Y%m%d_%H%M%S")
-    work = tempfile.mkdtemp(prefix="migration_", dir=app.config["TEMP_PDF_FOLDER"])
+    _sweep_stale_bundle_staging()
+    work = tempfile.mkdtemp(prefix="migration_", dir=_bundle_staging_root())
+    try:
+        return _assemble_migration_bundle(work, stamp, include_reference,
+                                          include_images_manifest)
+    finally:
+        # Unconditional: the old code only cleaned up on the success path, so
+        # any failure (disk full, unserializable row) left the plaintext
+        # credentials staged on disk indefinitely.
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _assemble_migration_bundle(work, stamp, include_reference, include_images_manifest):
+    import tarfile
     bundle_dir = os.path.join(work, f"ccim_migration_{stamp}")
     os.makedirs(bundle_dir, exist_ok=True)
 
@@ -12701,8 +12749,7 @@ def _build_migration_bundle(include_reference=False, include_images_manifest=Tru
     tar_path = os.path.join(out_dir, f"ccim_migration_{stamp}.tar.gz")
     with tarfile.open(tar_path, "w:gz") as tar:
         tar.add(bundle_dir, arcname=os.path.basename(bundle_dir))
-    shutil.rmtree(work, ignore_errors=True)
-    return tar_path, manifest
+    return tar_path, manifest   # staging removed by the caller's finally
 
 
 # Migration bundles are meant to be downloaded promptly and discarded; anything
