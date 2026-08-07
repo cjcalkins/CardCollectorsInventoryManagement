@@ -2649,6 +2649,10 @@ def auto_identify_record(record, min_score=None):
 
     out["type_guess"] = ocr.get("type_guess", "")
     out["type_confidence"] = ocr.get("type_confidence", 0.0)
+    out["type_method"] = ocr.get("type_method", "")
+    if ocr.get("engine_errors"):
+        # Blank name/number here mean a failing engine, not a blank card.
+        out["ocr_error"] = ocr.get("ocr_error", "")
 
     # ── Obtain step 2: score the OCR read against this game's REFERENCE DATA ──
     category_id, _ = _resolve_category_for_game(game)
@@ -9206,6 +9210,12 @@ def ocr_identify(record_id):
             "set_code_guess": ocr.get("set_code_guess", ""),
             "type_guess":     ocr.get("type_guess", ""),
             "type_confidence": ocr.get("type_confidence", 0.0),
+            # How the type was decided ("reference_match" vs the built-in
+            # "color_heuristic"), and whether the engine actually failed —
+            # empty guesses from a broken install used to look like a blank card.
+            "type_method":    ocr.get("type_method", ""),
+            "engine_errors":  ocr.get("engine_errors", 0),
+            "ocr_error":      ocr.get("ocr_error", ""),
             "conf_top":       ocr.get("conf_top", -1.0),
             "conf_bottom":    ocr.get("conf_bottom", -1.0),
             "raw_top":        ocr.get("raw_top", ""),

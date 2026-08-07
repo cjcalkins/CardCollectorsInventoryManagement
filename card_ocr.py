@@ -48,6 +48,7 @@ Environment overrides (all optional):
     RAPIDOCR_USE_CLS      default "0"          ("1" to enable 180 deg text-line orientation)
 """
 
+import logging
 import os
 import re
 from collections import Counter
@@ -56,6 +57,22 @@ from difflib import SequenceMatcher
 import cv2
 import numpy as np
 from PIL import Image
+
+log = logging.getLogger(__name__)
+
+
+class ImageDecodeError(ValueError):
+    """A file exists but no decoder could read it. Distinct from
+    FileNotFoundError, which this module used to raise for both cases —
+    callers that tell "missing" from "corrupt" apart could not."""
+
+
+# Inference failures are swallowed per crop so one bad band can't abort a scan,
+# but a broken install fails EVERY crop — and the old code returned empty text
+# while ocr_available() still said True, which reads exactly like a blank card.
+# The counter lets a single ocr_card_front() call tell "found nothing" from
+# "the engine raised on every read" and report it.
+_ENGINE_ERRORS = {"count": 0, "last": ""}
 
 # RapidOCR (PP-OCRv5 mobile via ONNX Runtime). Imported optionally so this module
 # — and the whole app — still boots on installs that haven't run
@@ -156,7 +173,12 @@ def _ocr_lines(crop, min_side=64):
                          interpolation=cv2.INTER_CUBIC)
     try:
         res = engine(img, use_cls=_USE_CLS)
-    except Exception:
+    except Exception as exc:
+        # Keep degrading (one bad crop must not abort the scan) but RECORD it:
+        # returning [] silently is indistinguishable from "no text here".
+        _ENGINE_ERRORS["count"] += 1
+        _ENGINE_ERRORS["last"] = f"{type(exc).__name__}: {exc}"
+        log.warning("OCR engine raised on a crop: %s", exc)
         return []
     txts   = getattr(res, "txts", None)
     boxes  = getattr(res, "boxes", None)
@@ -234,8 +256,27 @@ def _to_bgr(image_or_path):
         except Exception:
             img = None
     if img is None:
-        raise FileNotFoundError(f"Could not read image: {image_or_path}")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"No such image: {image_or_path}")
+        raise ImageDecodeError(f"Could not decode image: {image_or_path}")
+    _guard_pixel_ceiling(img, path)
     return img
+
+
+def _guard_pixel_ceiling(img, path=""):
+    """Reject absurdly large decodes. cv2.imread's own cap is 2**30 pixels, so
+    a 30000x30000 upload sails through it and allocates ~2.7 GB as BGR — an OOM
+    on the Raspberry Pi this module targets — while the Pillow fallback path
+    honours Image.MAX_IMAGE_PIXELS (set by the host app). Apply the same ceiling
+    to whatever OpenCV returns so both paths agree."""
+    cap = getattr(Image, "MAX_IMAGE_PIXELS", None)
+    if not cap:
+        return
+    h, w = img.shape[:2]
+    if h * w > cap:
+        raise ImageDecodeError(
+            f"Image is too large to process ({w}x{h} = {h * w} pixels, "
+            f"limit {cap}): {path or 'image'}")
 
 
 def _clean_name(text):
@@ -381,8 +422,13 @@ def _best_number(hits):
     return c.most_common(1)[0][0]
 
 
+# Scores this close to the best read count as tied, so the frequency vote in
+# _read_number decides between them. RapidOCR line scores are 0..1.
+_NUMBER_TIE_BAND = 0.05
+
+
 def _read_number(bgr, band_top=0.90, band_bottom=0.965, corner_frac=0.34):
-    """Return (normalized 'N/M', raw_text). The collector number lives in a bottom
+    """Return (normalized 'N/M', raw_text, confidence). The collector number lives in a bottom
     CORNER — bottom-left on modern sets, bottom-right on older ones — so we OCR
     only the two corners and skip the centre of the bottom band (where the flavour
     text and the weakness/resistance/retreat row live, which used to inject spurious
@@ -407,12 +453,20 @@ def _read_number(bgr, band_top=0.90, band_bottom=0.965, corner_frac=0.34):
 
     raw = " ".join(raw_parts).strip()
     if not scored:
-        return "", raw
+        return "", raw, -1.0
 
+    # "Ties" within a tolerance, not on exact float equality: OCR scores from
+    # separate lines/corners essentially never match to 1e-6, so the documented
+    # frequency vote (and its trailing-zero fold) was dead code — one spurious
+    # high-confidence read outranked a number seen repeatedly. _NUMBER_TIE_BAND
+    # keeps the vote for reads the engine rates about equally.
     top_score = max(sc for _nm, sc in scored)
-    tied = [nm for nm, sc in scored if abs(sc - top_score) < 1e-6]
+    tied = [nm for nm, sc in scored if (top_score - sc) <= _NUMBER_TIE_BAND]
     best = tied[0] if len(set(tied)) == 1 else _best_number(tied)
-    return _pad_serial(best), raw
+    # Report the best score among the reads that produced the winner, not a
+    # fabricated 100.0.
+    conf = max((sc for nm, sc in scored if nm == best), default=top_score)
+    return _pad_serial(best), raw, float(conf)
 
 
 def parse_collector_number(text):
@@ -464,10 +518,19 @@ def ocr_card_front(image_or_path, normalize=True, debug_dir=None, game=None, typ
     # based, not OCR — still runs.
     available = _get_engine() is not None
 
+    errors_before = _ENGINE_ERRORS["count"]
     name_guess, conf_top = _read_name(bgr)
-    number_guess, raw_bottom = _read_number(bgr)
+    number_guess, raw_bottom, conf_bottom = _read_number(bgr)
     set_code_guess = parse_set_code(raw_bottom, drop=number_guess.replace("/", ""))
-    type_guess, type_conf = detect_card_type(bgr, game, type_refs)
+    type_guess, type_conf, type_method = detect_card_type(bgr, game, type_refs)
+    engine_errors = _ENGINE_ERRORS["count"] - errors_before
+
+    # A blank read because the engine threw on every crop is a broken install,
+    # not a blank card — say so instead of leaving the caller to guess.
+    ocr_error = _ENGINE_ERRORS["last"] if engine_errors else ""
+    if engine_errors:
+        log.error("OCR engine failed on %d crop(s) this scan: %s",
+                  engine_errors, ocr_error)
 
     return {
         "ocr_available": available,
@@ -477,10 +540,19 @@ def ocr_card_front(image_or_path, normalize=True, debug_dir=None, game=None, typ
         "raw_top": name_guess,
         "raw_bottom": raw_bottom,
         "conf_top": conf_top if name_guess else -1.0,
-        "conf_bottom": 100.0 if number_guess else -1.0,
+        "conf_bottom": conf_bottom if number_guess else -1.0,
         "type_guess": type_guess,
         "type_confidence": type_conf,
+        # How the type was decided: "reference_match" (per-game icon library),
+        # "color_heuristic" (built-in guess — the library was empty/absent),
+        # or "none". The old result labelled a colour guess identically to a
+        # template match.
+        "type_method": type_method,
         "normalized": did_norm,
+        # Degraded-mode signals. engine_errors > 0 with empty guesses means the
+        # install is broken, not that the card is blank.
+        "engine_errors": engine_errors,
+        "ocr_error": ocr_error,
     }
 
 
@@ -690,21 +762,29 @@ def prepare_type_references(raw_refs, size=64):
     `raw_refs`: list of {'type_name', 'region', 'image'(BGR)}. Returns a list with
     cached 'gray'/'hist' features, region and mode (unreadable entries skipped).
     """
-    out = []
+    out, skipped = [], []
     for r in raw_refs or []:
         img = r.get("image")
         if img is None or getattr(img, "size", 0) == 0:
+            skipped.append(r.get("type_name", "?"))
             continue
         region = normalize_type_region(r.get("region"))
         mode = region_mode(region)
         try:
             g, h = _features(img, mode)
-        except Exception:
+        except Exception as exc:
+            skipped.append(f"{r.get('type_name', '?')} ({type(exc).__name__})")
             continue
         out.append({
             "type_name": r.get("type_name", ""),
             "region": region, "mode": mode, "gray": g, "hist": h,
         })
+    if skipped:
+        # Silently dropping these left an operator with a library that looked
+        # installed but matched nothing (and, when ALL of them fail, silently
+        # demoted type detection to the colour heuristic).
+        log.warning("Skipped %d unreadable type reference(s): %s",
+                    len(skipped), ", ".join(str(s) for s in skipped[:10]))
     return out
 
 
@@ -773,18 +853,24 @@ def detect_card_type(bgr, game, type_refs=None):
     general, per-game mechanism that works for any TCG once a library exists.
     Otherwise fall back to the built-in colour heuristic (currently Pokemon).
 
-    Returns (type_name, confidence 0..1).
+    Returns (type_name, confidence 0..1, method) where method is
+    "reference_match", "color_heuristic", or "none". The method is returned
+    because an EMPTY type_refs list is falsy: a game whose icon library failed
+    to load silently got colour guesses that looked exactly like template
+    matches, with no signal anywhere that the library was missing.
     """
     if type_refs:
-        return match_card_types(bgr, type_refs)
+        name, conf = match_card_types(bgr, type_refs)
+        return name, conf, "reference_match"
 
     g = (game or "").strip().lower()
     if not g:
-        return "", 0.0
+        return "", 0.0, "none"
     for key, fn in _TYPE_DETECTORS.items():
         if key in g:
-            return fn(bgr)
-    return "", 0.0
+            name, conf = fn(bgr)
+            return name, conf, "color_heuristic"
+    return "", 0.0, "none"
 
 
 # --------------------------------------------------------------------------- #
