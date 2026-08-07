@@ -57,6 +57,41 @@ _CONDITIONS = [
 _IMAP_FORBIDDEN = ("\r", "\n", "\x00")
 
 
+def _imap_quote(value):
+    """Render a value as an IMAP quoted-string, escaping what RFC 3501 requires.
+
+    The folder and the sender/subject filters were wrapped as f'"{value}"' with
+    nothing escaped, so a name legitimately containing a double quote (or a
+    backslash) closed the string early and produced a malformed command — the
+    user saw "Folder not found." for a folder that exists. Injection is
+    separately impossible because _imap_reject blocks CR/LF/NUL, but a
+    malformed command is still a real failure for real folder names.
+
+    Escape order matters: backslashes first, or the backslashes this function
+    adds would themselves be escaped. Same two substitutions imaplib's own
+    IMAP4._quote performs (not called directly: it is a private method on an
+    instance we do not always hold)."""
+    s = str(value or "")
+    s = s.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{s}"'
+
+
+def _fetch_payload(msgdata):
+    """The RFC822 literal out of a FETCH response, or None if it carries none.
+
+    `msgdata[0][1]` assumed every response's first element is the
+    (metadata, literal) tuple. imaplib also yields BARE BYTES elements for
+    untagged/unsolicited items — a flag update triggered by our own concurrent
+    STORE is the common one — and indexing bytes gives an int, so
+    _parse_message got an integer, raised, and the outer handler discarded the
+    WHOLE batch including messages already parsed. Scan for the first element
+    that actually is a literal-carrying tuple instead of assuming position."""
+    for part in (msgdata or []):
+        if isinstance(part, tuple) and len(part) >= 2 and isinstance(part[1], (bytes, bytearray)):
+            return part[1]
+    return None
+
+
 def _imap_reject(**fields):
     """Return an error string naming the first field carrying a control character
     that would break out of its IMAP command, or None when all are safe.
@@ -197,7 +232,7 @@ def test_imap(cfg):
         _safe_logout(conn)
         return {"ok": False, "message": bad}
     try:
-        typ, data = conn.select(f'"{folder}"', readonly=True)
+        typ, data = conn.select(_imap_quote(folder), readonly=True)
         if typ != "OK":
             return {"ok": False, "message": f"Folder '{folder}' not found."}
         count = int(data[0]) if data and data[0] else 0
@@ -213,9 +248,9 @@ def _search_criteria(cfg):
     sender = str(cfg.get("sender_filter", "") or "").strip()
     subject = str(cfg.get("subject_filter", "") or "").strip()
     if sender:
-        crit += ["FROM", f'"{sender}"']
+        crit += ["FROM", _imap_quote(sender)]
     if subject:
-        crit += ["SUBJECT", f'"{subject}"']
+        crit += ["SUBJECT", _imap_quote(subject)]
     if not crit:
         crit = ["ALL"]
     return crit
@@ -236,7 +271,7 @@ def mailbox_top_uid(cfg):
         _safe_logout(conn)
         return None
     try:
-        typ, _ = conn.select(f'"{folder}"', readonly=True)
+        typ, _ = conn.select(_imap_quote(folder), readonly=True)
         if typ != "OK":
             return None
         typ, data = conn.uid("SEARCH", None, "ALL")
@@ -272,7 +307,7 @@ def fetch_sale_emails(cfg, since_uid=0, limit=FETCH_LIMIT):
     mark_seen = bool(cfg.get("mark_seen", True))
     emails, max_uid = [], since_uid
     try:
-        typ, _ = conn.select(f'"{folder}"', readonly=not mark_seen)
+        typ, _ = conn.select(_imap_quote(folder), readonly=not mark_seen)
         if typ != "OK":
             return {"ok": False, "message": f"Folder '{folder}' not found.", "emails": [], "max_uid": since_uid}
 
@@ -307,7 +342,18 @@ def fetch_sale_emails(cfg, since_uid=0, limit=FETCH_LIMIT):
                 max_uid = max(max_uid, uid)
                 continue
             _FETCH_FAILS.pop(uid, None)
-            raw = msgdata[0][1]
+            raw = _fetch_payload(msgdata)
+            if raw is None:
+                # The response carried no literal for this UID — treat it like
+                # any other failed fetch rather than crashing the batch.
+                fails = _FETCH_FAILS.get(uid, 0) + 1
+                _FETCH_FAILS[uid] = fails
+                if fails < FETCH_SKIP_AFTER:
+                    break
+                _FETCH_FAILS.pop(uid, None)
+                skipped.append(uid)
+                max_uid = max(max_uid, uid)
+                continue
             parsed = _parse_message(raw)
             parsed["uid"] = uid
             emails.append(parsed)
