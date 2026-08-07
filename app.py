@@ -643,11 +643,6 @@ def _ximilar_fallback_on():
     return bool(SYSTEM.get("ximilar_fallback_enabled", True))
 
 
-def set_ximilar_fallback(enabled):
-    SYSTEM["ximilar_fallback_enabled"] = bool(enabled)
-    save_system_config()
-
-
 def _identify_provider():
     """Which external identification service to use when the local OCR/catalog
     lookup fails: 'ximilar', 'cardsight', or 'none'. This is the single control
@@ -979,95 +974,13 @@ def _record_storage_type(record):
     return "box" if val == "box" else "album"
 
 
-def build_storage_index():
-    """
-    Group owned records into their storage containers (Albums and Boxes).
-
-    A container is identified by its name (the extracted_data 'album' field, kept
-    for data continuity). Its kind comes from the records' 'storage_type': an
-    Album has pages + 9 slots, a Box is a flat 1..N run with no page numbers.
-    When records disagree, the majority kind wins (they share a kind at import).
-    """
-    # Only rows that can land in a container load: non-catalog (is_catalog
-    # mirrors _is_catalog_only) with a non-empty album (album_key is NULL
-    # exactly when the album strips to empty). The loop's checks still run.
-    from sqlalchemy import func as _f
-    records = (ScanRecord.query
-               .filter(_f.coalesce(ScanRecord.is_catalog, False) == False,  # noqa: E712
-                       ScanRecord.album_key.isnot(None))
-               .order_by(ScanRecord.scan_date.desc()).all())
-    storage_map = {}
-
-    for record in records:
-        data = record.extracted_data or {}
-        if _is_catalog_only(data):
-            continue
-
-        name = get_record_value(record, "album")
-        if not name:
-            continue
-
-        game_name = get_record_value(record, "game")
-
-        info = storage_map.setdefault(
-            name,
-            {
-                "name": name,
-                "count": 0,
-                "latest_scan": record.scan_date,
-                "records": [],
-                "games": set(),
-                "box_votes": 0,
-                "album_votes": 0,
-            },
-        )
-        info["count"] += 1
-        info["records"].append(record)
-        if _record_storage_type(record) == "box":
-            info["box_votes"] += 1
-        else:
-            info["album_votes"] += 1
-
-        if game_name:
-            info["games"].add(game_name)
-
-        if record.scan_date and (info["latest_scan"] is None or record.scan_date > info["latest_scan"]):
-            info["latest_scan"] = record.scan_date
-
-    containers = []
-    for info in storage_map.values():
-        stype = "box" if info["box_votes"] > info["album_votes"] else "album"
-        containers.append(
-            {
-                "name": info["name"],
-                "count": info["count"],
-                "latest_scan": info["latest_scan"],
-                "records": info["records"],
-                "games": sorted(info["games"]),
-                "storage_type": stype,
-                "is_box": stype == "box",
-            }
-        )
-
-    return sorted(
-        containers,
-        key=lambda item: item["latest_scan"] or datetime.min,
-        reverse=True,
-    )
-
-
-# Backwards-compatible alias: older callers referenced build_album_index.
-build_album_index = build_storage_index
-
-
 def build_storage_summary():
     """
     The container list without per-record hydration: one SQL aggregation over
-    the raw (trimmed) album value, matching build_storage_index's grouping —
+    the raw (trimmed) album value —
     case-sensitive container names, box-vs-album by majority storage_type
     vote, non-empty games, newest-first ordering with dateless containers
-    last. Serves /storage and /storage/list, which never touch the per-record
-    lists build_storage_index carries.
+    last. Serves /storage and /storage/list.
     """
     from sqlalchemy import func as _f
     not_cat = _f.coalesce(ScanRecord.is_catalog, False) == False  # noqa: E712
@@ -5082,7 +4995,6 @@ def _builder_csv(groups):
     """Full per-card detail CSV (all inventory_detail fields), grouped by
     pack/set. Returns (csv_text, ids)."""
     import csv as _csv
-    import io as _io
 
     flat = _builder_flatten(groups)
     ids = [i for _label, i in flat]
@@ -7631,16 +7543,6 @@ def _finalize_pdf_pair(front_path, back_path, front_page, back_page, game, album
     }
 
 
-def _import_single_card_pdf(pdf_bytes, game, album, edge_type, template, collection="", storage_type="album"):
-    """
-    Import a PDF (given as raw bytes) as front/back pairs. Suitable for smaller
-    uploads; inputs over 500 MB are spilled to a temp file automatically (see
-    _iter_pdf_bgr_pages). Prefer _import_single_card_pdf_path when the upload has
-    already been streamed to disk, to avoid ever holding the file in RAM.
-    """
-    return _import_pdf_pages(_iter_pdf_bgr_pages(pdf_bytes), game, album, edge_type, template, collection, storage_type)
-
-
 def _import_single_card_pdf_path(pdf_path, game, album, edge_type, template, collection="", storage_type="album"):
     """
     Import an already-on-disk PDF as front/back pairs, rasterizing one page at a
@@ -9726,7 +9628,6 @@ def _reference_sync_one_group(category_id, category_name, group_id, group_name, 
 # running while the user navigates elsewhere in the app. Progress lives in memory
 # and is polled by the Reference Data page; the SQLite WAL + busy_timeout config
 # lets the worker write while the rest of the app keeps reading.
-import threading as _threading
 _REF_JOBS = {}                       # category_id -> job dict
 _REF_JOBS_LOCK = _threading.Lock()
 
@@ -13533,12 +13434,6 @@ def _ximilar_http(method, url, payload=None):
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _ximilar_identify_enabled():
-    """The fallback will actually run only when its toggle is on AND a token is
-    set. Use _ximilar_fallback_on() alone to detect the on-but-no-key case."""
-    return _ximilar_fallback_on() and bool(get_api_key("XIMILAR_API_TOKEN"))
-
-
 def _ximilar_identify_card_ex(image_path):
     """Like _ximilar_identify_card, but returns (result_or_None, error_or_None) so
     callers can tell a config/network/image failure (error is a human message)
@@ -13655,70 +13550,6 @@ def _apply_ximilar_identification(record, xi, category_id):
     if matched:
         record.matched_product_id = matched.id
     return updates
-
-
-def _ximilar_identify_candidates(record, category_id):
-    """(candidates, error) for the manual-identify picker.
-
-    Returns reference candidates (rich: set/rarity/price, applied via
-    reference_product_id) when Ximilar's read resolves a synced catalog card;
-    otherwise a single raw candidate (source="ximilar") carrying name/number/set/
-    rarity so it can still be applied. `error` carries a human-readable message
-    for every non-success outcome (no key, image/network error, or Ximilar
-    couldn't identify the card) so the UI never fails silently."""
-    if not get_api_key("XIMILAR_API_TOKEN"):
-        return [], ("No Ximilar API key is set. Add your Ximilar API token in "
-                    "Settings \u2192 API Keys to identify cards with Ximilar.")
-
-    xi, xi_err = _ximilar_identify_card_ex(record.image_path)
-    if xi_err:
-        return [], xi_err
-    if not xi:
-        return [], "Ximilar read the front image but couldn't confidently identify this card."
-
-    cands = []
-    if category_id and card_ocr is not None:
-        try:
-            refs = _reference_candidates_for_ocr(
-                category_id,
-                {"name_guess": xi.get("name", ""), "number_guess": xi.get("number", "")},
-                limit=3,
-            )
-        except Exception:
-            refs = []
-        _min = auto_identify_min_score()
-        for r in refs:
-            if float(r.get("score", 0) or 0) >= _min:
-                cands.append({**r, "via": "ximilar"})
-
-    if not cands:
-        cands.append({
-            "source":          "ximilar",
-            "via":             "ximilar",
-            "name":            xi.get("name", ""),
-            "serial":          xi.get("number", ""),
-            "set":             xi.get("set", ""),
-            "rarity":          xi.get("rarity", ""),
-            "game":            (record.extracted_data or {}).get("game", ""),
-            "score":           0.95,
-            "serial_match":    False,
-            "name_similarity": 1.0,
-        })
-    return cands, None
-
-
-# ============================================================================ #
-# CardSight AI — image-based identification (free tier: 750 calls/month).
-#   Auth:   header  X-API-Key: <32-char alphanumeric key>
-#   Ident:  POST https://api.cardsight.ai/v1/identify/card  (multipart 'image')
-#   Health: GET  https://api.cardsight.ai/v1/health
-# One endpoint covers sports + Pokémon (and MTG as it rolls out). Response:
-#   { success, detections:[ { confidence, card:{ name, number, setName,
-#     releaseName, year, fields:[{key,value}], ... } } ] }
-# ============================================================================ #
-CARDSIGHT_IDENTIFY_URL = "https://api.cardsight.ai/v1/identify/card"
-CARDSIGHT_HEALTH_URL   = "https://api.cardsight.ai/v1/health"
-CARDSIGHT_TIMEOUT      = 40
 
 
 def _cardsight_auth_key():
@@ -14670,7 +14501,6 @@ def ebay_listing_csv():
     template per item. Accepts {record_ids:[...]} or Builder {groups:[...]}.
     Category / ConditionID are left for you to set for your account/category."""
     import csv as _csv
-    import io as _io
     body = request.get_json(silent=True) or {}
     ids = list(body.get("record_ids") or [])
     if not ids and body.get("groups"):
@@ -15189,7 +15019,6 @@ def shops_pull(marketplace):
 # giving exact matching without ever needing to stamp our CCIM SKU onto TCGplayer.
 # ---------------------------------------------------------------------------
 import csv as _csv
-import io as _io
 
 # Column order mirrors the TCGplayer Pricing-tab export so the file imports cleanly.
 TCGPLAYER_CSV_COLUMNS = [

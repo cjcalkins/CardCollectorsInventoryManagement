@@ -469,11 +469,6 @@ def _read_number(bgr, band_top=0.90, band_bottom=0.965, corner_frac=0.34):
     return _pad_serial(best), raw, float(conf)
 
 
-def parse_collector_number(text):
-    m = _NUMBER_RE.search(text or "")
-    return _pad_serial(f"{int(m.group(1))}/{int(m.group(2))}") if m else ""
-
-
 def parse_set_code(text, drop=""):
     for tok in _SETCODE_RE.findall((text or "").upper()):
         if tok and tok != drop and not tok.isdigit():
@@ -718,10 +713,6 @@ def _extract_type_region(bgr, region=_DEFAULT_TYPE_REGION):
 
 
 # Back-compat name kept for any external callers.
-def _extract_type_icon(bgr, region=_DEFAULT_TYPE_REGION):
-    return _extract_type_region(bgr, region)
-
-
 def _square_pad(img):
     """Letterbox an icon to a square (white border) so wide card-captured icons
     and tight uploaded ones compare consistently after resizing."""
@@ -749,11 +740,6 @@ def _features(img, mode="icon"):
     hist = cv2.calcHist([hsv], [0], sat_mask, [30], [0, 180])
     cv2.normalize(hist, hist)
     return gray, hist
-
-
-# Back-compat alias.
-def _icon_features(icon_bgr, size=64):
-    return _features(icon_bgr, "icon")
 
 
 def prepare_type_references(raw_refs, size=64):
