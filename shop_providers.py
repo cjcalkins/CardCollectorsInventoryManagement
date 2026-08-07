@@ -29,7 +29,6 @@ Reality check (researched 2026):
              connector works only if you already hold TCGplayer API keys.
 """
 
-import os
 import json
 import base64
 import hmac

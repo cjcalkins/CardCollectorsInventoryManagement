@@ -35,11 +35,11 @@ import csv
 import io
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from flask import Blueprint, current_app, jsonify, render_template, request, send_file
 
-from models import db, utcnow, ShopConnection, ScanRecord, SaleEvent
+from models import db, utcnow, ShopConnection
 from shipping_models import Order, OrderItem, Shipment
 from shipping_providers import (
     SHIPPING_PROVIDERS, SHIPPING_SECRET_FIELDS, ENVELOPE_SIZES,

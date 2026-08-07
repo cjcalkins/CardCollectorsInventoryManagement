@@ -36,7 +36,6 @@ shop_providers.MARKETPLACES, so these rows never appear there.
 """
 
 import base64
-import json
 import urllib.request
 import urllib.parse
 import urllib.error

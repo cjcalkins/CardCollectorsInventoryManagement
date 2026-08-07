@@ -25,8 +25,6 @@ service* charged, recorded at purchase time. They are never recomputed later —
 a rate quoted today is not the rate you paid last week.
 """
 
-from datetime import datetime
-
 from models import db, utcnow
 
 
