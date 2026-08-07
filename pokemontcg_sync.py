@@ -39,10 +39,18 @@ CATEGORY_ID = 999_001
 PAGE_SIZE = 250
 TIMEOUT = 30
 MAX_RETRIES = 4
+# Ceiling on any single backoff sleep. A background sync thread must stay
+# responsive; a server asking for a longer wait gets this instead, and the
+# attempt budget runs out normally.
+MAX_BACKOFF_SECONDS = 30
 
 # Cache of {int group_id -> set string id} populated by get_groups()/_all_sets();
 # fetch_group_cards falls back to a fresh /sets pull if a lookup misses.
 _SET_ID_BY_GROUP = {}
+# The set OBJECTS from the last /sets pull, so _resolve_set can answer without
+# re-downloading the whole collection. Mutated in place so callers holding a
+# reference (and the tests) see refreshes.
+_SETS_CACHE = []
 
 
 # --------------------------------------------------------------------------- #
@@ -58,27 +66,60 @@ def _headers():
     return {"X-Api-Key": key} if key else {}
 
 
+def _retry_after_seconds(resp, attempt):
+    """Seconds to wait before the next attempt: the server's Retry-After when
+    it is a sane number, else linear backoff — CAPPED either way.
+
+    Uncapped, a Retry-After of 86400 (a misbehaving proxy, or an aggressive
+    rate limit) parked the background sync thread for a day PER ATTEMPT while
+    the job sat "running" with no way to tell it apart from progress."""
+    raw = (resp.headers.get("Retry-After") or "").strip()
+    try:
+        wait = float(raw)
+    except ValueError:
+        wait = 0.0
+    if wait <= 0:
+        wait = 1.5 * (attempt + 1)
+    return min(wait, MAX_BACKOFF_SECONDS)
+
+
 def _get(path, params=None):
-    """GET with basic retry/backoff on rate limits and transient errors."""
+    """GET with retry/backoff on rate limits and transient errors.
+
+    Raises the LAST failure's own exception: an all-429 exhaustion used to
+    re-raise a ConnectionError from an earlier attempt (last_exc was only set
+    on RequestException), reporting a rate limit as a network outage.
+    """
     url = f"{API_BASE}{path}"
     last_exc = None
+    last_status = None
+    last_body = ""
     for attempt in range(MAX_RETRIES):
+        final_attempt = (attempt == MAX_RETRIES - 1)
         try:
             resp = requests.get(url, params=params, headers=_headers(), timeout=TIMEOUT)
         except requests.RequestException as exc:
-            last_exc = exc
-            time.sleep(1.5 * (attempt + 1))
+            last_exc, last_status, last_body = exc, None, ""
+            if not final_attempt:      # never sleep after the last try
+                time.sleep(min(1.5 * (attempt + 1), MAX_BACKOFF_SECONDS))
             continue
         if resp.status_code == 429 or resp.status_code >= 500:
-            # Respect Retry-After when present, else linear backoff.
-            wait = resp.headers.get("Retry-After")
-            time.sleep(float(wait) if wait and wait.isdigit() else 1.5 * (attempt + 1))
+            last_exc = None            # this attempt's failure is the HTTP one
+            last_status = resp.status_code
+            last_body = (resp.text or "")[:300]
+            if not final_attempt:
+                time.sleep(_retry_after_seconds(resp, attempt))
             continue
         resp.raise_for_status()
         return resp.json()
-    if last_exc:
+    if last_exc is not None:
         raise last_exc
-    raise RuntimeError("pokemontcg.io request failed after retries")
+    detail = f"HTTP {last_status}" if last_status else "no response"
+    if last_body:
+        detail += f": {last_body}"
+    raise RuntimeError(
+        f"pokemontcg.io request failed after {MAX_RETRIES} attempts "
+        f"({url}) — {detail}")
 
 
 def _clean_name(name):
@@ -139,9 +180,19 @@ def get_last_updated():
     return None
 
 
-def _all_sets():
-    """Fetch every set (paginated), newest-cache the id->set map, and return the
-    raw set objects sorted oldest-first so vintage sets are easy to find."""
+def _all_sets(refresh=False):
+    """Fetch every set (paginated), cache both the id->set-id map and the set
+    OBJECTS, and return them sorted oldest-first so vintage sets are easy to
+    find.
+
+    The objects are cached, not just the id map: _resolve_set needs a set
+    object, so with only the map cached it re-downloaded the whole paginated
+    /sets collection on EVERY call — about 170 full downloads per category
+    sync against an API that rate-limits readily. Pass refresh=True to force a
+    re-pull (used when a group id is unknown, e.g. a set added since startup).
+    """
+    if _SETS_CACHE and not refresh:
+        return _SETS_CACHE
     sets = []
     page = 1
     while True:
@@ -154,14 +205,20 @@ def _all_sets():
         page += 1
     for s in sets:
         _SET_ID_BY_GROUP[_stable_int(s.get("id"))] = s.get("id")
+    _SETS_CACHE[:] = sets
     return sets
 
 
 def get_groups(category_id):
     """List all sets as groups. groupId is the stable int of the set string id;
-    extra keys (_set_id, release_date, total) are ignored by the route but handy."""
+    extra keys (_set_id, release_date, total) are ignored by the route but handy.
+
+    Forces a refresh: this is the entry point a sync starts from, so a set
+    released since the process started must show up. It costs one /sets pull
+    per sync — unlike _resolve_set, which runs once per group and reads the
+    cache this call fills."""
     groups = []
-    for s in _all_sets():
+    for s in _all_sets(refresh=True):
         sid = s.get("id")
         groups.append({
             "groupId": _stable_int(sid),
@@ -176,15 +233,13 @@ def get_groups(category_id):
 def _resolve_set(group_id):
     """(set_id, set_obj) for an integer group_id, refreshing the /sets cache if
     the id isn't known yet."""
+    sets = _all_sets()                      # cached after the first pull
     sid = _SET_ID_BY_GROUP.get(int(group_id))
-    sets = None
     if sid is None:
-        sets = _all_sets()
+        sets = _all_sets(refresh=True)      # unknown id: the cache may be stale
         sid = _SET_ID_BY_GROUP.get(int(group_id))
     if sid is None:
         raise RuntimeError(f"Unknown set for group_id {group_id}")
-    if sets is None:
-        sets = _all_sets()
     set_obj = next((s for s in sets if s.get("id") == sid), {})
     return sid, set_obj
 
