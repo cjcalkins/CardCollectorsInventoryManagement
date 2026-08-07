@@ -233,6 +233,10 @@ table.analytics-table, #inventoryTable { font-variant-numeric: tabular-nums; }
 
 /* ── App framework: settings sidebar ──────────────────────────────────── */
 .settings-sidebar { background: var(--surface); border-color: var(--border); }
+/* The pages size this against a 56px topbar that no longer exists at lg+
+   (the fixed rail replaced it); below lg the mobile topbar is back and the
+   pages' own media rules already flatten the sidebar. */
+@media (min-width: 992px) { .settings-sidebar { min-height: 100vh; } }
 .settings-sidebar a.ss-link { color: var(--text-soft); }
 .settings-sidebar a.ss-link:hover { background: var(--surface-2); color: var(--text); }
 .settings-sidebar a.ss-link.active { background: var(--ink); color: var(--on-ink); }

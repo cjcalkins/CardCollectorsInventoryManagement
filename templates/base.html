@@ -27,7 +27,7 @@
 {% block head %}{% endblock %}
     <link rel="stylesheet" href="{{ url_for('static', filename='theme.css') }}">
 </head>
-<body class="app-shell">
+<body class="{% block body_class %}app-shell{% endblock %}">
 {% block nav %}
     <header class="app-topbar navbar navbar-dark bg-dark d-lg-none">
         <div class="container-fluid">
