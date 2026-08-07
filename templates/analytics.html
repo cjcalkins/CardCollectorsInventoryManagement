@@ -23,7 +23,12 @@
         .stat-num { font-size:1.5rem; font-weight:800; line-height:1.1; }
         .stat-label { color:var(--muted); font-size:.8rem; }
 
-        .table-wrap { overflow-x:auto; }
+        /* Scroll both axes inside the wrapper: sticky thead binds to the
+           nearest scrollport, so without a bounded height it never engaged —
+           the page scrolled, the wrapper didn't. Capping the height makes the
+           wrapper the vertical scroller and the header actually stick, at
+           every viewport width, while keeping wide tables contained. */
+        .table-wrap { overflow:auto; max-height: calc(100vh - 210px); }
         table.analytics-table { width:100%; border-collapse:collapse; }
         table.analytics-table th, table.analytics-table td { padding:.55rem .7rem; border-bottom:1px solid var(--surface-2); font-size:.9rem; white-space:nowrap; }
         table.analytics-table th { text-align:left; color:var(--text-soft); font-weight:700; background:var(--bg); position:sticky; top:0; }
