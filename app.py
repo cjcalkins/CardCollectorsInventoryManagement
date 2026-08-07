@@ -16401,18 +16401,28 @@ def restart_mdns(new_name):
     return name
 
 
-def _port_bindable(port):
-    """True if we can bind the given TCP port on all interfaces right now."""
+def _bind_error(port):
+    """The OSError from binding the given TCP port on all interfaces, or None if it
+    binds. The error is worth keeping rather than collapsing to a bool: EACCES ("a
+    port below 1024 needs root") and EADDRINUSE ("something else has it") call for
+    completely different advice, and telling someone to re-run with sudo when the
+    real problem is a second copy of the app already running sends them the wrong
+    way."""
     import socket
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         s.bind(("0.0.0.0", port))
-        return True
-    except OSError:
-        return False
+        return None
+    except OSError as exc:
+        return exc
     finally:
         s.close()
+
+
+def _port_bindable(port):
+    """True if we can bind the given TCP port on all interfaces right now."""
+    return _bind_error(port) is None
 
 
 # SPKI SHA-256 of keypairs that are known to be public and must never be served.
@@ -16461,13 +16471,27 @@ def _ensure_self_signed_cert(cert_dir, hostnames, ips):
     key_path = os.path.join(cert_dir, "cardcollector.key")
     if os.path.exists(cert_path) and os.path.exists(key_path):
         try:
+            with open(cert_path, "rb"):
+                pass
             with open(key_path, "rb") as f:
-                fingerprint = _spki_sha256(f.read())
-        except OSError:
-            fingerprint = None
-        # Only a POSITIVE match discards the pair. An unreadable or unparseable key gives
-        # None, which is not in the set, so it is reused exactly as before — a transient
-        # read error must not churn a legitimate certificate on every boot.
+                key_pem = f.read()
+        except OSError as exc:
+            # A pair this process cannot read is a pair it cannot serve: the same
+            # process hands these paths to werkzeug moments later, so the failure is
+            # deterministic, not transient. Returning it anyway deferred the error
+            # into app.run(), which is outside the caller's try — so the launcher
+            # died with a raw PermissionError instead of falling back to HTTP. The
+            # usual cause is a single earlier start with sudo: that run leaves
+            # certs/ owned by root with the key at 0600, and every ordinary run
+            # afterwards crashes, which reads as "this app needs sudo".
+            raise RuntimeError(
+                f"the certificate exists but cannot be read ({exc}). If the app was "
+                f"ever started with sudo, that run left {cert_dir} owned by root — "
+                f"take it back with:  sudo chown -R $(id -un):$(id -gn) {cert_dir}")
+        fingerprint = _spki_sha256(key_pem)
+        # Only a POSITIVE match discards the pair. An unparseable key gives None,
+        # which is not in the set, so it is reused exactly as before — a garbled read
+        # must not churn a legitimate certificate on every boot.
         if fingerprint not in _COMPROMISED_SPKI_SHA256:
             return cert_path, key_path
         print("[https] SECURITY: this certificate's private key was published in the "
@@ -16611,13 +16635,31 @@ if __name__ == "__main__":
     default_port = 443 if USE_HTTPS else 80
 
     PORT = int(os.environ.get("PORT", str(default_port)))
-    if not _port_bindable(PORT):
+    _bind_err = _bind_error(PORT)
+    if _bind_err is not None:
+        import errno as _errno
+        import sys as _sys
+
         fallback = int(os.environ.get("PORT_FALLBACK", "8443" if USE_HTTPS else "5005"))
         if PORT != fallback:
-            print(f"[port] Couldn't bind port {PORT} — it needs admin/root privileges, "
-                  f"or it's already in use.")
-            print(f"[port] Falling back to {fallback}. To use {PORT}: launch with elevated "
-                  f"privileges (e.g. 'sudo'), or set PORT to a free port.")
+            # Separate the two causes: they need opposite advice, and telling someone
+            # to re-run with sudo when a second copy of the app already holds the
+            # port sends them the wrong way entirely.
+            if _bind_err.errno == _errno.EADDRINUSE:
+                print(f"[port] Port {PORT} is already in use — another program (or a "
+                      f"second copy of this app) is holding it.")
+            else:
+                print(f"[port] Couldn't bind port {PORT}: {_bind_err.strerror}. Ports "
+                      f"below 1024 are privileged and this process is not root.")
+            print(f"[port] Falling back to {fallback}. Nothing else changes — {scheme.upper()} "
+                  f"still works, the address just carries :{fallback}.")
+            if _bind_err.errno == _errno.EACCES and _sys.platform.startswith("linux"):
+                # Neither of these is needed to run the app; they only remove the
+                # ":port" suffix. Both need root ONCE, at setup, never at launch.
+                print(f"[port] To serve on {PORT} as an ordinary user (Linux, one-time root):")
+                print(f"[port]     sudo sysctl -w net.ipv4.ip_unprivileged_port_start={PORT}")
+                print(f"[port]     echo net.ipv4.ip_unprivileged_port_start={PORT} | "
+                      f"sudo tee /etc/sysctl.d/50-cardcollector.conf   # to persist it")
             PORT = fallback
 
     with app.app_context():
@@ -16638,8 +16680,16 @@ if __name__ == "__main__":
             if isinstance(exc, ImportError):
                 print("[https] HTTPS needs the 'cryptography' package. Install it with:")
                 print("[https]     pip install cryptography      (or: pip install -r requirements.txt)")
-            print(f"[https] Could not set up HTTPS ({exc}); serving over HTTP instead.")
-            print("[https] Note: the live camera won't work on other devices over HTTP.")
+            # On its own line: the certificate-permission message carries a command to
+            # run, and burying that in a parenthetical is how it gets skipped.
+            print(f"[https] Could not set up HTTPS: {exc}")
+            if isinstance(exc, PermissionError):
+                # makedirs failing, rather than the pair being unreadable — same
+                # ownership cause, so point at the same place.
+                print(f"[https] This is a file-permission problem, not a missing feature: "
+                      f"check who owns {cert_dir} and its parent.")
+            print("[https] Serving over HTTP instead — the live camera won't work on "
+                  "devices other than this machine.")
             USE_HTTPS = False
             scheme = "http"
             default_port = 80
