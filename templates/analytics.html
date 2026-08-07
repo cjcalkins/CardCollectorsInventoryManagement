@@ -1,27 +1,12 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <link rel="icon" type="image/jpeg" href="{{ url_for('static', filename='favicon.jpg') }}">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Analytics - Card Collector Inventory Manager</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" integrity="sha384-t1nt8BQoYMLFN5p42tRAtuAAFQaCQODekUVeKKZrEnEyp4H2R0RHFz0KWpmj7i8g" crossorigin="anonymous">
+{% extends "base.html" %}
+{% set nav_active = 'analytics' %}
+
+{% block title %}Analytics - Card Collector Inventory Manager{% endblock %}
+
+{% block head %}
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.js" integrity="sha384-dug+JxfBvklEQdJ4AYuBBAIScUz0bVN73xpy273gcAwHjb3qI0fXmuYNaNfdyYJG" crossorigin="anonymous"></script>
     <style>
         body { background-color: var(--bg); }
-        .nav-tabs-minimal { display: flex; gap: 10px; margin-left: auto; }
-        .nav-tab {
-            padding: 8px 14px; text-decoration: none; border-radius: 8px;
-            background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.85);
-            font-weight: 600; transition: 0.2s ease;
-        }
-        .nav-tab:hover { background: rgba(255,255,255,0.18); color: #fff; }
-        .nav-tab.active { background: var(--surface); color: var(--text); }
-        @media (max-width: 768px) {
-            .nav-tabs-minimal { margin-left: 0; margin-top: 12px; width: 100%; }
-            .nav-tab { flex: 1; text-align: center; }
-        }
 
         .panel { background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:1.25rem 1.4rem; box-shadow:0 3px 14px rgba(0,0,0,.05); margin-bottom:1.25rem; }
         .panel h6.section { font-size:.72rem; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); font-weight:700; margin-bottom:.6rem; }
@@ -49,24 +34,9 @@
         .section-head { font-size:.95rem; font-weight:700; color:var(--text-soft); margin:1.75rem 0 .6rem; }
         .chart-box { position:relative; height:360px; }
     </style>
-    <link rel="stylesheet" href="{{ url_for('static', filename='theme.css') }}">
-</head>
-<body>
-    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
-        <div class="container d-flex flex-wrap align-items-center">
-            <a class="navbar-brand" href="{{ url_for('index') }}">
-                <img src="{{ url_for('static', filename='favicon.jpg') }}" alt="logo" width="24" height="24" style="object-fit:cover;border-radius:4px;margin-right:0.5rem;" class="me-2">Card Collector Inventory Manager
-            </a>
-            <div class="nav-tabs-minimal">
-                {% if can_view('import') %}<a href="{{ url_for('import_page') }}" class="nav-tab">Import</a>{% endif %}
-                {% if can_view('inventory') %}<a href="{{ url_for('inventory') }}" class="nav-tab">Inventory</a>{% endif %}
-                {% if can_view('albums') %}<a href="{{ url_for('storage_list') }}" class="nav-tab">Storage</a>{% endif %}
-                {% if can_view('analytics') %}<a href="{{ url_for('analytics_page') }}" class="nav-tab active">Analytics</a>{% endif %}
-                {% if can_view('settings') %}<a href="{{ url_for('settings_page') }}" class="nav-tab" title="Settings"><i class="fas fa-gear"></i></a>{% endif %}
-                {% if auth_user %}<a href="{{ url_for('auth_logout') }}" class="nav-tab" title="Sign out ({{ auth_username }})"><i class="fas fa-right-from-bracket"></i></a>{% endif %}
-            </div>
-        </div>
-    </nav>
+{% endblock %}
+
+{% block content %}
 
     <div class="container py-5">
         <div class="mb-4">
@@ -221,7 +191,9 @@
         </div>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz" crossorigin="anonymous"></script>
+{% endblock %}
+
+{% block scripts %}
     <script>
         const QUERY_URL  = '{{ url_for("analytics_query") }}';
         const EXPORT_URL = '{{ url_for("analytics_export") }}';
@@ -608,5 +580,4 @@
                 + (fee * 100).toFixed(1) + '% fee; Sold = summed Sold Price where filled in.';
         }
     </script>
-</body>
-</html>
+{% endblock %}
