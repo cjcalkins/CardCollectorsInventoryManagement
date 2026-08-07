@@ -107,6 +107,11 @@ code, .path-line, .masked {
 }
 .table thead th { font-weight: 600; color: var(--text-soft); }
 table.analytics-table, #inventoryTable { font-variant-numeric: tabular-nums; }
+/* Phones: tighter cells so contained tables show more before scrolling */
+@media (max-width: 767px) {
+    .table > :not(caption) > * > * { padding: .4rem .5rem; }
+    table.analytics-table th, table.analytics-table td { padding: .4rem .5rem; }
+}
 
 /* ── Buttons — route Bootstrap's own component variables ──────────────── */
 .btn-dark {
