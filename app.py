@@ -1,3 +1,9 @@
+# Environment preflight — must run before ANY third-party import so a missing
+# package or system library (e.g. OpenCV's libGL on headless Linux) stops the
+# launch with the fix printed, not a traceback. CCIM_SKIP_PREFLIGHT=1 bypasses.
+from preflight import run_preflight
+run_preflight()
+
 from flask import Flask, request, jsonify, render_template, send_from_directory, url_for, redirect, Response, session, g
 import os
 import posixpath

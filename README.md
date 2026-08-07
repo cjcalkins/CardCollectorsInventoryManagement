@@ -176,6 +176,17 @@ command is in the lock file's header) so the next person inherits a tested set.
 python app.py
 ```
 
+Launch begins with an environment **preflight** that verifies Python 3.10+, every
+required package, and the OpenCV system libraries — a broken install prints the exact
+fix (e.g. the `apt` line for a missing `libGL.so.1` on headless Linux) instead of a
+traceback. Check an install without starting the app:
+
+```bash
+python preflight.py
+```
+
+Set `CCIM_SKIP_PREFLIGHT=1` to bypass the check.
+
 **`python app.py` is the only supported way to run the app.** Do not point a WSGI
 server (gunicorn, uWSGI, mod_wsgi) at it: a WSGI server imports the module without
 running its startup block, which is where the database schema is created, migrations
