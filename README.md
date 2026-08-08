@@ -193,15 +193,34 @@ command is in the lock file's header) so the next person inherits a tested set.
 
 ## Running the app
 
-**The app requires administrator/root privileges and refuses to start without them.**
+**Recommended: run it as a systemd service** ([full instructions below](#running-as-a-service-recommended)).
+systemd binds port 443 itself and hands the app the open socket, so the application
+process never holds root at all — there is no privileged phase to get wrong.
 
 ```bash
-sudo -E python3 app.py          # Linux / macOS
-python app.py                   # Windows, from a terminal opened "as administrator"
+sudo systemctl enable --now ccim.socket
 ```
 
-`sudo -E` preserves your environment, so `PORT`, `USE_HTTPS` and any other variables you
-set still apply; plain `sudo` clears them.
+For a direct launch (development, or a first look), the app binds the port itself and so
+needs root **on Linux/macOS**:
+
+```bash
+sudo /full/path/to/python3 app.py      # Linux / macOS — see the note on the path
+python app.py                          # Windows, terminal opened "as administrator"
+```
+
+> **Give the interpreter's full path, and do not use `sudo -E`.** `sudo` clears `PATH` on
+> purpose, and `-E` keeps your whole environment — including `PYTHONPATH`, which decides
+> what a *root* process imports. Either one lets anything writable on your `PATH` (a
+> virtualenv `bin/`, `~/.local/bin`, a pip package's scripts) choose what runs as root.
+> Pass the settings you need by name instead:
+>
+> ```bash
+> sudo PORT=443 USE_HTTPS=1 /full/path/to/python3 app.py
+> ```
+>
+> Inside a virtualenv the full path is `"$VIRTUAL_ENV/bin/python"`; under conda it is
+> `"$CONDA_PREFIX/bin/python"`.
 
 Launch begins with an environment **preflight** that verifies Python 3.10+, every
 required package, and the OpenCV system libraries — a broken install prints the exact
@@ -234,12 +253,13 @@ local network. On first launch it generates a self-signed certificate (stored in
 
 Notes on access:
 
-- **Administrator privileges are required.** The app checks at startup and exits if it is
-  not elevated, rather than starting in a reduced state. Port 443 is the concrete reason —
-  every port below 1024 is reserved for root — and starting unprivileged would silently
-  move the app to `:8443`.
+- **Administrator privileges are required for a direct launch.** The app checks at startup
+  and exits if it is not elevated, rather than starting in a reduced state. Port 443 is the
+  concrete reason — every port below 1024 is reserved for root. Running it as a systemd
+  service removes this requirement entirely: systemd binds the port, the app never needs
+  privilege.
   ```bash
-  sudo -E python3 app.py       # Linux / macOS — -E keeps PORT, USE_HTTPS and friends
+  sudo PORT=443 USE_HTTPS=1 /full/path/to/python3 app.py   # Linux / macOS
   ```
   On Windows, start the terminal with **Run as administrator**, then `python app.py`.
   There is deliberately **no environment variable to bypass the check**: an override would
@@ -268,7 +288,7 @@ Notes on access:
 - **HTTPS is required for the live camera** (browsers only allow camera access on secure
   origins), which is why it's the default. Set `USE_HTTPS=0` to serve plain HTTP instead.
 
-### Running as a service, without sudo (recommended for a permanent install)
+### Running as a service (recommended)
 
 `systemd` can bind the privileged port itself, at boot, and hand the already-open socket to
 the app. The application process then **never holds root — not even for the instant it takes
@@ -287,6 +307,11 @@ sudo systemctl enable --now ccim.socket
 Enable the **socket**, not the service — the service is started automatically on the first
 connection. Change the port in `ccim.socket` only; the app reads it off the socket, so `PORT`
 in the service environment is ignored on this path.
+
+If port 443 is unavailable, `ccim.socket` fails to start and the service never runs. The app
+has **no fallback port** on any launch path: it serves on the port you asked for or it stops,
+because an app quietly listening somewhere else looks healthy while every bookmark and
+certificate names an address nobody is answering.
 
 ```bash
 systemctl status ccim.service      # is it running
@@ -334,8 +359,7 @@ values can also be set in the UI and persist in the app's settings store or in
 | Variable                  | Default            | Description |
 |---------------------------|--------------------|-------------|
 | `USE_HTTPS`               | `1`                | Serve over HTTPS with a self-signed cert. `0` for plain HTTP. |
-| `PORT`                    | `443` / `80`       | Listening port (HTTPS / HTTP default). |
-| `PORT_FALLBACK`           | `8443` / `5005`    | Port used if the primary port can't bind. |
+| `PORT`                    | `443` / `80`       | Listening port (HTTPS / HTTP default). If it cannot be bound the app stops — it never moves itself to another port. |
 | `CCIM_RUN_AS`             | `SUDO_USER`        | Account to drop to once the port is bound. Must own the checkout and the storage roots. |
 | `SECRET_KEY`              | *(auto-persisted)* | Flask session secret. Auto-generated and stored if unset. |
 | `SESSION_COOKIE_SECURE`   | *(unset)*          | Mark the session cookie `Secure`. **Set this to `1` when running behind a TLS-terminating reverse proxy** (e.g. nginx, Tailscale, or Cloudflare in front of `python app.py`): the app sees plain HTTP there and cannot tell. Running `python app.py` over HTTPS turns it on by itself. Leave unset for plain HTTP — a `Secure` cookie on an `http://` origin is never sent back, which looks like "login does nothing". |

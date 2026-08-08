@@ -16779,28 +16779,29 @@ if __name__ == "__main__":
     else:
         _sock, _bind_err = _bind_listening_socket(PORT)
     if _bind_err is not None:
+        # No fallback port. Serving on a different address than the one asked for is a
+        # silent failure: the app looks healthy, every bookmark and every certificate
+        # still names the port nobody is listening on, and the operator finds out from
+        # a user. Stop instead, and say which of the two causes it was.
         import errno as _errno
-        fallback = int(os.environ.get("PORT_FALLBACK", "8443" if USE_HTTPS else "5005"))
         if _bind_err.errno == _errno.EADDRINUSE:
             print(f"[port] Port {PORT} is already in use — another program (or a second "
-                  f"copy of this app) is holding it.")
+                  f"copy of this app) is holding it. Stop that first, or set PORT to a "
+                  f"free port.", flush=True)
         elif _bind_err.errno == _errno.EACCES:
             # Elevated and still refused: the privilege came from something narrower
             # than root (a container without NET_BIND_SERVICE, an SELinux/AppArmor
             # policy). "Use sudo" would be the wrong advice — this launch already is.
             print(f"[port] Couldn't bind port {PORT}: {_bind_err.strerror}. This launch "
                   f"is elevated, so something outside the app is denying the port — "
-                  f"check container capabilities or an SELinux/AppArmor policy.")
+                  f"check container capabilities or an SELinux/AppArmor policy.", flush=True)
         else:
-            print(f"[port] Couldn't bind port {PORT}: {_bind_err.strerror}.")
-        if PORT != fallback:
-            print(f"[port] Falling back to {fallback}. {scheme.upper()} still works, the "
-                  f"address just carries :{fallback}.")
-            PORT = fallback
-            _sock, _bind_err = _bind_listening_socket(PORT)
+            print(f"[port] Couldn't bind port {PORT}: {_bind_err.strerror}.", flush=True)
+        print(f"[port] Nothing to serve on — stopping.", flush=True)
+        raise SystemExit(1)
     if _sock is None:
-        print(f"[port] Could not bind {PORT} either ({_bind_err}). Nothing to serve on — "
-              f"stopping.")
+        print(f"[port] Could not bind {PORT} ({_bind_err}). Nothing to serve on — "
+              f"stopping.", flush=True)
         raise SystemExit(1)
 
     _dropped = None
