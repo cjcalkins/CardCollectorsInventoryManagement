@@ -16437,6 +16437,57 @@ def _bind_listening_socket(port, backlog=128):
         return None, exc
 
 
+def _systemd_listen_socket():
+    """The listening socket systemd passed in, or (None, None) when not activated.
+
+    Implements the sd_listen_fds handshake: systemd binds the port itself (as root,
+    at boot) and execs this service already-unprivileged with the open descriptor at
+    fd 3. Nothing here ever holds root, not even briefly — which is the point of
+    using it instead of sudo.
+
+    LISTEN_PID is checked against our own pid and is not optional. The variables are
+    inherited by children, so without that check a process started BY an activated
+    service would read its parent's LISTEN_FDS and adopt a descriptor that is not a
+    listening socket, or worse is somebody else's connection.
+
+    Returns (socket, port). The port comes from the socket rather than from PORT,
+    because systemd owns the address here and the env var may say something else --
+    and that number goes on to the printed URL and the mDNS advertisement.
+    """
+    import socket as _socket
+    try:
+        if int(os.environ.get("LISTEN_PID", "0")) != os.getpid():
+            return None, None
+        n = int(os.environ.get("LISTEN_FDS", "0"))
+    except ValueError:
+        return None, None
+    if n < 1:
+        return None, None
+    SD_LISTEN_FDS_START = 3
+    try:
+        sock = _socket.socket(fileno=SD_LISTEN_FDS_START)
+        # Refuse anything that is not already listening. A passed descriptor that is
+        # not a server socket would fail much later, inside the WSGI server, where
+        # the cause is no longer obvious.
+        if not sock.getsockopt(_socket.SOL_SOCKET, _socket.SO_ACCEPTCONN):
+            print("[systemd] fd 3 is not a listening socket — ignoring the activation "
+                  "handshake and continuing with a normal launch.", flush=True)
+            return None, None
+        port = sock.getsockname()[1]
+    except OSError as exc:
+        print(f"[systemd] Could not adopt the passed socket ({exc}) — continuing with "
+              f"a normal launch.", flush=True)
+        return None, None
+    # Consume the handshake so anything this process spawns does not see it.
+    os.environ.pop("LISTEN_FDS", None)
+    os.environ.pop("LISTEN_PID", None)
+    os.environ.pop("LISTEN_FDNAMES", None)
+    if n > 1:
+        print(f"[systemd] {n} sockets were passed; this app serves on the first and "
+              f"ignores the rest.", flush=True)
+    return sock, port
+
+
 def _run_as_target():
     """(name, uid, gid) of the account to run as after the port is bound, or None
     if there is nobody to drop to.
@@ -16688,11 +16739,18 @@ def _ensure_self_signed_cert(cert_dir, hostnames, ips):
 
 
 if __name__ == "__main__":
-    # Privilege gate FIRST, ahead of every side effect below. A refused launch must
-    # not have moved the database, run a migration, written a certificate or created
-    # a storage root — otherwise the "wrong" launch leaves files owned by the wrong
-    # account, which is its own support problem.
-    _require_elevated()
+    # Socket activation is resolved BEFORE the privilege gate, because it answers the
+    # question the gate exists to ask. When systemd hands us an already-bound port
+    # there is nothing left that needs root, so demanding root would refuse the one
+    # launch path that never has it — the service runs under User= from the start.
+    _sd_sock, _sd_port = _systemd_listen_socket()
+
+    # Privilege gate, ahead of every side effect below. A refused launch must not have
+    # moved the database, run a migration, written a certificate or created a storage
+    # root — otherwise the "wrong" launch leaves files owned by the wrong account,
+    # which is its own support problem.
+    if _sd_sock is None:
+        _require_elevated()
 
     # ---- privileged phase -------------------------------------------------------
     # Everything that needs root happens here and nowhere else: bind the port, then
@@ -16709,34 +16767,49 @@ if __name__ == "__main__":
     DEBUG = os.environ.get("FLASK_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on")
 
     PORT = int(os.environ.get("PORT", str(default_port)))
-    _sock, _bind_err = _bind_listening_socket(PORT)
+    if _sd_sock is not None:
+        # systemd bound it; PORT comes from the socket so the printed URL and the
+        # mDNS advertisement match the address people can actually reach.
+        _sock, _bind_err = _sd_sock, None
+        PORT = _sd_port
+        # flush: stdout is a pipe under systemd and Python block-buffers it, so an
+        # unflushed line is lost entirely when the service is stopped.
+        print(f"[systemd] Socket activation: serving on the descriptor systemd passed "
+              f"(port {PORT}). This process never held root.", flush=True)
+    else:
+        _sock, _bind_err = _bind_listening_socket(PORT)
     if _bind_err is not None:
+        # No fallback port. Serving on a different address than the one asked for is a
+        # silent failure: the app looks healthy, every bookmark and every certificate
+        # still names the port nobody is listening on, and the operator finds out from
+        # a user. Stop instead, and say which of the two causes it was.
         import errno as _errno
-        fallback = int(os.environ.get("PORT_FALLBACK", "8443" if USE_HTTPS else "5005"))
         if _bind_err.errno == _errno.EADDRINUSE:
             print(f"[port] Port {PORT} is already in use — another program (or a second "
-                  f"copy of this app) is holding it.")
+                  f"copy of this app) is holding it. Stop that first, or set PORT to a "
+                  f"free port.", flush=True)
         elif _bind_err.errno == _errno.EACCES:
             # Elevated and still refused: the privilege came from something narrower
             # than root (a container without NET_BIND_SERVICE, an SELinux/AppArmor
             # policy). "Use sudo" would be the wrong advice — this launch already is.
             print(f"[port] Couldn't bind port {PORT}: {_bind_err.strerror}. This launch "
                   f"is elevated, so something outside the app is denying the port — "
-                  f"check container capabilities or an SELinux/AppArmor policy.")
+                  f"check container capabilities or an SELinux/AppArmor policy.", flush=True)
         else:
-            print(f"[port] Couldn't bind port {PORT}: {_bind_err.strerror}.")
-        if PORT != fallback:
-            print(f"[port] Falling back to {fallback}. {scheme.upper()} still works, the "
-                  f"address just carries :{fallback}.")
-            PORT = fallback
-            _sock, _bind_err = _bind_listening_socket(PORT)
+            print(f"[port] Couldn't bind port {PORT}: {_bind_err.strerror}.", flush=True)
+        print(f"[port] Nothing to serve on — stopping.", flush=True)
+        raise SystemExit(1)
     if _sock is None:
-        print(f"[port] Could not bind {PORT} either ({_bind_err}). Nothing to serve on — "
-              f"stopping.")
+        print(f"[port] Could not bind {PORT} ({_bind_err}). Nothing to serve on — "
+              f"stopping.", flush=True)
         raise SystemExit(1)
 
     _dropped = None
-    if DEBUG:
+    if _sd_sock is not None:
+        # Nothing to drop: systemd started this process as User= and the port was
+        # bound before we existed.
+        pass
+    elif DEBUG:
         # The reloader re-executes this file as a child process. After a drop that
         # child is unprivileged, so it would hit the privilege gate and exit — and a
         # reloader that dies on every edit is worse than no drop in development.

@@ -1,0 +1,62 @@
+# Started by ccim.socket. Do not enable this unit directly — enable the socket.
+#
+# Edit User, Group, WorkingDirectory and ExecStart for your install, then:
+#   sudo systemctl daemon-reload
+#
+# Everything below the [Service] basics is confinement. None of it is required for
+# the app to run; all of it narrows what a compromise of the app can reach.
+
+[Unit]
+Description=Card Collector Inventory Manager
+Requires=ccim.socket
+After=network.target
+
+[Service]
+Type=simple
+
+# The account that owns the checkout and everything the app writes. NOT root.
+User=ccim
+Group=ccim
+
+WorkingDirectory=/opt/ccim
+# Absolute interpreter path on purpose: nothing here is resolved through PATH, so a
+# writable directory on somebody's PATH cannot decide what this service executes.
+ExecStart=/opt/ccim/.venv/bin/python /opt/ccim/app.py
+
+Restart=on-failure
+RestartSec=5
+
+# ── Confinement ──────────────────────────────────────────────────────────────
+# The app needs no capabilities at all: systemd bound the port before this process
+# existed, so there is nothing left that requires privilege.
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Even if something in the tree were setuid, it could not gain privilege from here.
+NoNewPrivileges=yes
+
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+# ProtectSystem=strict makes the whole filesystem read-only, so name the one tree the
+# app legitimately writes: the database, uploads, generated images, certificates.
+ReadWritePaths=/opt/ccim
+
+# AF_NETLINK is present because the optional zeroconf/mDNS advertisement enumerates
+# network interfaces through it. Drop it if you do not use the <name>.local address.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+# Deliberately NOT set: MemoryDenyWriteExecute. The OCR stack (onnxruntime) maps
+# executable pages at runtime, and turning it on stops the app from starting.
+
+[Install]
+# No WantedBy — ccim.socket pulls this in.
