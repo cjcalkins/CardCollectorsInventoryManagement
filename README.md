@@ -268,6 +268,36 @@ Notes on access:
 - **HTTPS is required for the live camera** (browsers only allow camera access on secure
   origins), which is why it's the default. Set `USE_HTTPS=0` to serve plain HTTP instead.
 
+### Running as a service, without sudo (recommended for a permanent install)
+
+`systemd` can bind the privileged port itself, at boot, and hand the already-open socket to
+the app. The application process then **never holds root — not even for the instant it takes
+to bind** — so there is no privileged phase, no `sudo`, and nothing on disk can end up owned
+by root.
+
+Unit files are in [`deploy/`](deploy/). Edit `User`, `Group`, `WorkingDirectory` and
+`ExecStart` in `ccim.service` to match your install, then:
+
+```bash
+sudo cp deploy/ccim.socket deploy/ccim.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ccim.socket
+```
+
+Enable the **socket**, not the service — the service is started automatically on the first
+connection. Change the port in `ccim.socket` only; the app reads it off the socket, so `PORT`
+in the service environment is ignored on this path.
+
+```bash
+systemctl status ccim.service      # is it running
+journalctl -u ccim.service -f      # what it is saying
+```
+
+`ccim.service` also ships with confinement (`ProtectSystem=strict`, an empty
+`CapabilityBoundingSet`, `NoNewPrivileges`, `PrivateTmp`) — none of it is needed for the app
+to run, all of it narrows what a compromise could reach. `ReadWritePaths` names the one tree
+the app writes; widen it if you move the database or uploads outside the install directory.
+
 ---
 
 ## First-run setup

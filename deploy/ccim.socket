@@ -1,0 +1,33 @@
+# Socket activation for Card Collector Inventory Manager.
+#
+# systemd binds the port itself, at boot, as root — then starts ccim.service as an
+# ordinary account and hands it the already-open descriptor. The application process
+# never holds root, not even for the instant it takes to bind. That is the whole
+# reason to use this instead of sudo: there is no privileged phase to get wrong, and
+# nothing on disk can end up owned by root.
+#
+#   sudo cp deploy/ccim.socket deploy/ccim.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ccim.socket
+#
+# The service is pulled in automatically on the first connection; you do not enable
+# ccim.service yourself.
+
+[Unit]
+Description=Card Collector Inventory Manager (socket)
+Documentation=file:///opt/ccim/README.md
+
+[Socket]
+# 443 for HTTPS (the app's default). Use 80 with USE_HTTPS=0 in the service, or any
+# port you prefer — the app reads the port off the socket, so this is the only place
+# it needs changing.
+ListenStream=443
+
+# Accept=no is required: the app is a normal server that calls accept() itself. With
+# Accept=yes systemd would spawn one service instance per connection.
+Accept=no
+NoDelay=true
+Backlog=128
+
+[Install]
+WantedBy=sockets.target
